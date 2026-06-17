@@ -28,53 +28,34 @@ const std::vector<Whale> WHALES = {
 };
 
 const std::string BOT_NAME = "🐋 Whale Siren";
-
 const std::string TELEGRAM_BOT_TOKEN = "8845630927:AAEb0Xhm7DUn7ihwPPhZVaaLN3C7hRM2FS0";
 const std::string OWNER_CHAT_ID = "546348566";
 
 std::vector<std::string> SUBSCRIBERS = {"546348566"};
-
 double THRESHOLD_USD = 10000.0;
 
 const std::string BSC_RPC_URL = "https://bsc-dataseed.bnbchain.org";
 const std::string TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const std::string USDT_ADDRESS = "0x55d398326f99059ff775485246999027b3197955";
 
-// Адреса DEX для определения swap операций
 const std::string PANCAKE_ROUTER_V2 = "0x10ed43c718714eb63d5aa57b78b54704e256024e";
 const std::string PANCAKE_ROUTER_V1 = "0x05ff2b0db69458a0750badebc4f9e13add608c7f";
 const std::string PANCAKE_FACTORY = "0xca143ce32fe78f1f7012d318b25d93c61a5a5c5e";
 
-// ВСЕ МОНЕТЫ BINANCE + BSC
 const std::map<std::string, std::string> KNOWN_TOKENS = {
-    // === Stablecoins ===    {"0x55d398326f99059ff775485246999027b3197955", "USDT"},
+    {"0x55d398326f99059ff775485246999027b3197955", "USDT"},
     {"0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", "USDC"},
     {"0xe9e7cea3dedca5984780bafc599bd69add087d56", "BUSD"},
     {"0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", "DAI"},
-    {"0x14016e85a25aeb13065688cafb43044c2ef86784", "TUSD"},
-    {"0xc5f0f7b66764f6ec8c8dff7ba683102295e16409", "FDUSD"},
-    
-    // === Major Cryptocurrencies ===
-    {"0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", "BTCB"},
-    {"0x2170ed0880ac9a755fd29b2688956bd959f933f8", "ETH"},
+    {"0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", "BTCB"},    {"0x2170ed0880ac9a755fd29b2688956bd959f933f8", "ETH"},
     {"0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", "WBNB"},
-    {"0x570a5d26f7765ecb712c0924e4de545b89fd43df", "SOL"},
-    {"0x1ce0c2827e2ef14d5c4f29a091d735a204794041", "AVAX"},
-    {"0xcc42724c6683b7e57334c4e856f4c9965ed682bd", "MATIC"},
-    {"0x1fa4a73a3f0133f0025378af00236f3abdee5d63", "NEAR"},
-    {"0x0eb3a705fc54725037cc9e008bdede697f62f335", "ATOM"},
-    {"0x62b7b2149d559422227737496d4af0c2738ab274", "ICP"},
-    {"0x9bcf0506c62ca1f1ad9fca3008987297f707bc1a", "THETA"},
-    {"0xad29abb318791d579433d831ed122afeaf29dcfe", "FTM"},
-    {"0xb620d695a81c3e3019930691c9d28ce443f4d275", "EGLD"},
-    
-    // === Top Altcoins ===
+    {"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", "CAKE"},
+    {"0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63", "XVS"},
     {"0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe", "XRP"},
     {"0x3ee2200efb3400fabb9aacf31297cbdd1d435d47", "ADA"},
     {"0x7083609fce4d1d8dc0c979aab8c869ea2c873402", "DOT"},
     {"0xba2ae424d960c26247dd6c32edc70b295c744c43", "DOGE"},
     {"0xf8a0bf9cf54bb92f17374d9e9a321e6a111a51bd", "LINK"},
-    {"0xbf5140a22578168fd562dccf235e5d43a02ce9b1", "UNI"},
     {"0x4338665cbb7b2485a8855a139b75d5e34ab0db94", "LTC"},
     {"0x8ff795a6f4d97e7887c79bea79aba5cc76444adf", "BCH"},
     {"0x0d8ce2a99bb6e3b7db580ed848240e4a0f9ae153", "FIL"},
@@ -86,8 +67,6 @@ const std::map<std::string, std::string> KNOWN_TOKENS = {
     {"0x947950bcc74888a40ffa2593c5798f11fc9124c4", "SUSHI"},
     {"0x88f1a5ae2a3bf98aeaf342d26b30a79438c9142e", "YFI"},
     {"0x111111111117dc0aa78b770fa6a738034120c302", "1INCH"},
-    
-    // === Meme & Gaming ===
     {"0xc748673057861a797275cd8a068abb95a902e8de", "BabyDoge"},
     {"0x2859e4544c4bb03966803b044a93563bd2d0dd4d", "SHIB"},
     {"0x67b725d7e342d7b611fa85e859df9697d9378b2e", "SAND"},
@@ -96,65 +75,14 @@ const std::map<std::string, std::string> KNOWN_TOKENS = {
     {"0x7ddee176f665cd201f93eede625770e2fd911990", "GALA"},
     {"0x3f382dbd960e3a9bbceae22651e88158d2791550", "CHZ"},
     {"0x2ff3d0f6990a40261c66e1ff2017acbc282eb6d0", "ENJ"},
-    {"0x4a9a2b2b045ea0c6312b5c4a5c8a3c8b8e8e8e8e", "PEPE"},    {"0x5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a", "FLOKI"},
-    {"0x6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b", "WIF"},
-    {"0x7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c", "BONK"},
-    
-    // === BSC Native & DeFi ===
-    {"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", "CAKE"},
-    {"0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63", "XVS"},
     {"0x8f0528ce5ef7b51152a59745befdd91d97091d2f", "ALPACA"},
     {"0x56b6fb708fc5732dec1afc8d8556423a2edccbd6", "EOS"},
     {"0x3d6545b08693dae087e957cb1180ee38b9e3c25e", "ETC"},
     {"0xb3c11196a4f3b1da7c23d9fb0a319f7e79e83e0e", "TRX"},
-    {"0x352cb8992890b0366d75320d944070611d634a70", "BTT"},
-    {"0xae9269f27437f0fcbc232d39ec814844a51d6b8f", "WIN"},
-    {"0xa8c2b8eec3d368c0253ad3dae65a5f2bbb89c929", "JST"},
-    {"0x955a34b153a4b3e03f6a55468d92186683866314", "SUN"},
-    
-    // === AI & Layer 2 ===
-    {"0x8235e6323965a5b5b5b5b5b5b5b5b5b5b5b5b5b5", "FET"},
-    {"0x9346464646464646464646464646464646464646", "AGIX"},
-    {"0xa454545454545454545454545454545454545454", "OCEAN"},
-    {"0xb565656565656565656565656565656565656565", "RNDR"},
-    {"0xc676767676767676767676767676767676767676", "ARB"},
-    {"0xd787878787878787878787878787878787878787", "OP"},
-    
-    // === Real World Assets ===
-    {"0xe898989898989898989898989898989898989898", "OM"},
-    {"0xf9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9", "CFG"},
-    
-    // === Gaming & Metaverse ===
-    {"0x0ab0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0", "IMX"},
-    {"0x1bc1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "GRT"},
-    {"0x2cd2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2", "GLM"},
-    
-    // === DeFi Protocols ===
-    {"0x3de3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3", "LDO"},
-    {"0x4ef4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4", "RPL"},
-    {"0x5fa5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5", "BAL"},
-    
-    // === Meme Coins ===
-    {"0x6ab6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6", "MEME"},
-    {"0x7bc7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7", "ORDI"},
-    {"0x8cd8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8d8", "SATS"},
-    
-    // === Other Popular ===
-    {"0x9de9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9e9", "SEI"},
-    {"0xaef0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0", "SUI"},
-    {"0xbfa1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", "APT"},
-    {"0xc0b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2", "TIA"},
-    {"0xd1c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3", "INJ"},
-    {"0xe2d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4", "BLUR"},    {"0xf3e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5", "PYTH"},
-    {"0x04f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6", "JTO"},
-    {"0x15a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7", "DYM"},
-    {"0x26b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8b8", "STRK"},
-    
-    // === Токени з портфеля кита ===
     {"0x997a58129890bbda032231a52ed1ddc845fc18e1", "SIREN"}
 };
 
-// ==================== SQLITE БАЗА ДАНИХ ====================
+// ==================== SQLITE ====================
 sqlite3* db = nullptr;
 
 void initDatabase() {
@@ -168,14 +96,12 @@ void initDatabase() {
 
 void saveTransaction(const std::string& txHash, const std::string& whaleName, const std::string& action, const std::string& token, double usdValue) {
     if (!db) return;
-    std::string sql = "INSERT OR IGNORE INTO transactions (tx_hash, whale_name, action, token, usd_value) VALUES ('" + txHash + "', '" + whaleName + "', '" + action + "', '" + token + "', " + std::to_string(usdValue) + ");";
-    char* errMsg = nullptr;
+    std::string sql = "INSERT OR IGNORE INTO transactions (tx_hash, whale_name, action, token, usd_value) VALUES ('" + txHash + "', '" + whaleName + "', '" + action + "', '" + token + "', " + std::to_string(usdValue) + ");";    char* errMsg = nullptr;
     sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
     if (errMsg) sqlite3_free(errMsg);
 }
 
 // ==================== УТИЛИТЫ ====================
-
 size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
     s->append((char*)contents, size * nmemb);
     return size * nmemb;
@@ -194,13 +120,13 @@ double hexToDouble(const std::string& hex) {
     try { unsigned long long val = std::stoull(cleanHex, nullptr, 16); return static_cast<double>(val); }
     catch (...) { return 0.0; }
 }
+
 std::string extractAddress(const std::string& hex) {
     if (hex.length() < 42) return "";
     return "0x" + toLower(hex.substr(hex.length() - 40));
 }
 
-// ==================== HTTP ЗАПРОСЫ ====================
-
+// ==================== HTTP ====================
 std::string httpRequest(const std::string& url, const std::string& postData = "") {
     CURL* curl = curl_easy_init();
     if (!curl) return "";
@@ -219,9 +145,7 @@ std::string httpRequest(const std::string& url, const std::string& postData = ""
     curl_easy_cleanup(curl);
     return response;
 }
-
 // ==================== TELEGRAM ====================
-
 void sendToUser(const std::string& chatId, const std::string& text) {
     std::string url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
     json payload;
@@ -243,7 +167,8 @@ void addSubscriber(const std::string& chatId) {
         if (id == chatId) return;
     }
     SUBSCRIBERS.push_back(chatId);
-    std::cout << "[SUBSCRIBER] Добавлен новый: " << chatId << std::endl;    sendToUser(chatId, "✅ <b>Добро пожаловать в Whale Siren!</b>\n\nТеперь ты будешь получать уведомления о крупных сделках китов 🐋\n\nИспользуй /help для списка команд");
+    std::cout << "[SUBSCRIBER] Добавлен: " << chatId << std::endl;
+    sendToUser(chatId, "✅ <b>Добро пожаловать в Whale Siren!</b>\n\nТеперь ты будешь получать уведомления о крупных сделках китов 🐋");
 }
 
 json getTelegramUpdates(long offset) {
@@ -269,93 +194,63 @@ void handleTelegramCommands() {
         std::string text = update["message"]["text"].get<std::string>();
         std::string chatId = std::to_string(update["message"]["chat"]["id"].get<long>());
         
-        addSubscriber(chatId);
-        bool isOwner = (chatId == OWNER_CHAT_ID);
+        addSubscriber(chatId);        bool isOwner = (chatId == OWNER_CHAT_ID);
         
         if (text == "/start") {
-            std::string msg = "🐋 <b>Whale Siren</b>\n\nПривет! Я слежу за крупными сделками китов в сети BSC.\n\nТы подписан на уведомления!\n\nИспользуй /help для списка команд.";
-            sendToUser(chatId, msg);
+            sendToUser(chatId, "🐋 <b>Whale Siren</b>\n\nПривет! Я слежу за крупными сделками китов в сети BSC.\n\nТы подписан на уведомления!");
         }
         else if (text.find("/threshold") == 0) {
             if (!isOwner) {
-                sendToUser(chatId, "⚠️ Менять поріг може тільки власник бота!");
+                sendToUser(chatId, "⚠️ Менять поріг може тільки власник!");
                 continue;
             }
             size_t spacePos = text.find(' ');
             if (spacePos == std::string::npos) {
-                std::stringstream ss; ss << std::fixed << std::setprecision(0); ss << THRESHOLD_USD;
-                sendToUser(chatId, "📊 Поточний поріг: $" + ss.str() + "\n\nЩоб змінити:\n/threshold 10000");
-                continue;
-            }
-            if (spacePos >= text.length() - 1) {
-                sendToUser(chatId, "❌ Вкажи число після команди!");
+                std::stringstream ss; ss << std::fixed << std::setprecision(0) << THRESHOLD_USD;
+                sendToUser(chatId, "📊 Поточний поріг: $" + ss.str());
                 continue;
             }
             try {
-                std::string numStr = text.substr(spacePos + 1);                numStr.erase(0, numStr.find_first_not_of(" \t"));
-                numStr.erase(numStr.find_last_not_of(" \t") + 1);
-                double newThreshold = std::stod(numStr);
-                if (newThreshold < 100) { sendToUser(chatId, "⚠️ Мінімально $100"); continue; }
-                if (newThreshold > 1000000) { sendToUser(chatId, "⚠️ Максимально $1,000,000"); continue; }
+                double newThreshold = std::stod(text.substr(spacePos + 1));
+                if (newThreshold < 100 || newThreshold > 1000000) {
+                    sendToUser(chatId, "⚠️ Порог від $100 до $1,000,000");
+                    continue;
+                }
                 THRESHOLD_USD = newThreshold;
-                std::stringstream ss; ss << std::fixed << std::setprecision(0); ss << newThreshold;
-                sendToAll("✅ Порог успішно змінено!\n\nНовий поріг: $" + ss.str());
-                std::cout << "[COMMAND] Threshold changed to $" << THRESHOLD_USD << std::endl;
+                std::stringstream ss; ss << std::fixed << std::setprecision(0) << newThreshold;
+                sendToAll("✅ Порог змінено: $" + ss.str());
             } catch (...) {
                 sendToUser(chatId, "❌ Помилка! Вкажи число.");
             }
         }
         else if (text == "/status") {
-            std::string msg = "📊 <b>Статус бота</b>\n\n";
-            msg += "🐋 Китів: <b>" + std::to_string(WHALES.size()) + "</b>\n";
-            for (const auto& whale : WHALES) {
-                msg += "• " + whale.name + ": <code>" + whale.address.substr(0, 10) + "...</code>\n";
-            }
-            std::stringstream ss; ss << std::fixed << std::setprecision(0); ss << THRESHOLD_USD;
-            msg += "\n💰 Порог: $" + ss.str() + "\n";
-            msg += "👥 Підписників: " + std::to_string(SUBSCRIBERS.size()) + "\n";
-            msg += "⏱️ Оновлення: 2 сек";
+            std::string msg = "📊 <b>Статус</b>\n\n🐋 Китів: " + std::to_string(WHALES.size()) + "\n💰 Порог: $" + std::to_string((int)THRESHOLD_USD) + "\n👥 Підписників: " + std::to_string(SUBSCRIBERS.size());
             sendToUser(chatId, msg);
         }
         else if (text == "/help") {
-            std::string msg = "🤖 <b>Команди бота</b>\n\n";
-            msg += "/start - підписка на сповіщення\n";
-            msg += "/status - статус бота\n";
-            msg += "/threshold - поточний поріг\n";
-            if (isOwner) {
-                msg += "/threshold X - змінити поріг ($)\n";
-            }
-            msg += "/help - ця допомога";
-            sendToUser(chatId, msg);
-        }
-        else if (text == "/subscribers" && isOwner) {
-            std::string msg = "👥 <b>Підписники</b> (" + std::to_string(SUBSCRIBERS.size()) + "):\n\n";
-            for (size_t i = 0; i < SUBSCRIBERS.size(); i++) {
-                msg += std::to_string(i + 1) + ". <code>" + SUBSCRIBERS[i] + "</code>\n";
-            }
+            std::string msg = "🤖 <b>Команди</b>\n\n/start - підписка\n/status - статус\n/threshold - поріг";
+            if (isOwner) msg += "\n/threshold X - змінити";
             sendToUser(chatId, msg);
         }
     }
 }
 
 // ==================== BSC RPC ====================
-
 json rpcCall(const std::string& method, const json& params) {
-    json request;    request["jsonrpc"] = "2.0";
+    json request;
+    request["jsonrpc"] = "2.0";
     request["method"] = method;
     request["params"] = params;
     request["id"] = 1;
     std::string response = httpRequest(BSC_RPC_URL, request.dump());
-    if (response.empty()) return json();
-    try { json result = json::parse(response); return result["result"]; }
+    if (response.empty()) return json();    try { return json::parse(response)["result"]; }
     catch (...) { return json(); }
 }
 
 json getLatestBlock() { return rpcCall("eth_getBlockByNumber", {"latest", true}); }
 json getTransactionReceipt(const std::string& txHash) { return rpcCall("eth_getTransactionReceipt", {txHash}); }
 
-// ==================== ЦЕНЫ ТОКЕНОВ ====================
-
+// ==================== ЦЕНЫ ====================
 std::map<std::string, std::pair<double, time_t>> priceCache;
 
 double getTokenPriceUsd(const std::string& tokenAddress) {
@@ -390,37 +285,31 @@ double getTokenPriceUsd(const std::string& tokenAddress) {
             }
             if (bestPrice > 0) { priceCache[lowerAddr] = {bestPrice, time(nullptr)}; return bestPrice; }
         }
-    } catch (...) {}    return 0.0;
+    } catch (...) {}
+    return 0.0;
 }
 
-// ==================== АНАЛИЗ ТРАНЗАКЦИЙ ====================
-
+// ==================== АНАЛИЗ ====================
 struct Transfer { std::string tokenAddress; std::string from; std::string to; double amount; double usdValue; };
 
-std::vector<Transfer> analyzeTransaction(const std::string& txHash) {
-    std::vector<Transfer> transfers;
+std::vector<Transfer> analyzeTransaction(const std::string& txHash) {    std::vector<Transfer> transfers;
     json receipt = getTransactionReceipt(txHash);
     if (receipt.is_null() || !receipt.contains("logs")) return transfers;
     for (const auto& log : receipt["logs"]) {
         if (!log.contains("topics") || log["topics"].size() < 3) continue;
-        std::string topic0 = log["topics"][0].get<std::string>();
-        if (topic0 != TRANSFER_TOPIC) continue;
+        if (log["topics"][0].get<std::string>() != TRANSFER_TOPIC) continue;
         Transfer t;
         t.tokenAddress = toLower(log["address"].get<std::string>());
         t.from = extractAddress(log["topics"][1].get<std::string>());
         t.to = extractAddress(log["topics"][2].get<std::string>());
-        std::string dataHex = log["data"].get<std::string>();
-        double rawAmount = hexToDouble(dataHex);
-        t.amount = rawAmount / std::pow(10.0, 18);
-        double price = getTokenPriceUsd(t.tokenAddress);
-        t.usdValue = t.amount * price;
+        t.amount = hexToDouble(log["data"].get<std::string>()) / std::pow(10.0, 18);
+        t.usdValue = t.amount * getTokenPriceUsd(t.tokenAddress);
         transfers.push_back(t);
     }
     return transfers;
 }
 
 // ==================== ГЛАВНАЯ ЛОГИКА ====================
-
 void processTransaction(const std::string& txHash, const std::string& whaleAddr, const std::string& whaleName) {
     std::vector<Transfer> transfers = analyzeTransaction(txHash);
     if (transfers.empty()) return;
@@ -434,61 +323,47 @@ void processTransaction(const std::string& txHash, const std::string& whaleAddr,
     for (const auto& t : transfers) {
         bool fromWhale = (t.from == whaleAddr);
         bool toWhale = (t.to == whaleAddr);
-        
         if (!fromWhale && !toWhale) continue;
         if (fromWhale && toWhale) continue;
         
         totalUsd += t.usdValue;
-                std::string otherAddr = fromWhale ? t.to : t.from;
+        std::string otherAddr = fromWhale ? t.to : t.from;
         std::string lowerOther = toLower(otherAddr);
         
-        // Проверяем это swap на DEX
         if (lowerOther == PANCAKE_ROUTER_V2 || lowerOther == PANCAKE_ROUTER_V1 || lowerOther == PANCAKE_FACTORY) {
             isSwap = true;
         }
         
         if (t.tokenAddress == USDT_ADDRESS || toLower(t.tokenAddress) == USDT_ADDRESS) {
-            if (toWhale) action = "🔴 ПРОДАЖ";
-            else action = "🟢 ПОКУПКА";
+            action = toWhale ? "🔴 ПРОДАЖ" : "🟢 ПОКУПКА";
         } else {
             otherToken = t.tokenAddress;
         }
-        
         counterparty = otherAddr;
     }
+        if (totalUsd < THRESHOLD_USD) return;
     
-    if (totalUsd < THRESHOLD_USD) return;
+    std::string tokenName = otherToken.empty() ? "USDT" : (KNOWN_TOKENS.count(otherToken) ? KNOWN_TOKENS.at(otherToken) : "Unknown");
     
-    std::string tokenName = otherToken;
-    if (KNOWN_TOKENS.count(otherToken)) tokenName = KNOWN_TOKENS.at(otherToken);
-    else if (!otherToken.empty()) tokenName = "Unknown Token";
-    
+    // ✅ ИСПРАВЛЕНО: добавлен totalUsd в поток!
     std::stringstream ss;
-    ss << std::fixed << std::setprecision(2);
+    ss << std::fixed << std::setprecision(2) << totalUsd;
     
-    std::string msg = "<b>" + BOT_NAME + "</b>\n\n";
-    msg += "👤 <b>" + whaleName + "</b>\n";
+    std::string msg = "<b>" + BOT_NAME + "</b>\n\n👤 <b>" + whaleName + "</b>\n";
     
     if (!isSwap) {
-        // Обычный перевод
-        msg += "📤 <b>ПЕРЕВОД</b>\n\n";
-        msg += "💰 Сумма: <b>$" + ss.str() + "</b>\n";
-        if (!tokenName.empty() && tokenName != "Unknown Token") {
-            msg += "🪙 Токен: <b>" + tokenName + "</b>\n";
-        }
+        msg += "📤 <b>ПЕРЕВОД</b>\n\n💰 Сумма: <b>$" + ss.str() + "</b>\n";
+        if (tokenName != "Unknown") msg += "🪙 Токен: <b>" + tokenName + "</b>\n";
         msg += "📍 Кому: <code>" + counterparty.substr(0, 10) + "..." + counterparty.substr(38) + "</code>\n";
     } else {
-        // Swap на DEX
         msg += action + "\n\n";
         if (action == "🔴 ПРОДАЖ") {
-            msg += "Продав: <b>" + tokenName + "</b>\n";
-            msg += "Отримав: <b>$" + ss.str() + " USDT</b>\n";
-        } else if (action == "🟢 ПОКУПКА") {
-            msg += "Купив: <b>" + tokenName + "</b>\n";
-            msg += "Витратив: <b>$" + ss.str() + " USDT</b>\n";
+            msg += "Продав: <b>" + tokenName + "</b>\nОтримав: <b>$" + ss.str() + "</b>\n";
+        } else {
+            msg += "Купив: <b>" + tokenName + "</b>\nВитратив: <b>$" + ss.str() + "</b>\n";
         }
     }
-        msg += "🔗 <a href=\"https://bscscan.com/tx/" + txHash + "\">Транзакция</a>";
+    msg += "🔗 <a href=\"https://bscscan.com/tx/" + txHash + "\">Транзакция</a>";
     
     sendToAll(msg);
     saveTransaction(txHash, whaleName, action, tokenName, totalUsd);
@@ -496,35 +371,39 @@ void processTransaction(const std::string& txHash, const std::string& whaleAddr,
 }
 
 // ==================== MAIN ====================
-
 int main() {
     curl_global_init(CURL_GLOBAL_DEFAULT);
     initDatabase();
     std::cout << BOT_NAME << " STARTED" << std::endl;
-    std::cout << "Monitoring " << WHALES.size() << " whale(s):" << std::endl;
-    for (const auto& whale : WHALES) { std::cout << "  • " << whale.name << ": " << whale.address << std::endl; }
+    std::cout << "Monitoring " << WHALES.size() << " whale(s)" << std::endl;
     std::cout << "Threshold: $" << THRESHOLD_USD << std::endl;
-    std::cout << "Subscribers: " << SUBSCRIBERS.size() << std::endl;
     std::cout << "==========================" << std::endl;
+    
     std::set<std::string> seenHashes;
     while (true) {
         try {
             handleTelegramCommands();
             json block = getLatestBlock();
-            if (block.is_null() || !block.contains("transactions")) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+            if (block.is_null() || !block.contains("transactions")) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                continue;
+            }
             for (const auto& tx : block["transactions"]) {
                 std::string txHash = tx["hash"].get<std::string>();
-                if (seenHashes.count(txHash)) continue;
-                seenHashes.insert(txHash);
+                if (seenHashes.count(txHash)) continue;                seenHashes.insert(txHash);
                 std::string from = toLower(tx["from"].get<std::string>());
                 std::string to = "";
-                if (tx.contains("to") && !tx["to"].is_null()) { to = toLower(tx["to"].get<std::string>()); }
+                if (tx.contains("to") && !tx["to"].is_null()) to = toLower(tx["to"].get<std::string>());
                 for (const auto& whale : WHALES) {
-                    if (from == whale.address || to == whale.address) { processTransaction(txHash, whale.address, whale.name); }
+                    if (from == whale.address || to == whale.address) {
+                        processTransaction(txHash, whale.address, whale.name);
+                    }
                 }
             }
             if (seenHashes.size() > 10000) seenHashes.clear();
-        } catch (const std::exception& e) { std::cerr << "Error: " << e.what() << std::endl; }
+        } catch (const std::exception& e) {
+            std::cerr << "Error: " << e.what() << std::endl;
+        }
         std::this_thread::sleep_for(std::chrono::seconds(2));
     }
     if (db) sqlite3_close(db);
