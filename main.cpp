@@ -446,11 +446,23 @@ cpp_int parseUint256(const std::string& hexData) {
 
 std::string formatAmount(const cpp_int& raw, int decimals) {
     if (raw == 0) return "0.00";
-    cpp_int div = 1; for (int i = 0; i < decimals; i++) div *= 10;
-    std::string ip = (raw / div).str();
-    std::string fp = (raw % div).str();
-    while ((int)fp.length() < decimals) fp = "0" + fp;
-    if (fp.length() > 2) fp = fp.substr(0, 2);
+
+    cpp_int div = 1;
+    for (int i = 0; i < decimals; i++)
+        div *= 10;
+
+    cpp_int ip_val = raw / div;
+    cpp_int fp_val = raw % div;
+
+    std::string ip = ip_val.convert_to<std::string>();
+    std::string fp = fp_val.convert_to<std::string>();
+
+    while ((int)fp.length() < decimals)
+        fp = "0" + fp;
+
+    if (fp.length() > 2)
+        fp = fp.substr(0, 2);
+
     return ip + "." + fp;
 }
 
@@ -461,7 +473,7 @@ cpp_int calcUsdNanos(const cpp_int& raw, int decimals, uint64_t priceNanos) {
 }
 
 std::string formatUsd(const cpp_int& nanos) {
-    std::string s = nanos.str();
+    std::string s = nanos.convert_to<std::string>();
     while (s.length() < 10) s = "0" + s;
     std::string dollars = s.substr(0, s.length() - 9);
     std::string cents = s.substr(s.length() - 9, 2);
