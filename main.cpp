@@ -1,412 +1,736 @@
 #include <iostream>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <set>
-#include <thread>
-#include <chrono>
-#include <curl/curl.h>
-#include <cmath>
-#include <iomanip>
-#include <sstream>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <memory>
+#include <csignal>
+#include <curl/curl.h>
+#include <sstream>
+#include <iomanip>
 #include <algorithm>
 #include <sqlite3.h>
-
+#include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 
 using json = nlohmann::json;
+using boost::multiprecision::cpp_int;
 
 // ==================== КОНФИГУРАЦИЯ ====================
+const std::string TG_TOKEN    = "8845630927:AAEb0Xhm7DUn7ihwPPhZVaaLN3C7hRM2FS0";
+const std::string MY_CHAT_ID  = "546348566";
+const std::string BSC_RPC     = "https://bsc-dataseed.bnbchain.org";
+const std::string CONFIG_FILE = "config.json";
+const std::string DB_FILE     = "whale_bot.db";
 
-struct Whale {
-    std::string address;
-    std::string name;
+const long long FAST_SYNC_LAG   = 1000;
+const long long REORG_ROLLBACK  = 10;
+const long long TX_TTL_BLOCKS   = 200000; // ~7 дней BSC
+constexpr int MAX_FAILS_BEFORE_REMOVE = 3;
+
+const std::string SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
+const std::set<std::string> STABLECOINS = {
+    "0x55d398326f99059ff775485246999027b3197955", // USDT
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56"  // BUSD
 };
 
-const std::vector<Whale> WHALES = {
-    {"0xb81be888587704aa77c581e01299abe3667a7897", "Кит №1 Siren 🐋"},
-};
+// ✅ ЦЕЛОЧИСЛЕННЫЙ ПОРОГ ($1 = 1e9 nanos)
+std::atomic<uint64_t> THRESHOLD_NANOS{10000000000000ULL}; // $10,000
 
-const std::string BOT_NAME = "🐋 Whale";
-const std::string TELEGRAM_BOT_TOKEN = "8845630927:AAEb0Xhm7DUn7ihwPPhZVaaLN3C7hRM2FS0";
-const std::string OWNER_CHAT_ID = "546348566";
+// ✅ GRACEFUL SHUTDOWN (async-signal-safe)
+std::atomic<bool> running{true};
+void signalHandler(int) {
+    running.store(false, std::memory_order_relaxed);
+}
+// ✅ SHARED MUTEX FOR WHALES
+std::shared_mutex whalesMutex;
+std::vector<std::pair<std::string, std::string>> WHALES;
 
-std::vector<std::string> SUBSCRIBERS = {"546348566"};
-double THRESHOLD_USD = 100.0;
+// ✅ SYNCHRONIZED SUBSCRIBERS
+std::shared_mutex subsMutex;
+std::shared_ptr<const std::set<std::string>> SUBSCRIBERS_PTR;
 
-const std::string BSC_RPC_URL = "https://bsc-dataseed.bnbchain.org";
-const std::string TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-const std::string USDT_ADDRESS = "0x55d398326f99059ff775485246999027b3197955";
+// ✅ FAIL COUNTER FOR SMART BROADCAST
+std::mutex failCountMutex;
+std::map<std::string, int> SUBSCRIBER_FAIL_COUNT;
 
-const std::string PANCAKE_ROUTER_V2 = "0x10ed43c718714eb63d5aa57b78b54704e256024e";
-const std::string PANCAKE_ROUTER_V1 = "0x05ff2b0db69458a0750badebc4f9e13add608c7f";
-const std::string PANCAKE_FACTORY = "0xca143ce32fe78f1f7012d318b25d93c61a5a5c5e";
-
-const std::map<std::string, std::string> KNOWN_TOKENS = {
-    {"0x55d398326f99059ff775485246999027b3197955", "USDT"},
-    {"0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", "USDC"},
-    {"0xe9e7cea3dedca5984780bafc599bd69add087d56", "BUSD"},
-    {"0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3", "DAI"},
-    {"0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c", "BTCB"},    {"0x2170ed0880ac9a755fd29b2688956bd959f933f8", "ETH"},
-    {"0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", "WBNB"},
-    {"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82", "CAKE"},
-    {"0xcf6bb5389c92bdda8a3747ddb454cb7a64626c63", "XVS"},
-    {"0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe", "XRP"},
-    {"0x3ee2200efb3400fabb9aacf31297cbdd1d435d47", "ADA"},
-    {"0x7083609fce4d1d8dc0c979aab8c869ea2c873402", "DOT"},
-    {"0xba2ae424d960c26247dd6c32edc70b295c744c43", "DOGE"},
-    {"0xf8a0bf9cf54bb92f17374d9e9a321e6a111a51bd", "LINK"},
-    {"0x4338665cbb7b2485a8855a139b75d5e34ab0db94", "LTC"},
-    {"0x8ff795a6f4d97e7887c79bea79aba5cc76444adf", "BCH"},
-    {"0x0d8ce2a99bb6e3b7db580ed848240e4a0f9ae153", "FIL"},
-    {"0xfb6115445bff7b52feb98650c87f44907e58f802", "AAVE"},
-    {"0x5f0da599bb2cccfcf67dfd5d6247d2600d7070f7", "MKR"},
-    {"0x9ac98382f0bc08e75067ca9c53a262b9b75f1fb8", "SNX"},
-    {"0x16939ef78684453bfdfb47825f8a5f714f12623a", "CRV"},
-    {"0x52ce071bd9b1c4b00a0b92d298c512478cad67e8", "COMP"},
-    {"0x947950bcc74888a40ffa2593c5798f11fc9124c4", "SUSHI"},
-    {"0x88f1a5ae2a3bf98aeaf342d26b30a79438c9142e", "YFI"},
-    {"0x111111111117dc0aa78b770fa6a738034120c302", "1INCH"},
-    {"0xc748673057861a797275cd8a068abb95a902e8de", "BabyDoge"},
-    {"0x2859e4544c4bb03966803b044a93563bd2d0dd4d", "SHIB"},
-    {"0x67b725d7e342d7b611fa85e859df9697d9378b2e", "SAND"},
-    {"0x3203c9e46ca618c8c1ce5dc67e7e9d75f5da2377", "MANA"},
-    {"0x715d400f88c167884bbcc41c5fea407ed4d2f8a0", "AXS"},
-    {"0x7ddee176f665cd201f93eede625770e2fd911990", "GALA"},
-    {"0x3f382dbd960e3a9bbceae22651e88158d2791550", "CHZ"},
-    {"0x2ff3d0f6990a40261c66e1ff2017acbc282eb6d0", "ENJ"},
-    {"0x8f0528ce5ef7b51152a59745befdd91d97091d2f", "ALPACA"},
-    {"0x56b6fb708fc5732dec1afc8d8556423a2edccbd6", "EOS"},
-    {"0x3d6545b08693dae087e957cb1180ee38b9e3c25e", "ETC"},
-    {"0xb3c11196a4f3b1da7c23d9fb0a319f7e79e83e0e", "TRX"},
-    {"0x997a58129890bbda032231a52ed1ddc845fc18e1", "SIREN"}
-};
-
-// ==================== SQLITE ====================
+std::mutex dbMutex;
+std::mutex cacheMutex;
 sqlite3* db = nullptr;
 
-void initDatabase() {
-    int rc = sqlite3_open("whale_history.db", &db);
-    if (rc) { std::cerr << "Cannot open database: " << sqlite3_errmsg(db) << std::endl; return; }
-    const char* sql = "CREATE TABLE IF NOT EXISTS transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, tx_hash TEXT UNIQUE, whale_name TEXT, action TEXT, token TEXT, usd_value REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);";
-    char* errMsg = nullptr;
-    rc = sqlite3_exec(db, sql, nullptr, nullptr, &errMsg);
-    if (rc != SQLITE_OK) { std::cerr << "SQL error: " << errMsg << std::endl; sqlite3_free(errMsg); }
-}
+std::map<std::string, std::string> TOKEN_SYMBOLS;
+std::map<std::string, int> TOKEN_DECIMALS;
+std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 
-void saveTransaction(const std::string& txHash, const std::string& whaleName, const std::string& action, const std::string& token, double usdValue) {
-    if (!db) return;
-    std::string sql = "INSERT OR IGNORE INTO transactions (tx_hash, whale_name, action, token, usd_value) VALUES ('" + txHash + "', '" + whaleName + "', '" + action + "', '" + token + "', " + std::to_string(usdValue) + ");";    char* errMsg = nullptr;
-    sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
-    if (errMsg) sqlite3_free(errMsg);
-}
-
-// ==================== УТИЛИТЫ ====================
-size_t writeCallback(void* contents, size_t size, size_t nmemb, std::string* s) {
-    s->append((char*)contents, size * nmemb);
-    return size * nmemb;
+// ==================== HTTP & RPC ====================
+size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
+    d->append((char*)c, s * n); return s * n;
 }
 
 std::string toLower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-    return s;
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower); return s;
 }
 
-double hexToDouble(const std::string& hex) {
-    if (hex.empty() || hex == "0x" || hex == "0x0") return 0.0;
-    std::string cleanHex = hex;
-    if (cleanHex.substr(0, 2) == "0x") cleanHex = cleanHex.substr(2);
-    if (cleanHex.empty()) return 0.0;
-    try { unsigned long long val = std::stoull(cleanHex, nullptr, 16); return static_cast<double>(val); }
-    catch (...) { return 0.0; }
-}
-
-std::string extractAddress(const std::string& hex) {
-    if (hex.length() < 42) return "";
-    return "0x" + toLower(hex.substr(hex.length() - 40));
-}
-
-// ==================== HTTP ====================
-std::string httpRequest(const std::string& url, const std::string& postData = "") {
+std::string http(const std::string& url, const std::string& post = "", int timeout = 15) {
     CURL* curl = curl_easy_init();
+    std::string res;
     if (!curl) return "";
-    std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    if (!postData.empty()) {
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postData.c_str());
-        struct curl_slist* headers = NULL;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    if (!post.empty()) {
+        struct curl_slist* h = curl_slist_append(NULL, "Content-Type: application/json");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post.c_str());
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
     }
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
     curl_easy_perform(curl);
     curl_easy_cleanup(curl);
-    return response;
-}
-// ==================== TELEGRAM ====================
-void sendToUser(const std::string& chatId, const std::string& text) {
-    std::string url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/sendMessage";
-    json payload;
-    payload["chat_id"] = chatId;
-    payload["text"] = text;
-    payload["parse_mode"] = "HTML";
-    payload["disable_web_page_preview"] = true;
-    httpRequest(url, payload.dump());
+    return res;
 }
 
-void sendToAll(const std::string& text) {
-    for (const auto& chatId : SUBSCRIBERS) {
-        sendToUser(chatId, text);
+json rpc(const std::string& method, json params, int maxRetries = 3) {    json r; r["jsonrpc"] = "2.0"; r["method"] = method; r["params"] = params; r["id"] = 1;
+    std::string body = r.dump();
+    for (int attempt = 0; attempt < maxRetries && running.load(std::memory_order_relaxed); attempt++) {
+        auto res = http(BSC_RPC, body);
+        try {
+            auto parsed = json::parse(res);
+            if (parsed.contains("result")) return parsed["result"];
+            if (parsed.contains("error")) return nullptr;
+        } catch (...) {}
+        if (attempt < maxRetries - 1)
+            std::this_thread::sleep_for(std::chrono::milliseconds((1 << attempt) * 500));
     }
+    return nullptr;
+}
+
+// ==================== SQLITE ====================
+void initDB() {
+    if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
+        std::cerr << "[DB] Cannot open: " << sqlite3_errmsg(db) << std::endl;
+        return;
+    }
+    const char* sql = R"(
+        CREATE TABLE IF NOT EXISTS subscribers (chat_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS processed_tx (
+            tx_hash TEXT PRIMARY KEY,
+            block_number INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_processed_block ON processed_tx(block_number);
+        CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS token_cache (
+            address TEXT PRIMARY KEY, symbol TEXT, decimals INTEGER,
+            price_nanos INTEGER, price_ts INTEGER
+        );
+        PRAGMA journal_mode=WAL;
+        PRAGMA synchronous=NORMAL;
+    )";
+    char* err = nullptr;
+    sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    if (err) { std::cerr << "[DB] Init error: " << err << std::endl; sqlite3_free(err); }
+}
+
+void walCheckpoint() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_wal_checkpoint_v2(db, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+}
+
+void cleanupOldTx(long long currentBlock) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    long long cutoff = currentBlock - TX_TTL_BLOCKS;    sqlite3_prepare_v2(db, "DELETE FROM processed_tx WHERE block_number < ?", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, cutoff);
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+void rollbackToBlock(long long targetBlock) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "DELETE FROM processed_tx WHERE block_number > ?", -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, targetBlock);
+    sqlite3_step(stmt);
+    int deleted = sqlite3_changes(db);
+    sqlite3_finalize(stmt);
+    std::cerr << "[REORG] Rolled back " << deleted << " txs above block " << targetBlock << std::endl;
+}
+
+void loadTokenCache() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT address,symbol,decimals,price_nanos,price_ts FROM token_cache", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string addr = (const char*)sqlite3_column_text(stmt, 0);
+        TOKEN_SYMBOLS[addr] = (const char*)sqlite3_column_text(stmt, 1);
+        TOKEN_DECIMALS[addr] = sqlite3_column_int(stmt, 2);
+        uint64_t pn = sqlite3_column_int64(stmt, 3);
+        time_t ts = sqlite3_column_int64(stmt, 4);
+        if (pn > 0) PRICE_NANOS_CACHE[addr] = {pn, ts};
+    }
+    sqlite3_finalize(stmt);
+}
+
+void saveTokenToCache(const std::string& addr, const std::string& sym, int dec, uint64_t pn) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO token_cache VALUES(?,?,?,?,?)", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, addr.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, sym.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, dec);
+    sqlite3_bind_int64(stmt, 4, pn);
+    sqlite3_bind_int64(stmt, 5, time(nullptr));
+    sqlite3_step(stmt); sqlite3_finalize(stmt);
+}
+
+bool isTxProcessed(const std::string& hash) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT 1 FROM processed_tx WHERE tx_hash=?", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, hash.c_str(), -1, SQLITE_STATIC);
+    bool e = sqlite3_step(stmt) == SQLITE_ROW;    sqlite3_finalize(stmt); return e;
+}
+
+void markTxProcessed(const std::string& hash, long long blockNum) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO processed_tx(tx_hash, block_number) VALUES(?,?)", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, hash.c_str(), -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, blockNum);
+    sqlite3_step(stmt); sqlite3_finalize(stmt);
+}
+
+// ==================== SUBSCRIBERS ====================
+std::shared_ptr<const std::set<std::string>> loadSubscribersFromDB() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    auto subs = std::make_shared<std::set<std::string>>();
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT chat_id FROM subscribers", -1, &stmt, nullptr);
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+        subs->insert((const char*)sqlite3_column_text(stmt, 0));
+    sqlite3_finalize(stmt);
+    return subs;
+}
+
+void refreshSubscribers() {
+    auto newSubs = loadSubscribersFromDB();
+    std::unique_lock lock(subsMutex);
+    SUBSCRIBERS_PTR = newSubs;
 }
 
 void addSubscriber(const std::string& chatId) {
-    for (const auto& id : SUBSCRIBERS) {
-        if (id == chatId) return;
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO subscribers(chat_id) VALUES(?)", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, chatId.c_str(), -1, SQLITE_STATIC);
+        sqlite3_step(stmt); sqlite3_finalize(stmt);
     }
-    SUBSCRIBERS.push_back(chatId);
-    std::cout << "[SUBSCRIBER] Добавлен: " << chatId << std::endl;
-    sendToUser(chatId, "✅ <b>Добро пожаловать в Whale Siren!</b>\n\nТеперь ты будешь получать уведомления о крупных сделках китов 🐋");
+    refreshSubscribers();
 }
 
-json getTelegramUpdates(long offset) {
-    std::string url = "https://api.telegram.org/bot" + TELEGRAM_BOT_TOKEN + "/getUpdates?offset=" + std::to_string(offset) + "&timeout=1";
-    std::string response = httpRequest(url);
-    if (response.empty()) return json();
-    try { return json::parse(response); }
-    catch (...) { return json(); }
+void removeDeadSubscriber(const std::string& chatId) {
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        sqlite3_stmt* stmt;
+        sqlite3_prepare_v2(db, "DELETE FROM subscribers WHERE chat_id=?", -1, &stmt, nullptr);
+        sqlite3_bind_text(stmt, 1, chatId.c_str(), -1, SQLITE_STATIC);
+        sqlite3_step(stmt); sqlite3_finalize(stmt);
+    }
+    {        std::lock_guard<std::mutex> fl(failCountMutex);
+        SUBSCRIBER_FAIL_COUNT.erase(chatId);
+    }
+    refreshSubscribers();
+    std::cout << "[SUBS] Removed dead subscriber: " << chatId << std::endl;
 }
 
-void handleTelegramCommands() {
-    static long lastUpdateId = 0;
-    json updates = getTelegramUpdates(lastUpdateId);
-    if (updates.is_null() || !updates.contains("result")) return;
-    
-    for (const auto& update : updates["result"]) {
-        if (!update.contains("message")) continue;
-        if (!update["message"].contains("text")) continue;
-        
-        long updateId = update["update_id"].get<long>();
-        lastUpdateId = updateId + 1;
-        
-        std::string text = update["message"]["text"].get<std::string>();
-        std::string chatId = std::to_string(update["message"]["chat"]["id"].get<long>());
-        
-        addSubscriber(chatId);        bool isOwner = (chatId == OWNER_CHAT_ID);
-        
-        if (text == "/start") {
-            sendToUser(chatId, "🐋 <b>Whale Siren</b>\n\nПривет! Я слежу за крупными сделками китов в сети BSC.\n\nТы подписан на уведомления!");
-        }
-        else if (text.find("/threshold") == 0) {
-            if (!isOwner) {
-                sendToUser(chatId, "⚠️ Менять поріг може тільки власник!");
-                continue;
-            }
-            size_t spacePos = text.find(' ');
-            if (spacePos == std::string::npos) {
-                std::stringstream ss; ss << std::fixed << std::setprecision(0) << THRESHOLD_USD;
-                sendToUser(chatId, "📊 Поточний поріг: $" + ss.str());
-                continue;
-            }
-            try {
-                double newThreshold = std::stod(text.substr(spacePos + 1));
-                if (newThreshold < 100 || newThreshold > 1000000) {
-                    sendToUser(chatId, "⚠️ Порог від $100 до $1,000,000");
-                    continue;
-                }
-                THRESHOLD_USD = newThreshold;
-                std::stringstream ss; ss << std::fixed << std::setprecision(0) << newThreshold;
-                sendToAll("✅ Порог змінено: $" + ss.str());
-            } catch (...) {
-                sendToUser(chatId, "❌ Помилка! Вкажи число.");
-            }
-        }
-        else if (text == "/status") {
-            std::string msg = "📊 <b>Статус</b>\n\n🐋 Китів: " + std::to_string(WHALES.size()) + "\n💰 Порог: $" + std::to_string((int)THRESHOLD_USD) + "\n👥 Підписників: " + std::to_string(SUBSCRIBERS.size());
-            sendToUser(chatId, msg);
-        }
-        else if (text == "/help") {
-            std::string msg = "🤖 <b>Команди</b>\n\n/start - підписка\n/status - статус\n/threshold - поріг";
-            if (isOwner) msg += "\n/threshold X - змінити";
-            sendToUser(chatId, msg);
-        }
-    }
+// ==================== STATE ====================
+long long getLastBlock() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT value FROM state WHERE key='last_block'", -1, &stmt, nullptr);
+    long long b = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) b = std::stoll((const char*)sqlite3_column_text(stmt, 0));
+    sqlite3_finalize(stmt); return b;
 }
 
-// ==================== BSC RPC ====================
-json rpcCall(const std::string& method, const json& params) {
-    json request;
-    request["jsonrpc"] = "2.0";
-    request["method"] = method;
-    request["params"] = params;
-    request["id"] = 1;
-    std::string response = httpRequest(BSC_RPC_URL, request.dump());
-    if (response.empty()) return json();    try { return json::parse(response)["result"]; }
-    catch (...) { return json(); }
+void saveLastBlock(long long b) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO state(key,value) VALUES('last_block',?)", -1, &stmt, nullptr);
+    std::string v = std::to_string(b);
+    sqlite3_bind_text(stmt, 1, v.c_str(), -1, SQLITE_STATIC);
+    sqlite3_step(stmt); sqlite3_finalize(stmt);
 }
 
-json getLatestBlock() { return rpcCall("eth_getBlockByNumber", {"latest", true}); }
-json getTransactionReceipt(const std::string& txHash) { return rpcCall("eth_getTransactionReceipt", {txHash}); }
+std::string getLastBlockHash() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT value FROM state WHERE key='last_block_hash'", -1, &stmt, nullptr);
+    std::string h;
+    if (sqlite3_step(stmt) == SQLITE_ROW) h = (const char*)sqlite3_column_text(stmt, 0);
+    sqlite3_finalize(stmt); return h;
+}
 
-// ==================== ЦЕНЫ ====================
-std::map<std::string, std::pair<double, time_t>> priceCache;
+void saveLastBlockHash(const std::string& h) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO state(key,value) VALUES('last_block_hash',?)", -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, h.c_str(), -1, SQLITE_STATIC);
+    sqlite3_step(stmt); sqlite3_finalize(stmt);
+}
 
-double getTokenPriceUsd(const std::string& tokenAddress) {
-    std::string lowerAddr = toLower(tokenAddress);
-    if (priceCache.count(lowerAddr)) {
-        auto& cached = priceCache[lowerAddr];
-        if (time(nullptr) - cached.second < 60) return cached.first;
-    }
-    if (lowerAddr == "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c") {
-        std::string response = httpRequest("https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT");
-        try {
-            json j = json::parse(response);
-            double price = std::stod(j["price"].get<std::string>());
-            priceCache[lowerAddr] = {price, time(nullptr)};
-            return price;
-        } catch (...) { return 0.0; }
-    }
-    std::string url = "https://api.dexscreener.com/latest/dex/tokens/" + tokenAddress;
-    std::string response = httpRequest(url);
+// ==================== CONFIG ====================
+void loadConfig() {
+    std::ifstream f(CONFIG_FILE);
+    if (!f.is_open()) return;
     try {
-        json j = json::parse(response);
-        if (j.contains("pairs") && j["pairs"].is_array() && j["pairs"].size() > 0) {
-            double maxLiquidity = 0, bestPrice = 0;
-            for (const auto& pair : j["pairs"]) {
-                if (pair.contains("liquidity") && pair["liquidity"].contains("usd")) {
-                    double liq = pair["liquidity"]["usd"].get<double>();
-                    if (liq > maxLiquidity && pair.contains("priceUsd")) {
-                        maxLiquidity = liq;
-                        bestPrice = std::stod(pair["priceUsd"].get<std::string>());
+        json j = json::parse(f);
+        double thresh = j.value("threshold", 10000.0);        THRESHOLD_NANOS.store((uint64_t)(thresh * 1000000000.0));
+        std::unique_lock lock(whalesMutex);
+        WHALES.clear();
+        for (auto& w : j["whales"]) WHALES.push_back({toLower(w["address"]), w["name"]});
+        std::cout << "[CONFIG] Loaded " << WHALES.size() << " whales, threshold $" << thresh << std::endl;
+    } catch (...) { std::cerr << "[CONFIG] Parse error!" << std::endl; }
+}
+
+void saveConfig() {
+    json j;
+    j["threshold"] = (double)THRESHOLD_NANOS.load() / 1000000000.0;
+    j["whales"] = json::array();
+    {
+        std::shared_lock lock(whalesMutex);
+        for (auto& [a, n] : WHALES) j["whales"].push_back({{"address", a}, {"name", n}});
+    }
+    std::ofstream(CONFIG_FILE) << j.dump(4);
+}
+
+// ==================== TELEGRAM ====================
+struct SendResult { bool ok; bool deadUser; };
+
+SendResult sendMsg(const std::string& chatId, const std::string& text) {
+    json j; j["chat_id"] = chatId; j["text"] = text;
+    j["parse_mode"] = "HTML"; j["disable_web_page_preview"] = true;
+    auto res = http("https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage", j.dump());
+    try {
+        auto r = json::parse(res);
+        if (r.value("ok", false)) return {true, false};
+        int code = r.value("error_code", 0);
+        if (code == 429) return {false, false};       // Rate limit — не считаем dead
+        if (code == 403 || code == 400) return {false, true}; // Blocked / deactivated
+        return {false, false};
+    } catch (...) { return {false, false}; }
+}
+
+bool broadcast(const std::string& text) {
+    std::shared_ptr<const std::set<std::string>> subs;
+    { std::shared_lock lock(subsMutex); subs = SUBSCRIBERS_PTR; }
+    if (!subs || subs->empty()) return true;
+
+    int total = subs->size();
+    int success = 0;
+    bool adminOk = false;
+    std::vector<std::string> toRemove;
+
+    for (auto& id : *subs) {
+        auto [ok, dead] = sendMsg(id, text);
+        if (ok) {
+            success++;            if (id == MY_CHAT_ID) adminOk = true;
+            std::lock_guard<std::mutex> fl(failCountMutex);
+            SUBSCRIBER_FAIL_COUNT[id] = 0;
+        } else if (dead) {
+            std::lock_guard<std::mutex> fl(failCountMutex);
+            SUBSCRIBER_FAIL_COUNT[id]++;
+            if (SUBSCRIBER_FAIL_COUNT[id] >= MAX_FAILS_BEFORE_REMOVE)
+                toRemove.push_back(id);
+        }
+    }
+
+    for (auto& d : toRemove) removeDeadSubscriber(d);
+
+    double ratio = (total > 0) ? (double)success / total : 1.0;
+    return adminOk || (ratio >= 0.5);
+}
+
+// ==================== TOKENS & PRICES ====================
+int getDecimals(const std::string& addr) {
+    std::string a = toLower(addr);
+    { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
+    auto res = rpc("eth_call", {{{"to", addr}, {"data", "0x313ce567"}}, "latest"});
+    int dec = 18;
+    if (res.is_string() && res.get<std::string>().length() >= 66)
+        try { dec = std::stoi(res.get<std::string>().substr(2), nullptr, 16); } catch (...) {}
+    { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a] = dec; }
+    saveTokenToCache(a, "", dec, 0);
+    return dec;
+}
+
+// ✅ STRING + BYTES32 FALLBACK
+std::string getSymbol(const std::string& addr) {
+    std::string a = toLower(addr);
+    { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
+
+    auto res = rpc("eth_call", {{{"to", addr}, {"data", "0x95d89b41"}}, "latest"});
+    std::string sym;
+
+    // Попытка 1: ABI-encoded string
+    if (res.is_string() && res.get<std::string>().length() > 130) {
+        try {
+            std::string hex = res.get<std::string>().substr(2);
+            int len = std::stoi(hex.substr(64, 64), nullptr, 16);
+            if (len > 0 && len <= 32) {
+                std::string strHex = hex.substr(128, len * 2);
+                for (size_t i = 0; i < strHex.length(); i += 2)
+                    sym += (char)std::stoi(strHex.substr(i, 2), nullptr, 16);
+            }
+        } catch (...) {}
+    }
+    // Попытка 2: bytes32 (старые/нестандартные контракты)
+    if (sym.empty() && res.is_string() && res.get<std::string>().length() >= 66) {
+        try {
+            std::string hex = res.get<std::string>().substr(2, 64);
+            for (size_t i = 0; i < hex.length(); i += 2) {
+                char c = (char)std::stoi(hex.substr(i, 2), nullptr, 16);
+                if (c == '\0') break;
+                sym += c;
+            }
+        } catch (...) {}
+    }
+
+    if (sym.empty()) sym = "UNKNOWN";
+    { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a] = sym; }
+    saveTokenToCache(a, sym, getDecimals(a), 0);
+    return sym;
+}
+
+uint64_t getPriceNanos(const std::string& token) {
+    std::string a = toLower(token);
+    {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        if (PRICE_NANOS_CACHE.count(a) && time(nullptr) - PRICE_NANOS_CACHE[a].second < 300)
+            return PRICE_NANOS_CACHE[a].first;
+    }
+    auto res = http("https://api.dexscreener.com/latest/dex/tokens/" + token);
+    double p = 0;
+    try {
+        auto j = json::parse(res);
+        if (j.contains("pairs") && !j["pairs"].empty())
+            p = std::stod(j["pairs"][0]["priceUsd"].get<std::string>());
+    } catch (...) {}
+
+    uint64_t nanos = (uint64_t)(p * 1000000000.0);
+    if (nanos > 0) {
+        { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a] = {nanos, time(nullptr)}; }
+        saveTokenToCache(a, "", getDecimals(a), nanos);
+    }
+    return nanos;
+}
+
+// ==================== MATH ====================
+cpp_int parseUint256(const std::string& hexData) {
+    if (hexData.length() < 66) return 0;
+    cpp_int raw = 0;
+    for (char c : hexData.substr(2, 64)) {
+        raw <<= 4;
+        if (c >= '0' && c <= '9')      raw |= (c - '0');
+        else if (c >= 'a' && c <= 'f') raw |= (c - 'a' + 10);        else if (c >= 'A' && c <= 'F') raw |= (c - 'A' + 10);
+    }
+    return raw;
+}
+
+std::string formatAmount(const cpp_int& raw, int decimals) {
+    if (raw == 0) return "0.00";
+    cpp_int div = 1; for (int i = 0; i < decimals; i++) div *= 10;
+    std::string ip = (raw / div).str();
+    std::string fp = (raw % div).str();
+    while ((int)fp.length() < decimals) fp = "0" + fp;
+    if (fp.length() > 2) fp = fp.substr(0, 2);
+    return ip + "." + fp;
+}
+
+cpp_int calcUsdNanos(const cpp_int& raw, int decimals, uint64_t priceNanos) {
+    if (priceNanos == 0) return 0;
+    cpp_int div = 1; for (int i = 0; i < decimals; i++) div *= 10;
+    return (raw * priceNanos) / div;
+}
+
+std::string formatUsd(const cpp_int& nanos) {
+    std::string s = nanos.str();
+    while (s.length() < 10) s = "0" + s;
+    std::string dollars = s.substr(0, s.length() - 9);
+    std::string cents = s.substr(s.length() - 9, 2);
+    if (dollars.empty()) dollars = "0";
+    return "$" + dollars + "." + cents;
+}
+
+// ==================== ANALYZE TX ====================
+struct TxResult {
+    bool valid, isSwap, isBuy;
+    cpp_int rawAmount, usdNanos;
+    std::string tokenAddr;
+};
+
+TxResult analyzeTx(const json& receipt, const std::string& whaleAddr) {
+    TxResult r = {};
+    if (receipt.is_null() || !receipt.contains("logs")) return r;
+
+    bool hasSwapEvent = false;
+    for (auto& log : receipt["logs"]) {
+        if (log["topics"].size() >= 1 && log["topics"][0] == SWAP_TOPIC) {
+            hasSwapEvent = true; break;
+        }
+    }
+
+    struct TI { cpp_int amt; std::string tok; bool in; };
+    std::vector<TI> trs;
+    for (auto& log : receipt["logs"]) {
+        if (log["topics"].size() < 3) continue;
+        if (log["topics"][0] != "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") continue;
+        std::string from = "0x" + toLower(log["topics"][1].get<std::string>().substr(26));
+        std::string to   = "0x" + toLower(log["topics"][2].get<std::string>().substr(26));
+        std::string tok  = toLower(log["address"]);
+        if (from != whaleAddr && to != whaleAddr) continue;
+        trs.push_back({parseUint256(log["data"].get<std::string>()), tok, to == whaleAddr});
+    }
+
+    if (trs.empty()) return r;
+    r.valid = true;
+
+    bool hasIn = false, hasOut = false;
+    for (auto& t : trs) { if (t.in) hasIn = true; else hasOut = true; }
+    r.isSwap = hasSwapEvent && hasIn && hasOut;
+
+    cpp_int stIn = 0, stOut = 0;
+    std::string nsTok; cpp_int nsAmt; bool nsIn = false;
+    for (auto& t : trs) {
+        if (STABLECOINS.count(t.tok)) { if (t.in) stIn += t.amt; else stOut += t.amt; }
+        else { nsTok = t.tok; nsAmt = t.amt; nsIn = t.in; }
+    }
+
+    if (r.isSwap) {
+        if (stOut > 0 && stIn == 0)      { r.isBuy = true;  r.tokenAddr = nsTok.empty() ? trs.back().tok : nsTok; r.rawAmount = nsIn ? nsAmt : trs.front().amt; }
+        else if (stIn > 0 && stOut == 0) { r.isBuy = false; r.tokenAddr = nsTok.empty() ? trs.front().tok : nsTok; r.rawAmount = nsIn ? nsAmt : trs.front().amt; }
+        else                             { r.isBuy = stIn > stOut; r.tokenAddr = trs.front().tok; r.rawAmount = trs.front().amt; }
+    } else {
+        r.isBuy = hasIn;
+        r.tokenAddr = trs.front().tok;
+        r.rawAmount = trs.front().amt;
+    }
+
+    int dec = getDecimals(r.tokenAddr);
+    uint64_t pn = getPriceNanos(r.tokenAddr);
+    r.usdNanos = calcUsdNanos(r.rawAmount, dec, pn);
+    return r;
+}
+
+// ==================== PROCESS BLOCK ====================
+bool processBlock(long long blockNum) {
+    std::stringstream ss; ss << "0x" << std::hex << blockNum;
+    auto block = rpc("eth_getBlockByNumber", {ss.str(), true});
+    if (block.is_null() || !block.contains("transactions")) return false;
+
+    // ✅ REORG CHECK + ROLLBACK
+    std::string parentHash = block.value("parentHash", "");
+    std::string expectedParent = getLastBlockHash();    if (!expectedParent.empty() && parentHash != expectedParent && blockNum > 1) {
+        std::cerr << "[REORG] Detected at block " << blockNum
+                  << ", rolling back " << REORG_ROLLBACK << " blocks" << std::endl;
+        rollbackToBlock(blockNum - REORG_ROLLBACK - 1);
+        saveLastBlock(blockNum - REORG_ROLLBACK - 1);
+        saveLastBlockHash("");
+        return false;
+    }
+
+    for (auto& tx : block["transactions"]) {
+        if (!running.load(std::memory_order_relaxed)) return false;
+
+        std::string hash = tx["hash"].get<std::string>();
+        if (isTxProcessed(hash)) continue;
+
+        std::string from = toLower(tx["from"].get<std::string>());
+        std::string to = tx["to"].is_null() ? "" : toLower(tx["to"].get<std::string>());
+
+        std::string mA, mN;
+        {
+            std::shared_lock lock(whalesMutex);
+            for (auto& [wA, wN] : WHALES) {
+                if (from == wA || to == wA) { mA = wA; mN = wN; break; }
+            }
+        }
+
+        if (mA.empty()) { markTxProcessed(hash, blockNum); continue; }
+
+        auto receipt = rpc("eth_getTransactionReceipt", {hash});
+        if (receipt.is_null()) continue; // Retry next cycle
+
+        TxResult res = analyzeTx(receipt, mA);
+        if (!res.valid) { markTxProcessed(hash, blockNum); continue; }
+
+        // ✅ Целочисленное сравнение без float
+        cpp_int threshNanos = (cpp_int)THRESHOLD_NANOS.load();
+        if (res.usdNanos < threshNanos) { markTxProcessed(hash, blockNum); continue; }
+
+        std::string msg = "🐋 <b>" + mN + "</b>\n\n";
+        if (res.isSwap) {
+            msg += res.isBuy ? "🟢 <b>ПОКУПКА</b>" : "🔴 <b>ПРОДАЖА</b>";
+            msg += "\n💰 Сумма: <b>" + formatUsd(res.usdNanos) + "</b>\n";
+            msg += "🪙 Монета: <b>" + getSymbol(res.tokenAddr) + "</b>\n";
+            msg += "📦 Кол-во: <b>" + formatAmount(res.rawAmount, getDecimals(res.tokenAddr)) + "</b>\n";
+        } else {
+            msg += "📤 <b>ПЕРЕВОД</b>\n";
+            msg += "💰 Сумма: <b>" + formatUsd(res.usdNanos) + "</b>\n";
+            msg += "🪙 Монета: <b>" + getSymbol(res.tokenAddr) + "</b>\n";
+            msg += "📦 Кол-во: <b>" + formatAmount(res.rawAmount, getDecimals(res.tokenAddr)) + "</b>\n";
+        }        msg += "📜 Контракт: <code>" + res.tokenAddr + "</code>\n\n";
+        msg += "🔗 <a href=\"https://bscscan.com/tx/" + hash + "\">Транзакция</a>";
+
+        // ✅ Mark ONLY after successful broadcast
+        if (broadcast(msg)) {
+            markTxProcessed(hash, blockNum);
+            std::cout << "[OK] " << mN << " " << formatUsd(res.usdNanos)
+                      << " " << getSymbol(res.tokenAddr) << std::endl;
+        } else {
+            std::cerr << "[WARN] Broadcast failed for " << hash << ", will retry" << std::endl;
+        }
+    }
+
+    saveLastBlockHash(block.value("hash", ""));
+    return true;
+}
+
+// ==================== TELEGRAM LOOP ====================
+void telegramLoop() {
+    long offset = 0;
+    while (running.load(std::memory_order_relaxed)) {
+        try {
+            auto raw = http("https://api.telegram.org/bot" + TG_TOKEN
+                            + "/getUpdates?offset=" + std::to_string(offset));
+            if (raw.empty()) { std::this_thread::sleep_for(std::chrono::seconds(1)); continue; }
+            auto upd = json::parse(raw);
+            for (auto& u : upd["result"]) {
+                offset = u["update_id"].get<long>() + 1;
+                if (!u.contains("message") || !u["message"].contains("text")) continue;
+                std::string txt = u["message"]["text"];
+                std::string cid = std::to_string(u["message"]["chat"]["id"].get<long>());
+
+                addSubscriber(cid);
+                if (txt == "/start") sendMsg(cid, "✅ Подписка активна!");
+
+                if (cid == MY_CHAT_ID) {
+                    if (txt.find("/add ") == 0) {
+                        size_t p1 = txt.find(' '), p2 = txt.find(' ', p1 + 1);
+                        if (p1 != std::string::npos && p2 != std::string::npos) {
+                            std::unique_lock lock(whalesMutex);
+                            WHALES.push_back({toLower(txt.substr(p1 + 1, p2 - p1 - 1)), txt.substr(p2 + 1)});
+                            lock.unlock();
+                            saveConfig(); sendMsg(cid, "✅ Кит добавлен");
+                        } else sendMsg(cid, "❌ Формат: /add 0x... Имя");
+                    }
+                    else if (txt.find("/remove ") == 0) {
+                        std::string addr = toLower(txt.substr(8));
+                        std::unique_lock lock(whalesMutex);
+                        WHALES.erase(std::remove_if(WHALES.begin(), WHALES.end(),
+                            [&](auto& w) { return w.first == addr; }), WHALES.end());                        lock.unlock();
+                        saveConfig(); sendMsg(cid, "✅ Кит удален");
+                    }
+                    else if (txt.find("/limit ") == 0) {
+                        try {
+                            double val = std::stod(txt.substr(7));
+                            THRESHOLD_NANOS.store((uint64_t)(val * 1000000000.0));
+                            saveConfig();
+                            sendMsg(cid, "✅ Лимит: $" + std::to_string((uint64_t)val));
+                        } catch (...) { sendMsg(cid, "❌ Укажи число"); }
+                    }
+                    else if (txt == "/list") {
+                        std::shared_lock lock(whalesMutex);
+                        uint64_t thresh = THRESHOLD_NANOS.load();
+                        std::string msg = "💰 Лимит: $" + std::to_string(thresh / 1000000000ULL) + "\n\n";
+                        for (auto& [a, n] : WHALES) msg += "• " + n + "\n<code>" + a + "</code>\n\n";
+                        lock.unlock();
+                        sendMsg(cid, msg);
                     }
                 }
             }
-            if (bestPrice > 0) { priceCache[lowerAddr] = {bestPrice, time(nullptr)}; return bestPrice; }
-        }
-    } catch (...) {}
-    return 0.0;
-}
-
-// ==================== АНАЛИЗ ====================
-struct Transfer { std::string tokenAddress; std::string from; std::string to; double amount; double usdValue; };
-
-std::vector<Transfer> analyzeTransaction(const std::string& txHash) {    std::vector<Transfer> transfers;
-    json receipt = getTransactionReceipt(txHash);
-    if (receipt.is_null() || !receipt.contains("logs")) return transfers;
-    for (const auto& log : receipt["logs"]) {
-        if (!log.contains("topics") || log["topics"].size() < 3) continue;
-        if (log["topics"][0].get<std::string>() != TRANSFER_TOPIC) continue;
-        Transfer t;
-        t.tokenAddress = toLower(log["address"].get<std::string>());
-        t.from = extractAddress(log["topics"][1].get<std::string>());
-        t.to = extractAddress(log["topics"][2].get<std::string>());
-        t.amount = hexToDouble(log["data"].get<std::string>()) / std::pow(10.0, 18);
-        t.usdValue = t.amount * getTokenPriceUsd(t.tokenAddress);
-        transfers.push_back(t);
+        } catch (...) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
-    return transfers;
-}
-
-// ==================== ГЛАВНАЯ ЛОГИКА ====================
-void processTransaction(const std::string& txHash, const std::string& whaleAddr, const std::string& whaleName) {
-    std::vector<Transfer> transfers = analyzeTransaction(txHash);
-    if (transfers.empty()) return;
-    
-    std::string otherToken;
-    std::string action = "";
-    double totalUsd = 0.0;
-    std::string counterparty;
-    bool isSwap = false;
-    
-    for (const auto& t : transfers) {
-        bool fromWhale = (t.from == whaleAddr);
-        bool toWhale = (t.to == whaleAddr);
-        if (!fromWhale && !toWhale) continue;
-        if (fromWhale && toWhale) continue;
-        
-        totalUsd += t.usdValue;
-        std::string otherAddr = fromWhale ? t.to : t.from;
-        std::string lowerOther = toLower(otherAddr);
-        
-        if (lowerOther == PANCAKE_ROUTER_V2 || lowerOther == PANCAKE_ROUTER_V1 || lowerOther == PANCAKE_FACTORY) {
-            isSwap = true;
-        }
-        
-        if (t.tokenAddress == USDT_ADDRESS || toLower(t.tokenAddress) == USDT_ADDRESS) {
-            action = toWhale ? "🔴 ПРОДАЖ" : "🟢 ПОКУПКА";
-        } else {
-            otherToken = t.tokenAddress;
-        }
-        counterparty = otherAddr;
-    }
-        if (totalUsd < THRESHOLD_USD) return;
-    
-    std::string tokenName = otherToken.empty() ? "USDT" : (KNOWN_TOKENS.count(otherToken) ? KNOWN_TOKENS.at(otherToken) : "Unknown");
-    
-    // ✅ ИСПРАВЛЕНО: добавлен totalUsd в поток!
-    std::stringstream ss;
-    ss << std::fixed << std::setprecision(2) << totalUsd;
-    
-    std::string msg = "<b>" + BOT_NAME + "</b>\n\n👤 <b>" + whaleName + "</b>\n";
-    
-    if (!isSwap) {
-        msg += "📤 <b>ПЕРЕВОД</b>\n\n💰 Сумма: <b>$" + ss.str() + "</b>\n";
-        if (tokenName != "Unknown") msg += "🪙 Токен: <b>" + tokenName + "</b>\n";
-        msg += "📍 Кому: <code>" + counterparty.substr(0, 10) + "..." + counterparty.substr(38) + "</code>\n";
-    } else {
-        msg += action + "\n\n";
-        if (action == "🔴 ПРОДАЖ") {
-            msg += "Продав: <b>" + tokenName + "</b>\nОтримав: <b>$" + ss.str() + "</b>\n";
-        } else {
-            msg += "Купив: <b>" + tokenName + "</b>\nВитратив: <b>$" + ss.str() + "</b>\n";
-        }
-    }
-    msg += "🔗 <a href=\"https://bscscan.com/tx/" + txHash + "\">Транзакция</a>";
-    
-    sendToAll(msg);
-    saveTransaction(txHash, whaleName, action, tokenName, totalUsd);
-    std::cout << "[" << whaleName << "] " << (isSwap ? action : "ПЕРЕВОД") << " " << tokenName << " - $" << totalUsd << std::endl;
 }
 
 // ==================== MAIN ====================
 int main() {
+    std::signal(SIGINT, signalHandler);
+    std::signal(SIGTERM, signalHandler);
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
-    initDatabase();
-    std::cout << BOT_NAME << " STARTED" << std::endl;
-    std::cout << "Monitoring " << WHALES.size() << " whale(s)" << std::endl;
-    std::cout << "Threshold: $" << THRESHOLD_USD << std::endl;
-    std::cout << "==========================" << std::endl;
-    
-    std::set<std::string> seenHashes;
-    while (true) {
+    initDB(); loadConfig(); loadTokenCache();
+
+    SUBSCRIBERS_PTR = loadSubscribersFromDB();
+    if (SUBSCRIBERS_PTR->empty()) addSubscriber(MY_CHAT_ID);
+
+    long long lastBlock = getLastBlock();
+    if (lastBlock == 0) {
+        auto b = rpc("eth_blockNumber", {});
+        if (b.is_string()) lastBlock = std::stoll(b.get<std::string>(), nullptr, 16);
+    }
+
+    // ✅ SAFE FAST SYNC
+    auto latestJson = rpc("eth_blockNumber", {});
+    if (latestJson.is_string()) {
+        long long latest = std::stoll(latestJson.get<std::string>(), nullptr, 16);
+        if (latest - lastBlock > FAST_SYNC_LAG) {
+            std::cout << "[FAST SYNC] Lag " << (latest - lastBlock)
+                      << " blocks, skipping to latest-5" << std::endl;            lastBlock = latest - 5;
+            saveLastBlock(lastBlock);
+            saveLastBlockHash("");
+        }
+    }
+
+    uint64_t threshDisplay = THRESHOLD_NANOS.load() / 1000000000ULL;
+    std::cout << "🐋 Bot started. Block: " << lastBlock
+              << ", Subs: " << SUBSCRIBERS_PTR->size()
+              << ", Whales: " << WHALES.size()
+              << ", Threshold: $" << threshDisplay << std::endl;
+
+    std::thread tgThread(telegramLoop);
+    long long blocksSinceCheckpoint = 0;
+
+    while (running.load(std::memory_order_relaxed)) {
         try {
-            handleTelegramCommands();
-            json block = getLatestBlock();
-            if (block.is_null() || !block.contains("transactions")) {
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
-            for (const auto& tx : block["transactions"]) {
-                std::string txHash = tx["hash"].get<std::string>();
-                if (seenHashes.count(txHash)) continue;                seenHashes.insert(txHash);
-                std::string from = toLower(tx["from"].get<std::string>());
-                std::string to = "";
-                if (tx.contains("to") && !tx["to"].is_null()) to = toLower(tx["to"].get<std::string>());
-                for (const auto& whale : WHALES) {
-                    if (from == whale.address || to == whale.address) {
-                        processTransaction(txHash, whale.address, whale.name);
+            auto lj = rpc("eth_blockNumber", {});
+            if (!lj.is_string()) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+            long long latest = std::stoll(lj.get<std::string>(), nullptr, 16);
+
+            while (lastBlock < latest && running.load(std::memory_order_relaxed)) {
+                lastBlock++;
+                if (processBlock(lastBlock)) {
+                    saveLastBlock(lastBlock);
+                    if (++blocksSinceCheckpoint >= 1000) {
+                        walCheckpoint();
+                        cleanupOldTx(lastBlock);
+                        blocksSinceCheckpoint = 0;
                     }
                 }
             }
-            if (seenHashes.size() > 10000) seenHashes.clear();
         } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            std::cerr << "[ERROR] " << e.what() << std::endl;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(2));
+        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
+
+    // ✅ GRACEFUL SHUTDOWN SEQUENCE
+    std::cout << "[SHUTDOWN] Signal received, stopping gracefully..." << std::endl;
+    std::cout << "[SHUTDOWN] Waiting for Telegram thread..." << std::endl;
+    tgThread.join();
+    std::cout << "[SHUTDOWN] Final WAL checkpoint..." << std::endl;
+    walCheckpoint();
+    std::cout << "[SHUTDOWN] Closing database..." << std::endl;
     if (db) sqlite3_close(db);
     curl_global_cleanup();
+    std::cout << "[SHUTDOWN] Clean exit." << std::endl;
     return 0;
 }
