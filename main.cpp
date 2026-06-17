@@ -24,10 +24,10 @@ struct Whale {
 };
 
 const std::vector<Whale> WHALES = {
-    {"0xb81be888587704aa77c581e01299abe3667a7897", "Кит №1 🐋"},
+    {"0xb81be888587704aa77c581e01299abe3667a7897", "Кит №1 Siren 🐋"},
 };
 
-const std::string BOT_NAME = "🐋 Whale Siren";
+const std::string BOT_NAME = "🐋 Whale";
 const std::string TELEGRAM_BOT_TOKEN = "8845630927:AAEb0Xhm7DUn7ihwPPhZVaaLN3C7hRM2FS0";
 const std::string OWNER_CHAT_ID = "546348566";
 
