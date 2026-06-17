@@ -32,7 +32,7 @@ const std::string TELEGRAM_BOT_TOKEN = "8845630927:AAEb0Xhm7DUn7ihwPPhZVaaLN3C7h
 const std::string OWNER_CHAT_ID = "546348566";
 
 std::vector<std::string> SUBSCRIBERS = {"546348566"};
-double THRESHOLD_USD = 10000.0;
+double THRESHOLD_USD = 100.0;
 
 const std::string BSC_RPC_URL = "https://bsc-dataseed.bnbchain.org";
 const std::string TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
