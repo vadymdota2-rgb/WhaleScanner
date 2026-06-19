@@ -26,7 +26,7 @@ using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
 
 // ============================================================================
-// LOCK ORDER CONTRACT: dbMutex → cacheMutex → whalesMutex → subsMutex → failCountMutex
+// LOCK ORDER CONTRACT: dbMutex → cacheMutex → whalesMutex → subsMutex
 // НИКОГДА не нарушать этот порядок во избежание дедлоков
 // ============================================================================
 
@@ -36,6 +36,7 @@ struct Stats {
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
+    std::atomic<time_t> last_rpc_failure{0};
 } g_stats;
 
 const auto START_TIME = std::chrono::steady_clock::now();
@@ -123,6 +124,13 @@ bool hexToLL(const std::string& hex, long long& out) {
     }
 }
 
+std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n\xc2\xa0");
+    if (a == std::string::npos) return "";
+    size_t b = s.find_last_not_of(" \t\r\n\xc2\xa0");
+    return s.substr(a, b - a + 1);
+}
+
 // ==================== КОНФИГУРАЦИЯ ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
@@ -133,6 +141,12 @@ const std::string TG_TOKEN = []{
 }();
 
 const std::string MY_CHAT_ID = "546348566";
+// ID закрытого Telegram-канала для дублирования алертов, например "-100xxxxxxxxxx".
+// Опционально: если переменная не задана, отправка в канал просто пропускается.
+const std::string CHANNEL_ID = []{
+    const char* env = std::getenv("WHALE_CHANNEL_ID");
+    return env ? std::string(env) : std::string();
+}();
 const std::string CONFIG_FILE = "config.json";
 const std::string DB_FILE = "whale_bot.db";
 
@@ -146,8 +160,8 @@ const std::vector<std::string> BSC_RPC_ENDPOINTS = {
 std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
-const long long REORG_ROLLBACK = 5;const long long TX_TTL_BLOCKS = 200000;
-constexpr int MAX_FAILS_BEFORE_REMOVE = 3;
+const long long REORG_ROLLBACK = 5;
+const long long TX_TTL_BLOCKS = 200000;
 constexpr time_t PRICE_TTL = 3600;
 constexpr size_t MAX_SUBSCRIBERS = 5000;
 constexpr size_t MAX_QUEUE_SIZE = 50000;
@@ -172,8 +186,6 @@ std::shared_mutex whalesMutex;
 std::vector<std::pair<std::string, std::string>> WHALES;
 std::shared_mutex subsMutex;
 std::shared_ptr<const std::set<std::string>> SUBSCRIBERS_PTR;
-std::mutex failCountMutex;
-std::map<std::string, int> SUBSCRIBER_FAIL_COUNT;
 std::mutex dbMutex, cacheMutex;
 sqlite3* db = nullptr;
 std::map<std::string, std::string> TOKEN_SYMBOLS;
@@ -230,6 +242,7 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
         try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) { valid=true; return p["result"]; } } catch (...) {}
         if (!valid) {
             g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
+            g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
             size_t cur = rpcIndex.load(std::memory_order_relaxed);
             rpcIndex.store((cur+1) % BSC_RPC_ENDPOINTS.size(), std::memory_order_relaxed);
             std::cerr << "[RPC] Switching to " << ((cur+1)%BSC_RPC_ENDPOINTS.size()) << " after failure on " << BSC_RPC_ENDPOINTS[cur] << std::endl;
@@ -371,7 +384,6 @@ void removeSubscriber(const std::string& c) {
     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
       if (!prepareOrLog(db,&s,"DELETE FROM subscribers WHERE chat_id=?")) return;
       sqlite3_bind_text(s,1,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
-    { std::lock_guard<std::mutex> fl(failCountMutex); SUBSCRIBER_FAIL_COUNT.erase(c); }
     refreshSubscribers(); std::cout << "[SUBS] Unsubscribed: " << c << std::endl;
 }
 void removeDeadSubscriber(const std::string& c) {
@@ -497,10 +509,13 @@ public:
     }
     bool enqueueBroadcast(const std::string& text) {
         std::shared_ptr<const std::set<std::string>> subs; { std::shared_lock l(subsMutex); subs=SUBSCRIBERS_PTR; }
-        if (!subs||subs->empty()) return true;
+        std::vector<std::string> recipients;
+        if (subs) recipients.assign(subs->begin(), subs->end());
+        if (!CHANNEL_ID.empty() && (!subs || !subs->count(CHANNEL_ID))) recipients.push_back(CHANNEL_ID);
+        if (recipients.empty()) return true;
 
         size_t current = queueSize.load(std::memory_order_relaxed);
-        size_t batchSize = subs->size();
+        size_t batchSize = recipients.size();
         if (current + batchSize > MAX_QUEUE_SIZE) {
             logCritical("Queue OVERLOAD (" + std::to_string(current) + "+" +
                         std::to_string(batchSize) + ">" + std::to_string(MAX_QUEUE_SIZE) +
@@ -517,7 +532,7 @@ public:
         if (sqlite3_step(s)!=SQLITE_DONE) { sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
         int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
         if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at) VALUES(?,?,0,0,0)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-        for (auto& c:*subs) { sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); }
+        for (auto& c:recipients) { sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); }
         sqlite3_finalize(s); sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
         auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-txStart).count();
         if (ms>1000) std::cerr << "[DB] ⚠️ Slow enqueue: " << ms << "ms" << std::endl;
@@ -615,7 +630,11 @@ bool processBlock(long long bn) {
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         std::string mA,mN; { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) if (from==a||to==a) { mA=a; mN=n; break; } }
         if (mA.empty()) { markTxProcessed(hash,bn); continue; }
-        auto receipt=rpc("eth_getTransactionReceipt",{hash}); if (receipt.is_null()) continue;
+        auto receipt=rpc("eth_getTransactionReceipt",{hash});
+        if (receipt.is_null()) {
+            std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
+            return false;
+        }
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         if (isBaseAsset(res.tokenAddr)) { markTxProcessed(hash,bn); continue; }
         if (res.usdNanos<static_cast<cpp_int>(THRESHOLD_NANOS.load())) { markTxProcessed(hash,bn); continue; }
@@ -655,26 +674,23 @@ void telegramLoop() {
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    std::string data=u["callback_query"].value("data",""), cid=std::to_string(u["callback_query"]["from"]["id"].get<long>()), cbId=u["callback_query"]["id"].get<std::string>();
-                    std::string ans; if (data=="sub") { auto subs=loadSubscribersFromDB();
-                        if (subs->count(cid)) ans="Уже подписаны!"; else if (subs->size()>=MAX_SUBSCRIBERS) ans="⚠️ Лимит достигнут"; else { addSubscriber(cid); ans="✅ Подписка оформлена!"; } }
-                    json aj; aj["callback_query_id"]=cbId; aj["text"]=ans; http("https://api.telegram.org/bot"+TG_TOKEN+"/answerCallbackQuery",aj.dump());
+                    // Кнопка подписки убрана вместе с /start — callback-кнопок больше нет,
+                    // но обновления такого типа всё равно нужно квитировать по offset.
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
                 if (ADMIN_IDS.count(cid)==0&&!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
-                if (txt=="/start") { json kb; kb["inline_keyboard"]={{{{"text","✅ Подписаться"},{"callback_data","sub"}}}};
-                    json j; j["chat_id"]=cid; j["text"]="🐋 <b>Whale Alert Bot</b>\n\nНажмите кнопку для подписки.\nЛимит: "+std::to_string(MAX_SUBSCRIBERS); j["parse_mode"]="HTML"; j["reply_markup"]=kb;
-                    http("https://api.telegram.org/bot"+TG_TOKEN+"/sendMessage",j.dump()); }
                 else if (txt=="/subscribe") { auto subs=loadSubscribersFromDB(); if (subs->size()>=MAX_SUBSCRIBERS) sendMsg(cid,"⚠️ Лимит достигнут"); else { addSubscriber(cid); sendMsg(cid,"✅ Вы подписаны!"); } }
                 else if (txt=="/unsubscribe") { removeSubscriber(cid); sendMsg(cid,"❌ Вы отписались."); }
                 else if (txt=="/health") {
                     size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
                     int diskFree = getDiskFreePercent();
+                    time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
+                    bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
                     std::stringstream ss; ss << "✅ <b>OK</b>\n\n"
                         << "Block: <code>" << getLastBlock() << "</code>\n"
                         << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
-                        << "RPC: <b>" << (g_stats.rpc_failures.load()<10?"healthy":"degraded") << "</b>\n"
+                        << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (всего сбоев: " << g_stats.rpc_failures.load() << ")\n"
                         << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
                         << "DB: healthy\n";
                     if (diskFree >= 0) {
@@ -691,10 +707,21 @@ void telegramLoop() {
                         << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
                     if (qs>1000) ss << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                     sendMsg(cid,ss.str()); }
-                else if (txt=="/help") { sendMsg(cid,"/start — меню\n/subscribe — подписка\n/unsubscribe — отписка\n/stats — статистика\n/health — здоровье\n/help — справка"); }
+                else if (txt=="/help") { sendMsg(cid,"/subscribe — подписка\n/unsubscribe — отписка\n/stats — статистика\n/health — здоровье\n/help — справка"); }
                 else if (ADMIN_IDS.count(cid)) {
-                    if (txt.find("/add ")==0) { size_t p1=txt.find(' '),p2=txt.find(' ',p1+1); if (p1!=std::string::npos&&p2!=std::string::npos) { std::unique_lock l(whalesMutex); WHALES.push_back({toLower(txt.substr(p1+1,p2-p1-1)),txt.substr(p2+1)}); l.unlock(); saveConfig(); sendMsg(cid,"✅ Кит добавлен"); } else sendMsg(cid,"❌ /add 0x... Имя"); }
-                    else if (txt.find("/remove ")==0) { std::string a=toLower(txt.substr(8)); std::unique_lock l(whalesMutex); WHALES.erase(std::remove_if(WHALES.begin(),WHALES.end(),[&](auto&w){return w.first==a;}),WHALES.end()); l.unlock(); saveConfig(); sendMsg(cid,"✅ Кит удален"); }
+                    if (txt.find("/add ")==0) { size_t p1=txt.find(' '),p2=txt.find(' ',p1+1); if (p1!=std::string::npos&&p2!=std::string::npos) {
+                        std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
+                        std::unique_lock l(whalesMutex);
+                        bool exists=false; for (auto& [a,n]:WHALES) if (a==addr) { exists=true; break; }
+                        if (exists) { l.unlock(); sendMsg(cid,"⚠️ Этот кит уже есть в списке"); }
+                        else { WHALES.push_back({addr,trim(txt.substr(p2+1))}); l.unlock(); saveConfig(); sendMsg(cid,"✅ Кит добавлен"); }
+                    } else sendMsg(cid,"❌ /add 0x... Имя"); }
+                    else if (txt.find("/remove ")==0) { std::string a=toLower(trim(txt.substr(8))); std::unique_lock l(whalesMutex);
+                        size_t before=WHALES.size();
+                        WHALES.erase(std::remove_if(WHALES.begin(),WHALES.end(),[&](auto&w){return w.first==a;}),WHALES.end());
+                        bool removed=WHALES.size()<before; l.unlock();
+                        if (removed) { saveConfig(); sendMsg(cid,"✅ Кит удален"); }
+                        else sendMsg(cid,"⚠️ Адрес не найден в списке. Проверь /list"); }
                     else if (txt.find("/limit ")==0) { try { double v=std::stod(txt.substr(7)); THRESHOLD_NANOS.store(static_cast<uint64_t>(v*1000000000.0)); saveConfig(); sendMsg(cid,"✅ Лимит: $"+std::to_string(static_cast<uint64_t>(v))); } catch (...) { sendMsg(cid,"❌ Число"); } }
                     else if (txt=="/list") { std::shared_lock l(whalesMutex); uint64_t t=THRESHOLD_NANOS.load(); std::string m="💰 $"+std::to_string(t/1000000000ULL)+"\n\n"; for (auto& [a,n]:WHALES) m+="• "+safeString(n)+"\n<code>"+safeString(a)+"</code>\n\n"; l.unlock(); sendMsg(cid,m); }
                 }
