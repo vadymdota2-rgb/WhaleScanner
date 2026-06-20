@@ -161,7 +161,7 @@ std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
-const long long TX_TTL_BLOCKS = 200000;
+const long long TX_TTL_BLOCKS = 20000;
 constexpr time_t PRICE_TTL = 3600;
 constexpr size_t MAX_SUBSCRIBERS = 5000;
 constexpr size_t MAX_QUEUE_SIZE = 50000;
