@@ -49,7 +49,8 @@ std::string getUptime() {
     int m = secs / 60;
     std::stringstream ss;
     if (d > 0) ss << d << "d ";
-    ss << h << "h " << m << "m";    return ss.str();
+    ss << h << "h " << m << "m";
+    return ss.str();
 }
 
 // ==================== УТИЛИТЫ ====================
@@ -98,7 +99,8 @@ std::string safeString(const std::string& s, size_t maxLen = 64) {
 void logCritical(const std::string& msg) {
     std::cerr << "[CRITICAL] " << msg << std::endl;
     try {
-        std::ofstream("critical.log", std::ios::app)            << "[" << time(nullptr) << "] " << msg << "\n";
+        std::ofstream("critical.log", std::ios::app)
+            << "[" << time(nullptr) << "] " << msg << "\n";
     } catch (...) {}
 }
 
@@ -207,7 +209,8 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
-        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {            return running.load(std::memory_order_relaxed) ? 0 : 1; });
+        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+            return running.load(std::memory_order_relaxed) ? 0 : 1; });
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     if (!post.empty()) {
         h = curl_slist_append(h, "Content-Type: application/json");
@@ -257,7 +260,8 @@ void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
         std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
     }
-    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
 
     sqlite3_stmt* chk;
@@ -306,7 +310,8 @@ void rollbackToBlock(long long t) {
     std::cerr << "[REORG] Rolled back above block " << t << std::endl;
 }
 void loadTokenCache() {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;    if (!prepareOrLog(db,&s,"SELECT address,symbol,decimals,price_nanos,price_ts FROM token_cache")) return;
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT address,symbol,decimals,price_nanos,price_ts FROM token_cache")) return;
     while (sqlite3_step(s)==SQLITE_ROW) {
         std::string a=safeColumnText(s,0), sym=safeColumnText(s,1);
         if (!sym.empty()) TOKEN_SYMBOLS[a]=sym;
@@ -355,7 +360,8 @@ long long getLastBlock() {
 void saveLastBlock(long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block',?)")) return;
-    std::string v=std::to_string(b); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);}
+    std::string v=std::to_string(b); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+}
 std::string getLastBlockHash() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='last_block_hash'")) return "";
@@ -403,7 +409,8 @@ void loadConfig() {
         std::cout << "[CONFIG] No whales. Use /add in Telegram." << std::endl; return;
     }
     try {
-        json j=json::parse(f); double t=j.value("threshold",10000.0);        THRESHOLD_NANOS.store(static_cast<uint64_t>(t*1000000000.0));
+        json j=json::parse(f); double t=j.value("threshold",10000.0);
+        THRESHOLD_NANOS.store(static_cast<uint64_t>(t*1000000000.0));
         std::unique_lock l(whalesMutex); WHALES.clear();
         for (auto& w:j["whales"]) WHALES.push_back({toLower(w["address"]),w["name"]});
         std::cout << "[CONFIG] Loaded " << WHALES.size() << " whales, $" << t << std::endl;
@@ -437,10 +444,27 @@ struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
 SendResult sendMsg(const std::string& c, const std::string& t) {
     json j; j["chat_id"]=c; j["text"]=t; j["parse_mode"]="HTML"; j["disable_web_page_preview"]=true;
     auto r=http("https://api.telegram.org/bot"+TG_TOKEN+"/sendMessage",j.dump());
-    try { auto p=json::parse(r); if (p.value("ok",false)) return {true,false,0};
+    try {
+        auto p=json::parse(r); if (p.value("ok",false)) return {true,false,0};
         int code=p.value("error_code",0);
         if (code==429) { int ra=p.contains("parameters")&&p["parameters"].contains("retry_after")?p["parameters"]["retry_after"].get<int>():30; return {false,false,ra}; }
-        if (code==403||code==400) return {false,true,0}; return {false,false,0};
+        // 403 у Telegram всегда означает, что бот заблокирован/удалён из чата — пользователь точно "мёртв".
+        // 400 — общий код ошибки запроса (например, "message is too long", "can't parse entities",
+        // невалидный HTML), и НЕ всегда означает мёртвого получателя. Раньше любой 400 трактовался
+        // как deadUser и навсегда отписывал ЖИВОГО подписчика из-за ошибки в самом тексте сообщения
+        // (а так как сообщение одинаковое для всех в broadcast — это могло массово отписать всех
+        // подписчиков за одну неудачную рассылку). Теперь для 400 проверяем описание ошибки и
+        // считаем "мёртвым" только явные признаки удалённого/недоступного чата.
+        std::string desc = toLower(p.value("description",""));
+        bool chatGone = desc.find("chat not found")!=std::string::npos ||
+                         desc.find("bot was blocked")!=std::string::npos ||
+                         desc.find("user is deactivated")!=std::string::npos ||
+                         desc.find("kicked")!=std::string::npos ||
+                         desc.find("chat_id is empty")!=std::string::npos;
+        if (code==403) return {false,true,0};
+        if (code==400 && chatGone) return {false,true,0};
+        if (code==400) { std::cerr << "[TG] 400 (not treated as dead user): " << desc << std::endl; return {false,false,0}; }
+        return {false,false,0};
     } catch (...) { return {false,false,0}; }
 }
 
@@ -452,7 +476,8 @@ class SafeMessageQueue {
     std::thread senderThread;
     static constexpr int SEND_MS=33;
 
-    void initCounters() {        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    void initCounters() {
+        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
             if (sqlite3_step(s)==SQLITE_ROW) queueSize.store(sqlite3_column_int64(s,0)); sqlite3_finalize(s); }
     }
@@ -501,7 +526,8 @@ class SafeMessageQueue {
 public:
     void start() { qRunning.store(true); senderThread=std::thread(&SafeMessageQueue::senderLoop,this); }
     void stop() { qRunning.store(false); if (senderThread.joinable()) senderThread.join(); }
-    size_t size() { return queueSize.load(std::memory_order_relaxed); }    void syncSize() {
+    size_t size() { return queueSize.load(std::memory_order_relaxed); }
+    void syncSize() {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
             if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
@@ -545,15 +571,27 @@ bool broadcast(const std::string& t) { return g_msgQueue.enqueueBroadcast(t); }
 // ==================== TOKENS & PRICES ====================
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
-    auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"}); int d=18;
-    if (r.is_string()&&r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
+    auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
+    // Если RPC вообще не ответил (узел недоступен/таймаут) — НЕ кэшируем дефолт 18
+    // навсегда: иначе временный сбой ноды на первом запросе зафиксирует неверные
+    // decimals для токена насовсем, что тихо искажает все последующие расчёты USD
+    // по этому токену (ошибка на порядки, без какого-либо предупреждения).
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 18; }
+    int d=18;
+    if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
     { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
 }
 std::string getSymbol(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
-    auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"}); std::string sym;
-    if (r.is_string()&&r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
-        if (len>0&&len<=32) { std::string sh=h.substr(128,len*2); for (size_t i=0;i<sh.length();i+=2) sym+=static_cast<char>(std::stoi(sh.substr(i,2),nullptr,16)); } } catch (...) {} }    if (sym.empty()&&r.is_string()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
+    auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"});
+    // Если RPC вообще не ответил — не кэшируем "UNKNOWN" навсегда (см. комментарий в
+    // getDecimals): иначе токен останется UNKNOWN во всех будущих алертах после одного
+    // временного сбоя ноды, хотя символ реально известен и был бы получен при повторе.
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return "UNKNOWN"; }
+    std::string sym;
+    if (r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
+        if (len>0&&len<=32) { std::string sh=h.substr(128,len*2); for (size_t i=0;i<sh.length();i+=2) sym+=static_cast<char>(std::stoi(sh.substr(i,2),nullptr,16)); } } catch (...) {} }
+    if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
@@ -585,33 +623,137 @@ std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
 // ==================== ANALYZE TX ====================
+// Логика: считаем чистый netflow (in-out) ПО КАЖДОМУ токену отдельно, на основе
+// ВСЕХ Transfer-логов, где участвует адрес кита (fr==wa или to==wa). Это устойчиво
+// к мультихопам и нескольким Transfer-логам одного токена в одной tx — раньше такие
+// логи перезаписывали друг друга (nsIn/nsOut) вместо суммирования, и сумма свопа
+// могла занижаться или браться от неверного токена.
 struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; };
+
 TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
-std::cout << "[RECEIPT] " << receipt.dump() << std::endl;
 
-    bool hasSwap=false; for (auto& l:receipt["logs"]) if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) { hasSwap=true; break; }
-    struct TI { cpp_int amt; std::string tok; bool in; }; std::vector<TI> trs;
-    for (auto& l:receipt["logs"]) { if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
-    if (l.contains("topics") && l["topics"].is_array() && !l["topics"].empty()) {
-        std::cout << "[TOPIC] " << l["topics"][0].get<std::string>() << std::endl;
+    // Признак "это своп", а не просто перевод — наличие хотя бы одного Swap-лога в receipt.
+    bool hasSwap=false;
+    for (auto& l:receipt["logs"]) {
+        if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&
+            l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) { hasSwap=true; break; }
     }
 
+    // Чистый netflow по каждому токену: positive = чистый приход на wa, negative = чистый расход.
+    std::map<std::string, cpp_int> netFlow;
+    std::vector<std::string> tokenOrder; // порядок появления, для детерминированного fallback
+    auto touch = [&](const std::string& tok) {
+        if (netFlow.find(tok) == netFlow.end()) { netFlow[tok] = 0; tokenOrder.push_back(tok); }
+    };
+
+    bool anyTransferForWallet = false;
+    for (auto& l : receipt["logs"]) {
+        if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
         if (!l["topics"][0].is_string()||l["topics"][0].get<std::string>()!="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") continue;
         if (!l.contains("data")||!l["data"].is_string()) continue;
-        std::string fr="0x"+toLower(l["topics"][1].get<std::string>().substr(26)), to="0x"+toLower(l["topics"][2].get<std::string>().substr(26)), tk=toLower(l["address"].get<std::string>());
-        if (fr!=wa&&to!=wa) continue; trs.push_back({parseUint256(l["data"].get<std::string>()),tk,to==wa}); }
-    if (trs.empty()) return r; r.valid=true;
-std::cout << "[SWAPCHK] tx=" << receipt["transactionHash"].get<std::string>() << " hasSwap=" << hasSwap << " logs=" << receipt["logs"].size() << " topic0=" << receipt["logs"][0]["topics"][0].get<std::string>() << std::endl;
+        if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||!l.contains("address")||!l["address"].is_string()) continue;
 
-    bool hasIn=false,hasOut=false; for (auto& t:trs) if (t.in) hasIn=true; else hasOut=true; r.isSwap=hasSwap&&hasIn&&hasOut;
-    cpp_int bIn=0,bOut=0; std::string nsIn,nsOut; cpp_int naIn=0,naOut=0;
-    for (auto& t:trs) { if (isBaseAsset(t.tok)) { if (t.in) bIn+=t.amt; else bOut+=t.amt; } else { if (t.in) { nsIn=t.tok; naIn+=t.amt; } else { nsOut=t.tok; naOut+=t.amt; } } }
-    if (r.isSwap) { if (bOut>0&&bIn==0) { r.isBuy=true; r.tokenAddr=nsIn.empty()?trs.back().tok:nsIn; r.rawAmount=naIn>0?naIn:trs.back().amt; }
-        else if (bIn>0&&bOut==0) { r.isBuy=false; r.tokenAddr=nsOut.empty()?trs.front().tok:nsOut; r.rawAmount=naOut>0?naOut:trs.front().amt; }
-        else if (!nsIn.empty()&&!nsOut.empty()) { r.isBuy=true; r.tokenAddr=nsIn; r.rawAmount=naIn; }
-        else { r.isBuy=bIn>bOut; r.tokenAddr=trs.front().tok; r.rawAmount=trs.front().amt; }    } else { r.isBuy=hasIn; r.tokenAddr=trs.front().tok; r.rawAmount=trs.front().amt; }
-    r.usdNanos=calcUsdNanos(r.rawAmount,getDecimals(r.tokenAddr),getPriceNanos(r.tokenAddr)); return r;
+        // Topic-хеш адреса должен быть "0x" + 64 hex символа (32-байтовый word,
+        // где адрес занимает младшие 20 байт = последние 40 символов после позиции 26).
+        // Раньше substr(26) без проверки длины бросал std::out_of_range на укороченной/
+        // нестандартной строке от RPC, что прерывало analyzeTx без перехвата исключения
+        // и могло застопорить обработку блока навсегда (после retry-фикса в main блок
+        // повторялся бы бесконечно с тем же самым исключением на том же receipt).
+        const std::string& t1 = l["topics"][1].get_ref<const std::string&>();
+        const std::string& t2 = l["topics"][2].get_ref<const std::string&>();
+        const std::string& addrField = l["address"].get_ref<const std::string&>();
+        const std::string& dataField = l["data"].get_ref<const std::string&>();
+        if (t1.length() < 66 || t2.length() < 66) continue;
+
+        std::string fr = "0x"+toLower(t1.substr(26));
+        std::string to = "0x"+toLower(t2.substr(26));
+        std::string tk = toLower(addrField);
+        if (fr != wa && to != wa) continue; // лог не касается кошелька кита напрямую
+
+        cpp_int amt = parseUint256(dataField);
+        touch(tk);
+        anyTransferForWallet = true;
+        if (to == wa) netFlow[tk] += amt;   // пришло на кошелек
+        if (fr == wa) netFlow[tk] -= amt;   // ушло с кошелька (fr==to==wa компенсируется — корректно)
+    }
+
+    if (!anyTransferForWallet) return r;
+    r.valid = true;
+
+    // Разделяем netflow на "базовые" (стейблы/WBNB) и "не базовые" — собственно интересующий нас токен.
+    // Сравнивать токены по сырой величине напрямую нельзя — у них разные decimals,
+    // поэтому приоритет отдаём токену, который ПРИШЁЛ на кошелёк (купленный актив);
+    // если входящих non-base токенов нет — берём токен с наибольшим |netflow| среди ушедших.
+    std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
+    bool hasBaseIn=false, hasBaseOut=false;
+
+    for (auto& tok : tokenOrder) {
+        cpp_int net = netFlow[tok];
+        if (isBaseAsset(tok)) {
+            if (net > 0) hasBaseIn = true;
+            if (net < 0) hasBaseOut = true;
+        } else {
+            if (net <= 0) continue; // первый проход: только входящие non-base токены
+            if (net > bestNonBaseAbs) { bestNonBaseAbs = net; bestNonBaseTok = tok; bestNonBaseNet = net; }
+        }
+    }
+    if (bestNonBaseTok.empty()) {
+        for (auto& tok : tokenOrder) {
+            if (isBaseAsset(tok)) continue;
+            cpp_int net = netFlow[tok];
+            cpp_int absNet = net >= 0 ? net : -net;
+            if (absNet > bestNonBaseAbs) { bestNonBaseAbs = absNet; bestNonBaseTok = tok; bestNonBaseNet = net; }
+        }
+    }
+
+    r.isSwap = hasSwap && (
+        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) || // non-base <-> base
+        (hasBaseIn && hasBaseOut)                                  // base <-> base (напр. USDT->WBNB)
+    );
+
+    if (!bestNonBaseTok.empty()) {
+        // Есть нестейбл-токен с ненулевым нетфлоу — это и есть актив сделки.
+        r.tokenAddr = bestNonBaseTok;
+        r.rawAmount = bestNonBaseAbs;
+        r.isBuy = bestNonBaseNet > 0; // токен пришёл на кошелек кита => покупка
+    } else {
+        // Только базовые активы участвовали (например USDT->WBNB). Сравнивать их по
+        // сырому количеству бессмысленно — у разных токенов разные decimals (тот же
+        // объём в USD может иметь совершенно разные "сырые" числа). Поэтому берём
+        // тот, что ПРИШЁЛ на кошелёк кита (это и есть результат сделки), а если
+        // пришедших несколько — с наибольшим |netflow| среди них; если ничего не
+        // пришло (передан только расход) — среди ушедших.
+        std::string bestBaseTok; cpp_int bestBaseAbs = -1; cpp_int bestBaseNet = 0;
+        for (auto& tok : tokenOrder) {
+            if (!isBaseAsset(tok)) continue;
+            cpp_int net = netFlow[tok];
+            if (net <= 0) continue; // первый проход: только входящие
+            if (net > bestBaseAbs) { bestBaseAbs = net; bestBaseTok = tok; bestBaseNet = net; }
+        }
+        if (bestBaseTok.empty()) {
+            for (auto& tok : tokenOrder) {
+                if (!isBaseAsset(tok)) continue;
+                cpp_int net = netFlow[tok];
+                cpp_int absNet = net >= 0 ? net : -net;
+                if (absNet > bestBaseAbs) { bestBaseAbs = absNet; bestBaseTok = tok; bestBaseNet = net; }
+            }
+        }
+        if (!bestBaseTok.empty()) {
+            r.tokenAddr = bestBaseTok;
+            r.rawAmount = bestBaseAbs;
+            r.isBuy = bestBaseNet > 0;
+        } else {
+            // Подстраховка: anyTransferForWallet=true гарантирует хотя бы один токен в netFlow.
+            r.tokenAddr = tokenOrder.front();
+            cpp_int net = netFlow[r.tokenAddr];
+            r.rawAmount = net >= 0 ? net : -net;
+            r.isBuy = net > 0;
+        }
+    }
+
+    r.usdNanos = calcUsdNanos(r.rawAmount, getDecimals(r.tokenAddr), getPriceNanos(r.tokenAddr));
+    return r;
 }
 
 // ==================== PROCESS BLOCK ====================
@@ -639,21 +781,15 @@ bool processBlock(long long bn) {
         std::string mA,mN; { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) if (from==a||to==a) { mA=a; mN=n; break; } }
         if (mA.empty()) { markTxProcessed(hash,bn); continue; }
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
-    std::cout << "[TX] " << hash << std::endl;
-    std::cout << "[LOGS] " << receipt["logs"].size() << std::endl;
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-for (auto &l : receipt["logs"]) {
-    if (!l.contains("topics") || !l["topics"].is_array() || l["topics"].empty() || !l["topics"][0].is_string()) continue;
-    std::string t0 = l["topics"][0];
-std::cout << "[TOP0] " << t0 << std::endl;
-        std::cout << "[TOP0] " << t0 << std::endl;
-    if (t0 == SWAP_TOPIC) std::cout << "[FOUND_SWAP] " << hash << std::endl;
-}
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        if (isBaseAsset(res.tokenAddr)) { markTxProcessed(hash,bn); continue; }
+        // Базовый актив (стейбл/WBNB) как итоговый токен интересен только если это
+        // часть свопа (напр. USDT->WBNB) — а не просто прямой перевод стейбла/WBNB
+        // между адресами, который сам по себе не торговый сигнал.
+        if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
         if (res.usdNanos<static_cast<cpp_int>(THRESHOLD_NANOS.load())) { markTxProcessed(hash,bn); continue; }
         std::string msg="🐋 <b>"+safeString(mN)+"</b>\n\n";
         msg+=res.isSwap?(res.isBuy?"🟢 <b>ПОКУПКА</b>":"🔴 <b>ПРОДАЖА</b>"):"📤 <b>ПЕРЕВОД</b>";
@@ -674,7 +810,8 @@ std::cout << "[TOP0] " << t0 << std::endl;
 // ==================== CLEANUP ====================
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {        sqlite3_bind_int64(s,1,time(nullptr)-30*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
+    if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
+        sqlite3_bind_int64(s,1,time(nullptr)-30*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
         if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
         sqlite3_bind_int64(s,1,time(nullptr)-14*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
@@ -720,7 +857,8 @@ void telegramLoop() {
                     }
                     ss << "Uptime: <b>" << getUptime() << "</b>";
                     sendMsg(cid,ss.str()); }
-                else if (txt=="/stats") {                    size_t qs=g_msgQueue.size(); auto subs=loadSubscribersFromDB(); int64_t fc=0;
+                else if (txt=="/stats") {
+                    size_t qs=g_msgQueue.size(); auto subs=loadSubscribersFromDB(); int64_t fc=0;
                     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
                     std::stringstream ss; ss << "📊 <b>Stats</b>\n\n👥 Subs: <b>" << subs->size() << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                         << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
@@ -767,9 +905,23 @@ int main() {
         try {
             auto lj=rpc("eth_blockNumber",{}); long long lat;
             if (!lj.is_string()||!hexToLL(lj.get<std::string>(),lat)) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
-            while (lb<lat&&running.load(std::memory_order_relaxed)) { lb++; if (processBlock(lb)) { saveLastBlock(lb);
+            while (lb<lat&&running.load(std::memory_order_relaxed)) {
+                long long next = lb+1;
+                if (!processBlock(next)) {
+                    // Блок не обработан: либо временный сбой RPC (receipt/block ещё не
+                    // готовы — тогда last_block в БД не менялся, и нужно повторить тот
+                    // же next), либо processBlock сам откатил last_block из-за reorg
+                    // (тогда в БД уже лежит более ранний номер). В обоих случаях
+                    // синхронизируем in-memory lb с тем, что реально сохранено в БД —
+                    // раньше lb продвигался безусловно и непрочитанный/откаченный
+                    // блок терялся навсегда без повторной попытки.
+                    lb = getLastBlock();
+                    break;
+                }
+                lb = next; saveLastBlock(lb);
                 bool nc=(++bsc>=1000); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=30; }
-                if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); } } }
+                if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
+            }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lcl).count()>=24) { cleanupOldAlerts(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
@@ -780,4 +932,5 @@ int main() {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
     std::cout << "[SHUTDOWN] Stopping..." << std::endl; g_msgQueue.stop(); tg.join(); walCheckpoint(); if (db) sqlite3_close(db); curl_global_cleanup();
-    std::cout << "[SHUTDOWN] Clean exit." << std::endl; return 0;}
+    std::cout << "[SHUTDOWN] Clean exit." << std::endl; return 0;
+}
