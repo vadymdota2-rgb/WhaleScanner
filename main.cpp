@@ -588,14 +588,22 @@ std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string
 struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; };
 TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
+std::cout << "[RECEIPT] " << receipt.dump() << std::endl;
+
     bool hasSwap=false; for (auto& l:receipt["logs"]) if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) { hasSwap=true; break; }
     struct TI { cpp_int amt; std::string tok; bool in; }; std::vector<TI> trs;
     for (auto& l:receipt["logs"]) { if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
+    if (l.contains("topics") && l["topics"].is_array() && !l["topics"].empty()) {
+        std::cout << "[TOPIC] " << l["topics"][0].get<std::string>() << std::endl;
+    }
+
         if (!l["topics"][0].is_string()||l["topics"][0].get<std::string>()!="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") continue;
         if (!l.contains("data")||!l["data"].is_string()) continue;
         std::string fr="0x"+toLower(l["topics"][1].get<std::string>().substr(26)), to="0x"+toLower(l["topics"][2].get<std::string>().substr(26)), tk=toLower(l["address"].get<std::string>());
         if (fr!=wa&&to!=wa) continue; trs.push_back({parseUint256(l["data"].get<std::string>()),tk,to==wa}); }
     if (trs.empty()) return r; r.valid=true;
+std::cout << "[SWAPCHK] tx=" << receipt["transactionHash"].get<std::string>() << " hasSwap=" << hasSwap << " logs=" << receipt["logs"].size() << " topic0=" << receipt["logs"][0]["topics"][0].get<std::string>() << std::endl;
+
     bool hasIn=false,hasOut=false; for (auto& t:trs) if (t.in) hasIn=true; else hasOut=true; r.isSwap=hasSwap&&hasIn&&hasOut;
     cpp_int bIn=0,bOut=0; std::string nsIn,nsOut; cpp_int naIn=0,naOut=0;
     for (auto& t:trs) { if (isBaseAsset(t.tok)) { if (t.in) bIn+=t.amt; else bOut+=t.amt; } else { if (t.in) { nsIn=t.tok; naIn+=t.amt; } else { nsOut=t.tok; naOut+=t.amt; } } }
@@ -631,10 +639,19 @@ bool processBlock(long long bn) {
         std::string mA,mN; { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) if (from==a||to==a) { mA=a; mN=n; break; } }
         if (mA.empty()) { markTxProcessed(hash,bn); continue; }
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
+    std::cout << "[TX] " << hash << std::endl;
+    std::cout << "[LOGS] " << receipt["logs"].size() << std::endl;
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
+for (auto &l : receipt["logs"]) {
+    if (!l.contains("topics") || !l["topics"].is_array() || l["topics"].empty() || !l["topics"][0].is_string()) continue;
+    std::string t0 = l["topics"][0];
+std::cout << "[TOP0] " << t0 << std::endl;
+        std::cout << "[TOP0] " << t0 << std::endl;
+    if (t0 == SWAP_TOPIC) std::cout << "[FOUND_SWAP] " << hash << std::endl;
+}
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         if (isBaseAsset(res.tokenAddr)) { markTxProcessed(hash,bn); continue; }
         if (res.usdNanos<static_cast<cpp_int>(THRESHOLD_NANOS.load())) { markTxProcessed(hash,bn); continue; }
@@ -643,7 +660,9 @@ bool processBlock(long long bn) {
         msg+="\n💰 Сумма: <b>"+formatUsd(res.usdNanos)+"</b>\n";
         msg+="🪙 Монета: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
         msg+="📦 Кол-во: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
-        msg+="📜 Контракт: <code>"+safeString(res.tokenAddr)+"</code>\n\n";
+        msg+="📜 Контракт: <code>"+safeString(res.tokenAddr)+"</code>\n";
+        msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
+        msg+="👛 Кошелек: <b>"+safeString(mN)+"</b>\n\n";
         msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Транзакция</a>";
         if (broadcast(msg)) { markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(1);
             std::cout << "[OK] " << mN << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr) << std::endl;
