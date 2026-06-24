@@ -707,7 +707,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         }
     }
 
-    r.isSwap = hasSwap && (
+    r.isSwap = (
         (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) || // non-base <-> base
         (hasBaseIn && hasBaseOut)                                  // base <-> base (напр. USDT->WBNB)
     );
@@ -780,6 +780,10 @@ bool processBlock(long long bn) {
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         std::string mA,mN; { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) if (from==a||to==a) { mA=a; mN=n; break; } }
         if (mA.empty()) { markTxProcessed(hash,bn); continue; }
+        if (from!=mA && to!=mA) {
+            markTxProcessed(hash,bn);
+            continue;
+        }
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
