@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <atomic>
 #include <memory>
+#include <optional>
 #include <csignal>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -27,7 +28,7 @@ using boost::multiprecision::cpp_int;
 
 // ============================================================================
 // LOCK ORDER CONTRACT: dbMutex → cacheMutex → whalesMutex → subsMutex
-// НИКОГДА не нарушать этот порядок во избежание дедлоков
+// Never violate this order to avoid deadlocks
 // ============================================================================
 
 struct Stats {
@@ -53,7 +54,7 @@ std::string getUptime() {
     return ss.str();
 }
 
-// ==================== УТИЛИТЫ ====================
+// ==================== UTILITIES ====================
 std::string toLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
         [](unsigned char c) { return std::tolower(c); });
@@ -95,7 +96,7 @@ std::string safeString(const std::string& s, size_t maxLen = 64) {
     return e;
 }
 
-// Безопасное логирование: НИКОГДА не вызывает сеть
+// Safe logging: NEVER touches the network
 void logCritical(const std::string& msg) {
     std::cerr << "[CRITICAL] " << msg << std::endl;
     try {
@@ -104,7 +105,7 @@ void logCritical(const std::string& msg) {
     } catch (...) {}
 }
 
-// Корректный расчёт свободного места через размеры блоков
+// Correct free-space calculation using block sizes
 int getDiskFreePercent() {
     struct statvfs st;
     if (statvfs(".", &st) != 0) return -1;
@@ -114,7 +115,7 @@ int getDiskFreePercent() {
     return static_cast<int>((100.0 * free) / total);
 }
 
-// Безопасный парсинг hex-чисел без исключений
+// Safe hex parsing without exceptions
 bool hexToLL(const std::string& hex, long long& out) {
     if (hex.empty()) return false;
     try {
@@ -133,7 +134,7 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
-// ==================== КОНФИГУРАЦИЯ ====================
+// ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
     if (!env || std::string(env).empty()) {
@@ -143,8 +144,8 @@ const std::string TG_TOKEN = []{
 }();
 
 const std::string MY_CHAT_ID = "546348566";
-// ID закрытого Telegram-канала для дублирования алертов, например "-100xxxxxxxxxx".
-// Опционально: если переменная не задана, отправка в канал просто пропускается.
+// ID of the private Telegram channel for duplicating alerts, e.g. "-100xxxxxxxxxx".
+// Optional: if the variable is not set, sending to the channel is simply skipped.
 const std::string CHANNEL_ID = []{
     const char* env = std::getenv("WHALE_CHANNEL_ID");
     return env ? std::string(env) : std::string();
@@ -180,6 +181,39 @@ const std::set<std::string> BASE_ASSETS = {
 };
 bool isBaseAsset(const std::string& a) { return BASE_ASSETS.count(toLower(a)) > 0; }
 
+// ==================== KNOWN ROUTERS / AGGREGATORS / DEXES ====================
+// Address book of well-known router / aggregator contracts on BSC, used purely
+// for labeling alerts (e.g. "via PancakeSwap V3"). This is NOT used for any
+// trust/security decision — it only improves the message shown to the user.
+// Every address below was verified against a block explorer at the time it was
+// added. If a lookup misses, the bot silently falls back to no label; it never
+// guesses or fabricates a venue name.
+// NOTE on 0x10ed43c7...256024e: the address is 42 chars (0x + 40 hex). An earlier
+// version of this table had it truncated to 41 chars, which would never match any
+// real address and would simply make the label disappear — not a crash, but worth
+// double-checking length explicitly given how easy it is to drop one hex digit.
+const std::map<std::string, std::string> KNOWN_ROUTERS = {
+    {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
+    {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
+    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
+    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
+    {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
+    {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
+    {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
+    {"0x6015126d7d23648c2e4466693b8deab005ffaba8", "OKX DEX"},
+    {"0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap"},
+    {"0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap"},
+    {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
+};
+
+// Best-effort label lookup for a router/aggregator address. Returns empty
+// string if unknown — callers must treat that as "no label available", not as
+// an error.
+std::string lookupRouterLabel(const std::string& addr) {
+    auto it = KNOWN_ROUTERS.find(toLower(addr));
+    return it != KNOWN_ROUTERS.end() ? it->second : std::string();
+}
+
 std::atomic<uint64_t> THRESHOLD_NANOS{10000000000000ULL};
 std::atomic<bool> running{true};
 void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
@@ -193,6 +227,12 @@ sqlite3* db = nullptr;
 std::map<std::string, std::string> TOKEN_SYMBOLS;
 std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
+// In-memory only (not persisted to SQLite, unlike TOKEN_SYMBOLS/DECIMALS): which
+// token0/token1 a given pool contract holds. This is purely an optimization to
+// avoid re-querying the same pool's token0()/token1() on every swap through it —
+// losing this cache on restart just means re-fetching it once per pool, which is
+// cheap and not worth a schema migration for.
+std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
 
 // ==================== HTTP & RPC ====================
 size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
@@ -448,13 +488,15 @@ SendResult sendMsg(const std::string& c, const std::string& t) {
         auto p=json::parse(r); if (p.value("ok",false)) return {true,false,0};
         int code=p.value("error_code",0);
         if (code==429) { int ra=p.contains("parameters")&&p["parameters"].contains("retry_after")?p["parameters"]["retry_after"].get<int>():30; return {false,false,ra}; }
-        // 403 у Telegram всегда означает, что бот заблокирован/удалён из чата — пользователь точно "мёртв".
-        // 400 — общий код ошибки запроса (например, "message is too long", "can't parse entities",
-        // невалидный HTML), и НЕ всегда означает мёртвого получателя. Раньше любой 400 трактовался
-        // как deadUser и навсегда отписывал ЖИВОГО подписчика из-за ошибки в самом тексте сообщения
-        // (а так как сообщение одинаковое для всех в broadcast — это могло массово отписать всех
-        // подписчиков за одну неудачную рассылку). Теперь для 400 проверяем описание ошибки и
-        // считаем "мёртвым" только явные признаки удалённого/недоступного чата.
+        // Telegram's 403 always means the bot was blocked/removed from the chat — the
+        // user is definitely "dead". 400 is a generic request-error code (e.g. "message
+        // is too long", "can't parse entities", invalid HTML) and does NOT always mean a
+        // dead recipient. Previously any 400 was treated as deadUser and permanently
+        // unsubscribed a LIVE subscriber because of an error in the message text itself
+        // (and since the message is the same for everyone in a broadcast, this could mass
+        // -unsubscribe all subscribers from a single failed broadcast). Now for 400 we
+        // check the error description and only treat it as "dead" for explicit signs of a
+        // removed/unreachable chat.
         std::string desc = toLower(p.value("description",""));
         bool chatGone = desc.find("chat not found")!=std::string::npos ||
                          desc.find("bot was blocked")!=std::string::npos ||
@@ -572,10 +614,11 @@ bool broadcast(const std::string& t) { return g_msgQueue.enqueueBroadcast(t); }
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
     auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
-    // Если RPC вообще не ответил (узел недоступен/таймаут) — НЕ кэшируем дефолт 18
-    // навсегда: иначе временный сбой ноды на первом запросе зафиксирует неверные
-    // decimals для токена насовсем, что тихо искажает все последующие расчёты USD
-    // по этому токену (ошибка на порядки, без какого-либо предупреждения).
+    // If the RPC didn't respond at all (node unreachable/timeout), do NOT cache the
+    // default of 18 forever: otherwise a temporary node outage on the first request
+    // would permanently lock in the wrong decimals for the token, which silently
+    // skews every later USD calculation for it (an error of orders of magnitude,
+    // with no warning at all).
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 18; }
     int d=18;
     if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
@@ -584,9 +627,10 @@ int getDecimals(const std::string& addr) {
 std::string getSymbol(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
     auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"});
-    // Если RPC вообще не ответил — не кэшируем "UNKNOWN" навсегда (см. комментарий в
-    // getDecimals): иначе токен останется UNKNOWN во всех будущих алертах после одного
-    // временного сбоя ноды, хотя символ реально известен и был бы получен при повторе.
+    // If the RPC didn't respond at all, don't cache "UNKNOWN" forever (see the comment
+    // in getDecimals): otherwise the token would stay UNKNOWN in every future alert
+    // after a single temporary node outage, even though the symbol is actually known
+    // and would be fetched successfully on retry.
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return "UNKNOWN"; }
     std::string sym;
     if (r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
@@ -613,6 +657,32 @@ cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
     for (char c:h.substr(2,64)) { r<<=4; if (c>='0'&&c<='9') r|=(c-'0'); else if (c>='a'&&c<='f') r|=(c-'a'+10); else if (c>='A'&&c<='F') r|=(c-'A'+10); } return r;
 }
+// Extracts the wordIdx-th 32-byte (64 hex char) word from a multi-word ABI-encoded
+// "data" hex string (e.g. a Swap event with several uint256/int256 fields packed
+// back to back). Returns "" if the data is too short for that word index — callers
+// must check for an empty result rather than assume success.
+std::string nthWord(const std::string& h, size_t wordIdx) {
+    size_t start = 2 + wordIdx*64; // skip "0x", then wordIdx full 32-byte words
+    if (h.length() < start + 64) return "";
+    return "0x" + h.substr(start, 64);
+}
+// Signed 256-bit two's-complement parse, needed for PancakeSwap/Uniswap V3-style
+// Swap events whose amount0/amount1 fields are int256 (negative = token left the
+// pool, positive = token entered the pool from the trader's perspective). Reusing
+// the unsigned parseUint256 on a negative value would silently turn it into a huge
+// positive number instead of the small negative one actually meant — this function
+// exists specifically to avoid that misread.
+cpp_int parseInt256(const std::string& h) {
+    cpp_int u = parseUint256(h);
+    // If the top bit (bit 255) is set, the value is negative in two's complement:
+    // actual value = u - 2^256.
+    cpp_int signBit = cpp_int(1) << 255;
+    if (u >= signBit) {
+        cpp_int modulus = cpp_int(1) << 256;
+        return u - modulus;
+    }
+    return u;
+}
 std::string formatAmount(const cpp_int& raw, int dec) {
     if (raw==0) return "0.00"; cpp_int d=1; for (int i=0;i<dec;i++) d*=10;
     std::string ip=(raw/d).convert_to<std::string>(), fp=(raw%d).convert_to<std::string>();
@@ -622,44 +692,97 @@ cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
+// ==================== BALANCE-DIFF CROSS-CHECK ====================
+// Queries an ERC-20 token's balanceOf(wallet) pinned to a specific historical
+// block via eth_call. Used as an independent cross-check of the Transfer-log
+// netflow result: comparing balance at block N-1 vs block N for the SAME token
+// and SAME wallet gives the actual on-chain balance change over that block,
+// which is immune to misleading Transfer events (fee-on-transfer tokens that
+// emit a Transfer for the pre-fee amount, rebasing tokens, or any token whose
+// Transfer event doesn't match what balanceOf later reports).
+//
+// IMPORTANT LIMITATION: this is a balance change over the WHOLE BLOCK, not over
+// a single transaction — public RPC has no "balance immediately after tx X but
+// before tx X+1 in the same block" view (that requires a debug/trace API this
+// bot does not have access to). Callers MUST only treat this as a meaningful
+// cross-check of one specific transaction's result when that whale had exactly
+// one relevant transaction for this token in this block; otherwise the diff is
+// a mix of multiple transactions and cannot be attributed to any single one.
+// Returns std::nullopt on any RPC failure — callers must treat that as "no
+// cross-check available", not as a zero balance or a contradiction.
+std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
+    if (blockNumber < 0) return std::nullopt; // block -1 (i.e. before genesis) has no defined balance
+    std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2); // pad 20-byte address to 32-byte word
+    std::stringstream bs; bs << "0x" << std::hex << blockNumber;
+    auto r = rpc("eth_call", {{{"to",token},{"data","0x70a08231"+walletPadded}}, bs.str()});
+    if (!r.is_string()) return std::nullopt;
+    const std::string& hex = r.get<std::string>();
+    if (hex.length() < 66) return std::nullopt;
+    return parseUint256(hex);
+}
+
 // ==================== ANALYZE TX ====================
-// Логика: считаем чистый netflow (in-out) ПО КАЖДОМУ токену отдельно, на основе
-// ВСЕХ Transfer-логов, где участвует адрес кита (fr==wa или to==wa). Это устойчиво
-// к мультихопам и нескольким Transfer-логам одного токена в одной tx — раньше такие
-// логи перезаписывали друг друга (nsIn/nsOut) вместо суммирования, и сумма свопа
-// могла занижаться или браться от неверного токена.
-struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; };
+// Logic: compute the net flow (in-out) PER TOKEN separately, based on ALL Transfer
+// logs in which the whale address participates (fr==wa or to==wa). This is robust
+// against multi-hop routes and against multiple Transfer logs for the same token
+// within one tx — previously such logs overwrote each other (nsIn/nsOut) instead of
+// being summed, which could under-count a swap's amount or attribute it to the
+// wrong token.
+// counterAddr/counterAmount describe the OTHER side of a swap (e.g. for a BUY of
+// KOMA paid with USDT, tokenAddr/rawAmount is the KOMA received and
+// counterAddr/counterAmount is the USDT spent). They are only populated when
+// isSwap is true and a counter asset with nonzero net flow was actually found;
+// callers must check counterAddr.empty() before using counterAmount.
+struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; std::string venue; std::string counterAddr; cpp_int counterAmount; };
 
 TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
-    // Признак "это своп", а не просто перевод — наличие хотя бы одного Swap-лога в receipt.
+    // Marker for "this is a swap" rather than a plain transfer — presence of at
+    // least one Swap log in the receipt. We also remember which contract emitted it,
+    // since that's usually the pool/router most relevant for labeling the venue.
     bool hasSwap=false;
+    std::string swapLogAddr;
+    size_t swapLogDataHexLen=0; // length of the hex digits in the Swap log's data field (excluding "0x"), used only for a generic V2/V3-style shape guess, never for brand naming
     for (auto& l:receipt["logs"]) {
         if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&
-            l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) { hasSwap=true; break; }
+            l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) {
+            hasSwap=true;
+            if (swapLogAddr.empty() && l.contains("address") && l["address"].is_string())
+                swapLogAddr = toLower(l["address"].get<std::string>());
+            if (l.contains("data") && l["data"].is_string()) {
+                const std::string& d = l["data"].get_ref<const std::string&>();
+                swapLogDataHexLen = d.size() >= 2 ? d.size() - 2 : 0;
+            }
+            break;
+        }
     }
 
-    // Чистый netflow по каждому токену: positive = чистый приход на wa, negative = чистый расход.
+    // Net flow per token: positive = net inflow to wa, negative = net outflow.
     std::map<std::string, cpp_int> netFlow;
-    std::vector<std::string> tokenOrder; // порядок появления, для детерминированного fallback
+    std::vector<std::string> tokenOrder; // order of first appearance, for deterministic fallback
     auto touch = [&](const std::string& tok) {
         if (netFlow.find(tok) == netFlow.end()) { netFlow[tok] = 0; tokenOrder.push_back(tok); }
     };
 
     bool anyTransferForWallet = false;
+    // First address the wallet directly interacted with via a Transfer log (its
+    // "from" counterpart when sending, or "to" counterpart is irrelevant here) — used
+    // only as a fallback label source if we don't otherwise find a known router.
+    std::string firstCounterpartAddr;
     for (auto& l : receipt["logs"]) {
         if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
         if (!l["topics"][0].is_string()||l["topics"][0].get<std::string>()!="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") continue;
         if (!l.contains("data")||!l["data"].is_string()) continue;
         if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||!l.contains("address")||!l["address"].is_string()) continue;
 
-        // Topic-хеш адреса должен быть "0x" + 64 hex символа (32-байтовый word,
-        // где адрес занимает младшие 20 байт = последние 40 символов после позиции 26).
-        // Раньше substr(26) без проверки длины бросал std::out_of_range на укороченной/
-        // нестандартной строке от RPC, что прерывало analyzeTx без перехвата исключения
-        // и могло застопорить обработку блока навсегда (после retry-фикса в main блок
-        // повторялся бы бесконечно с тем же самым исключением на том же receipt).
+        // The address topic must be "0x" + 64 hex chars (a 32-byte word where the
+        // address occupies the low 20 bytes = the last 40 chars starting at offset 26).
+        // Previously substr(26) without a length check threw std::out_of_range on a
+        // truncated/non-standard string from the RPC, which aborted analyzeTx without
+        // being caught and could stall block processing forever (after the retry fix in
+        // main, the block would be retried indefinitely hitting the same exception on
+        // the same receipt).
         const std::string& t1 = l["topics"][1].get_ref<const std::string&>();
         const std::string& t2 = l["topics"][2].get_ref<const std::string&>();
         const std::string& addrField = l["address"].get_ref<const std::string&>();
@@ -669,22 +792,47 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         std::string fr = "0x"+toLower(t1.substr(26));
         std::string to = "0x"+toLower(t2.substr(26));
         std::string tk = toLower(addrField);
-        if (fr != wa && to != wa) continue; // лог не касается кошелька кита напрямую
+        if (fr != wa && to != wa) continue; // log doesn't touch the whale wallet directly
 
         cpp_int amt = parseUint256(dataField);
         touch(tk);
         anyTransferForWallet = true;
-        if (to == wa) netFlow[tk] += amt;   // пришло на кошелек
-        if (fr == wa) netFlow[tk] -= amt;   // ушло с кошелька (fr==to==wa компенсируется — корректно)
+        if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
+        if (to == wa) netFlow[tk] += amt;   // arrived at the wallet
+        if (fr == wa) netFlow[tk] -= amt;   // left the wallet (fr==to==wa cancels out — correct)
     }
 
     if (!anyTransferForWallet) return r;
     r.valid = true;
 
-    // Разделяем netflow на "базовые" (стейблы/WBNB) и "не базовые" — собственно интересующий нас токен.
-    // Сравнивать токены по сырой величине напрямую нельзя — у них разные decimals,
-    // поэтому приоритет отдаём токену, который ПРИШЁЛ на кошелёк (купленный актив);
-    // если входящих non-base токенов нет — берём токен с наибольшим |netflow| среди ушедших.
+    // Best-effort venue label: prefer the contract that emitted the Swap log (the
+    // pool/router actually doing the swapping), falling back to the first
+    // counterpart address the wallet transferred with. This is purely cosmetic —
+    // an unrecognized address just means no label is shown, never an error.
+    if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
+    if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
+    // If the swap went straight to a pool we don't recognize (no known router/
+    // aggregator address matched), we deliberately do NOT guess a specific DEX
+    // brand from the Swap event's field layout (V2-style amount0In/out vs V3-style
+    // sqrtPriceX96/tick): many protocols fork the same ABI, so that would risk a
+    // confident-looking but wrong brand name. Instead we only note the AMM
+    // generation, which is inferable from the event shape itself, not from address
+    // matching, and label it generically as "pool" rather than naming a DEX.
+    if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
+        // V2-style Swap(address,uint256,uint256,uint256,uint256,address) data is 4
+        // packed uint256 fields = 256 hex chars; V3-style Swap(...) with
+        // sqrtPriceX96/liquidity/tick is 5 fields = 320 hex chars. This is a shape
+        // heuristic, not a brand identification — kept deliberately generic.
+        if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
+        else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
+    }
+    if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
+
+    // Split net flow into "base" (stablecoins/WBNB) and "non-base" (the actual asset
+    // of interest). Raw magnitudes aren't comparable across tokens with different
+    // decimals, so we prioritize the token that ARRIVED at the wallet (the asset
+    // bought); if there are no incoming non-base tokens, we take the one with the
+    // largest |netflow| among outgoing ones.
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
 
@@ -694,7 +842,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             if (net > 0) hasBaseIn = true;
             if (net < 0) hasBaseOut = true;
         } else {
-            if (net <= 0) continue; // первый проход: только входящие non-base токены
+            if (net <= 0) continue; // first pass: incoming non-base tokens only
             if (net > bestNonBaseAbs) { bestNonBaseAbs = net; bestNonBaseTok = tok; bestNonBaseNet = net; }
         }
     }
@@ -709,26 +857,45 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
 
     r.isSwap = (
         (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) || // non-base <-> base
-        (hasBaseIn && hasBaseOut)                                  // base <-> base (напр. USDT->WBNB)
+        (hasBaseIn && hasBaseOut)                                  // base <-> base (e.g. USDT->WBNB)
     );
 
     if (!bestNonBaseTok.empty()) {
-        // Есть нестейбл-токен с ненулевым нетфлоу — это и есть актив сделки.
+        // There's a non-stable token with nonzero net flow — that's the trade's asset.
         r.tokenAddr = bestNonBaseTok;
         r.rawAmount = bestNonBaseAbs;
-        r.isBuy = bestNonBaseNet > 0; // токен пришёл на кошелек кита => покупка
+        r.isBuy = bestNonBaseNet > 0; // token arrived at the whale's wallet => buy
+
+        // Counter side: the base asset that moved in the opposite direction. On a
+        // buy we expect a base outflow (what was paid); on a sell, a base inflow
+        // (what was received). If several base assets moved on that side (rare,
+        // e.g. a router refunding leftover dust in a second token), we report the
+        // one with the largest |netflow| — same tie-break rule as elsewhere here.
+        if (r.isSwap) {
+            std::string bestCounterTok; cpp_int bestCounterAbs = -1;
+            for (auto& tok : tokenOrder) {
+                if (!isBaseAsset(tok)) continue;
+                cpp_int net = netFlow[tok];
+                bool wantsOutflow = r.isBuy; // buy: we paid with base (net<0); sell: we received base (net>0)
+                if (wantsOutflow && net >= 0) continue;
+                if (!wantsOutflow && net <= 0) continue;
+                cpp_int absNet = net >= 0 ? net : -net;
+                if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
+            }
+            if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
+        }
     } else {
-        // Только базовые активы участвовали (например USDT->WBNB). Сравнивать их по
-        // сырому количеству бессмысленно — у разных токенов разные decimals (тот же
-        // объём в USD может иметь совершенно разные "сырые" числа). Поэтому берём
-        // тот, что ПРИШЁЛ на кошелёк кита (это и есть результат сделки), а если
-        // пришедших несколько — с наибольшим |netflow| среди них; если ничего не
-        // пришло (передан только расход) — среди ушедших.
+        // Only base assets were involved (e.g. USDT->WBNB). Comparing them by raw
+        // amount is meaningless — different tokens have different decimals (the same
+        // USD value can have very different "raw" numbers). So we take whichever
+        // ARRIVED at the whale's wallet (that's the trade's result), and if multiple
+        // arrived, the one with the largest |netflow| among them; if nothing arrived
+        // (only an outflow was recorded), among the outgoing ones.
         std::string bestBaseTok; cpp_int bestBaseAbs = -1; cpp_int bestBaseNet = 0;
         for (auto& tok : tokenOrder) {
             if (!isBaseAsset(tok)) continue;
             cpp_int net = netFlow[tok];
-            if (net <= 0) continue; // первый проход: только входящие
+            if (net <= 0) continue; // first pass: incoming only
             if (net > bestBaseAbs) { bestBaseAbs = net; bestBaseTok = tok; bestBaseNet = net; }
         }
         if (bestBaseTok.empty()) {
@@ -743,8 +910,23 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             r.tokenAddr = bestBaseTok;
             r.rawAmount = bestBaseAbs;
             r.isBuy = bestBaseNet > 0;
+
+            // Counter side for a base<->base swap: the other base asset that moved
+            // opposite to tokenAddr. Same logic as the non-base branch above, just
+            // restricted to base assets other than tokenAddr itself.
+            std::string bestCounterTok; cpp_int bestCounterAbs = -1;
+            for (auto& tok : tokenOrder) {
+                if (tok == r.tokenAddr || !isBaseAsset(tok)) continue;
+                cpp_int net = netFlow[tok];
+                bool wantsOutflow = r.isBuy;
+                if (wantsOutflow && net >= 0) continue;
+                if (!wantsOutflow && net <= 0) continue;
+                cpp_int absNet = net >= 0 ? net : -net;
+                if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
+            }
+            if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         } else {
-            // Подстраховка: anyTransferForWallet=true гарантирует хотя бы один токен в netFlow.
+            // Fallback: anyTransferForWallet=true guarantees at least one token in netFlow.
             r.tokenAddr = tokenOrder.front();
             cpp_int net = netFlow[r.tokenAddr];
             r.rawAmount = net >= 0 ? net : -net;
@@ -771,6 +953,23 @@ bool processBlock(long long bn) {
         else if (vp==ph) { std::cerr << "[REORG] Confirmed! Rollback " << REORG_ROLLBACK << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
         else { std::cerr << "[REORG] Both disagree, rollback" << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
     }
+    // Pre-pass: count how many transactions in this block touch each whale address
+    // (from or to). This is needed before the balance-diff cross-check below: a
+    // balance change over the whole block can only be attributed to one specific
+    // transaction when that whale has exactly ONE relevant transaction in the
+    // block — otherwise the diff mixes multiple transactions together and cannot
+    // be assigned to any single one. No RPC calls here, just string comparisons
+    // against the already-fetched block data.
+    std::map<std::string, int> whaleTxCountInBlock;
+    {
+        std::shared_lock l(whalesMutex);
+        for (auto& tx : block["transactions"]) {
+            if (!tx.is_object()) continue;
+            std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
+            std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
+            for (auto& [a,n]:WHALES) { (void)n; if (from==a||to==a) { whaleTxCountInBlock[a]++; break; } }
+        }
+    }
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -790,20 +989,32 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        // Базовый актив (стейбл/WBNB) как итоговый токен интересен только если это
-        // часть свопа (напр. USDT->WBNB) — а не просто прямой перевод стейбла/WBNB
-        // между адресами, который сам по себе не торговый сигнал.
+        // A base asset (stablecoin/WBNB) as the resulting token is only interesting if
+        // it's part of a swap (e.g. USDT->WBNB) — not just a plain stablecoin/WBNB
+        // transfer between addresses, which by itself isn't a trading signal.
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
         if (res.usdNanos<static_cast<cpp_int>(THRESHOLD_NANOS.load())) { markTxProcessed(hash,bn); continue; }
         std::string msg="🐋 <b>"+safeString(mN)+"</b>\n\n";
-        msg+=res.isSwap?(res.isBuy?"🟢 <b>ПОКУПКА</b>":"🔴 <b>ПРОДАЖА</b>"):"📤 <b>ПЕРЕВОД</b>";
-        msg+="\n💰 Сумма: <b>"+formatUsd(res.usdNanos)+"</b>\n";
-        msg+="🪙 Монета: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
-        msg+="📦 Кол-во: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
-        msg+="📜 Контракт: <code>"+safeString(res.tokenAddr)+"</code>\n";
+        msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🔴 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
+        msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
+        msg+="🪙 Token: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
+        msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
+        // Counter side of the trade (e.g. "Spent: 44,812.00 USDT" for a buy, or
+        // "Received: 44,812.00 USDT" for a sell). Only shown when analyzeTx actually
+        // found a counter asset with nonzero net flow — for plain transfers, or swaps
+        // where the counter side couldn't be determined, this line is simply omitted
+        // rather than guessing.
+        if (res.isSwap && !res.counterAddr.empty()) {
+            std::string counterLabel = res.isBuy ? "Spent" : "Received";
+            msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
+                   formatAmount(res.counterAmount, getDecimals(res.counterAddr)) + " " +
+                   safeString(getSymbol(res.counterAddr), 16) + "</b>\n";
+        }
+        msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
+        if (!res.venue.empty()) msg+="🔁 DEX: <b>"+safeString(res.venue,48)+"</b>\n";
         msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
-        msg+="👛 Кошелек: <b>"+safeString(mN)+"</b>\n\n";
-        msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Транзакция</a>";
+        msg+="👛 Wallet: <b>"+safeString(mN)+"</b>\n\n";
+        msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Transaction</a>";
         if (broadcast(msg)) { markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(1);
             std::cout << "[OK] " << mN << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr) << std::endl;
         } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
@@ -834,8 +1045,9 @@ void telegramLoop() {
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    // Кнопка подписки убрана вместе с /start — callback-кнопок больше нет,
-                    // но обновления такого типа всё равно нужно квитировать по offset.
+                    // The subscribe button was removed along with /start — there are no
+                    // more callback buttons, but updates of this type still need to be
+                    // acknowledged via the offset.
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
@@ -912,13 +1124,13 @@ int main() {
             while (lb<lat&&running.load(std::memory_order_relaxed)) {
                 long long next = lb+1;
                 if (!processBlock(next)) {
-                    // Блок не обработан: либо временный сбой RPC (receipt/block ещё не
-                    // готовы — тогда last_block в БД не менялся, и нужно повторить тот
-                    // же next), либо processBlock сам откатил last_block из-за reorg
-                    // (тогда в БД уже лежит более ранний номер). В обоих случаях
-                    // синхронизируем in-memory lb с тем, что реально сохранено в БД —
-                    // раньше lb продвигался безусловно и непрочитанный/откаченный
-                    // блок терялся навсегда без повторной попытки.
+                    // Block not processed: either a temporary RPC failure (receipt/block
+                    // not ready yet — last_block in the DB wasn't changed, so we need to
+                    // retry the same next), or processBlock itself rolled back last_block
+                    // due to a reorg (in which case the DB already holds an earlier
+                    // number). In both cases, sync the in-memory lb with what's actually
+                    // saved in the DB — previously lb advanced unconditionally and an
+                    // unprocessed/rolled-back block was lost forever with no retry.
                     lb = getLastBlock();
                     break;
                 }
