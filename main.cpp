@@ -4,6 +4,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <thread>
 #include <deque>
 #include <mutex>
@@ -27,7 +28,7 @@ using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
 
 // ============================================================================
-// LOCK ORDER CONTRACT: dbMutex → cacheMutex → whalesMutex → subsMutex
+// LOCK ORDER CONTRACT: dbMutex → cacheMutex → watchersMutex
 // Never violate this order to avoid deadlocks
 // ============================================================================
 
@@ -134,6 +135,18 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Minimal sanity check for an EVM address: "0x" + 40 hex chars. This is not a
+// checksum validator, just enough to keep obvious typos out of the DB now that
+// any user (not just an admin) can add addresses.
+bool isValidAddress(const std::string& a) {
+    if (a.length() != 42 || a[0] != '0' || a[1] != 'x') return false;
+    for (size_t i = 2; i < a.length(); i++) {
+        char c = a[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
 // ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
@@ -143,14 +156,17 @@ const std::string TG_TOKEN = []{
     return std::string(env);
 }();
 
-const std::string MY_CHAT_ID = "546348566";
+// Owner/default chat, used only to make sure at least one user account exists
+// on a brand new install so the bot isn't silently mute before anyone types
+// /start. Not privileged in any special way anymore — see README note on the
+// old ADMIN_IDS-gated commands, which are now available to every user.
+const std::string OWNER_CHAT_ID = "546348566";
 // ID of the private Telegram channel for duplicating alerts, e.g. "-100xxxxxxxxxx".
 // Optional: if the variable is not set, sending to the channel is simply skipped.
 const std::string CHANNEL_ID = []{
     const char* env = std::getenv("WHALE_CHANNEL_ID");
     return env ? std::string(env) : std::string();
 }();
-const std::string CONFIG_FILE = "config.json";
 const std::string DB_FILE = "whale_bot.db";
 
 const std::vector<std::string> BSC_RPC_ENDPOINTS = {
@@ -166,10 +182,17 @@ const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 20000;
 constexpr time_t PRICE_TTL = 3600;
-constexpr size_t MAX_SUBSCRIBERS = 5000;
+constexpr size_t MAX_USERS = 5000;
+constexpr size_t MAX_WHALES_PER_USER = 50;
 constexpr size_t MAX_QUEUE_SIZE = 50000;
-
-const std::set<std::string> ADMIN_IDS = {"546348566"};
+// Stored as integer nanos (1 USD = 1e9 nanos), not as REAL/double USD: SQLite's
+// REAL is IEEE754 and repeated read-modify-write on a float threshold can drift
+// (e.g. 10000.0 -> 9999.999999...), which would silently shift a user's alert
+// threshold over time. Integer nanos match how the rest of the file already
+// represents money (usdNanos, THRESHOLD_NANOS in the original single-user code).
+constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 10000ULL * 1000000000ULL;
+uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
+double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 const std::string SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const std::set<std::string> BASE_ASSETS = {
@@ -214,14 +237,9 @@ std::string lookupRouterLabel(const std::string& addr) {
     return it != KNOWN_ROUTERS.end() ? it->second : std::string();
 }
 
-std::atomic<uint64_t> THRESHOLD_NANOS{10000000000000ULL};
 std::atomic<bool> running{true};
 void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
 
-std::shared_mutex whalesMutex;
-std::vector<std::pair<std::string, std::string>> WHALES;
-std::shared_mutex subsMutex;
-std::shared_ptr<const std::set<std::string>> SUBSCRIBERS_PTR;
 std::mutex dbMutex, cacheMutex;
 sqlite3* db = nullptr;
 std::map<std::string, std::string> TOKEN_SYMBOLS;
@@ -233,6 +251,23 @@ std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 // losing this cache on restart just means re-fetching it once per pool, which is
 // cheap and not worth a schema migration for.
 std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
+
+// ==================== USERS & WATCHERS (multi-user model) ====================
+// A single whale address can now be watched by many users, each with their own
+// display label and their own USD alert threshold. To keep processBlock() from
+// touching SQLite for every transaction (the whole point of this refactor),
+// the address -> watcher-list mapping is kept fully in memory and only rebuilt
+// from SQLite when a user actually changes their watch list (/add, /remove,
+// /limit) or is removed (dead delivery). Reads use the same lock-free
+// shared_ptr swap pattern the rest of the file already uses for SUBSCRIBERS_PTR.
+struct Watcher {
+    std::string chatId;
+    std::string label;
+    uint64_t thresholdNanos;
+};
+std::shared_mutex watchersMutex;
+std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
+    std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
 
 // ==================== HTTP & RPC ====================
 size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
@@ -315,7 +350,26 @@ void initDB() {
     }
 
     const char* sql = R"(
-        CREATE TABLE IF NOT EXISTS subscribers (chat_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS users (
+            chat_id TEXT PRIMARY KEY,
+            language TEXT NOT NULL DEFAULT 'en',
+            threshold_nanos INTEGER NOT NULL DEFAULT 10000000000000,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS whale_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            address TEXT UNIQUE NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS user_whales (
+            user_id TEXT NOT NULL,
+            whale_id INTEGER NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (user_id, whale_id),
+            FOREIGN KEY(user_id) REFERENCES users(chat_id) ON DELETE CASCADE,
+            FOREIGN KEY(whale_id) REFERENCES whale_addresses(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_user_whales_whale ON user_whales(whale_id);
         CREATE TABLE IF NOT EXISTS processed_tx (tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_processed_block ON processed_tx(block_number);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
@@ -413,53 +467,179 @@ void saveLastBlockHash(const std::string& h) {
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// ==================== SUBSCRIBERS ====================
-std::shared_ptr<const std::set<std::string>> loadSubscribersFromDB() {
-    std::lock_guard<std::mutex> l(dbMutex); auto subs=std::make_shared<std::set<std::string>>(); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"SELECT chat_id FROM subscribers")) return subs;
-    while (sqlite3_step(s)==SQLITE_ROW) subs->insert(safeColumnText(s,0)); sqlite3_finalize(s); return subs;
-}
-void refreshSubscribers() { auto n=loadSubscribersFromDB(); std::unique_lock l(subsMutex); SUBSCRIBERS_PTR=n; }
-void addSubscriber(const std::string& c) {
-    { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-      if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO subscribers(chat_id) VALUES(?)")) return;
-      sqlite3_bind_text(s,1,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
-    refreshSubscribers();
-}
-void removeSubscriber(const std::string& c) {
-    { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-      if (!prepareOrLog(db,&s,"DELETE FROM subscribers WHERE chat_id=?")) return;
-      sqlite3_bind_text(s,1,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
-    refreshSubscribers(); std::cout << "[SUBS] Unsubscribed: " << c << std::endl;
-}
-void removeDeadSubscriber(const std::string& c) {
-    removeSubscriber(c);
-    std::cout << "[SUBS] Removed dead subscriber: " << c << std::endl;
+// ==================== USERS / WHALE SUBSCRIPTIONS ====================
+// All functions in this section touch SQLite (they're invoked from Telegram
+// command handlers, which are not hot-path), and then call refreshWatchers()
+// so the in-memory map used by processBlock() picks up the change. processBlock
+// itself never calls into this section directly — it only reads WATCHERS_PTR.
+
+void ensureUser(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO users(chat_id,language,threshold_nanos,created_at) VALUES(?,?,?,?)")) return;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,"en",-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s,3,static_cast<sqlite3_int64>(DEFAULT_THRESHOLD_NANOS));
+    sqlite3_bind_int64(s,4,time(nullptr));
+    sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// ==================== CONFIG ====================
-void loadConfig() {
-    std::ifstream f(CONFIG_FILE);
-    if (!f.is_open()) {
-        std::cout << "[CONFIG] Creating empty template..." << std::endl;
-        json d; d["threshold"]=10000.0; d["whales"]=json::array();
-        std::ofstream(CONFIG_FILE) << d.dump(4);
-        THRESHOLD_NANOS.store(10000ULL*1000000000ULL);
-        std::unique_lock l(whalesMutex); WHALES.clear();
-        std::cout << "[CONFIG] No whales. Use /add in Telegram." << std::endl; return;
-    }
-    try {
-        json j=json::parse(f); double t=j.value("threshold",10000.0);
-        THRESHOLD_NANOS.store(static_cast<uint64_t>(t*1000000000.0));
-        std::unique_lock l(whalesMutex); WHALES.clear();
-        for (auto& w:j["whales"]) WHALES.push_back({toLower(w["address"]),w["name"]});
-        std::cout << "[CONFIG] Loaded " << WHALES.size() << " whales, $" << t << std::endl;
-    } catch (...) { std::cerr << "[CONFIG] Parse error!" << std::endl; }
+size_t countUsers() {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM users")) return 0;
+    size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
-void saveConfig() {
-    json j; j["threshold"]=static_cast<double>(THRESHOLD_NANOS.load())/1000000000.0; j["whales"]=json::array();
-    { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) j["whales"].push_back({{"address",a},{"name",n}}); }
-    std::ofstream(CONFIG_FILE) << j.dump(4);
+
+size_t countUserWhales(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM user_whales WHERE user_id=?")) return 0;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
+}
+
+uint64_t getUserThresholdNanos(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT threshold_nanos FROM users WHERE chat_id=?")) return DEFAULT_THRESHOLD_NANOS;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    uint64_t v=DEFAULT_THRESHOLD_NANOS; if (sqlite3_step(s)==SQLITE_ROW) v=static_cast<uint64_t>(sqlite3_column_int64(s,0)); sqlite3_finalize(s); return v;
+}
+
+// Rebuilds the in-memory address -> watchers map from SQLite. Called after any
+// mutation to users/whale_addresses/user_whales. A single JOIN, O(number of
+// subscriptions) — cheap compared to a per-transaction SQL lookup, and it means
+// processBlock() itself is 100% in-memory for whale matching and threshold checks.
+void refreshWatchers() {
+    auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
+    {
+        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+        if (prepareOrLog(db,&s,
+            "SELECT wa.address, uw.user_id, uw.label, u.threshold_nanos "
+            "FROM user_whales uw "
+            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+            "JOIN users u ON u.chat_id = uw.user_id")) {
+            while (sqlite3_step(s)==SQLITE_ROW) {
+                std::string addr = toLower(safeColumnText(s,0));
+                std::string uid = safeColumnText(s,1);
+                std::string label = safeColumnText(s,2);
+                uint64_t nanos = static_cast<uint64_t>(sqlite3_column_int64(s,3));
+                (*m)[addr].push_back(Watcher{uid,label,nanos});
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    std::unique_lock l(watchersMutex);
+    WATCHERS_PTR = m;
+}
+
+enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, ERROR };
+
+AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
+    if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
+    ensureUser(chatId);
+    if (countUserWhales(chatId) >= MAX_WHALES_PER_USER) return AddWhaleResult::LIMIT_REACHED;
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO whale_addresses(address) VALUES(?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+    sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_step(s); sqlite3_finalize(s);
+
+    long long whaleId=-1;
+    if (!prepareOrLog(db,&s,"SELECT id FROM whale_addresses WHERE address=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+    sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
+    if (sqlite3_step(s)==SQLITE_ROW) whaleId=sqlite3_column_int64(s,0);
+    sqlite3_finalize(s);
+    if (whaleId<0) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+
+    if (!prepareOrLog(db,&s,"SELECT 1 FROM user_whales WHERE user_id=? AND whale_id=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
+    bool exists = sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s);
+    if (exists) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ALREADY_EXISTS; }
+
+    if (!prepareOrLog(db,&s,"INSERT INTO user_whales(user_id,whale_id,label,created_at) VALUES(?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
+    sqlite3_bind_text(s,3,label.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,4,time(nullptr));
+    sqlite3_step(s); sqlite3_finalize(s);
+    sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
+    return AddWhaleResult::OK;
+}
+
+bool removeUserWhale(const std::string& chatId, const std::string& address) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
+    sqlite3_stmt* s;
+    long long whaleId=-1;
+    if (prepareOrLog(db,&s,"SELECT id FROM whale_addresses WHERE address=?")) {
+        sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
+        if (sqlite3_step(s)==SQLITE_ROW) whaleId=sqlite3_column_int64(s,0);
+        sqlite3_finalize(s);
+    }
+    if (whaleId<0) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+
+    if (!prepareOrLog(db,&s,"DELETE FROM user_whales WHERE user_id=? AND whale_id=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
+    sqlite3_step(s); bool removed = sqlite3_changes(db)>0; sqlite3_finalize(s);
+
+    // Clean up whale_addresses no longer watched by anyone, so the master
+    // watch-list stays proportional to actual demand rather than growing forever.
+    if (prepareOrLog(db,&s,"DELETE FROM whale_addresses WHERE id=? AND NOT EXISTS (SELECT 1 FROM user_whales WHERE whale_id=?)")) {
+        sqlite3_bind_int64(s,1,whaleId); sqlite3_bind_int64(s,2,whaleId);
+        sqlite3_step(s); sqlite3_finalize(s);
+    }
+    sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
+    return removed;
+}
+
+// "usd" is the user-facing value typed in /limit; it's converted to integer
+// nanos exactly once here, at the input boundary, and stored/read as an
+// integer from then on — see the DEFAULT_THRESHOLD_NANOS comment above.
+void setUserThreshold(const std::string& chatId, double usd) {
+    ensureUser(chatId);
+    uint64_t nanos = usdToNanos(usd);
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
+    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+
+// Stored for future use — actual message translation is not implemented yet
+// (all bot text is currently English regardless of this field). Kept as a
+// column/command per the v1.0 spec so the schema doesn't need to change later.
+void setUserLanguage(const std::string& chatId, const std::string& lang) {
+    ensureUser(chatId);
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"UPDATE users SET language=? WHERE chat_id=?")) return;
+    sqlite3_bind_text(s,1,lang.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+
+std::string buildUserListText(const std::string& chatId) {
+    double thr = nanosToUsd(getUserThresholdNanos(chatId));
+    std::stringstream out;
+    out << "💰 Your alert threshold: $" << std::fixed << std::setprecision(2) << thr << "\n\n";
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    bool any=false;
+    if (prepareOrLog(db,&s,"SELECT wa.address, uw.label FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? ORDER BY uw.created_at")) {
+        sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+        while (sqlite3_step(s)==SQLITE_ROW) {
+            any=true;
+            out << "• " << safeString(safeColumnText(s,1)) << "\n<code>" << safeString(safeColumnText(s,0)) << "</code>\n\n";
+        }
+        sqlite3_finalize(s);
+    }
+    if (!any) out << "No wallets tracked yet. Use /add 0x... Name";
+    return out.str();
+}
+
+// Removes a user entirely (e.g. their Telegram account/chat is gone — see the
+// dead-delivery handling in SafeMessageQueue). ON DELETE CASCADE on
+// user_whales.user_id takes care of their subscriptions automatically.
+void removeUser(const std::string& chatId) {
+    { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+      if (!prepareOrLog(db,&s,"DELETE FROM users WHERE chat_id=?")) return;
+      sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
+    refreshWatchers();
+    std::cout << "[USERS] Removed dead user: " << chatId << std::endl;
 }
 
 // ==================== RATE LIMITER ====================
@@ -559,7 +739,7 @@ class SafeMessageQueue {
                 if (res.ok) { updateStatus(did,1,0,0); queueSize.fetch_sub(1,std::memory_order_relaxed); }
                 else if (res.retryAfterSec>0) { globalRetryAfter.store(time(nullptr)+res.retryAfterSec); scheduleRetry(did);
                     std::cerr << "[TG] 429: pausing " << res.retryAfterSec << "s" << std::endl; break; }
-                else if (res.deadUser) { updateStatus(did,2,0,0); removeDeadSubscriber(cid); queueSize.fetch_sub(1,std::memory_order_relaxed); }
+                else if (res.deadUser) { updateStatus(did,2,0,0); removeUser(cid); queueSize.fetch_sub(1,std::memory_order_relaxed); }
                 else scheduleRetry(did);
                 std::this_thread::sleep_for(std::chrono::milliseconds(SEND_MS));
             }
@@ -575,13 +755,12 @@ public:
             if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
                 if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
     }
-    bool enqueueBroadcast(const std::string& text) {
-        std::shared_ptr<const std::set<std::string>> subs; { std::shared_lock l(subsMutex); subs=SUBSCRIBERS_PTR; }
-        std::vector<std::string> recipients;
-        if (subs) recipients.assign(subs->begin(), subs->end());
-        if (!CHANNEL_ID.empty() && (!subs || !subs->count(CHANNEL_ID))) recipients.push_back(CHANNEL_ID);
+    // Enqueues one alert message for an explicit list of recipients. Replaces the
+    // old broadcast-to-all-subscribers path: in the multi-user model different
+    // recipients can get differently-labeled text for the very same on-chain
+    // event, so the queue now works per-recipient-list rather than per-broadcast.
+    bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
         if (recipients.empty()) return true;
-
         size_t current = queueSize.load(std::memory_order_relaxed);
         size_t batchSize = recipients.size();
         if (current + batchSize > MAX_QUEUE_SIZE) {
@@ -607,8 +786,6 @@ public:
         queueSize.fetch_add(batchSize,std::memory_order_relaxed); return true;
     }
 } g_msgQueue;
-
-bool broadcast(const std::string& t) { return g_msgQueue.enqueueBroadcast(t); }
 
 // ==================== TOKENS & PRICES ====================
 int getDecimals(const std::string& addr) {
@@ -938,6 +1115,30 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
     return r;
 }
 
+// Builds the alert text for a single label. "label" is either a user's own
+// custom name for the wallet, or — for the CHANNEL_ID forward — the raw
+// address itself, so no individual user's private label leaks into a shared
+// channel.
+std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
+    std::string msg="🐋 <b>"+safeString(label)+"</b>\n\n";
+    msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🔴 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
+    msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
+    msg+="🪙 Token: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
+    msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
+    if (res.isSwap && !res.counterAddr.empty()) {
+        std::string counterLabel = res.isBuy ? "Spent" : "Received";
+        msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
+               formatAmount(res.counterAmount, getDecimals(res.counterAddr)) + " " +
+               safeString(getSymbol(res.counterAddr), 16) + "</b>\n";
+    }
+    msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
+    if (!res.venue.empty()) msg+="🔁 DEX: <b>"+safeString(res.venue,48)+"</b>\n";
+    msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
+    msg+="👛 Wallet: <b>"+safeString(label)+"</b>\n\n";
+    msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Transaction</a>";
+    return msg;
+}
+
 // ==================== PROCESS BLOCK ====================
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
@@ -953,23 +1154,29 @@ bool processBlock(long long bn) {
         else if (vp==ph) { std::cerr << "[REORG] Confirmed! Rollback " << REORG_ROLLBACK << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
         else { std::cerr << "[REORG] Both disagree, rollback" << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
     }
-    // Pre-pass: count how many transactions in this block touch each whale address
-    // (from or to). This is needed before the balance-diff cross-check below: a
-    // balance change over the whole block can only be attributed to one specific
-    // transaction when that whale has exactly ONE relevant transaction in the
-    // block — otherwise the diff mixes multiple transactions together and cannot
-    // be assigned to any single one. No RPC calls here, just string comparisons
-    // against the already-fetched block data.
+
+    // Snapshot the current in-memory watcher map once per block (lock-free
+    // shared_ptr copy). processBlock never touches SQLite to determine whale
+    // matches or thresholds — that's the whole point of keeping this in memory.
+    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
+    { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
+
+    // Pre-pass: count how many transactions in this block touch each watched
+    // address (from or to). This is needed before the balance-diff cross-check
+    // below: a balance change over the whole block can only be attributed to one
+    // specific transaction when that address has exactly ONE relevant transaction
+    // in the block — otherwise the diff mixes multiple transactions together and
+    // cannot be assigned to any single one. No RPC calls here, just string
+    // comparisons against the already-fetched block data plus an O(1) map lookup.
     std::map<std::string, int> whaleTxCountInBlock;
-    {
-        std::shared_lock l(whalesMutex);
-        for (auto& tx : block["transactions"]) {
-            if (!tx.is_object()) continue;
-            std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
-            std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
-            for (auto& [a,n]:WHALES) { (void)n; if (from==a||to==a) { whaleTxCountInBlock[a]++; break; } }
-        }
+    for (auto& tx : block["transactions"]) {
+        if (!tx.is_object()) continue;
+        std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
+        std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
+        if (watchers->count(from)) whaleTxCountInBlock[from]++;
+        else if (watchers->count(to)) whaleTxCountInBlock[to]++;
     }
+
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -977,46 +1184,54 @@ bool processBlock(long long bn) {
         g_stats.tx_processed.fetch_add(1);
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
-        std::string mA,mN; { std::shared_lock l(whalesMutex); for (auto& [a,n]:WHALES) if (from==a||to==a) { mA=a; mN=n; break; } }
+        std::string mA;
+        if (watchers->count(from)) mA=from; else if (watchers->count(to)) mA=to;
         if (mA.empty()) { markTxProcessed(hash,bn); continue; }
-        if (from!=mA && to!=mA) {
-            markTxProcessed(hash,bn);
-            continue;
-        }
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
+        // analyzeTx (netflow calc, decimals/symbol/price lookups) runs exactly
+        // ONCE per transaction regardless of how many users watch mA — the
+        // per-user fan-out below only affects which recipients get which text.
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         // A base asset (stablecoin/WBNB) as the resulting token is only interesting if
         // it's part of a swap (e.g. USDT->WBNB) — not just a plain stablecoin/WBNB
         // transfer between addresses, which by itself isn't a trading signal.
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
-        if (res.usdNanos<static_cast<cpp_int>(THRESHOLD_NANOS.load())) { markTxProcessed(hash,bn); continue; }
-        std::string msg="🐋 <b>"+safeString(mN)+"</b>\n\n";
-        msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🔴 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
-        msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
-        msg+="🪙 Token: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
-        msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
-        // Counter side of the trade (e.g. "Spent: 44,812.00 USDT" for a buy, or
-        // "Received: 44,812.00 USDT" for a sell). Only shown when analyzeTx actually
-        // found a counter asset with nonzero net flow — for plain transfers, or swaps
-        // where the counter side couldn't be determined, this line is simply omitted
-        // rather than guessing.
-        if (res.isSwap && !res.counterAddr.empty()) {
-            std::string counterLabel = res.isBuy ? "Spent" : "Received";
-            msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
-                   formatAmount(res.counterAmount, getDecimals(res.counterAddr)) + " " +
-                   safeString(getSymbol(res.counterAddr), 16) + "</b>\n";
+
+        auto wit = watchers->find(mA);
+        if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; } // watch list changed concurrently; nothing to notify
+
+        // Group qualifying watchers by label, so users who happen to share the
+        // exact same label for this address get one shared alert row instead of
+        // one row per user — keeps the alerts table from growing one-row-per-
+        // recipient on large fan-out, without ever merging DIFFERENT labels.
+        std::map<std::string, std::vector<std::string>> byLabel; // label -> chatIds
+        for (auto& w : wit->second) {
+            if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) continue;
+            byLabel[w.label].push_back(w.chatId);
         }
-        msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
-        if (!res.venue.empty()) msg+="🔁 DEX: <b>"+safeString(res.venue,48)+"</b>\n";
-        msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
-        msg+="👛 Wallet: <b>"+safeString(mN)+"</b>\n\n";
-        msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Transaction</a>";
-        if (broadcast(msg)) { markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(1);
-            std::cout << "[OK] " << mN << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr) << std::endl;
+
+        if (byLabel.empty()) { markTxProcessed(hash,bn); continue; }
+
+        bool anySent = false;
+        for (auto& [label, chatIds] : byLabel) {
+            std::string msg = buildAlertMessage(label, res, hash);
+            if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
+        }
+        // Also forward to the admin/public channel, if configured, using the raw
+        // address as the label (not any individual user's private label).
+        if (!CHANNEL_ID.empty()) {
+            std::string genericMsg = buildAlertMessage(mA, res, hash);
+            g_msgQueue.enqueueToRecipients(genericMsg, {CHANNEL_ID});
+        }
+
+        if (anySent) {
+            markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(byLabel.size());
+            std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
+                      << " -> " << byLabel.size() << " label group(s)" << std::endl;
         } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
     }
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
@@ -1045,59 +1260,87 @@ void telegramLoop() {
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    // The subscribe button was removed along with /start — there are no
-                    // more callback buttons, but updates of this type still need to be
-                    // acknowledged via the offset.
+                    // No callback-query buttons are used anymore, but updates of this
+                    // type still need to be acknowledged via the offset.
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
-                if (ADMIN_IDS.count(cid)==0&&!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
-                else if (txt=="/subscribe") { auto subs=loadSubscribersFromDB(); if (subs->size()>=MAX_SUBSCRIBERS) sendMsg(cid,"⚠️ Лимит достигнут"); else { addSubscriber(cid); sendMsg(cid,"✅ Вы подписаны!"); } }
-                else if (txt=="/unsubscribe") { removeSubscriber(cid); sendMsg(cid,"❌ Вы отписались."); }
+                if (!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
+                if (txt=="/start") {
+                    if (countUsers()>=MAX_USERS) { sendMsg(cid,"⚠️ User limit reached. Please try again later."); }
+                    else { ensureUser(cid); sendMsg(cid,"✅ Welcome! Use /add 0x... Name to start tracking a wallet, /limit to set your alert threshold, and /help for the full command list."); }
+                }
                 else if (txt=="/health") {
                     size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
                     int diskFree = getDiskFreePercent();
                     time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
                     bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
-                    std::stringstream ss; ss << "✅ <b>OK</b>\n\n"
+                    std::stringstream ss2; ss2 << "✅ <b>OK</b>\n\n"
                         << "Block: <code>" << getLastBlock() << "</code>\n"
                         << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
-                        << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (всего сбоев: " << g_stats.rpc_failures.load() << ")\n"
+                        << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
                         << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
                         << "DB: healthy\n";
                     if (diskFree >= 0) {
-                        ss << "Disk: <b>" << diskFree << "% free</b>\n";
-                        if (diskFree < 15) ss << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
+                        ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
+                        if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
                     } else {
-                        ss << "Disk: <b>unknown</b>\n";
+                        ss2 << "Disk: <b>unknown</b>\n";
                     }
-                    ss << "Uptime: <b>" << getUptime() << "</b>";
-                    sendMsg(cid,ss.str()); }
+                    ss2 << "Uptime: <b>" << getUptime() << "</b>";
+                    sendMsg(cid,ss2.str()); }
                 else if (txt=="/stats") {
-                    size_t qs=g_msgQueue.size(); auto subs=loadSubscribersFromDB(); int64_t fc=0;
+                    size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
                     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
-                    std::stringstream ss; ss << "📊 <b>Stats</b>\n\n👥 Subs: <b>" << subs->size() << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
+                    std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                         << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
-                    if (qs>1000) ss << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss << "\n⚠️ <b>FAILED DELIVERIES!</b>";
-                    sendMsg(cid,ss.str()); }
-                else if (txt=="/help") { sendMsg(cid,"/subscribe — подписка\n/unsubscribe — отписка\n/stats — статистика\n/health — здоровье\n/help — справка"); }
-                else if (ADMIN_IDS.count(cid)) {
-                    if (txt.find("/add ")==0) { size_t p1=txt.find(' '),p2=txt.find(' ',p1+1); if (p1!=std::string::npos&&p2!=std::string::npos) {
+                    if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
+                    sendMsg(cid,ss2.str()); }
+                else if (txt=="/help") { sendMsg(cid,
+                    "/start — register\n"
+                    "/add 0x... Name — track a wallet under your own label\n"
+                    "/remove 0x... — stop tracking a wallet\n"
+                    "/list — your tracked wallets and threshold\n"
+                    "/limit 5000 — set your minimum alert amount in USD\n"
+                    "/language en — set your language preference\n"
+                    "/health — system health\n"
+                    "/stats — system stats\n"
+                    "/help — this message"); }
+                else if (txt.find("/add ")==0) {
+                    size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
+                    if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,"❌ Usage: /add 0x... Name"); }
+                    else {
                         std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
-                        std::unique_lock l(whalesMutex);
-                        bool exists=false; for (auto& [a,n]:WHALES) if (a==addr) { exists=true; break; }
-                        if (exists) { l.unlock(); sendMsg(cid,"⚠️ Этот кит уже есть в списке"); }
-                        else { WHALES.push_back({addr,trim(txt.substr(p2+1))}); l.unlock(); saveConfig(); sendMsg(cid,"✅ Кит добавлен"); }
-                    } else sendMsg(cid,"❌ /add 0x... Имя"); }
-                    else if (txt.find("/remove ")==0) { std::string a=toLower(trim(txt.substr(8))); std::unique_lock l(whalesMutex);
-                        size_t before=WHALES.size();
-                        WHALES.erase(std::remove_if(WHALES.begin(),WHALES.end(),[&](auto&w){return w.first==a;}),WHALES.end());
-                        bool removed=WHALES.size()<before; l.unlock();
-                        if (removed) { saveConfig(); sendMsg(cid,"✅ Кит удален"); }
-                        else sendMsg(cid,"⚠️ Адрес не найден в списке. Проверь /list"); }
-                    else if (txt.find("/limit ")==0) { try { double v=std::stod(txt.substr(7)); THRESHOLD_NANOS.store(static_cast<uint64_t>(v*1000000000.0)); saveConfig(); sendMsg(cid,"✅ Лимит: $"+std::to_string(static_cast<uint64_t>(v))); } catch (...) { sendMsg(cid,"❌ Число"); } }
-                    else if (txt=="/list") { std::shared_lock l(whalesMutex); uint64_t t=THRESHOLD_NANOS.load(); std::string m="💰 $"+std::to_string(t/1000000000ULL)+"\n\n"; for (auto& [a,n]:WHALES) m+="• "+safeString(n)+"\n<code>"+safeString(a)+"</code>\n\n"; l.unlock(); sendMsg(cid,m); }
+                        std::string label=trim(txt.substr(p2+1));
+                        if (label.empty()) label=addr;
+                        auto res=addUserWhale(cid,addr,label);
+                        switch (res) {
+                            case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,"✅ Wallet added: "+safeString(label)); break;
+                            case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,"⚠️ You're already tracking this wallet"); break;
+                            case AddWhaleResult::LIMIT_REACHED: sendMsg(cid,"⚠️ You've reached the limit of "+std::to_string(MAX_WHALES_PER_USER)+" tracked wallets"); break;
+                            case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,"❌ That doesn't look like a valid address (expected 0x + 40 hex characters)"); break;
+                            case AddWhaleResult::ERROR: sendMsg(cid,"❌ Something went wrong, please try again"); break;
+                        }
+                    }
                 }
+                else if (txt.find("/remove ")==0) {
+                    std::string a=toLower(trim(txt.substr(8)));
+                    bool removed=removeUserWhale(cid,a);
+                    if (removed) { refreshWatchers(); sendMsg(cid,"✅ Wallet removed"); }
+                    else sendMsg(cid,"⚠️ Address not found in your list. Check /list");
+                }
+                else if (txt.find("/limit ")==0) {
+                    try { double v=std::stod(txt.substr(7));
+                        if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
+                        else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+std::to_string(static_cast<uint64_t>(v))); }
+                    } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
+                }
+                else if (txt.find("/language")==0) {
+                    std::string rest = trim(txt.substr(9));
+                    if (rest.empty()) { sendMsg(cid,"❌ Usage: /language en"); }
+                    else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
+                }
+                else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
                 offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
             }
             if (ub>0) saveTgOffset(offset);
@@ -1109,12 +1352,15 @@ void telegramLoop() {
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
-    initDB(); loadConfig(); loadTokenCache();
-    SUBSCRIBERS_PTR=loadSubscribersFromDB(); if (SUBSCRIBERS_PTR->empty()) addSubscriber(MY_CHAT_ID);
+    initDB(); loadTokenCache();
+    ensureUser(OWNER_CHAT_ID); // make sure at least one account exists on a fresh install
+    refreshWatchers();
+    size_t initialWatcherAddrs;
+    { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
     long long lb=getLastBlock(); if (lb==0) { auto b=rpc("eth_blockNumber",{}); long long tmp; if (b.is_string()&&hexToLL(b.get<std::string>(),tmp)) lb=tmp; }
     auto lj=rpc("eth_blockNumber",{}); long long tmpLat;
     if (lj.is_string()&&hexToLL(lj.get<std::string>(),tmpLat)) { long long lat=tmpLat; if (lat-lb>FAST_SYNC_LAG) { std::cout << "[FAST SYNC] Lag " << (lat-lb) << ", skip to latest-5" << std::endl; lb=lat-5; saveLastBlock(lb); saveLastBlockHash(""); } }
-    std::cout << "🐋 Started. Block: " << lb << ", Subs: " << SUBSCRIBERS_PTR->size() << ", Whales: " << WHALES.size() << ", $"<<THRESHOLD_NANOS.load()/1000000000ULL << std::endl;
+    std::cout << "🐋 Started. Block: " << lb << ", Users: " << countUsers() << ", Watched addresses: " << initialWatcherAddrs << std::endl;
     g_msgQueue.start(); std::thread tg(telegramLoop);
     long long bsc=0; auto lcp=std::chrono::steady_clock::now(), lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
