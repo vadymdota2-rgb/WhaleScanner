@@ -21,16 +21,14 @@
 #include <sqlite3.h>
 #include <chrono>
 #include <sys/statvfs.h>
+#include <filesystem>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
 
-// ============================================================================
-// LOCK ORDER CONTRACT: dbMutex → cacheMutex → watchersMutex
-// Never violate this order to avoid deadlocks
-// ============================================================================
+// Lock order: dbMutex -> cacheMutex -> watchersMutex
 
 struct Stats {
     std::atomic<uint64_t> rpc_failures{0};
@@ -97,7 +95,6 @@ std::string safeString(const std::string& s, size_t maxLen = 64) {
     return e;
 }
 
-// Safe logging: NEVER touches the network
 void logCritical(const std::string& msg) {
     std::cerr << "[CRITICAL] " << msg << std::endl;
     try {
@@ -106,7 +103,6 @@ void logCritical(const std::string& msg) {
     } catch (...) {}
 }
 
-// Correct free-space calculation using block sizes
 int getDiskFreePercent() {
     struct statvfs st;
     if (statvfs(".", &st) != 0) return -1;
@@ -116,7 +112,15 @@ int getDiskFreePercent() {
     return static_cast<int>((100.0 * free) / total);
 }
 
-// Safe hex parsing without exceptions
+uintmax_t fileSizeMB(const std::string& path) {
+    try {
+        std::error_code ec;
+        auto sz = std::filesystem::file_size(path, ec);
+        if (ec) return 0;
+        return sz / (1024 * 1024);
+    } catch (...) { return 0; }
+}
+
 bool hexToLL(const std::string& hex, long long& out) {
     if (hex.empty()) return false;
     try {
@@ -135,9 +139,6 @@ std::string trim(const std::string& s) {
     return s.substr(a, b - a + 1);
 }
 
-// Minimal sanity check for an EVM address: "0x" + 40 hex chars. This is not a
-// checksum validator, just enough to keep obvious typos out of the DB now that
-// any user (not just an admin) can add addresses.
 bool isValidAddress(const std::string& a) {
     if (a.length() != 42 || a[0] != '0' || a[1] != 'x') return false;
     for (size_t i = 2; i < a.length(); i++) {
@@ -156,13 +157,7 @@ const std::string TG_TOKEN = []{
     return std::string(env);
 }();
 
-// Owner/default chat, used only to make sure at least one user account exists
-// on a brand new install so the bot isn't silently mute before anyone types
-// /start. Not privileged in any special way anymore — see README note on the
-// old ADMIN_IDS-gated commands, which are now available to every user.
 const std::string OWNER_CHAT_ID = "546348566";
-// ID of the private Telegram channel for duplicating alerts, e.g. "-100xxxxxxxxxx".
-// Optional: if the variable is not set, sending to the channel is simply skipped.
 const std::string CHANNEL_ID = []{
     const char* env = std::getenv("WHALE_CHANNEL_ID");
     return env ? std::string(env) : std::string();
@@ -180,16 +175,14 @@ std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
-const long long TX_TTL_BLOCKS = 20000;
+// Lowered from 20000: with checkpoints/cleanup now running much more often,
+// keeping ~4 hours of processed-tx history (at ~3s/block) is still comfortably
+// more than the reorg window this bot handles (REORG_ROLLBACK = 5 blocks).
+const long long TX_TTL_BLOCKS = 5000;
 constexpr time_t PRICE_TTL = 3600;
 constexpr size_t MAX_USERS = 5000;
 constexpr size_t MAX_WHALES_PER_USER = 50;
-constexpr size_t MAX_QUEUE_SIZE = 50000;
-// Stored as integer nanos (1 USD = 1e9 nanos), not as REAL/double USD: SQLite's
-// REAL is IEEE754 and repeated read-modify-write on a float threshold can drift
-// (e.g. 10000.0 -> 9999.999999...), which would silently shift a user's alert
-// threshold over time. Integer nanos match how the rest of the file already
-// represents money (usdNanos, THRESHOLD_NANOS in the original single-user code).
+constexpr size_t MAX_QUEUE_SIZE = 5000;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 10000ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -204,17 +197,8 @@ const std::set<std::string> BASE_ASSETS = {
 };
 bool isBaseAsset(const std::string& a) { return BASE_ASSETS.count(toLower(a)) > 0; }
 
-// ==================== KNOWN ROUTERS / AGGREGATORS / DEXES ====================
-// Address book of well-known router / aggregator contracts on BSC, used purely
-// for labeling alerts (e.g. "via PancakeSwap V3"). This is NOT used for any
-// trust/security decision — it only improves the message shown to the user.
-// Every address below was verified against a block explorer at the time it was
-// added. If a lookup misses, the bot silently falls back to no label; it never
-// guesses or fabricates a venue name.
-// NOTE on 0x10ed43c7...256024e: the address is 42 chars (0x + 40 hex). An earlier
-// version of this table had it truncated to 41 chars, which would never match any
-// real address and would simply make the label disappear — not a crash, but worth
-// double-checking length explicitly given how easy it is to drop one hex digit.
+// Address book of well-known router/aggregator contracts, used only to label
+// alerts (e.g. "via PancakeSwap V3"). Never used for trust/security decisions.
 const std::map<std::string, std::string> KNOWN_ROUTERS = {
     {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
     {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
@@ -229,9 +213,6 @@ const std::map<std::string, std::string> KNOWN_ROUTERS = {
     {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
 };
 
-// Best-effort label lookup for a router/aggregator address. Returns empty
-// string if unknown — callers must treat that as "no label available", not as
-// an error.
 std::string lookupRouterLabel(const std::string& addr) {
     auto it = KNOWN_ROUTERS.find(toLower(addr));
     return it != KNOWN_ROUTERS.end() ? it->second : std::string();
@@ -245,21 +226,9 @@ sqlite3* db = nullptr;
 std::map<std::string, std::string> TOKEN_SYMBOLS;
 std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
-// In-memory only (not persisted to SQLite, unlike TOKEN_SYMBOLS/DECIMALS): which
-// token0/token1 a given pool contract holds. This is purely an optimization to
-// avoid re-querying the same pool's token0()/token1() on every swap through it —
-// losing this cache on restart just means re-fetching it once per pool, which is
-// cheap and not worth a schema migration for.
 std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
 
 // ==================== USERS & WATCHERS (multi-user model) ====================
-// A single whale address can now be watched by many users, each with their own
-// display label and their own USD alert threshold. To keep processBlock() from
-// touching SQLite for every transaction (the whole point of this refactor),
-// the address -> watcher-list mapping is kept fully in memory and only rebuilt
-// from SQLite when a user actually changes their watch list (/add, /remove,
-// /limit) or is removed (dead delivery). Reads use the same lock-free
-// shared_ptr swap pattern the rest of the file already uses for SUBSCRIBERS_PTR.
 struct Watcher {
     std::string chatId;
     std::string label;
@@ -468,11 +437,6 @@ void saveLastBlockHash(const std::string& h) {
 }
 
 // ==================== USERS / WHALE SUBSCRIPTIONS ====================
-// All functions in this section touch SQLite (they're invoked from Telegram
-// command handlers, which are not hot-path), and then call refreshWatchers()
-// so the in-memory map used by processBlock() picks up the change. processBlock
-// itself never calls into this section directly — it only reads WATCHERS_PTR.
-
 void ensureUser(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO users(chat_id,language,threshold_nanos,created_at) VALUES(?,?,?,?)")) return;
@@ -503,10 +467,6 @@ uint64_t getUserThresholdNanos(const std::string& chatId) {
     uint64_t v=DEFAULT_THRESHOLD_NANOS; if (sqlite3_step(s)==SQLITE_ROW) v=static_cast<uint64_t>(sqlite3_column_int64(s,0)); sqlite3_finalize(s); return v;
 }
 
-// Rebuilds the in-memory address -> watchers map from SQLite. Called after any
-// mutation to users/whale_addresses/user_whales. A single JOIN, O(number of
-// subscriptions) — cheap compared to a per-transaction SQL lookup, and it means
-// processBlock() itself is 100% in-memory for whale matching and threshold checks.
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
     {
@@ -580,8 +540,6 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
     sqlite3_step(s); bool removed = sqlite3_changes(db)>0; sqlite3_finalize(s);
 
-    // Clean up whale_addresses no longer watched by anyone, so the master
-    // watch-list stays proportional to actual demand rather than growing forever.
     if (prepareOrLog(db,&s,"DELETE FROM whale_addresses WHERE id=? AND NOT EXISTS (SELECT 1 FROM user_whales WHERE whale_id=?)")) {
         sqlite3_bind_int64(s,1,whaleId); sqlite3_bind_int64(s,2,whaleId);
         sqlite3_step(s); sqlite3_finalize(s);
@@ -590,9 +548,6 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     return removed;
 }
 
-// "usd" is the user-facing value typed in /limit; it's converted to integer
-// nanos exactly once here, at the input boundary, and stored/read as an
-// integer from then on — see the DEFAULT_THRESHOLD_NANOS comment above.
 void setUserThreshold(const std::string& chatId, double usd) {
     ensureUser(chatId);
     uint64_t nanos = usdToNanos(usd);
@@ -602,9 +557,6 @@ void setUserThreshold(const std::string& chatId, double usd) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// Stored for future use — actual message translation is not implemented yet
-// (all bot text is currently English regardless of this field). Kept as a
-// column/command per the v1.0 spec so the schema doesn't need to change later.
 void setUserLanguage(const std::string& chatId, const std::string& lang) {
     ensureUser(chatId);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -631,9 +583,6 @@ std::string buildUserListText(const std::string& chatId) {
     return out.str();
 }
 
-// Removes a user entirely (e.g. their Telegram account/chat is gone — see the
-// dead-delivery handling in SafeMessageQueue). ON DELETE CASCADE on
-// user_whales.user_id takes care of their subscriptions automatically.
 void removeUser(const std::string& chatId) {
     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
       if (!prepareOrLog(db,&s,"DELETE FROM users WHERE chat_id=?")) return;
@@ -668,15 +617,10 @@ SendResult sendMsg(const std::string& c, const std::string& t) {
         auto p=json::parse(r); if (p.value("ok",false)) return {true,false,0};
         int code=p.value("error_code",0);
         if (code==429) { int ra=p.contains("parameters")&&p["parameters"].contains("retry_after")?p["parameters"]["retry_after"].get<int>():30; return {false,false,ra}; }
-        // Telegram's 403 always means the bot was blocked/removed from the chat — the
-        // user is definitely "dead". 400 is a generic request-error code (e.g. "message
-        // is too long", "can't parse entities", invalid HTML) and does NOT always mean a
-        // dead recipient. Previously any 400 was treated as deadUser and permanently
-        // unsubscribed a LIVE subscriber because of an error in the message text itself
-        // (and since the message is the same for everyone in a broadcast, this could mass
-        // -unsubscribe all subscribers from a single failed broadcast). Now for 400 we
-        // check the error description and only treat it as "dead" for explicit signs of a
-        // removed/unreachable chat.
+        // 403 always means the bot was blocked/removed -> dead user. 400 is a
+        // generic request-error code and is only treated as dead on explicit
+        // signs of a removed/unreachable chat, to avoid mass-unsubscribing live
+        // users because of a bad message string in a single broadcast.
         std::string desc = toLower(p.value("description",""));
         bool chatGone = desc.find("chat not found")!=std::string::npos ||
                          desc.find("bot was blocked")!=std::string::npos ||
@@ -755,10 +699,6 @@ public:
             if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
                 if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
     }
-    // Enqueues one alert message for an explicit list of recipients. Replaces the
-    // old broadcast-to-all-subscribers path: in the multi-user model different
-    // recipients can get differently-labeled text for the very same on-chain
-    // event, so the queue now works per-recipient-list rather than per-broadcast.
     bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
         if (recipients.empty()) return true;
         size_t current = queueSize.load(std::memory_order_relaxed);
@@ -791,11 +731,6 @@ public:
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
     auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
-    // If the RPC didn't respond at all (node unreachable/timeout), do NOT cache the
-    // default of 18 forever: otherwise a temporary node outage on the first request
-    // would permanently lock in the wrong decimals for the token, which silently
-    // skews every later USD calculation for it (an error of orders of magnitude,
-    // with no warning at all).
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 18; }
     int d=18;
     if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
@@ -804,10 +739,6 @@ int getDecimals(const std::string& addr) {
 std::string getSymbol(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
     auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"});
-    // If the RPC didn't respond at all, don't cache "UNKNOWN" forever (see the comment
-    // in getDecimals): otherwise the token would stay UNKNOWN in every future alert
-    // after a single temporary node outage, even though the symbol is actually known
-    // and would be fetched successfully on retry.
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return "UNKNOWN"; }
     std::string sym;
     if (r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
@@ -834,25 +765,13 @@ cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
     for (char c:h.substr(2,64)) { r<<=4; if (c>='0'&&c<='9') r|=(c-'0'); else if (c>='a'&&c<='f') r|=(c-'a'+10); else if (c>='A'&&c<='F') r|=(c-'A'+10); } return r;
 }
-// Extracts the wordIdx-th 32-byte (64 hex char) word from a multi-word ABI-encoded
-// "data" hex string (e.g. a Swap event with several uint256/int256 fields packed
-// back to back). Returns "" if the data is too short for that word index — callers
-// must check for an empty result rather than assume success.
 std::string nthWord(const std::string& h, size_t wordIdx) {
-    size_t start = 2 + wordIdx*64; // skip "0x", then wordIdx full 32-byte words
+    size_t start = 2 + wordIdx*64;
     if (h.length() < start + 64) return "";
     return "0x" + h.substr(start, 64);
 }
-// Signed 256-bit two's-complement parse, needed for PancakeSwap/Uniswap V3-style
-// Swap events whose amount0/amount1 fields are int256 (negative = token left the
-// pool, positive = token entered the pool from the trader's perspective). Reusing
-// the unsigned parseUint256 on a negative value would silently turn it into a huge
-// positive number instead of the small negative one actually meant — this function
-// exists specifically to avoid that misread.
 cpp_int parseInt256(const std::string& h) {
     cpp_int u = parseUint256(h);
-    // If the top bit (bit 255) is set, the value is negative in two's complement:
-    // actual value = u - 2^256.
     cpp_int signBit = cpp_int(1) << 255;
     if (u >= signBit) {
         cpp_int modulus = cpp_int(1) << 256;
@@ -870,26 +789,12 @@ std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
 // ==================== BALANCE-DIFF CROSS-CHECK ====================
-// Queries an ERC-20 token's balanceOf(wallet) pinned to a specific historical
-// block via eth_call. Used as an independent cross-check of the Transfer-log
-// netflow result: comparing balance at block N-1 vs block N for the SAME token
-// and SAME wallet gives the actual on-chain balance change over that block,
-// which is immune to misleading Transfer events (fee-on-transfer tokens that
-// emit a Transfer for the pre-fee amount, rebasing tokens, or any token whose
-// Transfer event doesn't match what balanceOf later reports).
-//
-// IMPORTANT LIMITATION: this is a balance change over the WHOLE BLOCK, not over
-// a single transaction — public RPC has no "balance immediately after tx X but
-// before tx X+1 in the same block" view (that requires a debug/trace API this
-// bot does not have access to). Callers MUST only treat this as a meaningful
-// cross-check of one specific transaction's result when that whale had exactly
-// one relevant transaction for this token in this block; otherwise the diff is
-// a mix of multiple transactions and cannot be attributed to any single one.
-// Returns std::nullopt on any RPC failure — callers must treat that as "no
-// cross-check available", not as a zero balance or a contradiction.
+// Only meaningful when the wallet has exactly one relevant tx for this token in
+// this block (whole-block balance delta, not per-tx). Returns nullopt on any
+// RPC failure — callers must treat that as "no cross-check available".
 std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
-    if (blockNumber < 0) return std::nullopt; // block -1 (i.e. before genesis) has no defined balance
-    std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2); // pad 20-byte address to 32-byte word
+    if (blockNumber < 0) return std::nullopt;
+    std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2);
     std::stringstream bs; bs << "0x" << std::hex << blockNumber;
     auto r = rpc("eth_call", {{{"to",token},{"data","0x70a08231"+walletPadded}}, bs.str()});
     if (!r.is_string()) return std::nullopt;
@@ -899,28 +804,17 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
 }
 
 // ==================== ANALYZE TX ====================
-// Logic: compute the net flow (in-out) PER TOKEN separately, based on ALL Transfer
-// logs in which the whale address participates (fr==wa or to==wa). This is robust
-// against multi-hop routes and against multiple Transfer logs for the same token
-// within one tx — previously such logs overwrote each other (nsIn/nsOut) instead of
-// being summed, which could under-count a swap's amount or attribute it to the
-// wrong token.
-// counterAddr/counterAmount describe the OTHER side of a swap (e.g. for a BUY of
-// KOMA paid with USDT, tokenAddr/rawAmount is the KOMA received and
-// counterAddr/counterAmount is the USDT spent). They are only populated when
-// isSwap is true and a counter asset with nonzero net flow was actually found;
-// callers must check counterAddr.empty() before using counterAmount.
+// Computes net flow (in-out) per token from ALL Transfer logs touching the
+// whale wallet, summed rather than overwritten so multi-hop/multi-log swaps in
+// one tx aren't under-counted or mis-attributed.
 struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; std::string venue; std::string counterAddr; cpp_int counterAmount; };
 
 TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
-    // Marker for "this is a swap" rather than a plain transfer — presence of at
-    // least one Swap log in the receipt. We also remember which contract emitted it,
-    // since that's usually the pool/router most relevant for labeling the venue.
     bool hasSwap=false;
     std::string swapLogAddr;
-    size_t swapLogDataHexLen=0; // length of the hex digits in the Swap log's data field (excluding "0x"), used only for a generic V2/V3-style shape guess, never for brand naming
+    size_t swapLogDataHexLen=0;
     for (auto& l:receipt["logs"]) {
         if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&
             l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) {
@@ -935,17 +829,13 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         }
     }
 
-    // Net flow per token: positive = net inflow to wa, negative = net outflow.
     std::map<std::string, cpp_int> netFlow;
-    std::vector<std::string> tokenOrder; // order of first appearance, for deterministic fallback
+    std::vector<std::string> tokenOrder;
     auto touch = [&](const std::string& tok) {
         if (netFlow.find(tok) == netFlow.end()) { netFlow[tok] = 0; tokenOrder.push_back(tok); }
     };
 
     bool anyTransferForWallet = false;
-    // First address the wallet directly interacted with via a Transfer log (its
-    // "from" counterpart when sending, or "to" counterpart is irrelevant here) — used
-    // only as a fallback label source if we don't otherwise find a known router.
     std::string firstCounterpartAddr;
     for (auto& l : receipt["logs"]) {
         if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
@@ -953,13 +843,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         if (!l.contains("data")||!l["data"].is_string()) continue;
         if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||!l.contains("address")||!l["address"].is_string()) continue;
 
-        // The address topic must be "0x" + 64 hex chars (a 32-byte word where the
-        // address occupies the low 20 bytes = the last 40 chars starting at offset 26).
-        // Previously substr(26) without a length check threw std::out_of_range on a
-        // truncated/non-standard string from the RPC, which aborted analyzeTx without
-        // being caught and could stall block processing forever (after the retry fix in
-        // main, the block would be retried indefinitely hitting the same exception on
-        // the same receipt).
         const std::string& t1 = l["topics"][1].get_ref<const std::string&>();
         const std::string& t2 = l["topics"][2].get_ref<const std::string&>();
         const std::string& addrField = l["address"].get_ref<const std::string&>();
@@ -969,47 +852,30 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         std::string fr = "0x"+toLower(t1.substr(26));
         std::string to = "0x"+toLower(t2.substr(26));
         std::string tk = toLower(addrField);
-        if (fr != wa && to != wa) continue; // log doesn't touch the whale wallet directly
+        if (fr != wa && to != wa) continue;
 
         cpp_int amt = parseUint256(dataField);
         touch(tk);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
-        if (to == wa) netFlow[tk] += amt;   // arrived at the wallet
-        if (fr == wa) netFlow[tk] -= amt;   // left the wallet (fr==to==wa cancels out — correct)
+        if (to == wa) netFlow[tk] += amt;
+        if (fr == wa) netFlow[tk] -= amt;
     }
 
     if (!anyTransferForWallet) return r;
     r.valid = true;
 
-    // Best-effort venue label: prefer the contract that emitted the Swap log (the
-    // pool/router actually doing the swapping), falling back to the first
-    // counterpart address the wallet transferred with. This is purely cosmetic —
-    // an unrecognized address just means no label is shown, never an error.
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
-    // If the swap went straight to a pool we don't recognize (no known router/
-    // aggregator address matched), we deliberately do NOT guess a specific DEX
-    // brand from the Swap event's field layout (V2-style amount0In/out vs V3-style
-    // sqrtPriceX96/tick): many protocols fork the same ABI, so that would risk a
-    // confident-looking but wrong brand name. Instead we only note the AMM
-    // generation, which is inferable from the event shape itself, not from address
-    // matching, and label it generically as "pool" rather than naming a DEX.
+    // Unrecognized pool: label only the AMM generation inferable from the Swap
+    // event's field layout, never guess a specific DEX brand (many protocols
+    // fork the same ABI).
     if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
-        // V2-style Swap(address,uint256,uint256,uint256,uint256,address) data is 4
-        // packed uint256 fields = 256 hex chars; V3-style Swap(...) with
-        // sqrtPriceX96/liquidity/tick is 5 fields = 320 hex chars. This is a shape
-        // heuristic, not a brand identification — kept deliberately generic.
         if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
     }
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
 
-    // Split net flow into "base" (stablecoins/WBNB) and "non-base" (the actual asset
-    // of interest). Raw magnitudes aren't comparable across tokens with different
-    // decimals, so we prioritize the token that ARRIVED at the wallet (the asset
-    // bought); if there are no incoming non-base tokens, we take the one with the
-    // largest |netflow| among outgoing ones.
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
 
@@ -1019,7 +885,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             if (net > 0) hasBaseIn = true;
             if (net < 0) hasBaseOut = true;
         } else {
-            if (net <= 0) continue; // first pass: incoming non-base tokens only
+            if (net <= 0) continue;
             if (net > bestNonBaseAbs) { bestNonBaseAbs = net; bestNonBaseTok = tok; bestNonBaseNet = net; }
         }
     }
@@ -1033,27 +899,21 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
     }
 
     r.isSwap = (
-        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) || // non-base <-> base
-        (hasBaseIn && hasBaseOut)                                  // base <-> base (e.g. USDT->WBNB)
+        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) ||
+        (hasBaseIn && hasBaseOut)
     );
 
     if (!bestNonBaseTok.empty()) {
-        // There's a non-stable token with nonzero net flow — that's the trade's asset.
         r.tokenAddr = bestNonBaseTok;
         r.rawAmount = bestNonBaseAbs;
-        r.isBuy = bestNonBaseNet > 0; // token arrived at the whale's wallet => buy
+        r.isBuy = bestNonBaseNet > 0;
 
-        // Counter side: the base asset that moved in the opposite direction. On a
-        // buy we expect a base outflow (what was paid); on a sell, a base inflow
-        // (what was received). If several base assets moved on that side (rare,
-        // e.g. a router refunding leftover dust in a second token), we report the
-        // one with the largest |netflow| — same tie-break rule as elsewhere here.
         if (r.isSwap) {
             std::string bestCounterTok; cpp_int bestCounterAbs = -1;
             for (auto& tok : tokenOrder) {
                 if (!isBaseAsset(tok)) continue;
                 cpp_int net = netFlow[tok];
-                bool wantsOutflow = r.isBuy; // buy: we paid with base (net<0); sell: we received base (net>0)
+                bool wantsOutflow = r.isBuy;
                 if (wantsOutflow && net >= 0) continue;
                 if (!wantsOutflow && net <= 0) continue;
                 cpp_int absNet = net >= 0 ? net : -net;
@@ -1062,17 +922,11 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         }
     } else {
-        // Only base assets were involved (e.g. USDT->WBNB). Comparing them by raw
-        // amount is meaningless — different tokens have different decimals (the same
-        // USD value can have very different "raw" numbers). So we take whichever
-        // ARRIVED at the whale's wallet (that's the trade's result), and if multiple
-        // arrived, the one with the largest |netflow| among them; if nothing arrived
-        // (only an outflow was recorded), among the outgoing ones.
         std::string bestBaseTok; cpp_int bestBaseAbs = -1; cpp_int bestBaseNet = 0;
         for (auto& tok : tokenOrder) {
             if (!isBaseAsset(tok)) continue;
             cpp_int net = netFlow[tok];
-            if (net <= 0) continue; // first pass: incoming only
+            if (net <= 0) continue;
             if (net > bestBaseAbs) { bestBaseAbs = net; bestBaseTok = tok; bestBaseNet = net; }
         }
         if (bestBaseTok.empty()) {
@@ -1088,9 +942,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             r.rawAmount = bestBaseAbs;
             r.isBuy = bestBaseNet > 0;
 
-            // Counter side for a base<->base swap: the other base asset that moved
-            // opposite to tokenAddr. Same logic as the non-base branch above, just
-            // restricted to base assets other than tokenAddr itself.
             std::string bestCounterTok; cpp_int bestCounterAbs = -1;
             for (auto& tok : tokenOrder) {
                 if (tok == r.tokenAddr || !isBaseAsset(tok)) continue;
@@ -1103,7 +954,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         } else {
-            // Fallback: anyTransferForWallet=true guarantees at least one token in netFlow.
             r.tokenAddr = tokenOrder.front();
             cpp_int net = netFlow[r.tokenAddr];
             r.rawAmount = net >= 0 ? net : -net;
@@ -1115,10 +965,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
     return r;
 }
 
-// Builds the alert text for a single label. "label" is either a user's own
-// custom name for the wallet, or — for the CHANNEL_ID forward — the raw
-// address itself, so no individual user's private label leaks into a shared
-// channel.
 std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
     std::string msg="🐋 <b>"+safeString(label)+"</b>\n\n";
     msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🔴 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
@@ -1155,19 +1001,9 @@ bool processBlock(long long bn) {
         else { std::cerr << "[REORG] Both disagree, rollback" << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
     }
 
-    // Snapshot the current in-memory watcher map once per block (lock-free
-    // shared_ptr copy). processBlock never touches SQLite to determine whale
-    // matches or thresholds — that's the whole point of keeping this in memory.
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
-    // Pre-pass: count how many transactions in this block touch each watched
-    // address (from or to). This is needed before the balance-diff cross-check
-    // below: a balance change over the whole block can only be attributed to one
-    // specific transaction when that address has exactly ONE relevant transaction
-    // in the block — otherwise the diff mixes multiple transactions together and
-    // cannot be assigned to any single one. No RPC calls here, just string
-    // comparisons against the already-fetched block data plus an O(1) map lookup.
     std::map<std::string, int> whaleTxCountInBlock;
     for (auto& tx : block["transactions"]) {
         if (!tx.is_object()) continue;
@@ -1192,23 +1028,13 @@ bool processBlock(long long bn) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-        // analyzeTx (netflow calc, decimals/symbol/price lookups) runs exactly
-        // ONCE per transaction regardless of how many users watch mA — the
-        // per-user fan-out below only affects which recipients get which text.
         TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        // A base asset (stablecoin/WBNB) as the resulting token is only interesting if
-        // it's part of a swap (e.g. USDT->WBNB) — not just a plain stablecoin/WBNB
-        // transfer between addresses, which by itself isn't a trading signal.
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
-        if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; } // watch list changed concurrently; nothing to notify
+        if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        // Group qualifying watchers by label, so users who happen to share the
-        // exact same label for this address get one shared alert row instead of
-        // one row per user — keeps the alerts table from growing one-row-per-
-        // recipient on large fan-out, without ever merging DIFFERENT labels.
-        std::map<std::string, std::vector<std::string>> byLabel; // label -> chatIds
+        std::map<std::string, std::vector<std::string>> byLabel;
         for (auto& w : wit->second) {
             if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) continue;
             byLabel[w.label].push_back(w.chatId);
@@ -1221,8 +1047,6 @@ bool processBlock(long long bn) {
             std::string msg = buildAlertMessage(label, res, hash);
             if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
         }
-        // Also forward to the admin/public channel, if configured, using the raw
-        // address as the label (not any individual user's private label).
         if (!CHANNEL_ID.empty()) {
             std::string genericMsg = buildAlertMessage(mA, res, hash);
             g_msgQueue.enqueueToRecipients(genericMsg, {CHANNEL_ID});
@@ -1238,13 +1062,16 @@ bool processBlock(long long bn) {
 }
 
 // ==================== CLEANUP ====================
+// Retention was tightened (30d/14d -> 3d/2d) and this now runs every 30
+// minutes instead of once a day, to keep whale_bot.db / the WAL file from
+// growing unbounded under sustained tx volume.
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-30*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
+        sqlite3_bind_int64(s,1,time(nullptr)-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
         if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-14*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
+        sqlite3_bind_int64(s,1,time(nullptr)-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
 }
 
@@ -1260,8 +1087,6 @@ void telegramLoop() {
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    // No callback-query buttons are used anymore, but updates of this
-                    // type still need to be acknowledged via the offset.
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
@@ -1280,7 +1105,7 @@ void telegramLoop() {
                         << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
                         << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
                         << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
-                        << "DB: healthy\n";
+                        << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
                     if (diskFree >= 0) {
                         ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
                         if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
@@ -1353,7 +1178,7 @@ int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
     initDB(); loadTokenCache();
-    ensureUser(OWNER_CHAT_ID); // make sure at least one account exists on a fresh install
+    ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     size_t initialWatcherAddrs;
     { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
@@ -1370,22 +1195,19 @@ int main() {
             while (lb<lat&&running.load(std::memory_order_relaxed)) {
                 long long next = lb+1;
                 if (!processBlock(next)) {
-                    // Block not processed: either a temporary RPC failure (receipt/block
-                    // not ready yet — last_block in the DB wasn't changed, so we need to
-                    // retry the same next), or processBlock itself rolled back last_block
-                    // due to a reorg (in which case the DB already holds an earlier
-                    // number). In both cases, sync the in-memory lb with what's actually
-                    // saved in the DB — previously lb advanced unconditionally and an
-                    // unprocessed/rolled-back block was lost forever with no retry.
                     lb = getLastBlock();
                     break;
                 }
                 lb = next; saveLastBlock(lb);
-                bool nc=(++bsc>=1000); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=30; }
+                // Checkpoint/cleanup cadence tightened from 1000 blocks / 30 min to
+                // 200 blocks / 5 min so the WAL file doesn't grow unbounded under
+                // sustained tx volume.
+                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lcl).count()>=24) { cleanupOldAlerts(); lcl=std::chrono::steady_clock::now(); }
+            // cleanupOldAlerts now runs every 30 minutes instead of daily.
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
