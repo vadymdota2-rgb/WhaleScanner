@@ -1495,8 +1495,6 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
                     TelegramUI::buildCancelButton());
         }
         return true;
-    }
-
     return false;
 }
 
