@@ -232,6 +232,12 @@ std::string lookupRouterLabel(const std::string& addr) {
     return it != KNOWN_ROUTERS.end() ? it->second : std::string();
 }
 
+// WBNB contract — used as the pricing/decimals proxy for native BNB.
+const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+// Internal sentinel for "native BNB paid via tx.value" — never a real on-chain
+// address, so it must be special-cased everywhere it's compared/displayed.
+const std::string NATIVE_BNB_MARKER = "native:bnb";
+
 std::atomic<bool> running{true};
 void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
 
@@ -1033,6 +1039,19 @@ std::string nthWord(const std::string& h, size_t wordIdx) {
     if (h.length() < start + 64) return "";
     return "0x" + h.substr(start, 64);
 }
+// Parses a variable-length "0x..." hex string (as used for tx.value, unlike
+// the fixed 32-byte words returned by eth_call/logs) into a cpp_int.
+cpp_int hexToCppInt(const std::string& h) {
+    if (h.size() < 2 || h[0] != '0' || h[1] != 'x') return 0;
+    cpp_int r = 0;
+    for (size_t i = 2; i < h.size(); i++) {
+        char c = h[i]; r <<= 4;
+        if (c >= '0' && c <= '9') r |= (c - '0');
+        else if (c >= 'a' && c <= 'f') r |= (c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') r |= (c - 'A' + 10);
+    }
+    return r;
+}
 cpp_int parseInt256(const std::string& h) {
     cpp_int u = parseUint256(h);
     cpp_int signBit = cpp_int(1) << 255;
@@ -1065,7 +1084,7 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
 // ==================== ANALYZE TX ====================
 struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; std::string venue; std::string counterAddr; cpp_int counterAmount; };
 
-TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
+TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
     bool hasSwap=false;
@@ -1117,15 +1136,42 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         if (fr == wa) netFlow[tk] -= amt;
     }
 
+    // ---- Native BNB leg (Этап 2/3) ----
+    // Routers that accept native BNB (msg.value) never emit an ERC20 Transfer
+    // for the wrapped asset, so the loop above can't see that leg. We can
+    // still observe the outflow side (wallet == tx.from, tx.value > 0) from
+    // the transaction object itself — no extra RPC needed. The inflow side
+    // (wallet receiving native BNB from an internal call) would require
+    // debug_traceTransaction, which is out of scope here.
+    cpp_int nativeOut = 0;
+    std::string txTo;
+    if (tx.is_object()) {
+        if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
+            txTo = toLower(tx["to"].get<std::string>());
+        if (tx.contains("from") && tx["from"].is_string() &&
+            toLower(tx["from"].get<std::string>()) == wa &&
+            tx.contains("value") && tx["value"].is_string()) {
+            nativeOut = hexToCppInt(tx["value"].get<std::string>());
+        }
+    }
+    bool nativeOutflow = nativeOut > 0;
+
     if (!anyTransferForWallet) return r;
     r.valid = true;
 
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
+    if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
     if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
         if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
     }
+    // Stage 4: only trust the native-BNB leg as a swap signal when the call
+    // target is a router/aggregator we recognize — guards against unrelated
+    // multicall/batched transactions that happen to move BNB and an ERC20
+    // in the same tx for reasons that have nothing to do with a trade.
+    bool routerCall = !txTo.empty() && !lookupRouterLabel(txTo).empty();
+    bool nativeSwapSignal = nativeOutflow && routerCall;
 
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
@@ -1150,7 +1196,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
     }
 
     r.isSwap = (
-        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut)) ||
+        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal)) ||
         (hasBaseIn && hasBaseOut)
     );
 
@@ -1168,6 +1214,12 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
                 if (!wantsOutflow && net <= 0) continue;
                 cpp_int absNet = net >= 0 ? net : -net;
                 if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
+            }
+            // No ERC20 base-asset leg found (e.g. paid with native BNB) —
+            // fall back to the tx.value leg so the alert still shows what
+            // was spent, without any extra RPC calls.
+            if (bestCounterTok.empty() && r.isBuy && nativeOutflow) {
+                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         }
@@ -1203,6 +1255,19 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
                 if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
+        } else if (nativeOutflow && !tokenOrder.empty()) {
+            // No base-asset ERC20 leg at all, but the wallet did send native
+            // BNB and did receive/send some other token — treat tx.value as
+            // the base leg (BUY side) so this doesn't fall through to the
+            // single-token/TRANSFER branch below.
+            r.tokenAddr = tokenOrder.front();
+            cpp_int net = netFlow[r.tokenAddr];
+            r.rawAmount = net >= 0 ? net : -net;
+            r.isBuy = net > 0;
+            if (r.isBuy && nativeSwapSignal) {
+                r.counterAddr = NATIVE_BNB_MARKER;
+                r.counterAmount = nativeOut;
+            }
         } else {
             r.tokenAddr = tokenOrder.front();
             cpp_int net = netFlow[r.tokenAddr];            r.rawAmount = net >= 0 ? net : -net;
@@ -1210,7 +1275,16 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         }
     }
 
-    r.usdNanos = calcUsdNanos(r.rawAmount, getDecimals(r.tokenAddr), getPriceNanos(r.tokenAddr));
+    // A BUY signal built solely from the native-BNB leg (no ERC20 base asset
+    // observed) still needs the router gate from Stage 4 to count as a swap.
+    if (!r.isSwap && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
+        !isBaseAsset(r.tokenAddr) && nativeSwapSignal) {
+        r.isSwap = true;
+    }
+
+    int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
+    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(WBNB_ADDR) : getPriceNanos(r.tokenAddr);
+    r.usdNanos = calcUsdNanos(r.rawAmount, tokenDec, tokenPrice);
     return r;
 }
 
@@ -1222,9 +1296,16 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
+        std::string counterAmountStr, counterSymbol;
+        if (res.counterAddr == NATIVE_BNB_MARKER) {
+            counterAmountStr = formatAmount(res.counterAmount, 18);
+            counterSymbol = "BNB";
+        } else {
+            counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
+            counterSymbol = safeString(getSymbol(res.counterAddr), 16);
+        }
         msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
-               formatAmount(res.counterAmount, getDecimals(res.counterAddr)) + " " +
-               safeString(getSymbol(res.counterAddr), 16) + "</b>\n";
+               counterAmountStr + " " + counterSymbol + "</b>\n";
     }
     msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
     if (!res.venue.empty()) msg+="🔁 DEX: <b>"+safeString(res.venue,48)+"</b>\n";
@@ -1268,7 +1349,7 @@ bool processBlock(long long bn) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-        TxResult res=analyzeTx(receipt,mA,hash); if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
