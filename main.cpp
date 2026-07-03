@@ -47,8 +47,7 @@ std::string getUptime() {
     int d = secs / 86400; secs %= 86400;
     int h = secs / 3600;  secs %= 3600;
     int m = secs / 60;
-    std::stringstream ss;
-    if (d > 0) ss << d << "d ";
+    std::stringstream ss;    if (d > 0) ss << d << "d ";
     ss << h << "h " << m << "m";
     return ss.str();
 }
@@ -97,8 +96,7 @@ std::string safeString(const std::string& s, size_t maxLen = 64) {
 
 void logCritical(const std::string& msg) {
     std::cerr << "[CRITICAL] " << msg << std::endl;
-    try {
-        std::ofstream("critical.log", std::ios::app)
+    try {        std::ofstream("critical.log", std::ios::app)
             << "[" << time(nullptr) << "] " << msg << "\n";
     } catch (...) {}
 }
@@ -147,7 +145,6 @@ bool isValidAddress(const std::string& a) {
     }
     return true;
 }
-
 // ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
@@ -175,9 +172,6 @@ std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
-// Lowered from 20000: with checkpoints/cleanup now running much more often,
-// keeping ~4 hours of processed-tx history (at ~3s/block) is still comfortably
-// more than the reorg window this bot handles (REORG_ROLLBACK = 5 blocks).
 const long long TX_TTL_BLOCKS = 5000;
 constexpr time_t PRICE_TTL = 3600;
 constexpr size_t MAX_USERS = 5000;
@@ -189,21 +183,18 @@ double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 10000000
 
 const std::string SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const std::set<std::string> BASE_ASSETS = {
-    "0x55d398326f99059ff775485246999027b3197955", // USDT
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d", // USDC
-    "0xe9e7cea3dedca5984780bafc599bd69add087d56", // BUSD
-    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c", // WBNB
-    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409"  // FDUSD
+    "0x55d398326f99059ff775485246999027b3197955",
+    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+    "0xe9e7cea3dedca5984780bafc599bd69add087d56",
+    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
+    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409"
 };
 bool isBaseAsset(const std::string& a) { return BASE_ASSETS.count(toLower(a)) > 0; }
 
-// Address book of well-known router/aggregator contracts, used only to label
-// alerts (e.g. "via PancakeSwap V3"). Never used for trust/security decisions.
 const std::map<std::string, std::string> KNOWN_ROUTERS = {
     {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
     {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
-    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
-    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
+    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
     {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
     {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
     {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
@@ -228,7 +219,7 @@ std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
 
-// ==================== USERS & WATCHERS (multi-user model) ====================
+// ==================== USERS & WATCHERS ====================
 struct Watcher {
     std::string chatId;
     std::string label;
@@ -252,8 +243,7 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
-        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
             return running.load(std::memory_order_relaxed) ? 0 : 1; });
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     if (!post.empty()) {
@@ -302,8 +292,7 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
 // ==================== SQLITE ====================
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
-        std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
-    }
+        std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);    }
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
@@ -352,8 +341,7 @@ void initDB() {
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
-        INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
-    )";
+        INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');    )";
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
@@ -402,8 +390,7 @@ bool isTxProcessed(const std::string& h) {
 }
 void markTxProcessed(const std::string& h, long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;
-    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
+    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
 }
 long getTgOffset() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -452,7 +439,6 @@ size_t countUsers() {
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM users")) return 0;
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
-
 size_t countUserWhales(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM user_whales WHERE user_id=?")) return 0;
@@ -503,7 +489,6 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO whale_addresses(address) VALUES(?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_step(s); sqlite3_finalize(s);
-
     long long whaleId=-1;
     if (!prepareOrLog(db,&s,"SELECT id FROM whale_addresses WHERE address=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
@@ -552,8 +537,7 @@ void setUserThreshold(const std::string& chatId, double usd) {
     ensureUser(chatId);
     uint64_t nanos = usdToNanos(usd);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
-    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
@@ -602,36 +586,237 @@ public:
             if (std::chrono::duration_cast<std::chrono::hours>(now-it->second.last).count()>CLEANUP_H) it=users.erase(it); else ++it;
         auto& s=users[c];
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now-s.last).count()<MIN_MS) return false;
-        while (!s.hist.empty()&&std::chrono::duration_cast<std::chrono::seconds>(now-s.hist.front()).count()>60) s.hist.pop_front();
-        if ((int)s.hist.size()>=MAX_MIN) return false;
+        while (!s.hist.empty()&&std::chrono::duration_cast<std::chrono::seconds>(now-s.hist.front()).count()>60) s.hist.pop_front();        if ((int)s.hist.size()>=MAX_MIN) return false;
         s.last=now; s.hist.push_back(now); return true;
     }
 } g_rateLimiter;
 
+// ==================== TELEGRAM UI ====================
+namespace TelegramUI {
+
+struct UIMessage {
+    std::string text;
+    std::string keyboard;
+};
+
+UIMessage buildMainMenu() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🐋 Add Wallet"}, {"callback_data", "menu:add_wallet"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "👛 My Wallets"}, {"callback_data", "menu:my_wallets"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "💰 Alert Threshold"}, {"callback_data", "menu:alert_threshold"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "⚙️ Settings"}, {"callback_data", "menu:settings"}}
+    }));
+    return {"🐋 <b>Wallet Tracker</b>\n\nChoose an option:", keyboard.dump()};
+}
+
+UIMessage buildWelcomeMessage() {
+    auto m = buildMainMenu();
+    m.text = "🐋 <b>Welcome to Wallet Tracker!</b>\n\n"
+             "Monitor whale wallets on BNB Smart Chain and get instant notifications.\n\n"
+             "Tap a button below to get started:";
+    return m;
+}
+
+std::string buildCancelButton() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "❌ Cancel"}, {"callback_data", "cancel"}}
+    }));
+    return keyboard.dump();
+}
+
+UIMessage buildWalletsList(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex);    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT wa.address, uw.label FROM user_whales uw "
+        "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+        "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
+        return {"❌ Error loading wallets.", ""};
+    }
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+
+    std::stringstream text;
+    text << "👛 <b>My Wallets</b>\n\n";
+
+    bool any = false;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        any = true;
+        std::string address = safeColumnText(s, 0);
+        std::string label = safeColumnText(s, 1);
+
+        std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
+
+        text << "🐋 <b>" << safeString(label, 32) << "</b>\n";
+        text << "<code>" << shortAddr << "</code>\n\n";
+
+        json row;
+        row.push_back({{"text", "✏️ Rename"}, {"callback_data", "rename:" + address}});
+        row.push_back({{"text", "🗑️ Remove"}, {"callback_data", "remove:" + address}});
+        keyboard["inline_keyboard"].push_back(row);
+    }
+    sqlite3_finalize(s);
+
+    if (!any) {
+        text << "No wallets tracked yet.\n\n";
+        text << "Tap 🐋 <b>Add Wallet</b> to start tracking.";
+    }
+
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+
+    return {text.str(), keyboard.dump()};
+}
+
+UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
+    double currentUsd = nanosToUsd(currentThresholdNanos);
+
+    std::stringstream text;
+    text << "💰 <b>Alert Threshold</b>\n\n";    text << "Current threshold: <b>$" << std::fixed << std::setprecision(0) << currentUsd << "</b>\n\n";
+    text << "Choose a preset or enter a custom amount:";
+
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "$1K"}, {"callback_data", "threshold:1000"}},
+        {{"text", "$5K"}, {"callback_data", "threshold:5000"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "$10K"}, {"callback_data", "threshold:10000"}},
+        {{"text", "$50K"}, {"callback_data", "threshold:50000"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "Custom"}, {"callback_data", "threshold:custom"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+
+    return {text.str(), keyboard.dump()};
+}
+
+UIMessage buildSettingsMenu() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "❓ Help"}, {"callback_data", "menu:help"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+    return {"⚙️ <b>Settings</b>\n\nChoose an option:", keyboard.dump()};
+}
+
+UIMessage buildHelpMessage() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+
+    std::string text = "❓ <b>Help</b>\n\n";
+    text += "🐋 <b>Wallet Tracker</b> monitors whale wallets on BNB Smart Chain and sends instant notifications.\n\n";
+    text += "<b>Features:</b>\n";
+    text += "• Track any wallet address\n";
+    text += "• Set minimum alert threshold\n";
+    text += "• Instant notifications for swaps and transfers\n";
+    text += "• BNB Smart Chain network\n\n";    text += "Tap a button in the main menu to get started.";
+
+    return {text, keyboard.dump()};
+}
+
+} // namespace TelegramUI
+
+// ==================== USER SESSION MANAGER ====================
+enum class UserState {
+    IDLE,
+    AWAITING_WALLET_ADDRESS,
+    AWAITING_WALLET_NAME,
+    AWAITING_RENAME,
+    AWAITING_CUSTOM_THRESHOLD
+};
+
+struct UserSession {
+    UserState state = UserState::IDLE;
+    std::string pendingAddress;
+    std::string pendingLabel;
+};
+
+class UserSessionManager {
+    std::mutex mtx;
+    std::unordered_map<std::string, UserSession> sessions;
+public:
+    UserSession getSession(const std::string& chatId) {
+        std::lock_guard<std::mutex> l(mtx);
+        auto it = sessions.find(chatId);
+        return it != sessions.end() ? it->second : UserSession{};
+    }
+
+    void setState(const std::string& chatId, UserState state,
+                  const std::string& pendingAddress = "",
+                  const std::string& pendingLabel = "") {
+        std::lock_guard<std::mutex> l(mtx);
+        sessions[chatId] = UserSession{state, pendingAddress, pendingLabel};
+    }
+
+    void clearSession(const std::string& chatId) {
+        std::lock_guard<std::mutex> l(mtx);
+        sessions.erase(chatId);
+    }
+} g_sessionManager;
+
 // ==================== TELEGRAM ====================
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
-SendResult sendMsg(const std::string& c, const std::string& t) {
-    json j; j["chat_id"]=c; j["text"]=t; j["parse_mode"]="HTML"; j["disable_web_page_preview"]=true;
-    auto r=http("https://api.telegram.org/bot"+TG_TOKEN+"/sendMessage",j.dump());
+
+SendResult sendMsg(const std::string& c, const std::string& t, const std::string& reply_markup = "") {
+    json j;    j["chat_id"] = c;
+    j["text"] = t;
+    j["parse_mode"] = "HTML";
+    j["disable_web_page_preview"] = true;
+    if (!reply_markup.empty()) {
+        try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
+    }
+    auto r = http("https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage", j.dump());
     try {
-        auto p=json::parse(r); if (p.value("ok",false)) return {true,false,0};
-        int code=p.value("error_code",0);
-        if (code==429) { int ra=p.contains("parameters")&&p["parameters"].contains("retry_after")?p["parameters"]["retry_after"].get<int>():30; return {false,false,ra}; }
-        // 403 always means the bot was blocked/removed -> dead user. 400 is a
-        // generic request-error code and is only treated as dead on explicit
-        // signs of a removed/unreachable chat, to avoid mass-unsubscribing live
-        // users because of a bad message string in a single broadcast.
-        std::string desc = toLower(p.value("description",""));
-        bool chatGone = desc.find("chat not found")!=std::string::npos ||
-                         desc.find("bot was blocked")!=std::string::npos ||
-                         desc.find("user is deactivated")!=std::string::npos ||
-                         desc.find("kicked")!=std::string::npos ||
-                         desc.find("chat_id is empty")!=std::string::npos;
-        if (code==403) return {false,true,0};
-        if (code==400 && chatGone) return {false,true,0};
-        if (code==400) { std::cerr << "[TG] 400 (not treated as dead user): " << desc << std::endl; return {false,false,0}; }
-        return {false,false,0};
-    } catch (...) { return {false,false,0}; }
+        auto p = json::parse(r);
+        if (p.value("ok", false)) return {true, false, 0};
+        int code = p.value("error_code", 0);
+        if (code == 429) {
+            int ra = p.contains("parameters") && p["parameters"].contains("retry_after")
+                     ? p["parameters"]["retry_after"].get<int>() : 30;
+            return {false, false, ra};
+        }
+        std::string desc = toLower(p.value("description", ""));
+        bool chatGone = desc.find("chat not found") != std::string::npos ||
+                         desc.find("bot was blocked") != std::string::npos ||
+                         desc.find("user is deactivated") != std::string::npos ||
+                         desc.find("kicked") != std::string::npos ||
+                         desc.find("chat_id is empty") != std::string::npos;
+        if (code == 403) return {false, true, 0};
+        if (code == 400 && chatGone) return {false, true, 0};
+        if (code == 400) { std::cerr << "[TG] 400 (not treated as dead user): " << desc << std::endl; return {false, false, 0}; }
+        return {false, false, 0};
+    } catch (...) { return {false, false, 0}; }
+}
+
+void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "") {
+    json j;
+    j["callback_query_id"] = callbackQueryId;
+    if (!text.empty()) j["text"] = text;
+    http("https://api.telegram.org/bot" + TG_TOKEN + "/answerCallbackQuery", j.dump());
 }
 
 // ==================== SAFE MESSAGE QUEUE ====================
@@ -646,8 +831,7 @@ class SafeMessageQueue {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
             if (sqlite3_step(s)==SQLITE_ROW) queueSize.store(sqlite3_column_int64(s,0)); sqlite3_finalize(s); }
-    }
-    void updateStatus(int64_t id, int st, int rc, time_t nr) {
+    }    void updateStatus(int64_t id, int st, int rc, time_t nr) {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=?")) return;
         sqlite3_bind_int(s,1,st); sqlite3_bind_int(s,2,rc); sqlite3_bind_int64(s,3,nr); sqlite3_bind_int64(s,4,id);
@@ -696,8 +880,7 @@ public:
     void syncSize() {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
-            if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
-                if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
+            if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();                if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
     }
     bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
         if (recipients.empty()) return true;
@@ -746,8 +929,7 @@ std::string getSymbol(const std::string& addr) {
     if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
-}
-uint64_t getPriceNanos(const std::string& token) {
+}uint64_t getPriceNanos(const std::string& token) {
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
     double p=0; auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
@@ -789,9 +971,6 @@ std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
 // ==================== BALANCE-DIFF CROSS-CHECK ====================
-// Only meaningful when the wallet has exactly one relevant tx for this token in
-// this block (whole-block balance delta, not per-tx). Returns nullopt on any
-// RPC failure — callers must treat that as "no cross-check available".
 std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
     if (blockNumber < 0) return std::nullopt;
     std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2);
@@ -799,14 +978,10 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
     auto r = rpc("eth_call", {{{"to",token},{"data","0x70a08231"+walletPadded}}, bs.str()});
     if (!r.is_string()) return std::nullopt;
     const std::string& hex = r.get<std::string>();
-    if (hex.length() < 66) return std::nullopt;
-    return parseUint256(hex);
+    if (hex.length() < 66) return std::nullopt;    return parseUint256(hex);
 }
 
 // ==================== ANALYZE TX ====================
-// Computes net flow (in-out) per token from ALL Transfer logs touching the
-// whale wallet, summed rather than overwritten so multi-hop/multi-log swaps in
-// one tx aren't under-counted or mis-attributed.
 struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; std::string venue; std::string counterAddr; cpp_int counterAmount; };
 
 TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string&) {
@@ -853,7 +1028,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         std::string to = "0x"+toLower(t2.substr(26));
         std::string tk = toLower(addrField);
         if (fr != wa && to != wa) continue;
-
         cpp_int amt = parseUint256(dataField);
         touch(tk);
         anyTransferForWallet = true;
@@ -867,9 +1041,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
 
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
-    // Unrecognized pool: label only the AMM generation inferable from the Swap
-    // event's field layout, never guess a specific DEX brand (many protocols
-    // fork the same ABI).
     if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
         if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
@@ -905,8 +1076,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
 
     if (!bestNonBaseTok.empty()) {
         r.tokenAddr = bestNonBaseTok;
-        r.rawAmount = bestNonBaseAbs;
-        r.isBuy = bestNonBaseNet > 0;
+        r.rawAmount = bestNonBaseAbs;        r.isBuy = bestNonBaseNet > 0;
 
         if (r.isSwap) {
             std::string bestCounterTok; cpp_int bestCounterAbs = -1;
@@ -955,8 +1125,7 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         } else {
             r.tokenAddr = tokenOrder.front();
-            cpp_int net = netFlow[r.tokenAddr];
-            r.rawAmount = net >= 0 ? net : -net;
+            cpp_int net = netFlow[r.tokenAddr];            r.rawAmount = net >= 0 ? net : -net;
             r.isBuy = net > 0;
         }
     }
@@ -1005,8 +1174,7 @@ bool processBlock(long long bn) {
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
     std::map<std::string, int> whaleTxCountInBlock;
-    for (auto& tx : block["transactions"]) {
-        if (!tx.is_object()) continue;
+    for (auto& tx : block["transactions"]) {        if (!tx.is_object()) continue;
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         if (watchers->count(from)) whaleTxCountInBlock[from]++;
@@ -1055,16 +1223,12 @@ bool processBlock(long long bn) {
         if (anySent) {
             markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(byLabel.size());
             std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
-                      << " -> " << byLabel.size() << " label group(s)" << std::endl;
-        } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
+                      << " -> " << byLabel.size() << " label group(s)" << std::endl;        } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
     }
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
 }
 
 // ==================== CLEANUP ====================
-// Retention was tightened (30d/14d -> 3d/2d) and this now runs every 30
-// minutes instead of once a day, to keep whale_bot.db / the WAL file from
-// growing unbounded under sustained tx volume.
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
@@ -1073,6 +1237,267 @@ void cleanupOldAlerts() {
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
         sqlite3_bind_int64(s,1,time(nullptr)-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
+}
+
+// ==================== CALLBACK HANDLERS ====================
+void handleCallbackQuery(const json& callbackQuery) {
+    if (!callbackQuery.contains("data") || !callbackQuery["data"].is_string()) return;
+    if (!callbackQuery.contains("from") || !callbackQuery["from"].contains("id")) return;
+
+    std::string data = callbackQuery["data"].get<std::string>();
+    std::string chatId = std::to_string(callbackQuery["from"]["id"].get<long>());
+    std::string callbackQueryId = callbackQuery.contains("id") ? callbackQuery["id"].get<std::string>() : "";
+
+    if (!callbackQueryId.empty()) {
+        answerCallbackQuery(callbackQueryId);
+    }
+
+    size_t colonPos = data.find(':');
+    std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
+    std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
+
+    // Menu navigation
+    if (action == "menu") {
+        g_sessionManager.clearSession(chatId);
+
+        if (param == "main") {
+            auto msg = TelegramUI::buildMainMenu();
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }
+        else if (param == "add_wallet") {
+            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
+            sendMsg(chatId, "🐋 <b>Add Wallet</b>\n\nPlease enter the wallet address (0x...):",
+                    TelegramUI::buildCancelButton());
+        }
+        else if (param == "my_wallets") {
+            auto msg = TelegramUI::buildWalletsList(chatId);
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }        else if (param == "alert_threshold") {
+            uint64_t threshold = getUserThresholdNanos(chatId);
+            auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }
+        else if (param == "settings") {
+            auto msg = TelegramUI::buildSettingsMenu();
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }
+        else if (param == "help") {
+            auto msg = TelegramUI::buildHelpMessage();
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }
+    }
+    // Cancel
+    else if (action == "cancel") {
+        g_sessionManager.clearSession(chatId);
+        auto msg = TelegramUI::buildMainMenu();
+        sendMsg(chatId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
+    }
+    // Rename wallet
+    else if (action == "rename") {
+        std::string address = toLower(param);
+        if (!isValidAddress(address)) {
+            sendMsg(chatId, "❌ Invalid wallet address.");
+            return;
+        }
+
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s,
+            "SELECT uw.label FROM user_whales uw "
+            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+            "WHERE uw.user_id = ? AND wa.address = ?")) {
+            sendMsg(chatId, "❌ Error loading wallet.");
+            return;
+        }
+        sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            std::string currentLabel = safeColumnText(s, 0);
+            sqlite3_finalize(s);
+
+            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, currentLabel);
+            sendMsg(chatId, "✏️ <b>Rename Wallet</b>\n\nCurrent name: <b>" + safeString(currentLabel, 32) +
+                    "</b>\n\nPlease enter a new name:", TelegramUI::buildCancelButton());
+        } else {
+            sqlite3_finalize(s);
+            sendMsg(chatId, "❌ Wallet not found in your list.");        }
+    }
+    // Remove wallet
+    else if (action == "remove") {
+        std::string address = toLower(param);
+        if (!isValidAddress(address)) {
+            sendMsg(chatId, "❌ Invalid wallet address.");
+            return;
+        }
+
+        bool removed = removeUserWhale(chatId, address);
+        if (removed) {
+            refreshWatchers();
+            auto msg = TelegramUI::buildMainMenu();
+            sendMsg(chatId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
+        } else {
+            sendMsg(chatId, "❌ Wallet not found in your list.");
+        }
+    }
+    // Threshold presets
+    else if (action == "threshold") {
+        if (param == "custom") {
+            g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD);
+            sendMsg(chatId, "💰 <b>Custom Threshold</b>\n\nPlease enter the minimum alert amount in USD (e.g., 7500):",
+                    TelegramUI::buildCancelButton());
+        } else {
+            try {
+                double usd = std::stod(param);
+                if (usd <= 0) {
+                    sendMsg(chatId, "❌ Threshold must be positive.");
+                    return;
+                }
+                setUserThreshold(chatId, usd);
+                refreshWatchers();
+                auto msg = TelegramUI::buildMainMenu();
+                sendMsg(chatId, "✅ Threshold set to <b>$" + std::to_string(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
+            } catch (...) {
+                sendMsg(chatId, "❌ Invalid threshold value.");
+            }
+        }
+    }
+}
+
+// ==================== TEXT INPUT HANDLERS ====================
+bool handleTextInput(const std::string& chatId, const std::string& text) {
+    UserSession session = g_sessionManager.getSession(chatId);
+
+    if (session.state == UserState::IDLE) {
+        return false;
+    }
+    // AWAITING_WALLET_ADDRESS
+    if (session.state == UserState::AWAITING_WALLET_ADDRESS) {
+        std::string address = toLower(trim(text));
+
+        if (!isValidAddress(address)) {
+            sendMsg(chatId, "❌ Invalid BSC address.\n\nPlease enter a valid address or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_NAME, address);
+        sendMsg(chatId, "✅ Address accepted.\n\nNow enter a name for this wallet (e.g., \"Binance\"):",
+                TelegramUI::buildCancelButton());
+        return true;
+    }
+
+    // AWAITING_WALLET_NAME
+    if (session.state == UserState::AWAITING_WALLET_NAME) {
+        std::string label = trim(text);
+
+        if (label.empty()) {
+            sendMsg(chatId, "❌ Name cannot be empty.\n\nPlease enter a name or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        if (label.length() > 32) {
+            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        auto result = addUserWhale(chatId, session.pendingAddress, label);
+
+        if (result == AddWhaleResult::OK) {
+            refreshWatchers();
+            g_sessionManager.clearSession(chatId);
+            auto msg = TelegramUI::buildMainMenu();
+            sendMsg(chatId, "✅ <b>Wallet added</b>\n\nName: <b>" + safeString(label, 32) +
+                    "</b>\nAddress: <code>" + session.pendingAddress + "</code>\n\nTracking enabled.\n\n" + msg.text,
+                    msg.keyboard);
+        }
+        else if (result == AddWhaleResult::ALREADY_EXISTS) {
+            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
+            sendMsg(chatId, "⚠️ You're already tracking this wallet.\n\nPlease enter a different address or press Cancel.",
+                    TelegramUI::buildCancelButton());
+        }
+        else if (result == AddWhaleResult::LIMIT_REACHED) {
+            g_sessionManager.clearSession(chatId);            auto msg = TelegramUI::buildMainMenu();
+            sendMsg(chatId, "⚠️ You've reached the limit of " + std::to_string(MAX_WHALES_PER_USER) +
+                    " tracked wallets.\n\n" + msg.text, msg.keyboard);
+        }
+        else {
+            sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
+        }
+
+        return true;
+    }
+
+    // AWAITING_RENAME
+    if (session.state == UserState::AWAITING_RENAME) {
+        std::string newLabel = trim(text);
+
+        if (newLabel.empty()) {
+            sendMsg(chatId, "❌ Name cannot be empty.\n\nPlease enter a name or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        if (newLabel.length() > 32) {
+            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s,
+                "UPDATE user_whales SET label = ? "
+                "WHERE user_id = ? AND whale_id = (SELECT id FROM whale_addresses WHERE address = ?)")) {
+                sqlite3_bind_text(s, 1, newLabel.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 3, session.pendingAddress.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
+        }
+
+        refreshWatchers();
+        g_sessionManager.clearSession(chatId);
+        auto msg = TelegramUI::buildMainMenu();
+        sendMsg(chatId, "✅ <b>Wallet renamed</b>\n\nNew name: <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
+                msg.keyboard);
+        return true;
+    }
+
+    // AWAITING_CUSTOM_THRESHOLD    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD) {
+        try {
+            double usd = std::stod(text);
+
+            if (usd <= 0) {
+                sendMsg(chatId, "❌ Threshold must be positive.\n\nPlease enter a valid amount or press Cancel.",
+                        TelegramUI::buildCancelButton());
+                return true;
+            }
+
+            if (usd > 1000000000) {
+                sendMsg(chatId, "❌ Threshold is too large.\n\nPlease enter a smaller amount or press Cancel.",
+                        TelegramUI::buildCancelButton());
+                return true;
+            }
+
+            setUserThreshold(chatId, usd);
+            refreshWatchers();
+            g_sessionManager.clearSession(chatId);
+            auto msg = TelegramUI::buildMainMenu();
+            sendMsg(chatId, "✅ Threshold set to <b>$" + std::to_string(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text,
+                    msg.keyboard);
+        } catch (...) {
+            sendMsg(chatId, "❌ Invalid number.\n\nPlease enter a valid amount (e.g., 7500) or press Cancel.",
+                    TelegramUI::buildCancelButton());
+        }
+        return true;
+    }
+
+    return false;
 }
 
 // ==================== TELEGRAM LOOP ====================
@@ -1086,86 +1511,127 @@ void telegramLoop() {
             int ub=0;
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
+
+                // === CALLBACK QUERY ===
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
+                    handleCallbackQuery(u["callback_query"]);
+                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
                 if (!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
-                if (txt=="/start") {
-                    if (countUsers()>=MAX_USERS) { sendMsg(cid,"⚠️ User limit reached. Please try again later."); }
-                    else { ensureUser(cid); sendMsg(cid,"✅ Welcome! Use /add 0x... Name to start tracking a wallet, /limit to set your alert threshold, and /help for the full command list."); }
-                }
-                else if (txt=="/health") {
-                    size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
-                    int diskFree = getDiskFreePercent();
-                    time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
-                    bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
-                    std::stringstream ss2; ss2 << "✅ <b>OK</b>\n\n"
-                        << "Block: <code>" << getLastBlock() << "</code>\n"
-                        << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
-                        << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
-                        << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
-                        << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
-                    if (diskFree >= 0) {
-                        ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
-                        if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
-                    } else {
-                        ss2 << "Disk: <b>unknown</b>\n";
-                    }
-                    ss2 << "Uptime: <b>" << getUptime() << "</b>";
-                    sendMsg(cid,ss2.str()); }
-                else if (txt=="/stats") {
-                    size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
-                    { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
-                    std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
-                        << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
-                    if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
-                    sendMsg(cid,ss2.str()); }
-                else if (txt=="/help") { sendMsg(cid,
-                    "/start — register\n"
-                    "/add 0x... Name — track a wallet under your own label\n"
-                    "/remove 0x... — stop tracking a wallet\n"
-                    "/list — your tracked wallets and threshold\n"
-                    "/limit 5000 — set your minimum alert amount in USD\n"
-                    "/language en — set your language preference\n"
-                    "/health — system health\n"
-                    "/stats — system stats\n"
-                    "/help — this message"); }
-                else if (txt.find("/add ")==0) {
-                    size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
-                    if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,"❌ Usage: /add 0x... Name"); }
-                    else {
-                        std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
-                        std::string label=trim(txt.substr(p2+1));
-                        if (label.empty()) label=addr;
-                        auto res=addUserWhale(cid,addr,label);
-                        switch (res) {
-                            case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,"✅ Wallet added: "+safeString(label)); break;
-                            case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,"⚠️ You're already tracking this wallet"); break;
-                            case AddWhaleResult::LIMIT_REACHED: sendMsg(cid,"⚠️ You've reached the limit of "+std::to_string(MAX_WHALES_PER_USER)+" tracked wallets"); break;
-                            case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,"❌ That doesn't look like a valid address (expected 0x + 40 hex characters)"); break;
-                            case AddWhaleResult::ERROR: sendMsg(cid,"❌ Something went wrong, please try again"); break;
+
+                // === COMMANDS (priority over state machine) ===
+                // Commands always start with '/', and must interrupt any active input session.
+                if (!txt.empty() && txt[0] == '/') {
+                    g_sessionManager.clearSession(cid);
+
+                    if (txt=="/start") {
+                        bool isNewUser = false;
+                        {
+                            std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+                            if (prepareOrLog(db, &s, "SELECT 1 FROM users WHERE chat_id = ?")) {
+                                sqlite3_bind_text(s, 1, cid.c_str(), -1, SQLITE_TRANSIENT);
+                                isNewUser = (sqlite3_step(s) != SQLITE_ROW);
+                                sqlite3_finalize(s);
+                            }
+                        }
+
+                        if (countUsers() >= MAX_USERS && isNewUser) {
+                            sendMsg(cid, "⚠️ User limit reached. Please try again later.");
+                        } else {
+                            ensureUser(cid);
+                            if (isNewUser) {
+                                auto msg = TelegramUI::buildWelcomeMessage();
+                                sendMsg(cid, msg.text, msg.keyboard);
+                            } else {
+                                auto msg = TelegramUI::buildMainMenu();
+                                sendMsg(cid, msg.text, msg.keyboard);
+                            }
                         }
                     }
+                    else if (txt=="/health") {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
+                            int diskFree = getDiskFreePercent();
+                            time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
+                            bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
+                            std::stringstream ss2; ss2 << "✅ <b>OK</b>\n\n"
+                                << "Block: <code>" << getLastBlock() << "</code>\n"
+                                << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
+                                << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
+                                << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
+                                << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
+                            if (diskFree >= 0) {
+                                ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
+                                if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";                            } else {
+                                ss2 << "Disk: <b>unknown</b>\n";
+                            }
+                            ss2 << "Uptime: <b>" << getUptime() << "</b>";
+                            sendMsg(cid,ss2.str());
+                        }
+                    }
+                    else if (txt=="/stats") {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
+                            { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
+                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
+                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
+                            if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
+                            sendMsg(cid,ss2.str());
+                        }
+                    }
+                    else if (txt=="/help") {
+                        auto msg = TelegramUI::buildHelpMessage();
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
+                    else if (txt.find("/add ")==0) {
+                        size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
+                        if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,"❌ Usage: /add 0x... Name"); }
+                        else {
+                            std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
+                            std::string label=trim(txt.substr(p2+1));
+                            if (label.empty()) label=addr;
+                            auto res=addUserWhale(cid,addr,label);
+                            switch (res) {
+                                case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,"✅ Wallet added: "+safeString(label)); break;
+                                case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,"⚠️ You're already tracking this wallet"); break;
+                                case AddWhaleResult::LIMIT_REACHED: sendMsg(cid,"⚠️ You've reached the limit of "+std::to_string(MAX_WHALES_PER_USER)+" tracked wallets"); break;
+                                case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,"❌ That doesn't look like a valid address (expected 0x + 40 hex characters)"); break;
+                                case AddWhaleResult::ERROR: sendMsg(cid,"❌ Something went wrong, please try again"); break;
+                            }
+                        }
+                    }
+                    else if (txt.find("/remove ")==0) {
+                        std::string a=toLower(trim(txt.substr(8)));
+                        bool removed=removeUserWhale(cid,a);
+                        if (removed) { refreshWatchers(); sendMsg(cid,"✅ Wallet removed"); }
+                        else sendMsg(cid,"⚠️ Address not found in your list. Check /list");
+                    }
+                    else if (txt.find("/limit ")==0) {
+                        try { double v=std::stod(txt.substr(7));
+                            if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
+                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+std::to_string(static_cast<uint64_t>(v))); }                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
+                    }
+                    else if (txt.find("/language")==0) {
+                        std::string rest = trim(txt.substr(9));
+                        if (rest.empty()) { sendMsg(cid,"❌ Usage: /language en"); }
+                        else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
+                    }
+                    else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
+                    else {
+                        // Unknown command — ignore silently
+                    }
                 }
-                else if (txt.find("/remove ")==0) {
-                    std::string a=toLower(trim(txt.substr(8)));
-                    bool removed=removeUserWhale(cid,a);
-                    if (removed) { refreshWatchers(); sendMsg(cid,"✅ Wallet removed"); }
-                    else sendMsg(cid,"⚠️ Address not found in your list. Check /list");
+                // === STATE MACHINE (only for non-command text) ===
+                else if (handleTextInput(cid, txt)) {
+                    // Handled by state machine
                 }
-                else if (txt.find("/limit ")==0) {
-                    try { double v=std::stod(txt.substr(7));
-                        if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
-                        else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+std::to_string(static_cast<uint64_t>(v))); }
-                    } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
-                }
-                else if (txt.find("/language")==0) {
-                    std::string rest = trim(txt.substr(9));
-                    if (rest.empty()) { sendMsg(cid,"❌ Usage: /language en"); }
-                    else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
-                }
-                else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
+
                 offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
             }
             if (ub>0) saveTgOffset(offset);
@@ -1198,15 +1664,10 @@ int main() {
                     lb = getLastBlock();
                     break;
                 }
-                lb = next; saveLastBlock(lb);
-                // Checkpoint/cleanup cadence tightened from 1000 blocks / 30 min to
-                // 200 blocks / 5 min so the WAL file doesn't grow unbounded under
-                // sustained tx volume.
-                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
+                lb = next; saveLastBlock(lb);                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            // cleanupOldAlerts now runs every 30 minutes instead of daily.
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
