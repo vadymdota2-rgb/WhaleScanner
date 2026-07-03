@@ -88,10 +88,19 @@ std::string escapeHtml(const std::string& s) {
     return r;
 }
 
+// Truncates on a UTF-8 codepoint boundary *before* escaping, so we never cut
+// a multi-byte character or an HTML entity in half (which broke Telegram's
+// HTML parser and could make sendMessage fail with a 400).
+std::string truncateUtf8(const std::string& s, size_t maxLen) {
+    if (s.size() <= maxLen) return s;
+    size_t end = maxLen;
+    // walk back while we're in the middle of a multi-byte UTF-8 sequence
+    while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) end--;
+    return s.substr(0, end);
+}
+
 std::string safeString(const std::string& s, size_t maxLen = 64) {
-    std::string e = escapeHtml(s);
-    if (e.size() > maxLen) e.resize(maxLen);
-    return e;
+    return escapeHtml(truncateUtf8(s, maxLen));
 }
 
 void logCritical(const std::string& msg) {
@@ -144,6 +153,20 @@ bool isValidAddress(const std::string& a) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
     }
     return true;
+}
+
+// Formats an integer with thousands separators, e.g. 1234567 -> "1,234,567"
+std::string formatThousands(uint64_t v) {
+    std::string s = std::to_string(v);
+    std::string out;
+    int cnt = 0;
+    for (auto it = s.rbegin(); it != s.rend(); ++it) {
+        if (cnt != 0 && cnt % 3 == 0) out.push_back(',');
+        out.push_back(*it);
+        cnt++;
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
 }
 // ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
@@ -552,7 +575,7 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
 std::string buildUserListText(const std::string& chatId) {
     double thr = nanosToUsd(getUserThresholdNanos(chatId));
     std::stringstream out;
-    out << "💰 Your alert threshold: $" << std::fixed << std::setprecision(2) << thr << "\n\n";
+    out << "💰 Your alert threshold: $" << formatThousands(static_cast<uint64_t>(thr)) << "\n\n";
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     bool any=false;
     if (prepareOrLog(db,&s,"SELECT wa.address, uw.label FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? ORDER BY uw.created_at")) {
@@ -599,28 +622,40 @@ struct UIMessage {
     std::string keyboard;
 };
 
-UIMessage buildMainMenu() {
+UIMessage buildMainMenu(const std::string& chatId) {
+    size_t walletCount = countUserWhales(chatId);
+    double thresholdUsd = nanosToUsd(getUserThresholdNanos(chatId));
+
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "🐋 Add Wallet"}, {"callback_data", "menu:add_wallet"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "👛 My Wallets"}, {"callback_data", "menu:my_wallets"}}
+        {{"text", "👛 My Wallets (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:my_wallets"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "💰 Alert Threshold"}, {"callback_data", "menu:alert_threshold"}}
+        {{"text", "💰 Alert Threshold ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "⚙️ Settings"}, {"callback_data", "menu:settings"}}
     }));
-    return {"🐋 <b>Wallet Tracker</b>\n\nChoose an option:", keyboard.dump()};
+
+    std::stringstream text;
+    text << "🐋 <b>Wallet Tracker</b>\n\n";
+    if (walletCount == 0) {
+        text << "You're not tracking any wallets yet.\nTap <b>Add Wallet</b> to start getting alerts.";
+    } else {
+        text << "Tracking <b>" << walletCount << "</b> wallet" << (walletCount == 1 ? "" : "s")
+             << ", alerts above <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
+    }
+    return {text.str(), keyboard.dump()};
 }
 
-UIMessage buildWelcomeMessage() {
-    auto m = buildMainMenu();
+UIMessage buildWelcomeMessage(const std::string& chatId) {
+    auto m = buildMainMenu(chatId);
     m.text = "🐋 <b>Welcome to Wallet Tracker!</b>\n\n"
-             "Monitor whale wallets on BNB Smart Chain and get instant notifications.\n\n"
+             "Monitor whale wallets on BNB Smart Chain and get instant notifications for buys, sells and transfers.\n\n"
              "Tap a button below to get started:";
     return m;
 }
@@ -663,7 +698,7 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
         json row;
         row.push_back({{"text", "✏️ Rename"}, {"callback_data", "rename:" + address}});
-        row.push_back({{"text", "🗑️ Remove"}, {"callback_data", "remove:" + address}});
+        row.push_back({{"text", "🗑️ Remove"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
     }
     sqlite3_finalize(s);
@@ -680,11 +715,31 @@ UIMessage buildWalletsList(const std::string& chatId) {
     return {text.str(), keyboard.dump()};
 }
 
+// Confirmation step shown before actually deleting a wallet, to guard
+// against accidental taps on "Remove".
+UIMessage buildRemoveConfirm(const std::string& address, const std::string& label) {
+    std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
+    std::stringstream text;
+    text << "🗑️ <b>Remove wallet?</b>\n\n";
+    text << "<b>" << safeString(label, 32) << "</b>\n<code>" << shortAddr << "</code>\n\n";
+    text << "You'll stop receiving alerts for this wallet.";
+
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🗑️ Yes, remove"}, {"callback_data", "remove:" + address}},
+        {{"text", "❌ Cancel"}, {"callback_data", "menu:my_wallets"}}
+    }));
+    return {text.str(), keyboard.dump()};
+}
+
 UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
     double currentUsd = nanosToUsd(currentThresholdNanos);
 
     std::stringstream text;
-    text << "💰 <b>Alert Threshold</b>\n\n";    text << "Current threshold: <b>$" << std::fixed << std::setprecision(0) << currentUsd << "</b>\n\n";
+    text << "💰 <b>Alert Threshold</b>\n\n";
+    text << "You'll only be alerted for transactions at or above this amount.\n\n";
+    text << "Current threshold: <b>$" << formatThousands(static_cast<uint64_t>(currentUsd)) << "</b>\n\n";
     text << "Choose a preset or enter a custom amount:";
 
     json keyboard;
@@ -699,7 +754,7 @@ UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
         {{"text", "$50K"}, {"callback_data", "threshold:50000"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "Custom"}, {"callback_data", "threshold:custom"}}
+        {{"text", "✏️ Custom amount"}, {"callback_data", "threshold:custom"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
@@ -708,7 +763,13 @@ UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
     return {text.str(), keyboard.dump()};
 }
 
-UIMessage buildSettingsMenu() {
+UIMessage buildSettingsMenu(const std::string& chatId) {
+    size_t walletCount = countUserWhales(chatId);
+    std::stringstream text;
+    text << "⚙️ <b>Settings</b>\n\n";
+    text << "Wallets tracked: <b>" << walletCount << "</b> / " << MAX_WHALES_PER_USER << "\n\n";
+    text << "Choose an option:";
+
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
@@ -717,7 +778,7 @@ UIMessage buildSettingsMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
-    return {"⚙️ <b>Settings</b>\n\nChoose an option:", keyboard.dump()};
+    return {text.str(), keyboard.dump()};
 }
 
 UIMessage buildHelpMessage() {
@@ -731,9 +792,15 @@ UIMessage buildHelpMessage() {
     text += "🐋 <b>Wallet Tracker</b> monitors whale wallets on BNB Smart Chain and sends instant notifications.\n\n";
     text += "<b>Features:</b>\n";
     text += "• Track any wallet address\n";
-    text += "• Set minimum alert threshold\n";
+    text += "• Set a minimum alert threshold\n";
     text += "• Instant notifications for swaps and transfers\n";
-    text += "• BNB Smart Chain network\n\n";    text += "Tap a button in the main menu to get started.";
+    text += "• BNB Smart Chain network\n\n";
+    text += "<b>Commands:</b>\n";
+    text += "/add 0x... Name — track a wallet\n";
+    text += "/remove 0x... — stop tracking a wallet\n";
+    text += "/list — show your tracked wallets\n";
+    text += "/limit 5000 — set alert threshold in USD\n\n";
+    text += "Or just tap a button in the main menu.";
 
     return {text, keyboard.dump()};
 }
@@ -812,11 +879,24 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     } catch (...) { return {false, false, 0}; }
 }
 
-void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "") {
+void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "", bool showAlert = false) {
     json j;
     j["callback_query_id"] = callbackQueryId;
     if (!text.empty()) j["text"] = text;
+    if (showAlert) j["show_alert"] = true;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/answerCallbackQuery", j.dump());
+}
+
+void setupBotCommands() {
+    json cmds = json::array();
+    cmds.push_back({{"command","start"},{"description","Open the main menu"}});
+    cmds.push_back({{"command","add"},{"description","Track a wallet: /add 0x... Name"}});
+    cmds.push_back({{"command","remove"},{"description","Stop tracking a wallet"}});
+    cmds.push_back({{"command","list"},{"description","Show your tracked wallets"}});
+    cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
+    cmds.push_back({{"command","help"},{"description","How this bot works"}});
+    json j; j["commands"] = cmds;
+    http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
 // ==================== SAFE MESSAGE QUEUE ====================
@@ -929,7 +1009,8 @@ std::string getSymbol(const std::string& addr) {
     if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
-}uint64_t getPriceNanos(const std::string& token) {
+}
+uint64_t getPriceNanos(const std::string& token) {
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
     double p=0; auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
@@ -1045,7 +1126,6 @@ TxResult analyzeTx(const json& receipt, const std::string& wa, const std::string
         if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
     }
-    if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
 
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
@@ -1173,14 +1253,6 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
-    std::map<std::string, int> whaleTxCountInBlock;
-    for (auto& tx : block["transactions"]) {        if (!tx.is_object()) continue;
-        std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
-        std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
-        if (watchers->count(from)) whaleTxCountInBlock[from]++;
-        else if (watchers->count(to)) whaleTxCountInBlock[to]++;
-    }
-
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -1261,7 +1333,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         g_sessionManager.clearSession(chatId);
 
         if (param == "main") {
-            auto msg = TelegramUI::buildMainMenu();
+            auto msg = TelegramUI::buildMainMenu(chatId);
             sendMsg(chatId, msg.text, msg.keyboard);
         }
         else if (param == "add_wallet") {
@@ -1272,13 +1344,14 @@ void handleCallbackQuery(const json& callbackQuery) {
         else if (param == "my_wallets") {
             auto msg = TelegramUI::buildWalletsList(chatId);
             sendMsg(chatId, msg.text, msg.keyboard);
-        }        else if (param == "alert_threshold") {
+        }
+        else if (param == "alert_threshold") {
             uint64_t threshold = getUserThresholdNanos(chatId);
             auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
             sendMsg(chatId, msg.text, msg.keyboard);
         }
         else if (param == "settings") {
-            auto msg = TelegramUI::buildSettingsMenu();
+            auto msg = TelegramUI::buildSettingsMenu(chatId);
             sendMsg(chatId, msg.text, msg.keyboard);
         }
         else if (param == "help") {
@@ -1289,7 +1362,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     // Cancel
     else if (action == "cancel") {
         g_sessionManager.clearSession(chatId);
-        auto msg = TelegramUI::buildMainMenu();
+        auto msg = TelegramUI::buildMainMenu(chatId);
         sendMsg(chatId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
     }
     // Rename wallet
@@ -1323,7 +1396,31 @@ void handleCallbackQuery(const json& callbackQuery) {
             sqlite3_finalize(s);
             sendMsg(chatId, "❌ Wallet not found in your list.");        }
     }
-    // Remove wallet
+    // Ask for confirmation before removing a wallet (guards against fat-finger taps)
+    else if (action == "askremove") {
+        std::string address = toLower(param);
+        if (!isValidAddress(address)) {
+            sendMsg(chatId, "❌ Invalid wallet address.");
+            return;
+        }
+        std::string label = address;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s,
+                "SELECT uw.label FROM user_whales uw "
+                "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+                "WHERE uw.user_id = ? AND wa.address = ?")) {
+                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) label = safeColumnText(s, 0);
+                sqlite3_finalize(s);
+            }
+        }
+        auto msg = TelegramUI::buildRemoveConfirm(address, label);
+        sendMsg(chatId, msg.text, msg.keyboard);
+    }
+    // Remove wallet (after confirmation)
     else if (action == "remove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
@@ -1334,7 +1431,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         bool removed = removeUserWhale(chatId, address);
         if (removed) {
             refreshWatchers();
-            auto msg = TelegramUI::buildMainMenu();
+            auto msg = TelegramUI::buildMainMenu(chatId);
             sendMsg(chatId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
         } else {
             sendMsg(chatId, "❌ Wallet not found in your list.");
@@ -1355,8 +1452,8 @@ void handleCallbackQuery(const json& callbackQuery) {
                 }
                 setUserThreshold(chatId, usd);
                 refreshWatchers();
-                auto msg = TelegramUI::buildMainMenu();
-                sendMsg(chatId, "✅ Threshold set to <b>$" + std::to_string(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
+                auto msg = TelegramUI::buildMainMenu(chatId);
+                sendMsg(chatId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
             } catch (...) {
                 sendMsg(chatId, "❌ Invalid threshold value.");
             }
@@ -1408,7 +1505,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         if (result == AddWhaleResult::OK) {
             refreshWatchers();
             g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu();
+            auto msg = TelegramUI::buildMainMenu(chatId);
             sendMsg(chatId, "✅ <b>Wallet added</b>\n\nName: <b>" + safeString(label, 32) +
                     "</b>\nAddress: <code>" + session.pendingAddress + "</code>\n\nTracking enabled.\n\n" + msg.text,
                     msg.keyboard);
@@ -1419,7 +1516,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
                     TelegramUI::buildCancelButton());
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
-            g_sessionManager.clearSession(chatId);            auto msg = TelegramUI::buildMainMenu();
+            g_sessionManager.clearSession(chatId);            auto msg = TelegramUI::buildMainMenu(chatId);
             sendMsg(chatId, "⚠️ You've reached the limit of " + std::to_string(MAX_WHALES_PER_USER) +
                     " tracked wallets.\n\n" + msg.text, msg.keyboard);
         }
@@ -1462,13 +1559,14 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
         refreshWatchers();
         g_sessionManager.clearSession(chatId);
-        auto msg = TelegramUI::buildMainMenu();
+        auto msg = TelegramUI::buildMainMenu(chatId);
         sendMsg(chatId, "✅ <b>Wallet renamed</b>\n\nNew name: <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
                 msg.keyboard);
         return true;
     }
 
-    // AWAITING_CUSTOM_THRESHOLD    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD) {
+    // AWAITING_CUSTOM_THRESHOLD
+    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD) {
         try {
             double usd = std::stod(text);
 
@@ -1487,14 +1585,16 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
             setUserThreshold(chatId, usd);
             refreshWatchers();
             g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu();
-            sendMsg(chatId, "✅ Threshold set to <b>$" + std::to_string(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text,
+            auto msg = TelegramUI::buildMainMenu(chatId);
+            sendMsg(chatId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text,
                     msg.keyboard);
         } catch (...) {
             sendMsg(chatId, "❌ Invalid number.\n\nPlease enter a valid amount (e.g., 7500) or press Cancel.",
                     TelegramUI::buildCancelButton());
         }
         return true;
+    }
+
     return false;
 }
 
@@ -1540,10 +1640,10 @@ void telegramLoop() {
                         } else {
                             ensureUser(cid);
                             if (isNewUser) {
-                                auto msg = TelegramUI::buildWelcomeMessage();
+                                auto msg = TelegramUI::buildWelcomeMessage(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
                             } else {
-                                auto msg = TelegramUI::buildMainMenu();
+                                auto msg = TelegramUI::buildMainMenu(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
                             }
                         }
@@ -1613,7 +1713,7 @@ void telegramLoop() {
                     else if (txt.find("/limit ")==0) {
                         try { double v=std::stod(txt.substr(7));
                             if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
-                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+std::to_string(static_cast<uint64_t>(v))); }                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
+                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+formatThousands(static_cast<uint64_t>(v))); }                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
                     }
                     else if (txt.find("/language")==0) {
                         std::string rest = trim(txt.substr(9));
@@ -1622,12 +1722,20 @@ void telegramLoop() {
                     }
                     else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
                     else {
-                        // Unknown command — ignore silently
+                        sendMsg(cid, "🤔 Unknown command. Try /help or use the menu below.");
+                        auto msg = TelegramUI::buildMainMenu(cid);
+                        sendMsg(cid, msg.text, msg.keyboard);
                     }
                 }
                 // === STATE MACHINE (only for non-command text) ===
                 else if (handleTextInput(cid, txt)) {
                     // Handled by state machine
+                }
+                else {
+                    // Idle user sent plain text with no active flow — nudge them to the menu
+                    // instead of silently dropping the message.
+                    auto msg = TelegramUI::buildMainMenu(cid);
+                    sendMsg(cid, msg.text, msg.keyboard);
                 }
 
                 offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
@@ -1644,6 +1752,7 @@ int main() {
     initDB(); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
+    setupBotCommands();
     size_t initialWatcherAddrs;
     { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
     long long lb=getLastBlock(); if (lb==0) { auto b=rpc("eth_blockNumber",{}); long long tmp; if (b.is_string()&&hexToLL(b.get<std::string>(),tmp)) lb=tmp; }
