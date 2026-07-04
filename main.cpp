@@ -196,10 +196,10 @@ std::atomic<size_t> rpcIndex{0};
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 1000;
-constexpr time_t PRICE_TTL = 300;
+constexpr time_t PRICE_TTL = 600;
 constexpr size_t MAX_USERS = 1000000;
 constexpr size_t MAX_WHALES_PER_USER = 50;
-constexpr size_t MAX_QUEUE_SIZE = 5000;
+constexpr size_t MAX_QUEUE_SIZE = 50000;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 10000ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
