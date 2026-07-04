@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
+#include "ranking.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -644,6 +645,9 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", "💰 Alert Threshold ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🏆 Top Traders"}, {"callback_data", "menu:toptrader"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "⚙️ Settings"}, {"callback_data", "menu:settings"}}
     }));
 
@@ -805,7 +809,8 @@ UIMessage buildHelpMessage() {
     text += "/add 0x... Name — track a wallet\n";
     text += "/remove 0x... — stop tracking a wallet\n";
     text += "/list — show your tracked wallets\n";
-    text += "/limit 5000 — set alert threshold in USD\n\n";
+    text += "/limit 5000 — set alert threshold in USD\n";
+    text += "/toptrader CAKE — top net traders for a token\n\n";
     text += "Or just tap a button in the main menu.";
 
     return {text, keyboard.dump()};
@@ -819,7 +824,8 @@ enum class UserState {
     AWAITING_WALLET_ADDRESS,
     AWAITING_WALLET_NAME,
     AWAITING_RENAME,
-    AWAITING_CUSTOM_THRESHOLD
+    AWAITING_CUSTOM_THRESHOLD,
+    AWAITING_TOPTRADER_TOKEN
 };
 
 struct UserSession {
@@ -900,6 +906,7 @@ void setupBotCommands() {
     cmds.push_back({{"command","remove"},{"description","Stop tracking a wallet"}});
     cmds.push_back({{"command","list"},{"description","Show your tracked wallets"}});
     cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
+    cmds.push_back({{"command","toptrader"},{"description","Top traders for a token: /toptrader TOKEN"}});
     cmds.push_back({{"command","help"},{"description","How this bot works"}});
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
@@ -1082,8 +1089,6 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
 }
 
 // ==================== ANALYZE TX ====================
-struct TxResult { bool valid,isSwap,isBuy; cpp_int rawAmount,usdNanos; std::string tokenAddr; std::string venue; std::string counterAddr; cpp_int counterAmount; };
-
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
@@ -1350,6 +1355,7 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        saveTrade(mA, res, hash, bn);
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
@@ -1430,6 +1436,18 @@ void handleCallbackQuery(const json& callbackQuery) {
             uint64_t threshold = getUserThresholdNanos(chatId);
             auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
             sendMsg(chatId, msg.text, msg.keyboard);
+        }
+        else if (param == "toptrader") {
+            g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
+            sendMsg(chatId,
+                "🏆 <b>Top Traders</b>\n\n"
+                "Enter token symbol or contract address.\n\n"
+                "Examples:\n\n"
+                "CAKE\n"
+                "FLOKI\n"
+                "USDT\n"
+                "0x...",
+                TelegramUI::buildCancelButton());
         }
         else if (param == "settings") {
             auto msg = TelegramUI::buildSettingsMenu(chatId);
@@ -1676,6 +1694,22 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         return true;
     }
 
+    // AWAITING_TOPTRADER_TOKEN
+    if (session.state == UserState::AWAITING_TOPTRADER_TOKEN) {
+        std::string tokenArg = trim(text);
+
+        if (tokenArg.empty()) {
+            sendMsg(chatId, "❌ Please enter a token symbol or contract address, or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        std::string result = buildTopNet(tokenArg);
+        g_sessionManager.clearSession(chatId);
+        sendMsg(chatId, result);
+        return true;
+    }
+
     return false;
 }
 
@@ -1802,6 +1836,11 @@ void telegramLoop() {
                         else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
                     }
                     else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
+                    else if (txt.find("/toptrader ")==0) {
+                        std::string arg = trim(txt.substr(11));
+                        if (arg.empty()) sendMsg(cid, "❌ Usage: /toptrader TOKEN (symbol or contract address)");
+                        else sendMsg(cid, buildTopNet(arg));
+                    }
                     else {
                         sendMsg(cid, "🤔 Unknown command. Try /help or use the menu below.");
                         auto msg = TelegramUI::buildMainMenu(cid);
@@ -1830,7 +1869,7 @@ void telegramLoop() {
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
-    initDB(); loadTokenCache();
+    initDB(); initRankingDB(); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     setupBotCommands();
