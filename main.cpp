@@ -512,7 +512,11 @@ enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, ERRO
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
-    if (countUserWhales(chatId) >= MAX_WHALES_PER_USER) return AddWhaleResult::LIMIT_REACHED;
+    if (chatId != SERVICE_CHAT_ID &&
+    countUserWhales(chatId) >= MAX_WHALES_PER_USER)
+{
+    return AddWhaleResult::LIMIT_REACHED;
+}
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
