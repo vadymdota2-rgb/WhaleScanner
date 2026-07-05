@@ -29,10 +29,35 @@ std::string safeString(const std::string& s, size_t maxLen);
 
 namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL;   // 30-day rolling window
-constexpr int MIN_COMPLETED_TRADES = 5;
-constexpr int MAX_RANKED_WALLETS = 20;
+constexpr int MIN_COMPLETED_TRADES = 5;                // per-token ranking entry threshold
+constexpr int MAX_RANKED_WALLETS = 20;                 // per-token ranking size
+constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;         // global ranking entry threshold
+constexpr int MAX_GLOBAL_RANKED = 100;                 // global ranking size (Top 100)
+// Wallets with more than this many completed trades in the 30-day window
+// are almost certainly trading bots rather than human "traders" — excluded
+// from every ranking (per-token and global alike) so they don't crowd out
+// real traders at the top of the leaderboard.
+constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
 constexpr time_t CACHE_TTL_SECONDS = 15 * 60;          // how long a computed ranking stays pageable
+}
+
+bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out) {
+    if (s == "pnl") { out = GlobalRankKind::PNL; return true; }
+    if (s == "roi") { out = GlobalRankKind::ROI; return true; }
+    if (s == "winrate") { out = GlobalRankKind::WIN_RATE; return true; }
+    if (s == "active") { out = GlobalRankKind::ACTIVE; return true; }
+    return false;
+}
+
+std::string globalRankKindToString(GlobalRankKind k) {
+    switch (k) {
+        case GlobalRankKind::PNL: return "pnl";
+        case GlobalRankKind::ROI: return "roi";
+        case GlobalRankKind::WIN_RATE: return "winrate";
+        case GlobalRankKind::ACTIVE: return "active";
+    }
+    return "pnl";
 }
 
 // ==================== SCHEMA ====================
@@ -121,6 +146,21 @@ std::string rankLabel(int rank) {
     }
 }
 
+// Used only by the global (cross-token) ranking cards, whose spec'd layout
+// shows a shortened address rather than the full one (unlike the per-token
+// Top PnL ranking, which always shows the full address).
+std::string shortAddr(const std::string& a) {
+    if (a.size() < 10) return a;
+    return a.substr(0, 6) + "..." + a.substr(a.size() - 4);
+}
+
+// Percentage without a forced leading "+" (e.g. "148%" / "-32%"), used for
+// ROI in the global ranking cards, per that feature's spec'd format.
+std::string formatPercentPlain(double pct) {
+    long long rounded = static_cast<long long>(pct >= 0 ? pct + 0.5 : pct - 0.5);
+    return (rounded < 0 ? "-" : "") + std::to_string(rounded < 0 ? -rounded : rounded) + "%";
+}
+
 // ==================== PNL MODEL ====================
 struct PnlRow {
     std::string wallet;
@@ -155,7 +195,8 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
     int winningTrades = 0;
 
     auto flush = [&]() {
-        if (!curWallet.empty() && completedTrades >= MIN_COMPLETED_TRADES) {
+        if (!curWallet.empty() && completedTrades >= MIN_COMPLETED_TRADES &&
+            completedTrades <= MAX_BOT_FILTER_TRADES) {
             PnlRow row;
             row.wallet = curWallet;
             row.pnlNanos = cppIntToClampedI64(realizedPnl);
@@ -279,6 +320,200 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
     return {text.str(), keyboard.dump()};
 }
 
+// ==================== GLOBAL (CROSS-TOKEN) TOP-100 RANKINGS ====================
+// Same Average Cost Basis model as computeTopPnl(), but the position (held
+// quantity / cost basis) is tracked per (wallet, token) while PnL, buy
+// volume, completed-trade and win counts are accumulated per *wallet*
+// across every token it traded — one pass over the whole `trades` table,
+// ordered by wallet then token then time.
+struct GlobalRankings {
+    std::vector<PnlRow> byPnl;
+    std::vector<PnlRow> byRoi;
+    std::vector<PnlRow> byWinRate;
+    std::vector<PnlRow> byActive;
+};
+
+std::vector<PnlRow> computeGlobalTop30D() {
+    std::vector<PnlRow> results;
+    long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
+
+    std::string curWallet, curToken;
+    cpp_int heldQty = 0, heldCost = 0;             // per (wallet, token) position
+    cpp_int outerPnl = 0, outerBuyVol = 0;         // per wallet, across all its tokens
+    int outerCompleted = 0, outerWinning = 0;
+
+    auto flush = [&]() {
+        if (!curWallet.empty() && outerCompleted >= MIN_GLOBAL_COMPLETED_TRADES &&
+            outerCompleted <= MAX_BOT_FILTER_TRADES) {
+            PnlRow row;
+            row.wallet = curWallet;
+            row.pnlNanos = cppIntToClampedI64(outerPnl);
+            double volD = outerBuyVol > 0 ? outerBuyVol.convert_to<double>() : 0.0;
+            double pnlD = outerPnl.convert_to<double>();
+            // Global ROI is defined against total buy volume (not just the
+            // cost basis consumed by completed sells) per this feature's spec.
+            row.roiPercent = volD > 0.0 ? (100.0 * pnlD / volD) : 0.0;
+            row.winRatePercent = outerCompleted > 0
+                ? static_cast<int>(100.0 * outerWinning / outerCompleted + 0.5)
+                : 0;
+            row.completedTrades = outerCompleted;
+            results.push_back(row);
+        }
+    };
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT wallet, token, is_buy, usd_nanos, token_amount FROM trades "
+        "WHERE timestamp>=? ORDER BY wallet ASC, token ASC, timestamp ASC")) return results;
+    sqlite3_bind_int64(s, 1, since);
+
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        std::string wallet = safeColumnText(s, 0);
+        std::string token = safeColumnText(s, 1);
+        bool isBuy = sqlite3_column_int(s, 2) != 0;
+        int64_t usdNanos = sqlite3_column_int64(s, 3);
+        std::string amountStr = safeColumnText(s, 4);
+        cpp_int amount = amountStr.empty() ? cpp_int(0) : cpp_int(amountStr);
+
+        if (wallet != curWallet) {
+            flush();
+            curWallet = wallet;
+            curToken.clear();
+            outerPnl = 0; outerBuyVol = 0; outerCompleted = 0; outerWinning = 0;
+        }
+        if (token != curToken) {
+            curToken = token;
+            heldQty = 0; heldCost = 0;
+        }
+
+        if (isBuy) {
+            heldQty += amount;
+            heldCost += cpp_int(usdNanos);
+            outerBuyVol += cpp_int(usdNanos);
+        } else if (heldQty > 0 && amount > 0) {
+            cpp_int matchedQty = amount < heldQty ? amount : heldQty;
+            cpp_int costOfMatched = (heldCost * matchedQty) / heldQty;
+            cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
+
+            outerPnl += (proceedsMatched - costOfMatched);
+            outerCompleted++;
+            if (proceedsMatched > costOfMatched) outerWinning++;
+
+            heldQty -= matchedQty;
+            heldCost -= costOfMatched;
+        }
+        // Sells with no known cost basis for that (wallet, token) pair are
+        // skipped, exactly as in computeTopPnl().
+    }
+    sqlite3_finalize(s);
+    flush();
+    return results;
+}
+
+GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
+    GlobalRankings out;
+
+    out.byPnl = base;
+    std::sort(out.byPnl.begin(), out.byPnl.end(),
+        [](const PnlRow& a, const PnlRow& b) { return a.pnlNanos > b.pnlNanos; });
+    if (out.byPnl.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byPnl.resize(MAX_GLOBAL_RANKED);
+
+    out.byRoi = base;
+    std::sort(out.byRoi.begin(), out.byRoi.end(),
+        [](const PnlRow& a, const PnlRow& b) { return a.roiPercent > b.roiPercent; });
+    if (out.byRoi.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byRoi.resize(MAX_GLOBAL_RANKED);
+
+    out.byWinRate = base;
+    std::sort(out.byWinRate.begin(), out.byWinRate.end(), [](const PnlRow& a, const PnlRow& b) {
+        if (a.winRatePercent != b.winRatePercent) return a.winRatePercent > b.winRatePercent;
+        return a.completedTrades > b.completedTrades;
+    });
+    if (out.byWinRate.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byWinRate.resize(MAX_GLOBAL_RANKED);
+
+    out.byActive = base;
+    std::sort(out.byActive.begin(), out.byActive.end(), [](const PnlRow& a, const PnlRow& b) {
+        if (a.completedTrades != b.completedTrades) return a.completedTrades > b.completedTrades;
+        return a.pnlNanos > b.pnlNanos;
+    });
+    if (out.byActive.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byActive.resize(MAX_GLOBAL_RANKED);
+
+    return out;
+}
+
+const std::vector<PnlRow>& selectGlobalList(const GlobalRankings& r, GlobalRankKind kind) {
+    switch (kind) {
+        case GlobalRankKind::PNL: return r.byPnl;
+        case GlobalRankKind::ROI: return r.byRoi;
+        case GlobalRankKind::WIN_RATE: return r.byWinRate;
+        case GlobalRankKind::ACTIVE: return r.byActive;
+    }
+    return r.byPnl;
+}
+
+std::string globalTitle(GlobalRankKind kind) {
+    switch (kind) {
+        case GlobalRankKind::PNL: return "💵 Top PnL (30D)";
+        case GlobalRankKind::ROI: return "📈 Top ROI (30D)";
+        case GlobalRankKind::WIN_RATE: return "🎯 Top Win Rate (30D)";
+        case GlobalRankKind::ACTIVE: return "🔄 Most Active (30D)";
+    }
+    return "🏆 Top Traders (30D)";
+}
+
+struct CachedGlobalRanking {
+    GlobalRankings rankings;
+    time_t computedAt = 0;
+};
+
+std::map<std::string, CachedGlobalRanking> g_globalRankingCache;
+
+// Card layout is unified across all four ranking kinds (PnL, ROI, Win Rate,
+// Trades are always all shown, in this fixed order) — only the sort order
+// and title differ per kind. Unlike the per-token ranking, addresses are
+// shortened here and there's a single "➕ Track" button per wallet (no
+// BscScan link), per this feature's spec'd card format.
+RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page) {
+    int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
+    page = std::max(1, std::min(page, totalPages));
+    int startIdx = (page - 1) * PER_PAGE;
+    int endIdx = std::min(static_cast<int>(rows.size()), startIdx + PER_PAGE);
+
+    std::stringstream text;
+    text << "🏆 <b>" << globalTitle(kind) << "</b>\n\n";
+
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+
+    if (rows.empty()) {
+        text << "📊 No completed trades in the last 30 days yet.";
+    } else {
+        for (int i = startIdx; i < endIdx; i++) {
+            const PnlRow& r = rows[i];
+            int rank = i + 1;
+            text << rankLabel(rank) << "\n\n";
+            text << "<code>" << safeString(shortAddr(r.wallet), 20) << "</code>\n\n";
+            text << "💵 <b>PnL</b>\n" << formatUsdSigned(r.pnlNanos) << "\n\n";
+            text << "📈 <b>ROI</b>\n" << formatPercentPlain(r.roiPercent) << "\n\n";
+            text << "🎯 <b>Win Rate</b>\n" << r.winRatePercent << "%\n\n";
+            text << "🔄 <b>Trades</b>\n" << r.completedTrades << "\n\n";
+
+            json row;
+            row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
+            keyboard["inline_keyboard"].push_back(row);
+        }
+    }
+
+    std::string kindParam = globalRankKindToString(kind);
+    json navRow = json::array();
+    if (page > 1) navRow.push_back({{"text", "⬅️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page - 1)}});
+    navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
+    if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1)}});
+    keyboard["inline_keyboard"].push_back(navRow);
+
+    return {text.str(), keyboard.dump()};
+}
+
 } // namespace
 
 // ==================== SAVE (unchanged algorithm) ====================
@@ -358,4 +593,51 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
         rows = it->second.rows;
     }
     return renderPage(token, rows, page);
+}
+
+// ==================== GLOBAL TOP TRADERS (30D) ====================
+RankingMessage buildGlobalTopMenu() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "💵 Top PnL"}, {"callback_data", "gt_open:pnl"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "📈 Top ROI"}, {"callback_data", "gt_open:roi"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🎯 Top Win Rate"}, {"callback_data", "gt_open:winrate"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🔄 Most Active"}, {"callback_data", "gt_open:active"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+    return {"🏆 <b>Top Traders (30D)</b>\n\nChoose a ranking:", keyboard.dump()};
+}
+
+RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind) {
+    GlobalRankings rankings;
+    {
+        std::lock_guard<std::mutex> l(g_cacheMutex);
+        auto it = g_globalRankingCache.find(chatId);
+        if (it != g_globalRankingCache.end() && time(nullptr) - it->second.computedAt <= CACHE_TTL_SECONDS) {
+            rankings = it->second.rankings;
+        } else {
+            std::vector<PnlRow> base = computeGlobalTop30D();
+            rankings = buildGlobalRankings(base);
+            g_globalRankingCache[chatId] = CachedGlobalRanking{rankings, time(nullptr)};
+        }
+    }
+    return renderGlobalPage(kind, selectGlobalList(rankings, kind), 1);
+}
+
+RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page) {
+    std::lock_guard<std::mutex> l(g_cacheMutex);
+    auto it = g_globalRankingCache.find(chatId);
+    if (it == g_globalRankingCache.end() || time(nullptr) - it->second.computedAt > CACHE_TTL_SECONDS) {
+        return {"⏳ This ranking has expired. Please reopen 🏆 Top Traders from the menu.", ""};
+    }
+    return renderGlobalPage(kind, selectGlobalList(it->second.rankings, kind), page);
 }
