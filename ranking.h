@@ -69,3 +69,30 @@ RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& 
 // expired), returns a message asking the user to request the ranking again.
 RankingMessage buildTopPnlPage(const std::string& chatId, int page);
 
+// ==================== GLOBAL TOP TRADERS (30D) ====================
+// Cross-token leaderboard: the same Average Cost Basis PnL model as
+// buildTopPnlMessage(), but aggregated over every token traded by each
+// wallet in the last 30 days, instead of one token at a time. Four
+// independent sortings (PnL, ROI, Win Rate, trade count) are computed
+// together in a single pass over `trades` and cached per chat; opening any
+// of the four views, or flipping pages, never re-touches the `trades`
+// table beyond the first computation for that chat.
+enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
+
+// Parses/serializes the short kind token used in callback_data
+// ("pnl" / "roi" / "winrate" / "active"). parse returns false if unrecognized.
+bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out);
+std::string globalRankKindToString(GlobalRankKind k);
+
+// The "choose a ranking" submenu shown from the main menu's 🏆 Top Traders
+// button: 💵 Top PnL / 📈 Top ROI / 🎯 Top Win Rate / 🔄 Most Active.
+RankingMessage buildGlobalTopMenu();
+
+// Computes (if not already cached for this chat) all four Top-100 global
+// leaderboards and renders page 1 of `kind`.
+RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind);
+
+// Renders `page` of `kind` from the cache populated by
+// buildGlobalTopMessage(). Never recomputes. If nothing is cached (or it
+// has expired), asks the user to reopen the ranking from the menu.
+RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page);
