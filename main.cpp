@@ -810,7 +810,7 @@ UIMessage buildHelpMessage() {
     text += "/remove 0x... — stop tracking a wallet\n";
     text += "/list — show your tracked wallets\n";
     text += "/limit 5000 — set alert threshold in USD\n";
-    text += "/toptrader CAKE — top net traders for a token\n\n";
+    text += "/toptrader CAKE — Top PnL (30D) leaderboard for a token\n\n";
     text += "Or just tap a button in the main menu.";
 
     return {text, keyboard.dump()};
@@ -889,6 +889,22 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
         if (code == 400) { std::cerr << "[TG] 400 (not treated as dead user): " << desc << std::endl; return {false, false, 0}; }
         return {false, false, 0};
     } catch (...) { return {false, false, 0}; }
+}
+
+// Edits an existing message in place — used for pagination so flipping
+// pages doesn't spam the chat with a new message each time. Returns false
+// on any failure (e.g. message too old to edit, or content unchanged);
+// callers should fall back to sendMsg() in that case.
+bool editMsg(const std::string& c, long long messageId, const std::string& t, const std::string& reply_markup = "") {
+    json j; j["chat_id"] = c; j["message_id"] = messageId;
+    j["text"] = t;
+    j["parse_mode"] = "HTML";
+    j["disable_web_page_preview"] = true;
+    if (!reply_markup.empty()) {
+        try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
+    }
+    auto r = http("https://api.telegram.org/bot" + TG_TOKEN + "/editMessageText", j.dump());
+    try { auto p = json::parse(r); return p.value("ok", false); } catch (...) { return false; }
 }
 
 void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "", bool showAlert = false) {
@@ -1406,14 +1422,21 @@ void handleCallbackQuery(const json& callbackQuery) {
     std::string data = callbackQuery["data"].get<std::string>();
     std::string chatId = std::to_string(callbackQuery["from"]["id"].get<long>());
     std::string callbackQueryId = callbackQuery.contains("id") ? callbackQuery["id"].get<std::string>() : "";
-
-    if (!callbackQueryId.empty()) {
-        answerCallbackQuery(callbackQueryId);
+    long long messageId = 0;
+    if (callbackQuery.contains("message") && callbackQuery["message"].is_object() &&
+        callbackQuery["message"].contains("message_id")) {
+        messageId = callbackQuery["message"]["message_id"].get<long long>();
     }
 
     size_t colonPos = data.find(':');
     std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
     std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
+
+    // "tt_track" answers the callback itself (with custom feedback text),
+    // since a callback query can only be answered once.
+    if (action != "tt_track" && !callbackQueryId.empty()) {
+        answerCallbackQuery(callbackQueryId);
+    }
 
     // Menu navigation
     if (action == "menu") {
@@ -1557,6 +1580,41 @@ void handleCallbackQuery(const json& callbackQuery) {
                 sendMsg(chatId, "❌ Invalid threshold value.");
             }
         }
+    }
+    // Top PnL (30D) — pagination (edits the existing message in place,
+    // reusing the cached ranking instead of recomputing it)
+    else if (action == "tt_page") {
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        auto msg = buildTopPnlPage(chatId, page);
+        if (messageId > 0 && editMsg(chatId, messageId, msg.text, msg.keyboard)) {
+            // edited in place
+        } else {
+            sendMsg(chatId, msg.text, msg.keyboard);
+        }
+    }
+    // Top PnL (30D) — "➕ Track" button under a ranked wallet
+    else if (action == "tt_track") {
+        std::string address = toLower(param);
+        std::string feedback;
+        if (!isValidAddress(address)) {
+            feedback = "❌ Invalid address.";
+        } else {
+            auto res = addUserWhale(chatId, address, address);
+            switch (res) {
+                case AddWhaleResult::OK: refreshWatchers(); feedback = "✅ Wallet added"; break;
+                case AddWhaleResult::ALREADY_EXISTS: feedback = "✅ Already tracking"; break;
+                case AddWhaleResult::LIMIT_REACHED:
+                    feedback = "⚠️ Wallet limit reached (" + std::to_string(MAX_WHALES_PER_USER) + ")"; break;
+                case AddWhaleResult::BAD_ADDRESS: feedback = "❌ Invalid address."; break;
+                case AddWhaleResult::ERROR: feedback = "❌ Something went wrong."; break;
+            }
+        }
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
+    }
+    // Page-indicator button ("3/4") — decorative, does nothing
+    else if (action == "tt_noop") {
+        // already silently acknowledged above
     }
 }
 
@@ -1704,9 +1762,9 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
             return true;
         }
 
-        std::string result = buildTopNet(tokenArg);
+        RankingMessage result = buildTopPnlMessage(chatId, tokenArg, 1);
         g_sessionManager.clearSession(chatId);
-        sendMsg(chatId, result);
+        sendMsg(chatId, result.text, result.keyboard);
         return true;
     }
 
@@ -1839,7 +1897,7 @@ void telegramLoop() {
                     else if (txt.find("/toptrader ")==0) {
                         std::string arg = trim(txt.substr(11));
                         if (arg.empty()) sendMsg(cid, "❌ Usage: /toptrader TOKEN (symbol or contract address)");
-                        else sendMsg(cid, buildTopNet(arg));
+                        else { auto msg = buildTopPnlMessage(cid, arg, 1); sendMsg(cid, msg.text, msg.keyboard); }
                     }
                     else {
                         sendMsg(cid, "🤔 Unknown command. Try /help or use the menu below.");
@@ -1895,7 +1953,7 @@ int main() {
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
