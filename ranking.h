@@ -5,6 +5,10 @@
 // APIs, no additional threads — everything runs on the existing dbMutex /
 // sqlite3* db connection from main.cpp.
 //
+// Ranking metric: Realized PnL (Average Cost Basis), computed locally from
+// the `trades` table over a rolling 30-day window. No other data source is
+// used.
+//
 // TxResult is declared here (instead of in main.cpp) purely so this header
 // can be included from both main.cpp and ranking.cpp without duplicating
 // the struct. Its fields are unchanged from the original definition.
@@ -34,6 +38,11 @@ void initRankingDB();
 void saveTrade(const std::string& wallet, const TxResult& tx,
                const std::string& hash, long long block);
 
+// Deletes trades older than 30 days. The `trades` table only ever holds a
+// rolling 30-day window, matching the Top PnL (30D) ranking window. Call
+// this alongside the bot's existing periodic cleanup (cleanupOldAlerts()).
+void cleanupOldTrades();
+
 // Resolves a user-supplied token argument (either a "0x..." contract
 // address or a ticker symbol such as "cake") to a canonical lowercase
 // contract address using the bot's own token_cache table. Returns an
@@ -41,10 +50,21 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
 // never seen a trade involving it).
 std::string resolveTokenArg(const std::string& arg);
 
-// Leaderboards (top 20), scoped to trades within the last `days` days
-// (default: effectively "all time"). All four are built from the same
-// `trades` table and differ only in sort order / which totals they rank by.
-std::string buildTopNet(const std::string& token, int days = 3650);
-std::string buildTopBuy(const std::string& token, int days = 3650);
-std::string buildTopSell(const std::string& token, int days = 3650);
-std::string buildTopVolume(const std::string& token, int days = 3650);
+// Telegram-ready {text, keyboard-JSON} pair, same shape/convention as
+// TelegramUI::UIMessage in main.cpp.
+struct RankingMessage {
+    std::string text;
+    std::string keyboard;
+};
+
+// Computes the Top PnL (30D) leaderboard for `tokenArg` (symbol or address),
+// caches it under `chatId` for cheap pagination, and renders `page` (1-based,
+// 5 wallets per page). This is the only entry point that actually recomputes
+// the ranking from the `trades` table.
+RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page = 1);
+
+// Renders `page` of the leaderboard previously computed for `chatId` by
+// buildTopPnlMessage(), without touching the `trades` table again. Used to
+// serve pagination button presses. If nothing is cached (or the cache has
+// expired), returns a message asking the user to request the ranking again.
+RankingMessage buildTopPnlPage(const std::string& chatId, int page);
