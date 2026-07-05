@@ -179,6 +179,7 @@ const std::string TG_TOKEN = []{
 }();
 
 const std::string OWNER_CHAT_ID = "546348566";
+const std::string SERVICE_CHAT_ID = "7479880531"
 const std::string CHANNEL_ID = []{
     const char* env = std::getenv("WHALE_CHANNEL_ID");
     return env ? std::string(env) : std::string();
