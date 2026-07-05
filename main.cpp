@@ -912,6 +912,19 @@ bool editMsg(const std::string& c, long long messageId, const std::string& t, co
     try { auto p = json::parse(r); return p.value("ok", false); } catch (...) { return false; }
 }
 
+// Menu navigation should feel like navigating a single screen, not spawning
+// a new message per tap. This edits the message the button was attached to
+// in place, falling back to sendMsg() only if the edit fails (message too
+// old, chat quirks, etc.) or there's no message to edit. When `keyboard` is
+// empty, this explicitly clears any inline keyboard left over from the
+// previous screen instead of leaving stale buttons behind.
+void replyInPlace(const std::string& chatId, long long messageId, const std::string& text, const std::string& keyboard = "") {
+    std::string kb = keyboard.empty() ? "{\"inline_keyboard\":[]}" : keyboard;
+    if (messageId <= 0 || !editMsg(chatId, messageId, text, kb)) {
+        sendMsg(chatId, text, keyboard);
+    }
+}
+
 void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "", bool showAlert = false) {
     json j;
     j["callback_query_id"] = callbackQueryId;
@@ -1097,6 +1110,33 @@ std::string formatAmount(const cpp_int& raw, int dec) {
 cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return 0; cpp_int d=1; for (int i=0;i<dec;i++) d*=10; return (raw*pn)/d; }
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
+
+// Per-unit USD price (USD*1e9) implied by a trade's total USD value and raw
+// token amount: priceNanos = usdNanos * 10^dec / rawAmount. No extra RPC —
+// derived entirely from fields already present on TxResult.
+cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec) {
+    if (rawAmount <= 0) return 0;
+    cpp_int d = 1; for (int i = 0; i < dec; i++) d *= 10;
+    return (usdNanos * d) / rawAmount;
+}
+
+// Formats a USD*1e9 price with dynamic precision (trailing zeros trimmed,
+// but always at least 2 decimal places) instead of formatUsd()'s fixed 2
+// decimals, since many BSC token prices are well under a cent.
+std::string formatPriceUsd(const cpp_int& n) {
+    bool neg = n < 0;
+    cpp_int a = neg ? -n : n;
+    std::string s = a.convert_to<std::string>();
+    while (s.length() < 10) s = "0" + s;
+    std::string dollarPart = s.substr(0, s.length() - 9);
+    std::string fracPart = s.substr(s.length() - 9);
+    if (dollarPart.empty()) dollarPart = "0";
+    size_t lastNonZero = fracPart.find_last_not_of('0');
+    size_t keep = (lastNonZero == std::string::npos) ? 0 : (lastNonZero + 1);
+    if (keep < 2) keep = 2;
+    fracPart = fracPart.substr(0, keep);
+    return std::string(neg ? "-$" : "$") + dollarPart + "." + fracPart;
+}
 
 // ==================== BALANCE-DIFF CROSS-CHECK ====================
 std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
@@ -1320,6 +1360,11 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
     msg+="🪙 Token: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
     msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
+    if (res.isSwap) {
+        cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, getDecimals(res.tokenAddr));
+        std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
+        msg += "💵 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+    }
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
         std::string counterAmountStr, counterSymbol;
@@ -1334,7 +1379,6 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
     msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
-    if (!res.venue.empty()) msg+="🔁 DEX: <b>"+safeString(res.venue,48)+"</b>\n";
     msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
     msg+="👛 Wallet: <b>"+safeString(label)+"</b>\n\n";
     msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Transaction</a>";
@@ -1449,54 +1493,46 @@ void handleCallbackQuery(const json& callbackQuery) {
 
         if (param == "main") {
             auto msg = TelegramUI::buildMainMenu(chatId);
-            sendMsg(chatId, msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "add_wallet") {
             g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
-            sendMsg(chatId, "🐋 <b>Add Wallet</b>\n\nPlease enter the wallet address (0x...):",
+            replyInPlace(chatId, messageId, "🐋 <b>Add Wallet</b>\n\nPlease enter the wallet address (0x...):",
                     TelegramUI::buildCancelButton());
         }
         else if (param == "my_wallets") {
             auto msg = TelegramUI::buildWalletsList(chatId);
-            sendMsg(chatId, msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "alert_threshold") {
             uint64_t threshold = getUserThresholdNanos(chatId);
             auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
-            sendMsg(chatId, msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "toptrader") {
-            g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
-            sendMsg(chatId,
-                "🏆 <b>Top Traders</b>\n\n"
-                "Enter token symbol or contract address.\n\n"
-                "Examples:\n\n"
-                "CAKE\n"
-                "FLOKI\n"
-                "USDT\n"
-                "0x...",
-                TelegramUI::buildCancelButton());
+            auto msg = buildGlobalTopMenu();
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "settings") {
             auto msg = TelegramUI::buildSettingsMenu(chatId);
-            sendMsg(chatId, msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "help") {
             auto msg = TelegramUI::buildHelpMessage();
-            sendMsg(chatId, msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
     // Cancel
     else if (action == "cancel") {
         g_sessionManager.clearSession(chatId);
         auto msg = TelegramUI::buildMainMenu(chatId);
-        sendMsg(chatId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
+        replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
     }
     // Rename wallet
     else if (action == "rename") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            sendMsg(chatId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
             return;
         }
 
@@ -1506,7 +1542,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             "SELECT uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? AND wa.address = ?")) {
-            sendMsg(chatId, "❌ Error loading wallet.");
+            replyInPlace(chatId, messageId, "❌ Error loading wallet.");
             return;
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
@@ -1517,17 +1553,18 @@ void handleCallbackQuery(const json& callbackQuery) {
             sqlite3_finalize(s);
 
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, currentLabel);
-            sendMsg(chatId, "✏️ <b>Rename Wallet</b>\n\nCurrent name: <b>" + safeString(currentLabel, 32) +
+            replyInPlace(chatId, messageId, "✏️ <b>Rename Wallet</b>\n\nCurrent name: <b>" + safeString(currentLabel, 32) +
                     "</b>\n\nPlease enter a new name:", TelegramUI::buildCancelButton());
         } else {
             sqlite3_finalize(s);
-            sendMsg(chatId, "❌ Wallet not found in your list.");        }
+            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
+        }
     }
     // Ask for confirmation before removing a wallet (guards against fat-finger taps)
     else if (action == "askremove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            sendMsg(chatId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
             return;
         }
         std::string label = address;
@@ -1545,13 +1582,13 @@ void handleCallbackQuery(const json& callbackQuery) {
             }
         }
         auto msg = TelegramUI::buildRemoveConfirm(address, label);
-        sendMsg(chatId, msg.text, msg.keyboard);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     // Remove wallet (after confirmation)
     else if (action == "remove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            sendMsg(chatId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
             return;
         }
 
@@ -1559,46 +1596,43 @@ void handleCallbackQuery(const json& callbackQuery) {
         if (removed) {
             refreshWatchers();
             auto msg = TelegramUI::buildMainMenu(chatId);
-            sendMsg(chatId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
         } else {
-            sendMsg(chatId, "❌ Wallet not found in your list.");
+            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
         }
     }
     // Threshold presets
     else if (action == "threshold") {
         if (param == "custom") {
             g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD);
-            sendMsg(chatId, "💰 <b>Custom Threshold</b>\n\nPlease enter the minimum alert amount in USD (e.g., 7500):",
+            replyInPlace(chatId, messageId, "💰 <b>Custom Threshold</b>\n\nPlease enter the minimum alert amount in USD (e.g., 7500):",
                     TelegramUI::buildCancelButton());
         } else {
             try {
                 double usd = std::stod(param);
                 if (usd <= 0) {
-                    sendMsg(chatId, "❌ Threshold must be positive.");
+                    replyInPlace(chatId, messageId, "❌ Threshold must be positive.");
                     return;
                 }
                 setUserThreshold(chatId, usd);
                 refreshWatchers();
                 auto msg = TelegramUI::buildMainMenu(chatId);
-                sendMsg(chatId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
+                replyInPlace(chatId, messageId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
             } catch (...) {
-                sendMsg(chatId, "❌ Invalid threshold value.");
+                replyInPlace(chatId, messageId, "❌ Invalid threshold value.");
             }
         }
     }
-    // Top PnL (30D) — pagination (edits the existing message in place,
-    // reusing the cached ranking instead of recomputing it)
+    // Top PnL (30D) [per token] — pagination (reuses the cached ranking
+    // instead of recomputing it)
     else if (action == "tt_page") {
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
         auto msg = buildTopPnlPage(chatId, page);
-        if (messageId > 0 && editMsg(chatId, messageId, msg.text, msg.keyboard)) {
-            // edited in place
-        } else {
-            sendMsg(chatId, msg.text, msg.keyboard);
-        }
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
-    // Top PnL (30D) — "➕ Track" button under a ranked wallet
+    // Top PnL (30D) — "➕ Track" button under a ranked wallet (shared by both
+    // the per-token and the global Top Traders rankings)
     else if (action == "tt_track") {
         std::string address = toLower(param);
         std::string feedback;
@@ -1620,6 +1654,29 @@ void handleCallbackQuery(const json& callbackQuery) {
     // Page-indicator button ("3/4") — decorative, does nothing
     else if (action == "tt_noop") {
         // already silently acknowledged above
+    }
+    // Global Top Traders (30D) — open one of the four rankings (computes
+    // and caches all four together, then shows page 1 of the chosen one)
+    else if (action == "gt_open") {
+        GlobalRankKind kind;
+        if (parseGlobalRankKind(param, kind)) {
+            auto msg = buildGlobalTopMessage(chatId, kind);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+    }
+    // Global Top Traders (30D) — pagination (cache-only, no recompute)
+    else if (action == "gt_page") {
+        size_t sep = param.find(':');
+        if (sep != std::string::npos) {
+            std::string kindStr = param.substr(0, sep);
+            int page = 1;
+            try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
+            GlobalRankKind kind;
+            if (parseGlobalRankKind(kindStr, kind)) {
+                auto msg = buildGlobalTopPage(chatId, kind, page);
+                replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+            }
+        }
     }
 }
 
