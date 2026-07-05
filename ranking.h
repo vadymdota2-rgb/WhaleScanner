@@ -68,3 +68,4 @@ RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& 
 // serve pagination button presses. If nothing is cached (or the cache has
 // expired), returns a message asking the user to request the ranking again.
 RankingMessage buildTopPnlPage(const std::string& chatId, int page);
+
