@@ -40,6 +40,19 @@ constexpr int MAX_GLOBAL_RANKED = 100;                 // global ranking size (T
 constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
 constexpr time_t CACHE_TTL_SECONDS = 15 * 60;          // how long a computed ranking stays pageable
+// Visual divider between cards on a page. A full-width run of U+2501 also
+// nudges Telegram Android into laying the message (and thus the inline
+// keyboard) out at full width instead of its collapsed minimum width.
+const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
+
+// Dedicated READ-ONLY SQLite connection for the heavy full-table ranking
+// scans. With WAL enabled (initDB() sets it), a reader on its own
+// connection never blocks writers on the main connection and vice versa —
+// so computing a ranking no longer stalls the whole bot behind dbMutex.
+// Opened in initRankingDB(); if opening fails, code falls back to the
+// shared `db` + dbMutex, which is correct but slower.
+sqlite3* g_rankingReadDb = nullptr;
+std::mutex g_rankingReadMutex;
 }
 
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out) {
@@ -84,6 +97,34 @@ void initRankingDB() {
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[RANKING][FATAL] schema init failed: " << (err ? err : "") << std::endl;
         sqlite3_free(err);
+    }
+
+    // Second, read-only connection to the same file for ranking scans.
+    // Requires WAL (already set in initDB()); without WAL a long read on a
+    // second connection would make writers fail with SQLITE_BUSY instead.
+    // sqlite3_db_filename() is used instead of extern-ing DB_FILE because
+    // `const std::string DB_FILE` in main.cpp has internal linkage.
+    const char* fn = sqlite3_db_filename(db, "main");
+    if (fn && *fn) {
+        if (sqlite3_open_v2(fn, &g_rankingReadDb,
+                            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+                            nullptr) == SQLITE_OK) {
+            sqlite3_busy_timeout(g_rankingReadDb, 5000);
+            std::cout << "[RANKING] Read-only connection opened" << std::endl;
+        } else {
+            std::cerr << "[RANKING] ⚠️ Read-only connection failed ("
+                      << (g_rankingReadDb ? sqlite3_errmsg(g_rankingReadDb) : "open error")
+                      << "), rankings will fall back to the shared connection" << std::endl;
+            if (g_rankingReadDb) { sqlite3_close(g_rankingReadDb); g_rankingReadDb = nullptr; }
+        }
+    }
+}
+
+void closeRankingDB() {
+    std::lock_guard<std::mutex> l(g_rankingReadMutex);
+    if (g_rankingReadDb) {
+        sqlite3_close(g_rankingReadDb);
+        g_rankingReadDb = nullptr;
     }
 }
 
@@ -146,14 +187,6 @@ std::string rankLabel(int rank) {
     }
 }
 
-// Used only by the global (cross-token) ranking cards, whose spec'd layout
-// shows a shortened address rather than the full one (unlike the per-token
-// Top PnL ranking, which always shows the full address).
-std::string shortAddr(const std::string& a) {
-    if (a.size() < 10) return a;
-    return a.substr(0, 6) + "..." + a.substr(a.size() - 4);
-}
-
 // Percentage without a forced leading "+" (e.g. "148%" / "-32%"), used for
 // ROI in the global ranking cards, per that feature's spec'd format.
 std::string formatPercentPlain(double pct) {
@@ -211,9 +244,18 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
         }
     };
 
-    std::lock_guard<std::mutex> l(dbMutex);
+    // Prefer the dedicated read-only connection: this is a full scan of the
+    // token's trades and must not hold dbMutex for its whole duration (the
+    // rest of the bot — block processing, alerts — would stall behind it).
+    // g_rankingReadDb is set once at startup and cleared once at shutdown,
+    // so reading the pointer here without a lock is fine.
+    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
+    std::unique_lock<std::mutex> readLock, writeLock;
+    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
+    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
+
     sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
+    if (!prepareOrLog(rdb, &s,
         "SELECT wallet, is_buy, usd_nanos, token_amount FROM trades "
         "WHERE token=? AND timestamp>=? ORDER BY wallet ASC, timestamp ASC")) return results;
     sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
@@ -278,6 +320,11 @@ struct CachedRanking {
 std::mutex g_cacheMutex;
 std::map<std::string, CachedRanking> g_topPnlCache;
 
+// Card layout (compact, per the display-fix spec): one "label: value" line
+// per metric instead of a label line followed by a value line. The full
+// 42-char wallet address is shown in <code> so it can be copied with one
+// tap — its monospace width also keeps Telegram from collapsing the whole
+// message (and the inline keyboard under it) to half the screen width.
 RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page) {
     int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
     page = std::max(1, std::min(page, totalPages));
@@ -297,12 +344,13 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
             int rank = i + 1;
-            text << rankLabel(rank) << "\n\n";
-            text << "💵 <b>PnL</b>\n" << formatUsdSigned(r.pnlNanos) << "\n\n";
-            text << "📈 <b>ROI</b>\n" << formatPercentSigned(r.roiPercent) << "\n\n";
-            text << "🎯 <b>Win Rate</b>\n" << r.winRatePercent << "%\n\n";
-            text << "🔄 <b>Trades</b>\n" << r.completedTrades << "\n\n";
-            text << "💼 <b>Wallet</b>\n\n<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << rankLabel(rank) << "\n";
+            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
+            text << "📈 <b>ROI:</b> " << formatPercentSigned(r.roiPercent) << "\n";
+            text << "🎯 <b>Win Rate:</b> " << r.winRatePercent << "%\n";
+            text << "🔄 <b>Trades:</b> " << r.completedTrades << "\n";
+            if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
             row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
@@ -361,9 +409,15 @@ std::vector<PnlRow> computeGlobalTop30D() {
         }
     };
 
-    std::lock_guard<std::mutex> l(dbMutex);
+    // Same rationale as computeTopPnl(): this scans the ENTIRE trades table,
+    // so it runs on the read-only connection and never holds dbMutex.
+    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
+    std::unique_lock<std::mutex> readLock, writeLock;
+    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
+    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
+
     sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
+    if (!prepareOrLog(rdb, &s,
         "SELECT wallet, token, is_buy, usd_nanos, token_amount FROM trades "
         "WHERE timestamp>=? ORDER BY wallet ASC, token ASC, timestamp ASC")) return results;
     sqlite3_bind_int64(s, 1, since);
@@ -470,9 +524,12 @@ std::map<std::string, CachedGlobalRanking> g_globalRankingCache;
 
 // Card layout is unified across all four ranking kinds (PnL, ROI, Win Rate,
 // Trades are always all shown, in this fixed order) — only the sort order
-// and title differ per kind. Unlike the per-token ranking, addresses are
-// shortened here and there's a single "➕ Track" button per wallet (no
-// BscScan link), per this feature's spec'd card format.
+// and title differ per kind. Compact "label: value" lines with a divider
+// between cards, per the display-fix spec. The wallet address is shown in
+// full (42 chars, <code>) so it's completely visible and copyable; the
+// monospace line also forces Telegram to render the message — and the
+// inline keyboard — at full width. Still a single "➕ Track" button per
+// wallet (no BscScan link), per this feature's spec'd card format.
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page) {
     int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
     page = std::max(1, std::min(page, totalPages));
@@ -491,12 +548,13 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
             int rank = i + 1;
-            text << rankLabel(rank) << "\n\n";
-            text << "<code>" << safeString(shortAddr(r.wallet), 20) << "</code>\n\n";
-            text << "💵 <b>PnL</b>\n" << formatUsdSigned(r.pnlNanos) << "\n\n";
-            text << "📈 <b>ROI</b>\n" << formatPercentPlain(r.roiPercent) << "\n\n";
-            text << "🎯 <b>Win Rate</b>\n" << r.winRatePercent << "%\n\n";
-            text << "🔄 <b>Trades</b>\n" << r.completedTrades << "\n\n";
+            text << rankLabel(rank) << "\n";
+            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
+            text << "📈 <b>ROI:</b> " << formatPercentPlain(r.roiPercent) << "\n";
+            text << "🎯 <b>Win Rate:</b> " << r.winRatePercent << "%\n";
+            text << "🔄 <b>Trades:</b> " << r.completedTrades << "\n";
+            if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
             row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
@@ -516,13 +574,23 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
 
 } // namespace
 
-// ==================== SAVE (unchanged algorithm) ====================
+// ==================== SAVE ====================
+// blockTimestamp is the on-chain timestamp of the block containing the tx.
+// Using it (instead of time(nullptr)) keeps the 30-day window and the
+// buy/sell ordering correct even when the bot catches up on a backlog of
+// old blocks after downtime — previously every backfilled trade got stamped
+// "now", which skewed both the window and the Average Cost Basis order.
+// Wall clock remains only as a fallback for a malformed/missing block field.
 void saveTrade(const std::string& wallet, const TxResult& tx,
-               const std::string& hash, long long block) {
+               const std::string& hash, long long block, long long blockTimestamp) {
     // Only BUY/SELL swaps get ranked — never TRANSFERs, never unclassified txs.
     if (!tx.valid || !tx.isSwap) return;
     if (tx.usdNanos <= 0) return;
     if (tx.tokenAddr.empty()) return;
+
+    long long ts = blockTimestamp > 0
+        ? blockTimestamp
+        : static_cast<long long>(time(nullptr));
 
     std::string token = toLower(tx.tokenAddr);
     std::string amountStr = tx.rawAmount.convert_to<std::string>();
@@ -540,7 +608,7 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
     sqlite3_bind_text(s, 5, amountStr.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 6, hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 7, block);
-    sqlite3_bind_int64(s, 8, static_cast<sqlite3_int64>(time(nullptr)));
+    sqlite3_bind_int64(s, 8, static_cast<sqlite3_int64>(ts));
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
