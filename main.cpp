@@ -1500,6 +1500,9 @@ bool processBlock(long long bn) {
     auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
     if (block.is_null()||!block.is_object()||!block.contains("transactions")||!block["transactions"].is_array()) return false;
     std::string ph=block.value("parentHash",""), ep=getLastBlockHash();
+    long long blockTs = 0;
+if (block.contains("timestamp") && block["timestamp"].is_string())
+    hexToLL(block["timestamp"].get<std::string>(), blockTs);
     if (!ep.empty()&&ph!=ep&&bn>1) {
         g_stats.reorg_verifications.fetch_add(1); std::cerr << "[REORG?] Mismatch at " << bn << ", verifying..." << std::endl;
         size_t ai=(rpcIndex.load(std::memory_order_relaxed)+1)%BSC_RPC_ENDPOINTS.size();
@@ -1529,7 +1532,8 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        saveTrade(mA, res, hash, bn);
+        
+        saveTrade(mA, res, hash, bn, blockTs);
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
@@ -2132,6 +2136,13 @@ int main() {
         } catch (const std::exception& e) { std::cerr << "[ERROR] " << e.what() << std::endl; }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    std::cout << "[SHUTDOWN] Stopping..." << std::endl; g_msgQueue.stop(); tg.join(); walCheckpoint(); if (db) sqlite3_close(db); curl_global_cleanup();
+    
+    std::cout << "[SHUTDOWN] Stopping..." << std::endl;
+g_msgQueue.stop();
+tg.join();
+walCheckpoint();
+closeRankingDB();
+if (db) sqlite3_close(db);
+curl_global_cleanup();
     std::cout << "[SHUTDOWN] Clean exit." << std::endl; return 0;
 }
