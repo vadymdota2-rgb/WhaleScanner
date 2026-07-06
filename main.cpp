@@ -206,7 +206,6 @@ constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 10000ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
-const std::string SWAP_TOPIC = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822";
 const std::set<std::string> BASE_ASSETS = {
     "0x55d398326f99059ff775485246999027b3197955",
     "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
@@ -227,6 +226,8 @@ const std::map<std::string, std::string> KNOWN_ROUTERS = {
     {"0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap"},
     {"0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap"},
     {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
+    {"0x3a6d8ca21d1cf76f653a67577fa0d27453350dd8", "BiSwap"},
+    {"0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7", "ApeSwap"},
 };
 
 std::string lookupRouterLabel(const std::string& addr) {
@@ -1150,25 +1151,56 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
 }
 
 // ==================== ANALYZE TX ====================
+// Known DEX Swap event signatures (topic0). These cover the overwhelming
+// majority of BSC swap volume (V2 forks like PancakeSwap V2/BiSwap/ApeSwap
+// all share the V2 signature; V3 forks share one of the two V3 signatures).
+// Anything more exotic is still caught by the two-sided-flow heuristic in
+// analyzeTx() below, so an unrecognized topic only costs venue attribution,
+// never BUY/SELL detection.
+const std::set<std::string> SWAP_EVENT_TOPICS = {
+    // Uniswap/PancakeSwap V2-style: Swap(address,uint256,uint256,uint256,uint256,address)
+    "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
+    // Uniswap V3-style: Swap(address,address,int256,int256,uint160,uint128,int24)
+    "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
+    // PancakeSwap V3: Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)
+    "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83",
+};
+const std::string ERC20_TRANSFER_TOPIC =
+    "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+// WBNB (WETH-style) wrap/unwrap events. Native BNB can only enter or leave a
+// DEX pool through these, so they are the receipt-level evidence of the
+// native-BNB leg of a swap — the leg that emits no ERC20 Transfer and would
+// otherwise need debug_traceTransaction to observe.
+const std::string WBNB_DEPOSIT_TOPIC =
+    "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
+const std::string WBNB_WITHDRAWAL_TOPIC =
+    "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
+
+// Classification model (single pass over receipt logs, zero extra RPC):
+//
+//  1. ERC20 Transfer legs touching the wallet -> per-token net flow.
+//     Exactly-3-topic Transfers only: 4 topics = ERC721 (NFT), which is
+//     never a trade leg and previously could pollute token selection.
+//     Zero-amount legs are ignored for the same reason.
+//  2. Swap events from SWAP_EVENT_TOPICS -> hard evidence of a trade
+//     somewhere in the tx (hasSwap), plus venue attribution.
+//  3. WBNB Deposit/Withdrawal (on the WBNB contract only) -> the native-BNB
+//     leg: Deposit means BNB was wrapped in (a buy paid with native BNB),
+//     Withdrawal means WBNB was unwrapped out (a sell paid out in native
+//     BNB). This finally makes "sell token for BNB" visible as a SELL
+//     instead of a TRANSFER.
+//  4. Two-sided flow: the wallet has a net inflow of one token AND a net
+//     outflow of a different token in the same tx. That alone is a swap
+//     (covers token-to-token trades, bonding curves, and DEXs whose Swap
+//     topic we don't know), no base asset or recognized event required.
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
     bool hasSwap=false;
     std::string swapLogAddr;
     size_t swapLogDataHexLen=0;
-    for (auto& l:receipt["logs"]) {
-        if (l.contains("topics")&&l["topics"].is_array()&&!l["topics"].empty()&&
-            l["topics"][0].is_string()&&l["topics"][0].get<std::string>()==SWAP_TOPIC) {
-            hasSwap=true;
-            if (swapLogAddr.empty() && l.contains("address") && l["address"].is_string())
-                swapLogAddr = toLower(l["address"].get<std::string>());
-            if (l.contains("data") && l["data"].is_string()) {
-                const std::string& d = l["data"].get_ref<const std::string&>();
-                swapLogDataHexLen = d.size() >= 2 ? d.size() - 2 : 0;
-            }
-            break;
-        }
-    }
+    cpp_int wbnbWrapped = 0;    // native BNB wrapped into WBNB within this tx
+    cpp_int wbnbUnwrapped = 0;  // WBNB unwrapped back to native BNB within this tx
 
     std::map<std::string, cpp_int> netFlow;
     std::vector<std::string> tokenOrder;
@@ -1178,46 +1210,76 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
     bool anyTransferForWallet = false;
     std::string firstCounterpartAddr;
+
     for (auto& l : receipt["logs"]) {
-        if (!l.contains("topics")||!l["topics"].is_array()||l["topics"].size()<3) continue;
-        if (!l["topics"][0].is_string()||l["topics"][0].get<std::string>()!="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef") continue;
+        if (!l.is_object()||!l.contains("topics")||!l["topics"].is_array()||l["topics"].empty()) continue;
+        if (!l["topics"][0].is_string()) continue;
+        const std::string t0 = l["topics"][0].get<std::string>();
+        std::string logAddr = (l.contains("address") && l["address"].is_string())
+            ? toLower(l["address"].get<std::string>()) : "";
+
+        // --- Swap events (any known DEX family) ---
+        if (SWAP_EVENT_TOPICS.count(t0)) {
+            hasSwap = true;
+            if (swapLogAddr.empty()) {
+                swapLogAddr = logAddr;
+                if (l.contains("data") && l["data"].is_string()) {
+                    const std::string& d = l["data"].get_ref<const std::string&>();
+                    swapLogDataHexLen = d.size() >= 2 ? d.size() - 2 : 0;
+                }
+            }
+            continue;
+        }
+
+        // --- WBNB wrap/unwrap (only trusted on the real WBNB contract) ---
+        if (logAddr == WBNB_ADDR && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
+            if (l.contains("data") && l["data"].is_string()) {
+                cpp_int wad = parseUint256(l["data"].get<std::string>());
+                if (t0 == WBNB_DEPOSIT_TOPIC) wbnbWrapped += wad; else wbnbUnwrapped += wad;
+            }
+            continue;
+        }
+
+        // --- ERC20 Transfer legs touching the wallet ---
+        if (t0 != ERC20_TRANSFER_TOPIC) continue;
+        // Exactly 3 topics = ERC20. 4 topics = ERC721 Transfer (indexed
+        // tokenId, empty data) — never a trade leg, skip.
+        if (l["topics"].size() != 3) continue;
         if (!l.contains("data")||!l["data"].is_string()) continue;
-        if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||!l.contains("address")||!l["address"].is_string()) continue;
+        if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||logAddr.empty()) continue;
 
         const std::string& t1 = l["topics"][1].get_ref<const std::string&>();
         const std::string& t2 = l["topics"][2].get_ref<const std::string&>();
-        const std::string& addrField = l["address"].get_ref<const std::string&>();
         const std::string& dataField = l["data"].get_ref<const std::string&>();
         if (t1.length() < 66 || t2.length() < 66) continue;
 
         std::string fr = "0x"+toLower(t1.substr(26));
         std::string to = "0x"+toLower(t2.substr(26));
-        std::string tk = toLower(addrField);
         if (fr != wa && to != wa) continue;
         cpp_int amt = parseUint256(dataField);
-        touch(tk);
+        if (amt == 0) continue;  // zero-value spam transfers must not steer token selection
+        touch(logAddr);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
-        if (to == wa) netFlow[tk] += amt;
-        if (fr == wa) netFlow[tk] -= amt;
+        if (to == wa) netFlow[logAddr] += amt;
+        if (fr == wa) netFlow[logAddr] -= amt;
     }
 
-    // ---- Native BNB leg (Этап 2/3) ----
+    // ---- Native BNB outflow leg ----
     // Routers that accept native BNB (msg.value) never emit an ERC20 Transfer
-    // for the wrapped asset, so the loop above can't see that leg. We can
-    // still observe the outflow side (wallet == tx.from, tx.value > 0) from
-    // the transaction object itself — no extra RPC needed. The inflow side
-    // (wallet receiving native BNB from an internal call) would require
-    // debug_traceTransaction, which is out of scope here.
+    // for the wrapped asset. The outflow side is visible directly on the tx
+    // object (wallet == tx.from, tx.value > 0) — no extra RPC needed.
     cpp_int nativeOut = 0;
     std::string txTo;
+    bool walletIsSender = false;
     if (tx.is_object()) {
         if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
             txTo = toLower(tx["to"].get<std::string>());
         if (tx.contains("from") && tx["from"].is_string() &&
-            toLower(tx["from"].get<std::string>()) == wa &&
-            tx.contains("value") && tx["value"].is_string()) {
-            nativeOut = hexToCppInt(tx["value"].get<std::string>());
+            toLower(tx["from"].get<std::string>()) == wa) {
+            walletIsSender = true;
+            if (tx.contains("value") && tx["value"].is_string())
+                nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
     }
     bool nativeOutflow = nativeOut > 0;
@@ -1225,19 +1287,38 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     if (!anyTransferForWallet) return r;
     r.valid = true;
 
+    // ---- Venue attribution (cosmetic only, never gates detection) ----
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
     if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
     if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
         if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
+        else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
     }
-    // Stage 4: only trust the native-BNB leg as a swap signal when the call
-    // target is a router/aggregator we recognize — guards against unrelated
-    // multicall/batched transactions that happen to move BNB and an ERC20
-    // in the same tx for reasons that have nothing to do with a trade.
+
+    // ---- Swap signals ----
+    // Native OUTFLOW counts as a swap leg when anything else in the receipt
+    // corroborates a trade: a known router as the call target, any Swap
+    // event, or the BNB actually being wrapped into WBNB. (The old version
+    // required a known router, which silently missed every unlisted router.)
     bool routerCall = !txTo.empty() && !lookupRouterLabel(txTo).empty();
-    bool nativeSwapSignal = nativeOutflow && routerCall;
+    bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
+    // Native INFLOW can't be observed directly, but a WBNB Withdrawal in a
+    // swap tx *sent by the wallet itself* means the pool's WBNB was unwrapped
+    // and the resulting BNB paid out — i.e. the wallet sold for native BNB.
+    cpp_int nativeIn = 0;
+    if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
+    bool nativeInflowSignal = nativeIn > 0;
+
+    // Two-sided flow: net inflow of one token and net outflow of another in
+    // the same tx is a swap by definition, whatever the venue.
+    bool anyIn = false, anyOut = false;
+    for (auto& tok : tokenOrder) {
+        if (netFlow[tok] > 0) anyIn = true;
+        if (netFlow[tok] < 0) anyOut = true;
+    }
+    bool twoSidedFlow = anyIn && anyOut;
 
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
@@ -1262,15 +1343,18 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     }
 
     r.isSwap = (
-        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal)) ||
+        twoSidedFlow ||
+        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal || nativeInflowSignal)) ||
         (hasBaseIn && hasBaseOut)
     );
 
     if (!bestNonBaseTok.empty()) {
         r.tokenAddr = bestNonBaseTok;
-        r.rawAmount = bestNonBaseAbs;        r.isBuy = bestNonBaseNet > 0;
+        r.rawAmount = bestNonBaseAbs;
+        r.isBuy = bestNonBaseNet > 0;
 
         if (r.isSwap) {
+            // Preferred counter leg: the largest opposite-direction BASE asset.
             std::string bestCounterTok; cpp_int bestCounterAbs = -1;
             for (auto& tok : tokenOrder) {
                 if (!isBaseAsset(tok)) continue;
@@ -1281,11 +1365,25 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
                 cpp_int absNet = net >= 0 ? net : -net;
                 if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
             }
-            // No ERC20 base-asset leg found (e.g. paid with native BNB) —
-            // fall back to the tx.value leg so the alert still shows what
-            // was spent, without any extra RPC calls.
-            if (bestCounterTok.empty() && r.isBuy && nativeOutflow) {
+            // Native BNB fallbacks: the leg that emits no ERC20 Transfer.
+            if (bestCounterTok.empty() && r.isBuy && nativeOutflow && nativeSwapSignal) {
                 bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
+            }
+            if (bestCounterTok.empty() && !r.isBuy && nativeInflowSignal) {
+                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeIn;
+            }
+            // Token-to-token fallback: largest opposite-direction token of
+            // any kind (e.g. a direct CAKE→FLOKI swap with no base asset).
+            if (bestCounterTok.empty()) {
+                for (auto& tok : tokenOrder) {
+                    if (tok == r.tokenAddr) continue;
+                    cpp_int net = netFlow[tok];
+                    bool wantsOutflow = r.isBuy;
+                    if (wantsOutflow && net >= 0) continue;
+                    if (!wantsOutflow && net <= 0) continue;
+                    cpp_int absNet = net >= 0 ? net : -net;
+                    if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
+                }
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         }
@@ -1320,6 +1418,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
                 cpp_int absNet = net >= 0 ? net : -net;
                 if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
             }
+            if (bestCounterTok.empty() && r.isBuy && nativeOutflow && nativeSwapSignal) {
+                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
+            }
+            if (bestCounterTok.empty() && !r.isBuy && nativeInflowSignal) {
+                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeIn;
+            }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         } else if (nativeOutflow && !tokenOrder.empty()) {
             // No base-asset ERC20 leg at all, but the wallet did send native
@@ -1336,16 +1440,21 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             }
         } else {
             r.tokenAddr = tokenOrder.front();
-            cpp_int net = netFlow[r.tokenAddr];            r.rawAmount = net >= 0 ? net : -net;
+            cpp_int net = netFlow[r.tokenAddr];
+            r.rawAmount = net >= 0 ? net : -net;
             r.isBuy = net > 0;
         }
     }
 
-    // A BUY signal built solely from the native-BNB leg (no ERC20 base asset
-    // observed) still needs the router gate from Stage 4 to count as a swap.
+    // A BUY/SELL built solely from a native-BNB leg (no ERC20 base asset
+    // observed) still needs corroboration to count as a swap.
     if (!r.isSwap && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
-        !isBaseAsset(r.tokenAddr) && nativeSwapSignal) {
+        !isBaseAsset(r.tokenAddr) && (nativeSwapSignal || nativeInflowSignal)) {
         r.isSwap = true;
+        if (r.counterAddr.empty()) {
+            if (r.isBuy && nativeOutflow && nativeSwapSignal) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeOut; }
+            else if (!r.isBuy && nativeInflowSignal) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeIn; }
+        }
     }
 
     int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
