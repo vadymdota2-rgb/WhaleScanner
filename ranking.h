@@ -36,7 +36,11 @@ void initRankingDB();
 // analyzeTx() couldn't classify are never stored. Duplicate tx_hash values
 // are silently ignored (INSERT OR IGNORE), so re-processing a block is safe.
 void saveTrade(const std::string& wallet, const TxResult& tx,
-               const std::string& hash, long long block);
+               const std::string& hash,
+               long long block,
+               long long blockTimestamp);
+
+void closeRankingDB();
 
 // Deletes trades older than 30 days. The `trades` table only ever holds a
 // rolling 30-day window, matching the Top PnL (30D) ranking window. Call
