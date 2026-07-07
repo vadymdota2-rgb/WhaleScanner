@@ -44,6 +44,14 @@ constexpr time_t CACHE_TTL_SECONDS = 15 * 60;          // how long a computed ra
 // nudges Telegram Android into laying the message (and thus the inline
 // keyboard) out at full width instead of its collapsed minimum width.
 const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
+// Width "stretcher" for menu messages that have no other wide content.
+// Rendered inside <code> so it's monospace — Telegram never shrinks a
+// monospace run below its natural width, which is exactly why the ranking
+// cards (with their 42-char <code> wallet address) come out near-full-width.
+// 42 chars matches the wallet-address width those cards already use; going
+// much longer is pointless because the line would just wrap and the bubble
+// would stay at the same max width.
+const char* const MENU_STRETCH = "──────────────────────────────────────────"; // 42 × U+2500
 
 // Dedicated READ-ONLY SQLite connection for the heavy full-table ranking
 // scans. With WAL enabled (initDB() sets it), a reader on its own
@@ -682,12 +690,15 @@ RankingMessage buildGlobalTopMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
-    // The CARD_SEPARATOR line (full-width run of U+2501) forces Telegram —
-    // Android in particular — to lay this message, and therefore the inline
-    // keyboard under it, out at 100% width instead of collapsing both to
-    // the minimum width of the short menu text.
+    // The <code> MENU_STRETCH line is a monospace "width stretcher": it
+    // reproduces the same 42-char monospace width as the wallet-address
+    // lines in the ranking cards, which is what makes those cards (and the
+    // keyboard under them) render near-full-width. A plain-text separator
+    // proved insufficient — Telegram only reliably honours monospace width.
+    // Note: even this is best-effort; the final bubble width is decided by
+    // the Telegram client and cannot be forced to exactly 100%.
     return {std::string("🏆 <b>Top Traders (30D)</b>\n")
-            + CARD_SEPARATOR
+            + "<code>" + MENU_STRETCH + "</code>"
             + "\n\nChoose a ranking:", keyboard.dump()};
 }
 
