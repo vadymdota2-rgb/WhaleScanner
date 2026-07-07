@@ -1791,6 +1791,21 @@ void handleCallbackQuery(const json& callbackQuery) {
             }
         }
     }
+
+
+// Global Top Traders — "🪙 Top PnL by Token"
+    else if (action == "gt_token") {
+        g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
+
+        replyInPlace(
+            chatId,
+            messageId,
+            "🪙 <b>Top PnL by Token</b>\n\n"
+            "Enter a token symbol (e.g. <code>CAKE</code>) "
+            "or a contract address (<code>0x...</code>):",
+            TelegramUI::buildCancelButton()
+        );
+    }
 }
 
 // ==================== TEXT INPUT HANDLERS ====================
