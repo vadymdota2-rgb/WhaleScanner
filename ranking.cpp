@@ -46,12 +46,17 @@ constexpr time_t CACHE_TTL_SECONDS = 15 * 60;          // how long a computed ra
 const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
 // Width "stretcher" for menu messages that have no other wide content.
 // Rendered inside <code> so it's monospace — Telegram never shrinks a
-// monospace run below its natural width, which is exactly why the ranking
-// cards (with their 42-char <code> wallet address) come out near-full-width.
-// 42 chars matches the wallet-address width those cards already use; going
-// much longer is pointless because the line would just wrap and the bubble
-// would stay at the same max width.
-const char* const MENU_STRETCH = "──────────────────────────────────────────"; // 42 × U+2500
+// monospace run below its natural width, which is what makes the ranking
+// cards (with their <code> wallet address) render near-full-width.
+// U+2800 (BRAILLE PATTERN BLANK) is used instead of a visible line: it is
+// NOT whitespace, so Telegram won't trim it, yet it renders as empty space —
+// the bubble stretches with no ugly ruled line in the menu.
+// Length 30: on a typical phone ~36 monospace chars fit per line (see how
+// the 42-char wallet address wraps), so 30 stays on ONE line with margin
+// while still pushing the bubble to (near) full width. Don't raise past
+// ~34 or it will wrap again on narrow screens.
+const char* const MENU_STRETCH =
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"; // 30 × U+2800
 
 // Dedicated READ-ONLY SQLite connection for the heavy full-table ranking
 // scans. With WAL enabled (initDB() sets it), a reader on its own
@@ -690,16 +695,16 @@ RankingMessage buildGlobalTopMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
-    // The <code> MENU_STRETCH line is a monospace "width stretcher": it
-    // reproduces the same 42-char monospace width as the wallet-address
-    // lines in the ranking cards, which is what makes those cards (and the
-    // keyboard under them) render near-full-width. A plain-text separator
-    // proved insufficient — Telegram only reliably honours monospace width.
-    // Note: even this is best-effort; the final bubble width is decided by
-    // the Telegram client and cannot be forced to exactly 100%.
+    // The <code> MENU_STRETCH line is an invisible monospace "width
+    // stretcher" (30 × U+2800): same mechanism that makes the ranking cards
+    // full-width via their <code> wallet address, but rendered as blank
+    // space instead of a visible ruled line. Kept short enough to never
+    // wrap onto a second line (see the constant's comment).
+    // Note: the final bubble width is still decided by the Telegram client
+    // and cannot be forced to exactly 100%.
     return {std::string("🏆 <b>Top Traders (30D)</b>\n")
             + "<code>" + MENU_STRETCH + "</code>"
-            + "\n\nChoose a ranking:", keyboard.dump()};
+            + "\nChoose a ranking:", keyboard.dump()};
 }
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind) {
