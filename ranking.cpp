@@ -682,7 +682,13 @@ RankingMessage buildGlobalTopMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
-    return {"🏆 <b>Top Traders (30D)</b>\n\nChoose a ranking:", keyboard.dump()};
+    // The CARD_SEPARATOR line (full-width run of U+2501) forces Telegram —
+    // Android in particular — to lay this message, and therefore the inline
+    // keyboard under it, out at 100% width instead of collapsing both to
+    // the minimum width of the short menu text.
+    return {std::string("🏆 <b>Top Traders (30D)</b>\n")
+            + CARD_SEPARATOR
+            + "\n\nChoose a ranking:", keyboard.dump()};
 }
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind) {
