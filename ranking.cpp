@@ -345,7 +345,10 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
     int endIdx = std::min(static_cast<int>(rows.size()), startIdx + PER_PAGE);
 
     std::stringstream text;
-    text << "🏆 <b>Top PnL (30D)</b>\n<code>" << safeString(token, 42) << "</code>\n\n";
+
+text << "🏆 <b>Top PnL (30D)</b>\n\n";
+text << "📄 <b>Smart Contract</b>\n";
+text << "<code>" << safeString(token, 42) << "</code>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
