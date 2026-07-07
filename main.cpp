@@ -25,6 +25,7 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 #include "ranking.h"
+#include "alert_settings.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -48,7 +49,8 @@ std::string getUptime() {
     int d = secs / 86400; secs %= 86400;
     int h = secs / 3600;  secs %= 3600;
     int m = secs / 60;
-    std::stringstream ss;    if (d > 0) ss << d << "d ";
+    std::stringstream ss;
+    if (d > 0) ss << d << "d ";
     ss << h << "h " << m << "m";
     return ss.str();
 }
@@ -89,13 +91,9 @@ std::string escapeHtml(const std::string& s) {
     return r;
 }
 
-// Truncates on a UTF-8 codepoint boundary *before* escaping, so we never cut
-// a multi-byte character or an HTML entity in half (which broke Telegram's
-// HTML parser and could make sendMessage fail with a 400).
 std::string truncateUtf8(const std::string& s, size_t maxLen) {
     if (s.size() <= maxLen) return s;
     size_t end = maxLen;
-    // walk back while we're in the middle of a multi-byte UTF-8 sequence
     while (end > 0 && (static_cast<unsigned char>(s[end]) & 0xC0) == 0x80) end--;
     return s.substr(0, end);
 }
@@ -106,7 +104,8 @@ std::string safeString(const std::string& s, size_t maxLen = 64) {
 
 void logCritical(const std::string& msg) {
     std::cerr << "[CRITICAL] " << msg << std::endl;
-    try {        std::ofstream("critical.log", std::ios::app)
+    try {
+        std::ofstream("critical.log", std::ios::app)
             << "[" << time(nullptr) << "] " << msg << "\n";
     } catch (...) {}
 }
@@ -156,7 +155,6 @@ bool isValidAddress(const std::string& a) {
     return true;
 }
 
-// Formats an integer with thousands separators, e.g. 1234567 -> "1,234,567"
 std::string formatThousands(uint64_t v) {
     std::string s = std::to_string(v);
     std::string out;
@@ -169,6 +167,7 @@ std::string formatThousands(uint64_t v) {
     std::reverse(out.begin(), out.end());
     return out;
 }
+
 // ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
@@ -218,7 +217,8 @@ bool isBaseAsset(const std::string& a) { return BASE_ASSETS.count(toLower(a)) > 
 const std::map<std::string, std::string> KNOWN_ROUTERS = {
     {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
     {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
-    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
+    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
+    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
     {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
     {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
     {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
@@ -235,10 +235,7 @@ std::string lookupRouterLabel(const std::string& addr) {
     return it != KNOWN_ROUTERS.end() ? it->second : std::string();
 }
 
-// WBNB contract — used as the pricing/decimals proxy for native BNB.
 const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
-// Internal sentinel for "native BNB paid via tx.value" — never a real on-chain
-// address, so it must be special-cased everywhere it's compared/displayed.
 const std::string NATIVE_BNB_MARKER = "native:bnb";
 
 std::atomic<bool> running{true};
@@ -275,7 +272,8 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
+        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
             return running.load(std::memory_order_relaxed) ? 0 : 1; });
     curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
     if (!post.empty()) {
@@ -324,7 +322,8 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
 // ==================== SQLITE ====================
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
-        std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);    }
+        std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
+    }
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
@@ -373,7 +372,8 @@ void initDB() {
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
-        INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');    )";
+        INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
+    )";
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
@@ -422,7 +422,8 @@ bool isTxProcessed(const std::string& h) {
 }
 void markTxProcessed(const std::string& h, long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
+    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;
+    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
 }
 long getTgOffset() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -514,10 +515,10 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
     if (chatId != SERVICE_CHAT_ID &&
-    countUserWhales(chatId) >= MAX_WHALES_PER_USER)
-{
-    return AddWhaleResult::LIMIT_REACHED;
-}
+        countUserWhales(chatId) >= MAX_WHALES_PER_USER)
+    {
+        return AddWhaleResult::LIMIT_REACHED;
+    }
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
@@ -573,7 +574,8 @@ void setUserThreshold(const std::string& chatId, double usd) {
     ensureUser(chatId);
     uint64_t nanos = usdToNanos(usd);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
+    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
@@ -622,18 +624,14 @@ public:
             if (std::chrono::duration_cast<std::chrono::hours>(now-it->second.last).count()>CLEANUP_H) it=users.erase(it); else ++it;
         auto& s=users[c];
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now-s.last).count()<MIN_MS) return false;
-        while (!s.hist.empty()&&std::chrono::duration_cast<std::chrono::seconds>(now-s.hist.front()).count()>60) s.hist.pop_front();        if ((int)s.hist.size()>=MAX_MIN) return false;
+        while (!s.hist.empty()&&std::chrono::duration_cast<std::chrono::seconds>(now-s.hist.front()).count()>60) s.hist.pop_front();
+        if ((int)s.hist.size()>=MAX_MIN) return false;
         s.last=now; s.hist.push_back(now); return true;
     }
 } g_rateLimiter;
 
 // ==================== TELEGRAM UI ====================
 namespace TelegramUI {
-
-struct UIMessage {
-    std::string text;
-    std::string keyboard;
-};
 
 UIMessage buildMainMenu(const std::string& chatId) {
     size_t walletCount = countUserWhales(chatId);
@@ -686,7 +684,8 @@ std::string buildCancelButton() {
 }
 
 UIMessage buildWalletsList(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(dbMutex);    sqlite3_stmt* s;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
         "SELECT wa.address, uw.label FROM user_whales uw "
         "JOIN whale_addresses wa ON wa.id = uw.whale_id "
@@ -731,8 +730,6 @@ UIMessage buildWalletsList(const std::string& chatId) {
     return {text.str(), keyboard.dump()};
 }
 
-// Confirmation step shown before actually deleting a wallet, to guard
-// against accidental taps on "Remove".
 UIMessage buildRemoveConfirm(const std::string& address, const std::string& label) {
     std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
     std::stringstream text;
@@ -746,36 +743,6 @@ UIMessage buildRemoveConfirm(const std::string& address, const std::string& labe
         {{"text", "🗑️ Yes, remove"}, {"callback_data", "remove:" + address}},
         {{"text", "❌ Cancel"}, {"callback_data", "menu:my_wallets"}}
     }));
-    return {text.str(), keyboard.dump()};
-}
-
-UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
-    double currentUsd = nanosToUsd(currentThresholdNanos);
-
-    std::stringstream text;
-    text << "💰 <b>Alert Threshold</b>\n\n";
-    text << "You'll only be alerted for transactions at or above this amount.\n\n";
-    text << "Current threshold: <b>$" << formatThousands(static_cast<uint64_t>(currentUsd)) << "</b>\n\n";
-    text << "Choose a preset or enter a custom amount:";
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "$1K"}, {"callback_data", "threshold:1000"}},
-        {{"text", "$5K"}, {"callback_data", "threshold:5000"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "$10K"}, {"callback_data", "threshold:10000"}},
-        {{"text", "$50K"}, {"callback_data", "threshold:50000"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "✏️ Custom amount"}, {"callback_data", "threshold:custom"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
-    }));
-
     return {text.str(), keyboard.dump()};
 }
 
@@ -825,49 +792,12 @@ UIMessage buildHelpMessage() {
 } // namespace TelegramUI
 
 // ==================== USER SESSION MANAGER ====================
-enum class UserState {
-    IDLE,
-    AWAITING_WALLET_ADDRESS,
-    AWAITING_WALLET_NAME,
-    AWAITING_RENAME,
-    AWAITING_CUSTOM_THRESHOLD,
-    AWAITING_TOPTRADER_TOKEN
-};
-
-struct UserSession {
-    UserState state = UserState::IDLE;
-    std::string pendingAddress;
-    std::string pendingLabel;
-};
-
-class UserSessionManager {
-    std::mutex mtx;
-    std::unordered_map<std::string, UserSession> sessions;
-public:
-    UserSession getSession(const std::string& chatId) {
-        std::lock_guard<std::mutex> l(mtx);
-        auto it = sessions.find(chatId);
-        return it != sessions.end() ? it->second : UserSession{};
-    }
-
-    void setState(const std::string& chatId, UserState state,
-                  const std::string& pendingAddress = "",
-                  const std::string& pendingLabel = "") {
-        std::lock_guard<std::mutex> l(mtx);
-        sessions[chatId] = UserSession{state, pendingAddress, pendingLabel};
-    }
-
-    void clearSession(const std::string& chatId) {
-        std::lock_guard<std::mutex> l(mtx);
-        sessions.erase(chatId);
-    }
-} g_sessionManager;
+UserSessionManager g_sessionManager;
 
 // ==================== TELEGRAM ====================
-struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
-
-SendResult sendMsg(const std::string& c, const std::string& t, const std::string& reply_markup = "") {
-    json j;    j["chat_id"] = c;
+SendResult sendMsg(const std::string& c, const std::string& t, const std::string& reply_markup) {
+    json j;
+    j["chat_id"] = c;
     j["text"] = t;
     j["parse_mode"] = "HTML";
     j["disable_web_page_preview"] = true;
@@ -897,10 +827,6 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     } catch (...) { return {false, false, 0}; }
 }
 
-// Edits an existing message in place — used for pagination so flipping
-// pages doesn't spam the chat with a new message each time. Returns false
-// on any failure (e.g. message too old to edit, or content unchanged);
-// callers should fall back to sendMsg() in that case.
 bool editMsg(const std::string& c, long long messageId, const std::string& t, const std::string& reply_markup = "") {
     json j; j["chat_id"] = c; j["message_id"] = messageId;
     j["text"] = t;
@@ -913,13 +839,7 @@ bool editMsg(const std::string& c, long long messageId, const std::string& t, co
     try { auto p = json::parse(r); return p.value("ok", false); } catch (...) { return false; }
 }
 
-// Menu navigation should feel like navigating a single screen, not spawning
-// a new message per tap. This edits the message the button was attached to
-// in place, falling back to sendMsg() only if the edit fails (message too
-// old, chat quirks, etc.) or there's no message to edit. When `keyboard` is
-// empty, this explicitly clears any inline keyboard left over from the
-// previous screen instead of leaving stale buttons behind.
-void replyInPlace(const std::string& chatId, long long messageId, const std::string& text, const std::string& keyboard = "") {
+void replyInPlace(const std::string& chatId, long long messageId, const std::string& text, const std::string& keyboard) {
     std::string kb = keyboard.empty() ? "{\"inline_keyboard\":[]}" : keyboard;
     if (messageId <= 0 || !editMsg(chatId, messageId, text, kb)) {
         sendMsg(chatId, text, keyboard);
@@ -959,7 +879,8 @@ class SafeMessageQueue {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
             if (sqlite3_step(s)==SQLITE_ROW) queueSize.store(sqlite3_column_int64(s,0)); sqlite3_finalize(s); }
-    }    void updateStatus(int64_t id, int st, int rc, time_t nr) {
+    }
+    void updateStatus(int64_t id, int st, int rc, time_t nr) {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=?")) return;
         sqlite3_bind_int(s,1,st); sqlite3_bind_int(s,2,rc); sqlite3_bind_int64(s,3,nr); sqlite3_bind_int64(s,4,id);
@@ -1008,7 +929,8 @@ public:
     void syncSize() {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
         if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
-            if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();                if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
+            if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
+                if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
     }
     bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
         if (recipients.empty()) return true;
@@ -1081,8 +1003,6 @@ std::string nthWord(const std::string& h, size_t wordIdx) {
     if (h.length() < start + 64) return "";
     return "0x" + h.substr(start, 64);
 }
-// Parses a variable-length "0x..." hex string (as used for tx.value, unlike
-// the fixed 32-byte words returned by eth_call/logs) into a cpp_int.
 cpp_int hexToCppInt(const std::string& h) {
     if (h.size() < 2 || h[0] != '0' || h[1] != 'x') return 0;
     cpp_int r = 0;
@@ -1112,18 +1032,12 @@ cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
-// Per-unit USD price (USD*1e9) implied by a trade's total USD value and raw
-// token amount: priceNanos = usdNanos * 10^dec / rawAmount. No extra RPC —
-// derived entirely from fields already present on TxResult.
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec) {
     if (rawAmount <= 0) return 0;
     cpp_int d = 1; for (int i = 0; i < dec; i++) d *= 10;
     return (usdNanos * d) / rawAmount;
 }
 
-// Formats a USD*1e9 price with dynamic precision (trailing zeros trimmed,
-// but always at least 2 decimal places) instead of formatUsd()'s fixed 2
-// decimals, since many BSC token prices are well under a cent.
 std::string formatPriceUsd(const cpp_int& n) {
     bool neg = n < 0;
     cpp_int a = neg ? -n : n;
@@ -1147,60 +1061,31 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
     auto r = rpc("eth_call", {{{"to",token},{"data","0x70a08231"+walletPadded}}, bs.str()});
     if (!r.is_string()) return std::nullopt;
     const std::string& hex = r.get<std::string>();
-    if (hex.length() < 66) return std::nullopt;    return parseUint256(hex);
+    if (hex.length() < 66) return std::nullopt;
+    return parseUint256(hex);
 }
 
 // ==================== ANALYZE TX ====================
-// Known DEX Swap event signatures (topic0). These cover the overwhelming
-// majority of BSC swap volume (V2 forks like PancakeSwap V2/BiSwap/ApeSwap
-// all share the V2 signature; V3 forks share one of the two V3 signatures).
-// Anything more exotic is still caught by the two-sided-flow heuristic in
-// analyzeTx() below, so an unrecognized topic only costs venue attribution,
-// never BUY/SELL detection.
 const std::set<std::string> SWAP_EVENT_TOPICS = {
-    // Uniswap/PancakeSwap V2-style: Swap(address,uint256,uint256,uint256,uint256,address)
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
-    // Uniswap V3-style: Swap(address,address,int256,int256,uint160,uint128,int24)
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
-    // PancakeSwap V3: Swap(address,address,int256,int256,uint160,uint128,int24,uint128,uint128)
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83",
 };
 const std::string ERC20_TRANSFER_TOPIC =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-// WBNB (WETH-style) wrap/unwrap events. Native BNB can only enter or leave a
-// DEX pool through these, so they are the receipt-level evidence of the
-// native-BNB leg of a swap — the leg that emits no ERC20 Transfer and would
-// otherwise need debug_traceTransaction to observe.
 const std::string WBNB_DEPOSIT_TOPIC =
     "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
 const std::string WBNB_WITHDRAWAL_TOPIC =
     "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
 
-// Classification model (single pass over receipt logs, zero extra RPC):
-//
-//  1. ERC20 Transfer legs touching the wallet -> per-token net flow.
-//     Exactly-3-topic Transfers only: 4 topics = ERC721 (NFT), which is
-//     never a trade leg and previously could pollute token selection.
-//     Zero-amount legs are ignored for the same reason.
-//  2. Swap events from SWAP_EVENT_TOPICS -> hard evidence of a trade
-//     somewhere in the tx (hasSwap), plus venue attribution.
-//  3. WBNB Deposit/Withdrawal (on the WBNB contract only) -> the native-BNB
-//     leg: Deposit means BNB was wrapped in (a buy paid with native BNB),
-//     Withdrawal means WBNB was unwrapped out (a sell paid out in native
-//     BNB). This finally makes "sell token for BNB" visible as a SELL
-//     instead of a TRANSFER.
-//  4. Two-sided flow: the wallet has a net inflow of one token AND a net
-//     outflow of a different token in the same tx. That alone is a swap
-//     (covers token-to-token trades, bonding curves, and DEXs whose Swap
-//     topic we don't know), no base asset or recognized event required.
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
 
     bool hasSwap=false;
     std::string swapLogAddr;
     size_t swapLogDataHexLen=0;
-    cpp_int wbnbWrapped = 0;    // native BNB wrapped into WBNB within this tx
-    cpp_int wbnbUnwrapped = 0;  // WBNB unwrapped back to native BNB within this tx
+    cpp_int wbnbWrapped = 0;
+    cpp_int wbnbUnwrapped = 0;
 
     std::map<std::string, cpp_int> netFlow;
     std::vector<std::string> tokenOrder;
@@ -1218,7 +1103,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         std::string logAddr = (l.contains("address") && l["address"].is_string())
             ? toLower(l["address"].get<std::string>()) : "";
 
-        // --- Swap events (any known DEX family) ---
         if (SWAP_EVENT_TOPICS.count(t0)) {
             hasSwap = true;
             if (swapLogAddr.empty()) {
@@ -1231,7 +1115,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             continue;
         }
 
-        // --- WBNB wrap/unwrap (only trusted on the real WBNB contract) ---
         if (logAddr == WBNB_ADDR && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
             if (l.contains("data") && l["data"].is_string()) {
                 cpp_int wad = parseUint256(l["data"].get<std::string>());
@@ -1240,10 +1123,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             continue;
         }
 
-        // --- ERC20 Transfer legs touching the wallet ---
         if (t0 != ERC20_TRANSFER_TOPIC) continue;
-        // Exactly 3 topics = ERC20. 4 topics = ERC721 Transfer (indexed
-        // tokenId, empty data) — never a trade leg, skip.
         if (l["topics"].size() != 3) continue;
         if (!l.contains("data")||!l["data"].is_string()) continue;
         if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||logAddr.empty()) continue;
@@ -1257,7 +1137,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         std::string to = "0x"+toLower(t2.substr(26));
         if (fr != wa && to != wa) continue;
         cpp_int amt = parseUint256(dataField);
-        if (amt == 0) continue;  // zero-value spam transfers must not steer token selection
+        if (amt == 0) continue;
         touch(logAddr);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
@@ -1265,10 +1145,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (fr == wa) netFlow[logAddr] -= amt;
     }
 
-    // ---- Native BNB outflow leg ----
-    // Routers that accept native BNB (msg.value) never emit an ERC20 Transfer
-    // for the wrapped asset. The outflow side is visible directly on the tx
-    // object (wallet == tx.from, tx.value > 0) — no extra RPC needed.
     cpp_int nativeOut = 0;
     std::string txTo;
     bool walletIsSender = false;
@@ -1287,7 +1163,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     if (!anyTransferForWallet) return r;
     r.valid = true;
 
-    // ---- Venue attribution (cosmetic only, never gates detection) ----
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
     if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
@@ -1297,22 +1172,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
     }
 
-    // ---- Swap signals ----
-    // Native OUTFLOW counts as a swap leg when anything else in the receipt
-    // corroborates a trade: a known router as the call target, any Swap
-    // event, or the BNB actually being wrapped into WBNB. (The old version
-    // required a known router, which silently missed every unlisted router.)
     bool routerCall = !txTo.empty() && !lookupRouterLabel(txTo).empty();
     bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
-    // Native INFLOW can't be observed directly, but a WBNB Withdrawal in a
-    // swap tx *sent by the wallet itself* means the pool's WBNB was unwrapped
-    // and the resulting BNB paid out — i.e. the wallet sold for native BNB.
     cpp_int nativeIn = 0;
     if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
     bool nativeInflowSignal = nativeIn > 0;
 
-    // Two-sided flow: net inflow of one token and net outflow of another in
-    // the same tx is a swap by definition, whatever the venue.
     bool anyIn = false, anyOut = false;
     for (auto& tok : tokenOrder) {
         if (netFlow[tok] > 0) anyIn = true;
@@ -1354,7 +1219,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         r.isBuy = bestNonBaseNet > 0;
 
         if (r.isSwap) {
-            // Preferred counter leg: the largest opposite-direction BASE asset.
             std::string bestCounterTok; cpp_int bestCounterAbs = -1;
             for (auto& tok : tokenOrder) {
                 if (!isBaseAsset(tok)) continue;
@@ -1365,15 +1229,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
                 cpp_int absNet = net >= 0 ? net : -net;
                 if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
             }
-            // Native BNB fallbacks: the leg that emits no ERC20 Transfer.
             if (bestCounterTok.empty() && r.isBuy && nativeOutflow && nativeSwapSignal) {
                 bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
             }
             if (bestCounterTok.empty() && !r.isBuy && nativeInflowSignal) {
                 bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeIn;
             }
-            // Token-to-token fallback: largest opposite-direction token of
-            // any kind (e.g. a direct CAKE→FLOKI swap with no base asset).
             if (bestCounterTok.empty()) {
                 for (auto& tok : tokenOrder) {
                     if (tok == r.tokenAddr) continue;
@@ -1426,10 +1287,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
         } else if (nativeOutflow && !tokenOrder.empty()) {
-            // No base-asset ERC20 leg at all, but the wallet did send native
-            // BNB and did receive/send some other token — treat tx.value as
-            // the base leg (BUY side) so this doesn't fall through to the
-            // single-token/TRANSFER branch below.
             r.tokenAddr = tokenOrder.front();
             cpp_int net = netFlow[r.tokenAddr];
             r.rawAmount = net >= 0 ? net : -net;
@@ -1446,8 +1303,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         }
     }
 
-    // A BUY/SELL built solely from a native-BNB leg (no ERC20 base asset
-    // observed) still needs corroboration to count as a swap.
     if (!r.isSwap && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
         !isBaseAsset(r.tokenAddr) && (nativeSwapSignal || nativeInflowSignal)) {
         r.isSwap = true;
@@ -1501,8 +1356,8 @@ bool processBlock(long long bn) {
     if (block.is_null()||!block.is_object()||!block.contains("transactions")||!block["transactions"].is_array()) return false;
     std::string ph=block.value("parentHash",""), ep=getLastBlockHash();
     long long blockTs = 0;
-if (block.contains("timestamp") && block["timestamp"].is_string())
-    hexToLL(block["timestamp"].get<std::string>(), blockTs);
+    if (block.contains("timestamp") && block["timestamp"].is_string())
+        hexToLL(block["timestamp"].get<std::string>(), blockTs);
     if (!ep.empty()&&ph!=ep&&bn>1) {
         g_stats.reorg_verifications.fetch_add(1); std::cerr << "[REORG?] Mismatch at " << bn << ", verifying..." << std::endl;
         size_t ai=(rpcIndex.load(std::memory_order_relaxed)+1)%BSC_RPC_ENDPOINTS.size();
@@ -1532,7 +1387,7 @@ if (block.contains("timestamp") && block["timestamp"].is_string())
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        
+
         saveTrade(mA, res, hash, bn, blockTs);
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
@@ -1560,7 +1415,8 @@ if (block.contains("timestamp") && block["timestamp"].is_string())
         if (anySent) {
             markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(byLabel.size());
             std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
-                      << " -> " << byLabel.size() << " label group(s)" << std::endl;        } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
+                      << " -> " << byLabel.size() << " label group(s)" << std::endl;
+        } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
     }
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
 }
@@ -1594,13 +1450,10 @@ void handleCallbackQuery(const json& callbackQuery) {
     std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
     std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
 
-    // "tt_track" answers the callback itself (with custom feedback text),
-    // since a callback query can only be answered once.
     if (action != "tt_track" && !callbackQueryId.empty()) {
         answerCallbackQuery(callbackQueryId);
     }
 
-    // Menu navigation
     if (action == "menu") {
         g_sessionManager.clearSession(chatId);
 
@@ -1635,13 +1488,11 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
-    // Cancel
     else if (action == "cancel") {
         g_sessionManager.clearSession(chatId);
         auto msg = TelegramUI::buildMainMenu(chatId);
         replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
     }
-    // Rename wallet
     else if (action == "rename") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
@@ -1673,7 +1524,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
         }
     }
-    // Ask for confirmation before removing a wallet (guards against fat-finger taps)
     else if (action == "askremove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
@@ -1697,7 +1547,6 @@ void handleCallbackQuery(const json& callbackQuery) {
         auto msg = TelegramUI::buildRemoveConfirm(address, label);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
-    // Remove wallet (after confirmation)
     else if (action == "remove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
@@ -1714,38 +1563,15 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
         }
     }
-    // Threshold presets
     else if (action == "threshold") {
-        if (param == "custom") {
-            g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD);
-            replyInPlace(chatId, messageId, "💰 <b>Custom Threshold</b>\n\nPlease enter the minimum alert amount in USD (e.g., 7500):",
-                    TelegramUI::buildCancelButton());
-        } else {
-            try {
-                double usd = std::stod(param);
-                if (usd <= 0) {
-                    replyInPlace(chatId, messageId, "❌ Threshold must be positive.");
-                    return;
-                }
-                setUserThreshold(chatId, usd);
-                refreshWatchers();
-                auto msg = TelegramUI::buildMainMenu(chatId);
-                replyInPlace(chatId, messageId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text, msg.keyboard);
-            } catch (...) {
-                replyInPlace(chatId, messageId, "❌ Invalid threshold value.");
-            }
-        }
+        handleThresholdCallback(chatId, param, messageId);
     }
-    // Top PnL (30D) [per token] — pagination (reuses the cached ranking
-    // instead of recomputing it)
     else if (action == "tt_page") {
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
         auto msg = buildTopPnlPage(chatId, page);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
-    // Top PnL (30D) — "➕ Track" button under a ranked wallet (shared by both
-    // the per-token and the global Top Traders rankings)
     else if (action == "tt_track") {
         std::string address = toLower(param);
         std::string feedback;
@@ -1764,12 +1590,8 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
         if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
     }
-    // Page-indicator button ("3/4") — decorative, does nothing
     else if (action == "tt_noop") {
-        // already silently acknowledged above
     }
-    // Global Top Traders (30D) — open one of the four rankings (computes
-    // and caches all four together, then shows page 1 of the chosen one)
     else if (action == "gt_open") {
         GlobalRankKind kind;
         if (parseGlobalRankKind(param, kind)) {
@@ -1777,7 +1599,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
-    // Global Top Traders (30D) — pagination (cache-only, no recompute)
     else if (action == "gt_page") {
         size_t sep = param.find(':');
         if (sep != std::string::npos) {
@@ -1791,9 +1612,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             }
         }
     }
-
-
-// Global Top Traders — "🪙 Top PnL by Token"
     else if (action == "gt_token") {
         g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
 
@@ -1815,7 +1633,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
     if (session.state == UserState::IDLE) {
         return false;
     }
-    // AWAITING_WALLET_ADDRESS
+
     if (session.state == UserState::AWAITING_WALLET_ADDRESS) {
         std::string address = toLower(trim(text));
 
@@ -1831,7 +1649,6 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         return true;
     }
 
-    // AWAITING_WALLET_NAME
     if (session.state == UserState::AWAITING_WALLET_NAME) {
         std::string label = trim(text);
 
@@ -1863,7 +1680,8 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
                     TelegramUI::buildCancelButton());
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
-            g_sessionManager.clearSession(chatId);            auto msg = TelegramUI::buildMainMenu(chatId);
+            g_sessionManager.clearSession(chatId);
+            auto msg = TelegramUI::buildMainMenu(chatId);
             sendMsg(chatId, "⚠️ You've reached the limit of " + std::to_string(MAX_WHALES_PER_USER) +
                     " tracked wallets.\n\n" + msg.text, msg.keyboard);
         }
@@ -1874,7 +1692,6 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         return true;
     }
 
-    // AWAITING_RENAME
     if (session.state == UserState::AWAITING_RENAME) {
         std::string newLabel = trim(text);
 
@@ -1912,37 +1729,9 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         return true;
     }
 
-    // AWAITING_CUSTOM_THRESHOLD
-    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD) {
-        try {
-            double usd = std::stod(text);
+    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD)
+        return handleThresholdText(chatId, text);
 
-            if (usd <= 0) {
-                sendMsg(chatId, "❌ Threshold must be positive.\n\nPlease enter a valid amount or press Cancel.",
-                        TelegramUI::buildCancelButton());
-                return true;
-            }
-
-            if (usd > 1000000000) {
-                sendMsg(chatId, "❌ Threshold is too large.\n\nPlease enter a smaller amount or press Cancel.",
-                        TelegramUI::buildCancelButton());
-                return true;
-            }
-
-            setUserThreshold(chatId, usd);
-            refreshWatchers();
-            g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            sendMsg(chatId, "✅ Threshold set to <b>$" + formatThousands(static_cast<uint64_t>(usd)) + "</b>.\n\n" + msg.text,
-                    msg.keyboard);
-        } catch (...) {
-            sendMsg(chatId, "❌ Invalid number.\n\nPlease enter a valid amount (e.g., 7500) or press Cancel.",
-                    TelegramUI::buildCancelButton());
-        }
-        return true;
-    }
-
-    // AWAITING_TOPTRADER_TOKEN
     if (session.state == UserState::AWAITING_TOPTRADER_TOKEN) {
         std::string tokenArg = trim(text);
 
@@ -1973,7 +1762,6 @@ void telegramLoop() {
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
 
-                // === CALLBACK QUERY ===
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
                     handleCallbackQuery(u["callback_query"]);
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
@@ -1982,8 +1770,6 @@ void telegramLoop() {
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
                 if (!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
 
-                // === COMMANDS (priority over state machine) ===
-                // Commands always start with '/', and must interrupt any active input session.
                 if (!txt.empty() && txt[0] == '/') {
                     g_sessionManager.clearSession(cid);
 
@@ -2027,7 +1813,8 @@ void telegramLoop() {
                                 << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
                             if (diskFree >= 0) {
                                 ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
-                                if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";                            } else {
+                                if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
+                            } else {
                                 ss2 << "Disk: <b>unknown</b>\n";
                             }
                             ss2 << "Uptime: <b>" << getUptime() << "</b>";
@@ -2076,7 +1863,8 @@ void telegramLoop() {
                     else if (txt.find("/limit ")==0) {
                         try { double v=std::stod(txt.substr(7));
                             if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
-                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+formatThousands(static_cast<uint64_t>(v))); }                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
+                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+formatThousands(static_cast<uint64_t>(v))); }
+                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
                     }
                     else if (txt.find("/language")==0) {
                         std::string rest = trim(txt.substr(9));
@@ -2095,13 +1883,9 @@ void telegramLoop() {
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
                 }
-                // === STATE MACHINE (only for non-command text) ===
                 else if (handleTextInput(cid, txt)) {
-                    // Handled by state machine
                 }
                 else {
-                    // Idle user sent plain text with no active flow — nudge them to the menu
-                    // instead of silently dropping the message.
                     auto msg = TelegramUI::buildMainMenu(cid);
                     sendMsg(cid, msg.text, msg.keyboard);
                 }
@@ -2139,7 +1923,8 @@ int main() {
                     lb = getLastBlock();
                     break;
                 }
-                lb = next; saveLastBlock(lb);                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
+                lb = next; saveLastBlock(lb);
+                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
@@ -2151,13 +1936,13 @@ int main() {
         } catch (const std::exception& e) { std::cerr << "[ERROR] " << e.what() << std::endl; }
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
-    
+
     std::cout << "[SHUTDOWN] Stopping..." << std::endl;
-g_msgQueue.stop();
-tg.join();
-walCheckpoint();
-closeRankingDB();
-if (db) sqlite3_close(db);
-curl_global_cleanup();
+    g_msgQueue.stop();
+    tg.join();
+    walCheckpoint();
+    closeRankingDB();
+    if (db) sqlite3_close(db);
+    curl_global_cleanup();
     std::cout << "[SHUTDOWN] Clean exit." << std::endl; return 0;
 }
