@@ -692,6 +692,13 @@ RankingMessage buildGlobalTopMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "🔄 Most Active"}, {"callback_data", "gt_open:active"}}
     }));
+    // Per-token leaderboard (the /toptrader TOKEN feature). An inline button
+    // can't carry a user-supplied argument, so this only sends the "gt_token"
+    // callback; main.cpp's handler must then ask the user which token
+    // (see the gt_token handler next to the other gt_* callbacks).
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "🪙 Top PnL by Token"}, {"callback_data", "gt_token"}}
+    }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
