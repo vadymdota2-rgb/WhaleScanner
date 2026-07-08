@@ -1,7 +1,7 @@
 #include "alert_settings.h"
 
+#include <array>
 #include <sstream>
-#include <cmath>
 #include <cstdio>
 #include "json.hpp"
 
@@ -9,64 +9,128 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr double MAX_THRESHOLD_USD = 1000000000.0;
+constexpr std::array<uint64_t, 6> PRESETS_USD{ 100, 500, 1000, 5000, 10000, 50000 };
+constexpr size_t PRESETS_PER_ROW = 2;
 
-std::string formatUsdAmount(double usd) {
-    if (usd < 0) usd = 0;
-    uint64_t cents = static_cast<uint64_t>(usd * 100.0 + 0.5);
-    uint64_t dollars = cents / 100;
-    int rem = static_cast<int>(cents % 100);
+constexpr uint64_t NANOS_PER_USD = 1000000000ULL;
+constexpr uint64_t NANOS_PER_CENT = NANOS_PER_USD / 100;
+constexpr uint64_t MAX_THRESHOLD_USD = 1000000000ULL;
+constexpr uint64_t MAX_THRESHOLD_CENTS = MAX_THRESHOLD_USD * 100;
+constexpr size_t MAX_INT_DIGITS = 10;
+
+constexpr char ERR_INVALID[]   = "❌ Invalid number.";
+constexpr char ERR_POSITIVE[]  = "❌ Threshold must be positive.";
+constexpr char ERR_TOO_LARGE[] = "❌ Threshold is too large.";
+constexpr char ERR_DECIMALS[]  = "❌ Use at most 2 decimal places (e.g., 7500.50).";
+constexpr char RETRY_HINT[] = "\n\nPlease enter a valid amount (e.g., 7500 or 7500.50) or press Cancel.";
+
+enum class ParseResult { OK, INVALID, NOT_POSITIVE, TOO_LARGE, TOO_MANY_DECIMALS };
+enum class ApplyResult { Changed, Unchanged };
+
+const char* parseError(ParseResult r) {
+    switch (r) {
+        case ParseResult::NOT_POSITIVE:      return ERR_POSITIVE;
+        case ParseResult::TOO_LARGE:         return ERR_TOO_LARGE;
+        case ParseResult::TOO_MANY_DECIMALS: return ERR_DECIMALS;
+        default:                             return ERR_INVALID;
+    }
+}
+
+ParseResult parseThresholdNanos(const std::string& raw, uint64_t& outNanos) {
+    std::string t = trim(raw);
+    if (t.empty()) return ParseResult::INVALID;
+    if (t[0] == '-') return ParseResult::NOT_POSITIVE;
+
+    uint64_t dollars = 0;
+    uint64_t cents = 0;
+    size_t i = 0;
+
+    size_t intDigits = 0;
+    for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; i++) {
+        if (++intDigits > MAX_INT_DIGITS) return ParseResult::TOO_LARGE;
+        dollars = dollars * 10 + static_cast<uint64_t>(t[i] - '0');
+    }
+    if (intDigits == 0) return ParseResult::INVALID;
+
+    if (i < t.size()) {
+        if (t[i] != '.') return ParseResult::INVALID;
+        i++;
+        size_t fracDigits = 0;
+        for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; i++) {
+            if (++fracDigits > 2) return ParseResult::TOO_MANY_DECIMALS;
+            cents = cents * 10 + static_cast<uint64_t>(t[i] - '0');
+        }
+        if (fracDigits == 0) return ParseResult::INVALID;
+        if (i != t.size()) return ParseResult::INVALID;
+        if (fracDigits == 1) cents *= 10;
+    }
+
+    uint64_t totalCents = dollars * 100 + cents;
+    if (totalCents == 0) return ParseResult::NOT_POSITIVE;
+    if (totalCents > MAX_THRESHOLD_CENTS) return ParseResult::TOO_LARGE;
+
+    outNanos = totalCents * NANOS_PER_CENT;
+    return ParseResult::OK;
+}
+
+std::string formatUsdNanos(uint64_t nanos) {
+    uint64_t dollars = nanos / NANOS_PER_USD;
+    int cents = static_cast<int>((nanos % NANOS_PER_USD) / NANOS_PER_CENT);
     std::string s = "$" + formatThousands(dollars);
-    if (rem != 0) {
+    if (cents != 0) {
         char buf[8];
-        std::snprintf(buf, sizeof(buf), ".%02d", rem);
+        std::snprintf(buf, sizeof(buf), ".%02d", cents);
         s += buf;
     }
     return s;
 }
 
-std::string buildUpdatedText(double usd) {
-    return "✅ <b>Alert threshold updated</b>\n\n"
-           "Current threshold:\n<b>" + formatUsdAmount(usd) + "</b>";
+std::string presetLabel(uint64_t usd) {
+    if (usd >= 1000 && usd % 1000 == 0) return "$" + std::to_string(usd / 1000) + "K";
+    return "$" + formatThousands(usd);
 }
 
-bool parseUsd(const std::string& raw, double& out) {
-    std::string t = trim(raw);
-    if (t.empty()) return false;
-    try {
-        size_t pos = 0;
-        out = std::stod(t, &pos);
-        return pos == t.size() && std::isfinite(out);
-    } catch (...) {
-        return false;
-    }
+ApplyResult applyThreshold(const std::string& chatId, uint64_t nanos) {
+    if (getUserThresholdNanos(chatId) == nanos) return ApplyResult::Unchanged;
+    setUserThresholdNanos(chatId, nanos);
+    refreshWatchers();
+    return ApplyResult::Changed;
+}
+
+std::string buildStatusText(ApplyResult result, uint64_t nanos) {
+    if (result == ApplyResult::Unchanged)
+        return "ℹ️ Current threshold is already <b>" + formatUsdNanos(nanos) + "</b>.";
+    return "✅ <b>Alert threshold updated</b>\n\n"
+           "Current threshold:\n<b>" + formatUsdNanos(nanos) + "</b>";
 }
 
 } // namespace
 
 TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
-    double currentUsd = nanosToUsd(currentThresholdNanos);
-
     std::stringstream text;
     text << "💰 <b>Alert Threshold</b>\n\n";
     text << "You'll only be alerted for transactions at or above this amount.\n\n";
-    text << "Current threshold: <b>" << formatUsdAmount(currentUsd) << "</b>\n\n";
+    text << "Current threshold: <b>" << formatUsdNanos(currentThresholdNanos) << "</b>\n\n";
     text << "Choose a preset or enter a custom amount:";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "$100"}, {"callback_data", "threshold:100"}},
-        {{"text", "$500"}, {"callback_data", "threshold:500"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "$1K"}, {"callback_data", "threshold:1000"}},
-        {{"text", "$5K"}, {"callback_data", "threshold:5000"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "$10K"}, {"callback_data", "threshold:10000"}},
-        {{"text", "$50K"}, {"callback_data", "threshold:50000"}}
-    }));
+
+    json row = json::array();
+    size_t inRow = 0;
+    for (uint64_t usd : PRESETS_USD) {
+        row.push_back({
+            {"text", presetLabel(usd)},
+            {"callback_data", "threshold:" + std::to_string(usd)}
+        });
+        if (++inRow == PRESETS_PER_ROW) {
+            keyboard["inline_keyboard"].push_back(row);
+            row = json::array();
+            inRow = 0;
+        }
+    }
+    if (inRow > 0) keyboard["inline_keyboard"].push_back(row);
+
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "✏️ Custom amount"}, {"callback_data", "threshold:custom"}}
     }));
@@ -87,59 +151,30 @@ bool handleThresholdCallback(const std::string& chatId, const std::string& param
         return true;
     }
 
-    double usd = 0;
-    if (!parseUsd(param, usd)) {
-        replyInPlace(chatId, messageId, "❌ Invalid threshold value.");
+    uint64_t nanos = 0;
+    ParseResult pr = parseThresholdNanos(param, nanos);
+    if (pr != ParseResult::OK) {
+        replyInPlace(chatId, messageId, parseError(pr));
         return true;
     }
-    if (usd <= 0) {
-        replyInPlace(chatId, messageId, "❌ Threshold must be positive.");
-        return true;
-    }
-    usd = std::round(usd * 100.0) / 100.0;
 
-    setUserThreshold(chatId, usd);
-    refreshWatchers();
-
+    ApplyResult ar = applyThreshold(chatId, nanos);
     auto menu = TelegramUI::buildMainMenu(chatId);
-    replyInPlace(chatId, messageId, buildUpdatedText(usd) + "\n\n" + menu.text, menu.keyboard);
+    replyInPlace(chatId, messageId, buildStatusText(ar, nanos) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
 
 bool handleThresholdText(const std::string& chatId, const std::string& text) {
-    double usd = 0;
-    if (!parseUsd(text, usd)) {
-        sendMsg(chatId,
-            "❌ Invalid number.\n\nPlease enter a valid amount (e.g., 7500 or 7500.50) or press Cancel.",
-            TelegramUI::buildCancelButton());
-        return true;
-    }
-    if (usd <= 0) {
-        sendMsg(chatId,
-            "❌ Threshold must be positive.\n\nPlease enter a valid amount or press Cancel.",
-            TelegramUI::buildCancelButton());
-        return true;
-    }
-    if (usd > MAX_THRESHOLD_USD) {
-        sendMsg(chatId,
-            "❌ Threshold is too large.\n\nPlease enter a smaller amount or press Cancel.",
-            TelegramUI::buildCancelButton());
+    uint64_t nanos = 0;
+    ParseResult pr = parseThresholdNanos(text, nanos);
+    if (pr != ParseResult::OK) {
+        sendMsg(chatId, std::string(parseError(pr)) + RETRY_HINT, TelegramUI::buildCancelButton());
         return true;
     }
 
-    usd = std::round(usd * 100.0) / 100.0;
-    if (usd < 0.01) {
-        sendMsg(chatId,
-            "❌ Threshold must be at least $0.01.\n\nPlease enter a valid amount or press Cancel.",
-            TelegramUI::buildCancelButton());
-        return true;
-    }
-
-    setUserThreshold(chatId, usd);
-    refreshWatchers();
     g_sessionManager.clearSession(chatId);
-
+    ApplyResult ar = applyThreshold(chatId, nanos);
     auto menu = TelegramUI::buildMainMenu(chatId);
-    sendMsg(chatId, buildUpdatedText(usd) + "\n\n" + menu.text, menu.keyboard);
+    sendMsg(chatId, buildStatusText(ar, nanos) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
