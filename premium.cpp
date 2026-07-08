@@ -27,7 +27,7 @@ namespace {
 // The single place to change when tariffs evolve. New subscription types
 // would become new payloads + rows in this style.
 constexpr long long PREMIUM_DURATION_SECONDS = 30LL * 86400LL;  // 30 days
-constexpr int       PREMIUM_PRICE_STARS      = 250;             // ⭐ XXX — set the real price here
+constexpr int       PREMIUM_PRICE_STARS      = 150;             // ⭐ XXX — set the real price here
 const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
