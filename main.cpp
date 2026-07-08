@@ -342,7 +342,7 @@ void initDB() {
         CREATE TABLE IF NOT EXISTS users (
             chat_id TEXT PRIMARY KEY,
             language TEXT NOT NULL DEFAULT 'en',
-            threshold_nanos INTEGER NOT NULL DEFAULT 10000000000000,
+            threshold_nanos INTEGER NOT NULL DEFAULT 100000000000,
             created_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS whale_addresses (
@@ -570,13 +570,16 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     return removed;
 }
 
-void setUserThreshold(const std::string& chatId, double usd) {
+void setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
     ensureUser(chatId);
-    uint64_t nanos = usdToNanos(usd);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
     sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_step(s); sqlite3_finalize(s);
+}
+
+void setUserThreshold(const std::string& chatId, double usd) {
+    setUserThresholdNanos(chatId, usdToNanos(usd));
 }
 
 void setUserLanguage(const std::string& chatId, const std::string& lang) {
