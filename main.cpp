@@ -26,6 +26,7 @@
 #include "json.hpp"
 #include "ranking.h"
 #include "alert_settings.h"
+#include "premium.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -199,6 +200,9 @@ const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 1000;
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
+// NOTE: with Premium enabled the per-user wallet limit is dynamic
+// (1 Free / 50 Premium) and comes from premiumMaxWallets() in the Premium
+// module. This constant remains only as the absolute technical ceiling.
 constexpr size_t MAX_WHALES_PER_USER = 50;
 constexpr size_t MAX_QUEUE_SIZE = 100000;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
@@ -514,8 +518,9 @@ enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, ERRO
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
+    // Plan-dependent limit: 1 wallet on Free, 50 on Premium (Premium module).
     if (chatId != SERVICE_CHAT_ID &&
-        countUserWhales(chatId) >= MAX_WHALES_PER_USER)
+        countUserWhales(chatId) >= premiumMaxWallets(chatId))
     {
         return AddWhaleResult::LIMIT_REACHED;
     }
@@ -655,6 +660,9 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", "🏆 Top Traders"}, {"callback_data", "menu:toptrader"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "⭐ Premium"}, {"callback_data", "menu:premium"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "⚙️ Settings"}, {"callback_data", "menu:settings"}}
     }));
 
@@ -753,7 +761,8 @@ UIMessage buildSettingsMenu(const std::string& chatId) {
     size_t walletCount = countUserWhales(chatId);
     std::stringstream text;
     text << "⚙️ <b>Settings</b>\n\n";
-    text << "Wallets tracked: <b>" << walletCount << "</b> / " << MAX_WHALES_PER_USER << "\n\n";
+    // Plan-dependent limit (1 Free / 50 Premium) from the Premium module.
+    text << "Wallets tracked: <b>" << walletCount << "</b> / " << premiumMaxWallets(chatId) << "\n\n";
     text << "Choose an option:";
 
     json keyboard;
@@ -865,6 +874,7 @@ void setupBotCommands() {
     cmds.push_back({{"command","list"},{"description","Show your tracked wallets"}});
     cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
     cmds.push_back({{"command","toptrader"},{"description","Top traders for a token: /toptrader TOKEN"}});
+    cmds.push_back({{"command","premium"},{"description","Wallet Tracker Premium"}});
     cmds.push_back({{"command","help"},{"description","How this bot works"}});
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
@@ -1482,6 +1492,11 @@ void handleCallbackQuery(const json& callbackQuery) {
             auto msg = buildGlobalTopMenu();
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
+        else if (param == "premium") {
+            // ⭐ Premium page (sales page or "Premium Active", built by the module).
+            auto msg = buildPremiumPage(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
         else if (param == "settings") {
             auto msg = TelegramUI::buildSettingsMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
@@ -1496,10 +1511,19 @@ void handleCallbackQuery(const json& callbackQuery) {
         auto msg = TelegramUI::buildMainMenu(chatId);
         replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
     }
+    else if (action == "premium_buy") {
+        // "⭐ Buy Premium" / "🔄 Renew Premium": the module sends the Telegram
+        // Stars invoice; payment then arrives as pre_checkout_query +
+        // successful_payment updates handled in telegramLoop().
+        if (!sendPremiumInvoice(chatId)) {
+            replyInPlace(chatId, messageId,
+                "❌ Could not create the invoice. Please try again later.", "");
+        }
+    }
     else if (action == "rename") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
             return;
         }
 
@@ -1509,7 +1533,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             "SELECT uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? AND wa.address = ?")) {
-            replyInPlace(chatId, messageId, "❌ Error loading wallet.");
+            replyInPlace(chatId, messageId, "❌ Error loading wallet.", "");
             return;
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
@@ -1524,13 +1548,13 @@ void handleCallbackQuery(const json& callbackQuery) {
                     "</b>\n\nPlease enter a new name:", TelegramUI::buildCancelButton());
         } else {
             sqlite3_finalize(s);
-            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
+            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.", "");
         }
     }
     else if (action == "askremove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
             return;
         }
         std::string label = address;
@@ -1553,7 +1577,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "remove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.");
+            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
             return;
         }
 
@@ -1563,7 +1587,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             auto msg = TelegramUI::buildMainMenu(chatId);
             replyInPlace(chatId, messageId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
         } else {
-            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.");
+            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.", "");
         }
     }
     else if (action == "threshold") {
@@ -1586,7 +1610,12 @@ void handleCallbackQuery(const json& callbackQuery) {
                 case AddWhaleResult::OK: refreshWatchers(); feedback = "✅ Wallet added"; break;
                 case AddWhaleResult::ALREADY_EXISTS: feedback = "✅ Already tracking"; break;
                 case AddWhaleResult::LIMIT_REACHED:
-                    feedback = "⚠️ Wallet limit reached (" + std::to_string(MAX_WHALES_PER_USER) + ")"; break;
+                    // Callback popups can't carry buttons, so the upgrade hint is text-only.
+                    if (isPremium(chatId))
+                        feedback = "⚠️ Wallet limit reached (50)";
+                    else
+                        feedback = "⚠️ Free plan allows tracking only 1 wallet. Upgrade to Premium — tap ⭐ Premium in the menu.";
+                    break;
                 case AddWhaleResult::BAD_ADDRESS: feedback = "❌ Invalid address."; break;
                 case AddWhaleResult::ERROR: feedback = "❌ Something went wrong."; break;
             }
@@ -1598,7 +1627,11 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "gt_open") {
         GlobalRankKind kind;
         if (parseGlobalRankKind(param, kind)) {
-            auto msg = buildGlobalTopMessage(chatId, kind);
+            // Plan-gated depth: Top 10 for Free (with the upsell footer),
+            // Top 50 for Premium.
+            auto msg = buildGlobalTopMessage(chatId, kind,
+                                             premiumTopTradersLimit(chatId),
+                                             !isPremium(chatId));
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
@@ -1610,7 +1643,9 @@ void handleCallbackQuery(const json& callbackQuery) {
             try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
             GlobalRankKind kind;
             if (parseGlobalRankKind(kindStr, kind)) {
-                auto msg = buildGlobalTopPage(chatId, kind, page);
+                auto msg = buildGlobalTopPage(chatId, kind, page,
+                                              premiumTopTradersLimit(chatId),
+                                              !isPremium(chatId));
                 replyInPlace(chatId, messageId, msg.text, msg.keyboard);
             }
         }
@@ -1684,9 +1719,14 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            sendMsg(chatId, "⚠️ You've reached the limit of " + std::to_string(MAX_WHALES_PER_USER) +
-                    " tracked wallets.\n\n" + msg.text, msg.keyboard);
+            if (isPremium(chatId)) {
+                auto msg = TelegramUI::buildMainMenu(chatId);
+                sendMsg(chatId, "⚠️ You've reached the limit of 50 tracked wallets.\n\n" + msg.text, msg.keyboard);
+            } else {
+                // "Free plan allows tracking only 1 wallet..." + ⭐ Upgrade to Premium
+                auto lim = buildWalletLimitMessage();
+                sendMsg(chatId, lim.text, lim.keyboard);
+            }
         }
         else {
             sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
@@ -1758,7 +1798,10 @@ void telegramLoop() {
     long offset=getTgOffset(); std::cout << "[TG] Restored offset: " << offset << std::endl;
     while (running.load(std::memory_order_relaxed)) {
         try {
-            auto raw=http("https://api.telegram.org/bot"+TG_TOKEN+"/getUpdates?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D","",35);
+            // allowed_updates now includes pre_checkout_query — without it the
+            // Telegram Stars payment flow never reaches the bot and the
+            // payment hangs on Telegram's side.
+            auto raw=http("https://api.telegram.org/bot"+TG_TOKEN+"/getUpdates?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%2C%22pre_checkout_query%22%5D","",35);
             if (raw.empty()) continue; auto upd=json::parse(raw);
             if (!upd.contains("result")||!upd["result"].is_array()) continue;
             int ub=0;
@@ -1767,6 +1810,22 @@ void telegramLoop() {
 
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
                     handleCallbackQuery(u["callback_query"]);
+                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                }
+                // Telegram Stars: the pre-payment confirmation must be
+                // answered within 10 seconds or the payment is cancelled.
+                if (u.contains("pre_checkout_query")&&u["pre_checkout_query"].is_object()) {
+                    handlePreCheckoutQuery(u["pre_checkout_query"]);
+                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                }
+                // A successful payment arrives as a message WITHOUT a text
+                // field, so it must be handled before the message.text check
+                // below (and before the rate limiter — a paid user's
+                // activation must never be dropped).
+                if (u.contains("message")&&u["message"].is_object()&&u["message"].contains("successful_payment")
+                    &&u["message"].contains("chat")&&u["message"]["chat"].is_object()&&u["message"]["chat"].contains("id")) {
+                    std::string pcid=std::to_string(u["message"]["chat"]["id"].get<long>());
+                    handleSuccessfulPayment(pcid, u["message"]["successful_payment"]);
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
                 }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
@@ -1840,6 +1899,11 @@ void telegramLoop() {
                         auto msg = TelegramUI::buildHelpMessage();
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
+                    else if (txt=="/premium") {
+                        ensureUser(cid);
+                        auto msg = buildPremiumPage(cid);
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
                     else if (txt.find("/add ")==0) {
                         size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
                         if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,"❌ Usage: /add 0x... Name"); }
@@ -1851,7 +1915,11 @@ void telegramLoop() {
                             switch (res) {
                                 case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,"✅ Wallet added: "+safeString(label)); break;
                                 case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,"⚠️ You're already tracking this wallet"); break;
-                                case AddWhaleResult::LIMIT_REACHED: sendMsg(cid,"⚠️ You've reached the limit of "+std::to_string(MAX_WHALES_PER_USER)+" tracked wallets"); break;
+                                case AddWhaleResult::LIMIT_REACHED: {
+                                    if (isPremium(cid)) sendMsg(cid,"⚠️ You've reached the limit of 50 tracked wallets");
+                                    else { auto lim = buildWalletLimitMessage(); sendMsg(cid, lim.text, lim.keyboard); }
+                                    break;
+                                }
                                 case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,"❌ That doesn't look like a valid address (expected 0x + 40 hex characters)"); break;
                                 case AddWhaleResult::ERROR: sendMsg(cid,"❌ Something went wrong, please try again"); break;
                             }
@@ -1904,7 +1972,7 @@ void telegramLoop() {
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
-    initDB(); initRankingDB(); loadTokenCache();
+    initDB(); initRankingDB(); initPremium(TG_TOKEN); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     setupBotCommands();
