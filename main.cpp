@@ -1547,7 +1547,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             std::string currentLabel = safeColumnText(s, 0);
             sqlite3_finalize(s);
 
-            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, currentLabel);
+            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address);
             replyInPlace(chatId, messageId, "✏️ <b>Rename Wallet</b>\n\nCurrent name: <b>" + safeString(currentLabel, 32) +
                     "</b>\n\nPlease enter a new name:", TelegramUI::buildCancelButton());
         } else {
