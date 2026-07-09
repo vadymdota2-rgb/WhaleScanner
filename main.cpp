@@ -492,19 +492,43 @@ uint64_t getUserThresholdNanos(const std::string& chatId) {
 
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
+    long long now = static_cast<long long>(time(nullptr));
     {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+        // Rows come ordered per user by created_at (uw.rowid breaks
+        // same-second ties in insertion order). For a non-Premium user only
+        // the FIRST wallet becomes an active watcher — the rest stay stored
+        // in user_whales untouched, they just don't get loaded (ТЗ №1: no
+        // data is ever deleted on Premium expiry; re-buying Premium needs no
+        // migration, the next refresh simply loads everything again). If a
+        // Free user removes their active wallet, the next one by created_at
+        // automatically becomes the first row here — i.e. active.
+        // The premium condition mirrors isPremium() in the Premium module
+        // but is evaluated in SQL against premium_expire directly, so an
+        // expired subscription stops matching even before isPremium() has
+        // had a chance to reset the is_premium flag.
+        // The service account is exempt: all of its wallets are always
+        // active regardless of premium fields.
         if (prepareOrLog(db,&s,
-            "SELECT wa.address, uw.user_id, uw.label, u.threshold_nanos "
+            "SELECT wa.address, uw.user_id, uw.label, u.threshold_nanos, "
+            "       CASE WHEN u.is_premium=1 AND u.premium_expire>? THEN 1 ELSE 0 END "
             "FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "JOIN users u ON u.chat_id = uw.user_id")) {
+            "JOIN users u ON u.chat_id = uw.user_id "
+            "ORDER BY uw.user_id ASC, uw.created_at ASC, uw.rowid ASC")) {
+            sqlite3_bind_int64(s,1,now);
+            std::string prevUser;
+            size_t loadedForUser = 0;
             while (sqlite3_step(s)==SQLITE_ROW) {
                 std::string addr = toLower(safeColumnText(s,0));
                 std::string uid = safeColumnText(s,1);
                 std::string label = safeColumnText(s,2);
                 uint64_t nanos = static_cast<uint64_t>(sqlite3_column_int64(s,3));
+                bool prem = sqlite3_column_int(s,4) != 0;
+                if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
+                if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue; // Free: only the first wallet is active
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
+                loadedForUser++;
             }
             sqlite3_finalize(s);
         }
@@ -614,6 +638,13 @@ std::string buildUserListText(const std::string& chatId) {
 }
 
 void removeUser(const std::string& chatId) {
+    // ТЗ №2: the service account is a permanent system user. It must never
+    // be deleted — neither from `users` (which via ON DELETE CASCADE would
+    // also wipe its user_whales) nor in response to any Telegram error.
+    if (chatId == SERVICE_CHAT_ID) {
+        std::cout << "[USERS] Skip removing service account" << std::endl;
+        return;
+    }
     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
       if (!prepareOrLog(db,&s,"DELETE FROM users WHERE chat_id=?")) return;
       sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
@@ -695,6 +726,9 @@ std::string buildCancelButton() {
 }
 
 UIMessage buildWalletsList(const std::string& chatId) {
+    // NOTE: computed BEFORE taking dbMutex — isPremium() locks dbMutex itself.
+    bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
+
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
@@ -712,6 +746,7 @@ UIMessage buildWalletsList(const std::string& chatId) {
     text << "👛 <b>My Wallets</b>\n\n";
 
     bool any = false;
+    size_t idx = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         any = true;
         std::string address = safeColumnText(s, 0);
@@ -719,8 +754,13 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
         std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
 
-        text << "🐋 <b>" << safeString(label, 32) << "</b>\n";
+        // ТЗ №1: on Free only the first wallet (by created_at) actually
+        // produces alerts; the rest stay stored but paused. The list still
+        // shows everything — with markers so it doesn't look like a bug.
+        const char* marker = premium ? "🐋" : (idx == 0 ? "🔔" : "⏸");
+        text << marker << " <b>" << safeString(label, 32) << "</b>\n";
         text << "<code>" << shortAddr << "</code>\n\n";
+        idx++;
 
         json row;
         row.push_back({{"text", "✏️ Rename"}, {"callback_data", "rename:" + address}});
@@ -732,6 +772,12 @@ UIMessage buildWalletsList(const std::string& chatId) {
     if (!any) {
         text << "No wallets tracked yet.\n\n";
         text << "Tap 🐋 <b>Add Wallet</b> to start tracking.";
+    } else if (!premium && idx > 1) {
+        text << "ℹ️ Free plan: alerts are active only for your first wallet (🔔).\n";
+        text << "Your other wallets are saved (⏸) and will re-activate with Premium.";
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
+        }));
     }
 
     keyboard["inline_keyboard"].push_back(json::array({
@@ -929,7 +975,7 @@ class SafeMessageQueue {
                 if (res.ok) { updateStatus(did,1,0,0); queueSize.fetch_sub(1,std::memory_order_relaxed); }
                 else if (res.retryAfterSec>0) { globalRetryAfter.store(time(nullptr)+res.retryAfterSec); scheduleRetry(did);
                     std::cerr << "[TG] 429: pausing " << res.retryAfterSec << "s" << std::endl; break; }
-                else if (res.deadUser) { updateStatus(did,2,0,0); removeUser(cid); queueSize.fetch_sub(1,std::memory_order_relaxed); }
+                else if (res.deadUser) { updateStatus(did,2,0,0); if (cid != SERVICE_CHAT_ID) removeUser(cid); else std::cout << "[USERS] Skip removing service account" << std::endl; queueSize.fetch_sub(1,std::memory_order_relaxed); }
                 else scheduleRetry(did);
                 std::this_thread::sleep_for(std::chrono::milliseconds(SEND_MS));
             }
@@ -1972,7 +2018,7 @@ void telegramLoop() {
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
-    initDB(); initRankingDB(); initPremium(TG_TOKEN); loadTokenCache();
+    initDB(); initRankingDB(); initPremium(TG_TOKEN, SERVICE_CHAT_ID); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     setupBotCommands();
@@ -1999,7 +2045,7 @@ int main() {
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); refreshWatchers(); /* expired Premium -> Free users drop to 1 active wallet within <=30 min (ТЗ №1) */ lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
