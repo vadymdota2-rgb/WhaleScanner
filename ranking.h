@@ -81,6 +81,14 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page);
 // together in a single pass over `trades` and cached per chat; opening any
 // of the four views, or flipping pages, never re-touches the `trades`
 // table beyond the first computation for that chat.
+//
+// Premium gating (see premium.h): the full leaderboards are Top 50; how
+// much of them a given user actually sees is decided by the CALLER via the
+// `maxRank` parameter (10 Free / 50 Premium — main.cpp gets the number
+// from the Premium module's premiumTopTradersLimit()). The cached rankings
+// themselves are plan-agnostic: the cut happens only at render time, so a
+// user who upgrades mid-session sees Top 50 immediately, without a
+// recompute.
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
 // Parses/serializes the short kind token used in callback_data
@@ -92,11 +100,18 @@ std::string globalRankKindToString(GlobalRankKind k);
 // button: 💵 Top PnL / 📈 Top ROI / 🎯 Top Win Rate / 🔄 Most Active.
 RankingMessage buildGlobalTopMenu();
 
-// Computes (if not already cached for this chat) all four Top-100 global
+// Computes (if not already cached for this chat) all four Top-50 global
 // leaderboards and renders page 1 of `kind`.
-RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind);
+// maxRank — how many positions this user may see (10 Free / 50 Premium);
+// showUpgrade — append the "Unlock Top 50 with Premium." footer with the
+// ⭐ Upgrade to Premium button (callers pass !isPremium(chatId)).
+RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
+                                     int maxRank, bool showUpgrade);
 
 // Renders `page` of `kind` from the cache populated by
 // buildGlobalTopMessage(). Never recomputes. If nothing is cached (or it
 // has expired), asks the user to reopen the ranking from the menu.
-RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page);
+// maxRank / showUpgrade — same as in buildGlobalTopMessage(); pagination
+// is computed over the visible (plan-limited) part of the list.
+RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page,
+                                  int maxRank, bool showUpgrade);
