@@ -24,16 +24,23 @@
 // premium_expire columns, Unix timestamps) and stores the bot token for
 // direct Telegram API calls (sendInvoice / answerPreCheckoutQuery /
 // sendMessage). Call once at startup, right after initDB():
-//   initPremium(TG_TOKEN);
+//   initPremium(TG_TOKEN, SERVICE_CHAT_ID);
 // The token is passed in because TG_TOKEN in main.cpp is a namespace-scope
 // `const std::string` and therefore has internal linkage (same reason
-// ranking.cpp couldn't extern DB_FILE).
-void initPremium(const std::string& botToken);
+// ranking.cpp couldn't extern DB_FILE); SERVICE_CHAT_ID likewise.
+//
+// serviceChatId (optional) is treated as PERMANENTLY Premium: isPremium()
+// returns true for it without touching the DB. In practice this opens
+// Top 50 Traders and removes the upsell footer for the service account;
+// wallet limits are unaffected — main.cpp's addUserWhale() already
+// bypasses the limit check for SERVICE_CHAT_ID entirely (unlimited).
+void initPremium(const std::string& botToken, const std::string& serviceChatId = "");
 
 // True iff the user currently has an ACTIVE subscription
 // (premium_expire > now). If the stored flag says premium but the expiry
 // has passed, the user is automatically downgraded to Free right here —
 // so every premium-gated feature only ever needs this one call.
+// The service account (see initPremium) is always true, with no expiry.
 bool isPremium(const std::string& chatId);
 
 // Unix timestamp of the subscription end (0 if none was ever bought).
