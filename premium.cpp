@@ -20,6 +20,7 @@ bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql);
 std::string safeColumnText(sqlite3_stmt* stmt, int col);
 std::string http(const std::string& url, const std::string& post, int timeout);
 void ensureUser(const std::string& chatId);
+void refreshWatchers();
 
 namespace {
 
@@ -27,7 +28,7 @@ namespace {
 // The single place to change when tariffs evolve. New subscription types
 // would become new payloads + rows in this style.
 constexpr long long PREMIUM_DURATION_SECONDS = 30LL * 86400LL;  // 30 days
-constexpr int       PREMIUM_PRICE_STARS      = 150;             // ⭐ XXX — set the real price here
+constexpr int       PREMIUM_PRICE_STARS      = 250;             // ⭐ XXX — set the real price here
 const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
@@ -36,6 +37,9 @@ constexpr int    FREE_TOP_TRADERS    = 10;
 constexpr int    PREMIUM_TOP_TRADERS = 50;
 
 std::string g_botToken;
+// Chat id that is always treated as Premium (the bot's service account).
+// Empty string = no such account. See initPremium() docs in premium.h.
+std::string g_serviceChatId;
 
 std::string apiUrl(const char* method) {
     return "https://api.telegram.org/bot" + g_botToken + "/" + method;
@@ -74,8 +78,9 @@ bool readPremiumRowLocked(const std::string& chatId,
 } // namespace
 
 // ==================== INIT / SCHEMA ====================
-void initPremium(const std::string& botToken) {
+void initPremium(const std::string& botToken, const std::string& serviceChatId) {
     g_botToken = botToken;
+    g_serviceChatId = serviceChatId;
 
     std::lock_guard<std::mutex> l(dbMutex);
     // SQLite has no "ADD COLUMN IF NOT EXISTS": run each ALTER and treat the
@@ -100,6 +105,11 @@ void initPremium(const std::string& botToken) {
 
 // ==================== PREMIUM STATE ====================
 bool isPremium(const std::string& chatId) {
+    // The service account is permanently Premium — no DB row, no expiry.
+    // (Opens Top 50 Traders and removes upsell footers for it; its wallet
+    // limit is already bypassed separately in main.cpp's addUserWhale.)
+    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return true;
+
     long long now = static_cast<long long>(time(nullptr));
 
     std::lock_guard<std::mutex> l(dbMutex);
@@ -167,6 +177,18 @@ int premiumTopTradersLimit(const std::string& chatId) {
 
 // ==================== UI ====================
 PremiumMessage buildPremiumPage(const std::string& chatId) {
+    // Service account: permanent access, so no expiry date and no point in
+    // showing a Renew button.
+    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) {
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        }));
+        return {"⭐ <b>Premium Active</b>\n\n"
+                "Service account — Premium access is permanent.", kb.dump()};
+    }
+
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
@@ -278,6 +300,12 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     }
 
     activateOrExtendPremium(chatId);
+
+    // ТЗ №1 п.4: no data migration is needed on re-purchase — every wallet
+    // stayed stored in user_whales while the user was Free. Rebuilding the
+    // watchers here makes ALL of them active again immediately, instead of
+    // waiting for the next periodic refresh.
+    refreshWatchers();
 
     // Confirmation is sent directly (not through the alert delivery queue):
     // a payment confirmation must reach the user immediately.
