@@ -13,10 +13,6 @@
 
 using json = nlohmann::json;
 
-// ---- Shared state / helpers from main.cpp ----
-// These are ordinary (non-static) globals and free functions defined in
-// main.cpp; declaring them here again gives this translation unit the
-// symbols it needs without touching main.cpp's own definitions.
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
@@ -28,42 +24,21 @@ bool isValidAddress(const std::string& a);
 std::string safeString(const std::string& s, size_t maxLen);
 
 namespace {
-constexpr long long WINDOW_SECONDS = 30LL * 86400LL;   // 30-day rolling window
-constexpr int MIN_COMPLETED_TRADES = 5;                // per-token ranking entry threshold
-constexpr int MAX_RANKED_WALLETS = 20;                 // per-token ranking size
-constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;         // global ranking entry threshold
-constexpr int MAX_GLOBAL_RANKED = 50;                  // global ranking size (Top 50, per the Premium spec)
-// Wallets with more than this many completed trades in the 30-day window
-// are almost certainly trading bots rather than human "traders" — excluded
-// from every ranking (per-token and global alike) so they don't crowd out
-// real traders at the top of the leaderboard.
+constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
+constexpr int MIN_COMPLETED_TRADES = 5;
+constexpr int MAX_RANKED_WALLETS = 20;
+constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;
+constexpr int MAX_GLOBAL_RANKED = 50;
+
 constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
-constexpr time_t CACHE_TTL_SECONDS = 15 * 60;          // how long a computed ranking stays pageable
-// Visual divider between cards on a page. A full-width run of U+2501 also
-// nudges Telegram Android into laying the message (and thus the inline
-// keyboard) out at full width instead of its collapsed minimum width.
-const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
-// Width "stretcher" for menu messages that have no other wide content.
-// Rendered inside <code> so it's monospace — Telegram never shrinks a
-// monospace run below its natural width, which is what makes the ranking
-// cards (with their <code> wallet address) render near-full-width.
-// U+2800 (BRAILLE PATTERN BLANK) is used instead of a visible line: it is
-// NOT whitespace, so Telegram won't trim it, yet it renders as empty space —
-// the bubble stretches with no ugly ruled line in the menu.
-// Length 30: on a typical phone ~36 monospace chars fit per line (see how
-// the 42-char wallet address wraps), so 30 stays on ONE line with margin
-// while still pushing the bubble to (near) full width. Don't raise past
-// ~34 or it will wrap again on narrow screens.
-const char* const MENU_STRETCH =
-    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀"; // 30 × U+2800
+constexpr time_t CACHE_TTL_SECONDS = 15 * 60;
 
-// Dedicated READ-ONLY SQLite connection for the heavy full-table ranking
-// scans. With WAL enabled (initDB() sets it), a reader on its own
-// connection never blocks writers on the main connection and vice versa —
-// so computing a ranking no longer stalls the whole bot behind dbMutex.
-// Opened in initRankingDB(); if opening fails, code falls back to the
-// shared `db` + dbMutex, which is correct but slower.
+const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
+
+const char* const MENU_STRETCH =
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀";
+
 sqlite3* g_rankingReadDb = nullptr;
 std::mutex g_rankingReadMutex;
 }
@@ -86,7 +61,6 @@ std::string globalRankKindToString(GlobalRankKind k) {
     return "pnl";
 }
 
-// ==================== SCHEMA ====================
 void initRankingDB() {
     std::lock_guard<std::mutex> l(dbMutex);
     const char* sql = R"(
@@ -112,11 +86,6 @@ void initRankingDB() {
         sqlite3_free(err);
     }
 
-    // Second, read-only connection to the same file for ranking scans.
-    // Requires WAL (already set in initDB()); without WAL a long read on a
-    // second connection would make writers fail with SQLITE_BUSY instead.
-    // sqlite3_db_filename() is used instead of extern-ing DB_FILE because
-    // `const std::string DB_FILE` in main.cpp has internal linkage.
     const char* fn = sqlite3_db_filename(db, "main");
     if (fn && *fn) {
         if (sqlite3_open_v2(fn, &g_rankingReadDb,
@@ -141,7 +110,6 @@ void closeRankingDB() {
     }
 }
 
-// ==================== ROLLING 30-DAY RETENTION ====================
 void cleanupOldTrades() {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
@@ -155,9 +123,6 @@ void cleanupOldTrades() {
 
 namespace {
 
-// Clamp a cpp_int (which can in principle exceed 64 bits) down to a value
-// that fits in an int64_t, instead of invoking UB on convert_to<int64_t>()
-// overflow. Realistic USD*1e9 amounts never get near this ceiling.
 int64_t cppIntToClampedI64(const cpp_int& v) {
     static const cpp_int maxV(INT64_MAX);
     static const cpp_int minV(INT64_MIN);
@@ -166,9 +131,6 @@ int64_t cppIntToClampedI64(const cpp_int& v) {
     return v.convert_to<int64_t>();
 }
 
-// Formats whole-dollar amounts with thousands separators, e.g. 18432000000000
-// (usd_nanos) -> "+$18,432". usdNanos follows the bot-wide convention of
-// USD * 1e9, truncated (not rounded) down to whole dollars.
 std::string formatUsdSigned(int64_t usdNanos) {
     bool neg = usdNanos < 0;
     int64_t dollars = usdNanos / 1000000000LL;
@@ -200,14 +162,11 @@ std::string rankLabel(int rank) {
     }
 }
 
-// Percentage without a forced leading "+" (e.g. "148%" / "-32%"), used for
-// ROI in the global ranking cards, per that feature's spec'd format.
 std::string formatPercentPlain(double pct) {
     long long rounded = static_cast<long long>(pct >= 0 ? pct + 0.5 : pct - 0.5);
     return (rounded < 0 ? "-" : "") + std::to_string(rounded < 0 ? -rounded : rounded) + "%";
 }
 
-// ==================== PNL MODEL ====================
 struct PnlRow {
     std::string wallet;
     int64_t pnlNanos = 0;
@@ -216,27 +175,15 @@ struct PnlRow {
     int completedTrades = 0;
 };
 
-// Walks every (wallet, token) trade in the 30-day window, ordered by wallet
-// then time, and derives Realized PnL per wallet using the Average Cost
-// Basis method:
-//   - a BUY adds to the held quantity and to the cost basis (in USD) of the
-//     open position;
-//   - a SELL is matched against whatever quantity/cost basis is currently
-//     held. If the wallet sells more than the window can account for (i.e.
-//     tokens bought more than 30 days ago), only the portion backed by a
-//     known cost basis counts as a "completed" trade — the rest is ignored
-//     rather than guessed at.
-// Everything is done with a single ordered SQL query and local arithmetic;
-// no extra RPC calls, no per-wallet queries.
 std::vector<PnlRow> computeTopPnl(const std::string& token) {
     std::vector<PnlRow> results;
     long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
 
     std::string curWallet;
     cpp_int heldQty = 0;
-    cpp_int heldCost = 0;          // USD*1e9 cost basis of the currently held position
-    cpp_int realizedPnl = 0;       // USD*1e9
-    cpp_int totalCostDeployed = 0; // USD*1e9, sum of cost basis consumed by completed sells
+    cpp_int heldCost = 0;
+    cpp_int realizedPnl = 0;
+    cpp_int totalCostDeployed = 0;
     int completedTrades = 0;
     int winningTrades = 0;
 
@@ -257,11 +204,6 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
         }
     };
 
-    // Prefer the dedicated read-only connection: this is a full scan of the
-    // token's trades and must not hold dbMutex for its whole duration (the
-    // rest of the bot — block processing, alerts — would stall behind it).
-    // g_rankingReadDb is set once at startup and cleared once at shutdown,
-    // so reading the pointer here without a lock is fine.
     sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
     std::unique_lock<std::mutex> readLock, writeLock;
     if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
@@ -304,9 +246,7 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
             heldQty -= matchedQty;
             heldCost -= costOfMatched;
         }
-        // A sell with heldQty<=0 (nothing known to have been bought within
-        // the window) has no knowable cost basis, so it's skipped entirely —
-        // it neither counts as a completed trade nor moves realizedPnl.
+
     }
     sqlite3_finalize(s);
     flush();
@@ -320,10 +260,6 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
     return results;
 }
 
-// ==================== PAGINATION CACHE ====================
-// Small in-memory cache so switching pages never re-touches the `trades`
-// table. Keyed by chatId (one active ranking view per user at a time);
-// entries older than CACHE_TTL_SECONDS are treated as gone.
 struct CachedRanking {
     std::string token;
     std::vector<PnlRow> rows;
@@ -333,11 +269,6 @@ struct CachedRanking {
 std::mutex g_cacheMutex;
 std::map<std::string, CachedRanking> g_topPnlCache;
 
-// Card layout (compact, per the display-fix spec): one "label: value" line
-// per metric instead of a label line followed by a value line. The full
-// 42-char wallet address is shown in <code> so it can be copied with one
-// tap — its monospace width also keeps Telegram from collapsing the whole
-// message (and the inline keyboard under it) to half the screen width.
 RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page) {
     int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
     page = std::max(1, std::min(page, totalPages));
@@ -384,12 +315,6 @@ text << "<code>" << safeString(token, 42) << "</code>\n\n";
     return {text.str(), keyboard.dump()};
 }
 
-// ==================== GLOBAL (CROSS-TOKEN) TOP-50 RANKINGS ====================
-// Same Average Cost Basis model as computeTopPnl(), but the position (held
-// quantity / cost basis) is tracked per (wallet, token) while PnL, buy
-// volume, completed-trade and win counts are accumulated per *wallet*
-// across every token it traded — one pass over the whole `trades` table,
-// ordered by wallet then token then time.
 struct GlobalRankings {
     std::vector<PnlRow> byPnl;
     std::vector<PnlRow> byRoi;
@@ -402,8 +327,8 @@ std::vector<PnlRow> computeGlobalTop30D() {
     long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
 
     std::string curWallet, curToken;
-    cpp_int heldQty = 0, heldCost = 0;             // per (wallet, token) position
-    cpp_int outerPnl = 0, outerBuyVol = 0;         // per wallet, across all its tokens
+    cpp_int heldQty = 0, heldCost = 0;
+    cpp_int outerPnl = 0, outerBuyVol = 0;
     int outerCompleted = 0, outerWinning = 0;
 
     auto flush = [&]() {
@@ -414,8 +339,7 @@ std::vector<PnlRow> computeGlobalTop30D() {
             row.pnlNanos = cppIntToClampedI64(outerPnl);
             double volD = outerBuyVol > 0 ? outerBuyVol.convert_to<double>() : 0.0;
             double pnlD = outerPnl.convert_to<double>();
-            // Global ROI is defined against total buy volume (not just the
-            // cost basis consumed by completed sells) per this feature's spec.
+
             row.roiPercent = volD > 0.0 ? (100.0 * pnlD / volD) : 0.0;
             row.winRatePercent = outerCompleted > 0
                 ? static_cast<int>(100.0 * outerWinning / outerCompleted + 0.5)
@@ -425,8 +349,6 @@ std::vector<PnlRow> computeGlobalTop30D() {
         }
     };
 
-    // Same rationale as computeTopPnl(): this scans the ENTIRE trades table,
-    // so it runs on the read-only connection and never holds dbMutex.
     sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
     std::unique_lock<std::mutex> readLock, writeLock;
     if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
@@ -473,8 +395,7 @@ std::vector<PnlRow> computeGlobalTop30D() {
             heldQty -= matchedQty;
             heldCost -= costOfMatched;
         }
-        // Sells with no known cost basis for that (wallet, token) pair are
-        // skipped, exactly as in computeTopPnl().
+
     }
     sqlite3_finalize(s);
     flush();
@@ -538,21 +459,6 @@ struct CachedGlobalRanking {
 
 std::map<std::string, CachedGlobalRanking> g_globalRankingCache;
 
-// Card layout is unified across all four ranking kinds (PnL, ROI, Win Rate,
-// Trades are always all shown, in this fixed order) — only the sort order
-// and title differ per kind. Compact "label: value" lines with a divider
-// between cards, per the display-fix spec. The wallet address is shown in
-// full (42 chars, <code>) so it's completely visible and copyable; the
-// monospace line also forces Telegram to render the message — and the
-// inline keyboard — at full width. Still a single "➕ Track" button per
-// wallet (no BscScan link), per this feature's spec'd card format.
-//
-// Premium gating: only the first `maxRank` positions are rendered (10 Free /
-// 50 Premium — decided by the caller, see the note in ranking.h); the page
-// count is computed over the VISIBLE part, so a Free user gets exactly two
-// pages (5+5) with no dead "Next" arrow into locked territory. When
-// `showUpgrade` is set (Free users), the spec'd "Unlock Top 50 with
-// Premium." footer and the ⭐ Upgrade to Premium button are appended.
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
                                 int maxRank, bool showUpgrade) {
     if (maxRank < 1) maxRank = 1;
@@ -606,18 +512,11 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     return {text.str(), keyboard.dump()};
 }
 
-} // namespace
+}
 
-// ==================== SAVE ====================
-// blockTimestamp is the on-chain timestamp of the block containing the tx.
-// Using it (instead of time(nullptr)) keeps the 30-day window and the
-// buy/sell ordering correct even when the bot catches up on a backlog of
-// old blocks after downtime — previously every backfilled trade got stamped
-// "now", which skewed both the window and the Average Cost Basis order.
-// Wall clock remains only as a fallback for a malformed/missing block field.
 void saveTrade(const std::string& wallet, const TxResult& tx,
                const std::string& hash, long long block, long long blockTimestamp) {
-    // Only BUY/SELL swaps get ranked — never TRANSFERs, never unclassified txs.
+
     if (!tx.valid || !tx.isSwap) return;
     if (tx.usdNanos <= 0) return;
     if (tx.tokenAddr.empty()) return;
@@ -647,7 +546,6 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
     sqlite3_finalize(s);
 }
 
-// ==================== TOKEN RESOLUTION (unchanged) ====================
 std::string resolveTokenArg(const std::string& argIn) {
     std::string arg = trim(argIn);
     if (arg.empty()) return "";
@@ -663,7 +561,6 @@ std::string resolveTokenArg(const std::string& argIn) {
     return result;
 }
 
-// ==================== TOP PNL (30D) ====================
 RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page) {
     std::string token = resolveTokenArg(tokenArg);
     if (token.empty()) {
@@ -697,7 +594,6 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
     return renderPage(token, rows, page);
 }
 
-// ==================== GLOBAL TOP TRADERS (30D) ====================
 RankingMessage buildGlobalTopMenu() {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -713,23 +609,14 @@ RankingMessage buildGlobalTopMenu() {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "🔄 Most Active"}, {"callback_data", "gt_open:active"}}
     }));
-    // Per-token leaderboard (the /toptrader TOKEN feature). An inline button
-    // can't carry a user-supplied argument, so this only sends the "gt_token"
-    // callback; main.cpp's handler must then ask the user which token
-    // (see the gt_token handler next to the other gt_* callbacks).
+
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "🪙 Top PnL by Token"}, {"callback_data", "gt_token"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", "← Back"}, {"callback_data", "menu:main"}}
     }));
-    // The <code> MENU_STRETCH line is an invisible monospace "width
-    // stretcher" (30 × U+2800): same mechanism that makes the ranking cards
-    // full-width via their <code> wallet address, but rendered as blank
-    // space instead of a visible ruled line. Kept short enough to never
-    // wrap onto a second line (see the constant's comment).
-    // Note: the final bubble width is still decided by the Telegram client
-    // and cannot be forced to exactly 100%.
+
     return {std::string("🏆 <b>Top Traders (30D)</b>\n")
             + "<code>" + MENU_STRETCH + "</code>"
             + "\nChoose a ranking:", keyboard.dump()};
