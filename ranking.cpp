@@ -32,7 +32,7 @@ constexpr long long WINDOW_SECONDS = 30LL * 86400LL;   // 30-day rolling window
 constexpr int MIN_COMPLETED_TRADES = 5;                // per-token ranking entry threshold
 constexpr int MAX_RANKED_WALLETS = 20;                 // per-token ranking size
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;         // global ranking entry threshold
-constexpr int MAX_GLOBAL_RANKED = 100;                 // global ranking size (Top 100)
+constexpr int MAX_GLOBAL_RANKED = 50;                  // global ranking size (Top 50, per the Premium spec)
 // Wallets with more than this many completed trades in the 30-day window
 // are almost certainly trading bots rather than human "traders" — excluded
 // from every ranking (per-token and global alike) so they don't crowd out
@@ -384,7 +384,7 @@ text << "<code>" << safeString(token, 42) << "</code>\n\n";
     return {text.str(), keyboard.dump()};
 }
 
-// ==================== GLOBAL (CROSS-TOKEN) TOP-100 RANKINGS ====================
+// ==================== GLOBAL (CROSS-TOKEN) TOP-50 RANKINGS ====================
 // Same Average Cost Basis model as computeTopPnl(), but the position (held
 // quantity / cost basis) is tracked per (wallet, token) while PnL, buy
 // volume, completed-trade and win counts are accumulated per *wallet*
@@ -546,11 +546,21 @@ std::map<std::string, CachedGlobalRanking> g_globalRankingCache;
 // monospace line also forces Telegram to render the message — and the
 // inline keyboard — at full width. Still a single "➕ Track" button per
 // wallet (no BscScan link), per this feature's spec'd card format.
-RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page) {
-    int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
+//
+// Premium gating: only the first `maxRank` positions are rendered (10 Free /
+// 50 Premium — decided by the caller, see the note in ranking.h); the page
+// count is computed over the VISIBLE part, so a Free user gets exactly two
+// pages (5+5) with no dead "Next" arrow into locked territory. When
+// `showUpgrade` is set (Free users), the spec'd "Unlock Top 50 with
+// Premium." footer and the ⭐ Upgrade to Premium button are appended.
+RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
+                                int maxRank, bool showUpgrade) {
+    if (maxRank < 1) maxRank = 1;
+    int visible = std::min(static_cast<int>(rows.size()), maxRank);
+    int totalPages = std::max(1, (visible + PER_PAGE - 1) / PER_PAGE);
     page = std::max(1, std::min(page, totalPages));
     int startIdx = (page - 1) * PER_PAGE;
-    int endIdx = std::min(static_cast<int>(rows.size()), startIdx + PER_PAGE);
+    int endIdx = std::min(visible, startIdx + PER_PAGE);
 
     std::stringstream text;
     text << "🏆 <b>" << globalTitle(kind) << "</b>\n\n";
@@ -576,6 +586,14 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
             keyboard["inline_keyboard"].push_back(row);
         }
+    }
+
+    if (showUpgrade && !rows.empty()) {
+        text << "\n" << CARD_SEPARATOR << "\n";
+        text << "🔒 Unlock Top 50 with Premium.";
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
+        }));
     }
 
     std::string kindParam = globalRankKindToString(kind);
@@ -717,7 +735,8 @@ RankingMessage buildGlobalTopMenu() {
             + "\nChoose a ranking:", keyboard.dump()};
 }
 
-RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind) {
+RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
+                                     int maxRank, bool showUpgrade) {
     GlobalRankings rankings;
     {
         std::lock_guard<std::mutex> l(g_cacheMutex);
@@ -730,14 +749,15 @@ RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind k
             g_globalRankingCache[chatId] = CachedGlobalRanking{rankings, time(nullptr)};
         }
     }
-    return renderGlobalPage(kind, selectGlobalList(rankings, kind), 1);
+    return renderGlobalPage(kind, selectGlobalList(rankings, kind), 1, maxRank, showUpgrade);
 }
 
-RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page) {
+RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page,
+                                  int maxRank, bool showUpgrade) {
     std::lock_guard<std::mutex> l(g_cacheMutex);
     auto it = g_globalRankingCache.find(chatId);
     if (it == g_globalRankingCache.end() || time(nullptr) - it->second.computedAt > CACHE_TTL_SECONDS) {
         return {"⏳ This ranking has expired. Please reopen 🏆 Top Traders from the menu.", ""};
     }
-    return renderGlobalPage(kind, selectGlobalList(it->second.rankings, kind), page);
+    return renderGlobalPage(kind, selectGlobalList(it->second.rankings, kind), page, maxRank, showUpgrade);
 }
