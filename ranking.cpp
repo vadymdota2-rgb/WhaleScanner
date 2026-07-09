@@ -76,9 +76,14 @@ void initRankingDB() {
             timestamp INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token);
-        CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet);
+        DROP INDEX IF EXISTS idx_trades_wallet;
+        CREATE INDEX IF NOT EXISTS idx_trades_wallet_time ON trades(wallet, timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp);
+        CREATE TABLE IF NOT EXISTS ignored_wallets(
+            wallet TEXT PRIMARY KEY,
+            ignored_until INTEGER NOT NULL
+        );
     )";
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -119,6 +124,14 @@ void cleanupOldTrades() {
     int deleted = sqlite3_changes(db);
     sqlite3_finalize(s);
     if (deleted > 0) std::cout << "[RANKING] Purged " << deleted << " trade(s) older than 30 days" << std::endl;
+
+    if (prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE ignored_until <= ?")) {
+        sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)));
+        sqlite3_step(s);
+        int unblocked = sqlite3_changes(db);
+        sqlite3_finalize(s);
+        if (unblocked > 0) std::cout << "[RANKING] Unblocked " << unblocked << " wallet(s)" << std::endl;
+    }
 }
 
 namespace {
@@ -514,6 +527,55 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
 
 }
 
+namespace {
+
+int countTrades30DLocked(const std::string& wallet, long long since) {
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT COUNT(*) FROM trades WHERE wallet=? AND timestamp>=?")) return 0;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, since);
+    int n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
+int countCompletedTrades30DLocked(const std::string& wallet, long long since, int stopAfter) {
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT token, is_buy, token_amount FROM trades "
+        "WHERE wallet=? AND timestamp>=? ORDER BY token ASC, timestamp ASC")) return 0;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, since);
+
+    std::string curToken;
+    cpp_int heldQty = 0;
+    int completed = 0;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        std::string token = safeColumnText(s, 0);
+        bool isBuy = sqlite3_column_int(s, 1) != 0;
+        std::string amountStr = safeColumnText(s, 2);
+        cpp_int amount = amountStr.empty() ? cpp_int(0) : cpp_int(amountStr);
+
+        if (token != curToken) {
+            curToken = token;
+            heldQty = 0;
+        }
+        if (isBuy) {
+            heldQty += amount;
+        } else if (heldQty > 0 && amount > 0) {
+            completed++;
+            heldQty -= (amount < heldQty ? amount : heldQty);
+            if (completed > stopAfter) break;
+        }
+    }
+    sqlite3_finalize(s);
+    return completed;
+}
+
+}
+
 void saveTrade(const std::string& wallet, const TxResult& tx,
                const std::string& hash, long long block, long long blockTimestamp) {
 
@@ -521,29 +583,82 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
     if (tx.usdNanos <= 0) return;
     if (tx.tokenAddr.empty()) return;
 
-    long long ts = blockTimestamp > 0
-        ? blockTimestamp
-        : static_cast<long long>(time(nullptr));
+    long long now = static_cast<long long>(time(nullptr));
+    long long ts = blockTimestamp > 0 ? blockTimestamp : now;
 
     std::string token = toLower(tx.tokenAddr);
     std::string amountStr = tx.rawAmount.convert_to<std::string>();
     int64_t usdNanos64 = cppIntToClampedI64(tx.usdNanos);
 
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "INSERT OR IGNORE INTO trades(wallet,token,is_buy,usd_nanos,token_amount,tx_hash,block_number,timestamp) "
-        "VALUES(?,?,?,?,?,?,?,?)")) return;
-    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(s, 3, tx.isBuy ? 1 : 0);
-    sqlite3_bind_int64(s, 4, usdNanos64);
-    sqlite3_bind_text(s, 5, amountStr.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 6, hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 7, block);
-    sqlite3_bind_int64(s, 8, static_cast<sqlite3_int64>(ts));
-    sqlite3_step(s);
-    sqlite3_finalize(s);
+    bool blockedNow = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+
+        bool ignored = false;
+        long long ignoredUntil = 0;
+        if (!prepareOrLog(db, &s, "SELECT ignored_until FROM ignored_wallets WHERE wallet=?")) return;
+        sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            ignored = true;
+            ignoredUntil = sqlite3_column_int64(s, 0);
+        }
+        sqlite3_finalize(s);
+
+        if (ignored) {
+            if (ignoredUntil > now) return;
+            if (prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE wallet=?")) {
+                sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+                std::cout << "[RANKING] Block expired, wallet re-enabled: " << wallet << std::endl;
+            }
+        }
+
+        if (!prepareOrLog(db, &s,
+            "INSERT OR IGNORE INTO trades(wallet,token,is_buy,usd_nanos,token_amount,tx_hash,block_number,timestamp) "
+            "VALUES(?,?,?,?,?,?,?,?)")) return;
+        sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(s, 3, tx.isBuy ? 1 : 0);
+        sqlite3_bind_int64(s, 4, usdNanos64);
+        sqlite3_bind_text(s, 5, amountStr.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 6, hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 7, block);
+        sqlite3_bind_int64(s, 8, static_cast<sqlite3_int64>(ts));
+        sqlite3_step(s);
+        bool inserted = sqlite3_changes(db) > 0;
+        sqlite3_finalize(s);
+
+        if (inserted && !tx.isBuy) {
+            long long since = now - WINDOW_SECONDS;
+            if (countTrades30DLocked(wallet, since) > MAX_BOT_FILTER_TRADES &&
+                countCompletedTrades30DLocked(wallet, since, MAX_BOT_FILTER_TRADES) > MAX_BOT_FILTER_TRADES) {
+                if (prepareOrLog(db, &s,
+                    "INSERT OR REPLACE INTO ignored_wallets(wallet, ignored_until) VALUES(?, ?)")) {
+                    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_int64(s, 2, now + WINDOW_SECONDS);
+                    sqlite3_step(s);
+                    sqlite3_finalize(s);
+                }
+                if (prepareOrLog(db, &s, "DELETE FROM trades WHERE wallet=?")) {
+                    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_step(s);
+                    int purged = sqlite3_changes(db);
+                    sqlite3_finalize(s);
+                    std::cout << "[RANKING] Bot detected: " << wallet << " — purged "
+                              << purged << " trade(s), ignored for 30 days" << std::endl;
+                }
+                blockedNow = true;
+            }
+        }
+    }
+
+    if (blockedNow) {
+        std::lock_guard<std::mutex> c(g_cacheMutex);
+        g_topPnlCache.clear();
+        g_globalRankingCache.clear();
+    }
 }
 
 std::string resolveTokenArg(const std::string& argIn) {
