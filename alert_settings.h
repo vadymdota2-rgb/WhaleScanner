@@ -16,7 +16,7 @@ UIMessage buildMainMenu(const std::string& chatId);
 std::string buildCancelButton();
 UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos);
 
-} // namespace TelegramUI
+}
 
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
 
@@ -25,10 +25,8 @@ SendResult sendMsg(const std::string& chatId, const std::string& text,
 void replyInPlace(const std::string& chatId, long long messageId,
                   const std::string& text, const std::string& keyboard = "");
 
-void setUserThreshold(const std::string& chatId, double usd);
 void setUserThresholdNanos(const std::string& chatId, uint64_t nanos);
 uint64_t getUserThresholdNanos(const std::string& chatId);
-uint64_t usdToNanos(double usd);
 std::string formatThousands(uint64_t v);
 std::string trim(const std::string& s);
 void refreshWatchers();
@@ -45,7 +43,6 @@ enum class UserState {
 struct UserSession {
     UserState state = UserState::IDLE;
     std::string pendingAddress;
-    std::string pendingLabel;
 };
 
 class UserSessionManager {
@@ -59,10 +56,9 @@ public:
     }
 
     void setState(const std::string& chatId, UserState state,
-                  const std::string& pendingAddress = "",
-                  const std::string& pendingLabel = "") {
+                  const std::string& pendingAddress = "") {
         std::lock_guard<std::mutex> l(mtx);
-        sessions[chatId] = UserSession{state, pendingAddress, pendingLabel};
+        sessions[chatId] = UserSession{state, pendingAddress};
     }
 
     void clearSession(const std::string& chatId) {
