@@ -31,8 +31,6 @@
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
 
-// Lock order: dbMutex -> cacheMutex -> watchersMutex
-
 struct Stats {
     std::atomic<uint64_t> rpc_failures{0};
     std::atomic<uint64_t> price_fallbacks{0};
@@ -56,7 +54,6 @@ std::string getUptime() {
     return ss.str();
 }
 
-// ==================== UTILITIES ====================
 std::string toLower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(),
         [](unsigned char c) { return std::tolower(c); });
@@ -169,7 +166,6 @@ std::string formatThousands(uint64_t v) {
     return out;
 }
 
-// ==================== CONFIGURATION ====================
 const std::string TG_TOKEN = []{
     const char* env = std::getenv("WHALE_TG_TOKEN");
     if (!env || std::string(env).empty()) {
@@ -200,9 +196,7 @@ const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 1000;
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
-// NOTE: with Premium enabled the per-user wallet limit is dynamic
-// (1 Free / 50 Premium) and comes from premiumMaxWallets() in the Premium
-// module. This constant remains only as the absolute technical ceiling.
+
 constexpr size_t MAX_WHALES_PER_USER = 50;
 constexpr size_t MAX_QUEUE_SIZE = 100000;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
@@ -252,7 +246,6 @@ std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
 
-// ==================== USERS & WATCHERS ====================
 struct Watcher {
     std::string chatId;
     std::string label;
@@ -262,7 +255,6 @@ std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
 
-// ==================== HTTP & RPC ====================
 size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
     d->append((char*)c, s * n); return s * n;
 }
@@ -323,7 +315,6 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
     return nullptr;
 }
 
-// ==================== SQLITE ====================
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
         std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
@@ -460,7 +451,6 @@ void saveLastBlockHash(const std::string& h) {
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// ==================== USERS / WHALE SUBSCRIPTIONS ====================
 void ensureUser(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO users(chat_id,language,threshold_nanos,created_at) VALUES(?,?,?,?)")) return;
@@ -495,20 +485,7 @@ void refreshWatchers() {
     long long now = static_cast<long long>(time(nullptr));
     {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-        // Rows come ordered per user by created_at (uw.rowid breaks
-        // same-second ties in insertion order). For a non-Premium user only
-        // the FIRST wallet becomes an active watcher — the rest stay stored
-        // in user_whales untouched, they just don't get loaded (ТЗ №1: no
-        // data is ever deleted on Premium expiry; re-buying Premium needs no
-        // migration, the next refresh simply loads everything again). If a
-        // Free user removes their active wallet, the next one by created_at
-        // automatically becomes the first row here — i.e. active.
-        // The premium condition mirrors isPremium() in the Premium module
-        // but is evaluated in SQL against premium_expire directly, so an
-        // expired subscription stops matching even before isPremium() has
-        // had a chance to reset the is_premium flag.
-        // The service account is exempt: all of its wallets are always
-        // active regardless of premium fields.
+
         if (prepareOrLog(db,&s,
             "SELECT wa.address, uw.user_id, uw.label, u.threshold_nanos, "
             "       CASE WHEN u.is_premium=1 AND u.premium_expire>? THEN 1 ELSE 0 END "
@@ -526,7 +503,7 @@ void refreshWatchers() {
                 uint64_t nanos = static_cast<uint64_t>(sqlite3_column_int64(s,3));
                 bool prem = sqlite3_column_int(s,4) != 0;
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
-                if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue; // Free: only the first wallet is active
+                if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
             }
@@ -542,7 +519,7 @@ enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, ERRO
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
-    // Plan-dependent limit: 1 wallet on Free, 50 on Premium (Premium module).
+
     if (chatId != SERVICE_CHAT_ID &&
         countUserWhales(chatId) >= premiumMaxWallets(chatId))
     {
@@ -638,9 +615,7 @@ std::string buildUserListText(const std::string& chatId) {
 }
 
 void removeUser(const std::string& chatId) {
-    // ТЗ №2: the service account is a permanent system user. It must never
-    // be deleted — neither from `users` (which via ON DELETE CASCADE would
-    // also wipe its user_whales) nor in response to any Telegram error.
+
     if (chatId == SERVICE_CHAT_ID) {
         std::cout << "[USERS] Skip removing service account" << std::endl;
         return;
@@ -652,7 +627,6 @@ void removeUser(const std::string& chatId) {
     std::cout << "[USERS] Removed dead user: " << chatId << std::endl;
 }
 
-// ==================== RATE LIMITER ====================
 class RateLimiter {
     std::mutex mtx; struct S { std::chrono::steady_clock::time_point last; std::deque<std::chrono::steady_clock::time_point> hist; };
     std::map<std::string,S> users; static constexpr int MIN_MS=1000, MAX_MIN=30, CLEANUP_H=24;
@@ -669,7 +643,6 @@ public:
     }
 } g_rateLimiter;
 
-// ==================== TELEGRAM UI ====================
 namespace TelegramUI {
 
 UIMessage buildMainMenu(const std::string& chatId) {
@@ -726,7 +699,7 @@ std::string buildCancelButton() {
 }
 
 UIMessage buildWalletsList(const std::string& chatId) {
-    // NOTE: computed BEFORE taking dbMutex — isPremium() locks dbMutex itself.
+
     bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
 
     std::lock_guard<std::mutex> l(dbMutex);
@@ -754,9 +727,6 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
         std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
 
-        // ТЗ №1: on Free only the first wallet (by created_at) actually
-        // produces alerts; the rest stay stored but paused. The list still
-        // shows everything — with markers so it doesn't look like a bug.
         const char* marker = premium ? "🐋" : (idx == 0 ? "🔔" : "⏸");
         text << marker << " <b>" << safeString(label, 32) << "</b>\n";
         text << "<code>" << shortAddr << "</code>\n\n";
@@ -807,7 +777,7 @@ UIMessage buildSettingsMenu(const std::string& chatId) {
     size_t walletCount = countUserWhales(chatId);
     std::stringstream text;
     text << "⚙️ <b>Settings</b>\n\n";
-    // Plan-dependent limit (1 Free / 50 Premium) from the Premium module.
+
     text << "Wallets tracked: <b>" << walletCount << "</b> / " << premiumMaxWallets(chatId) << "\n\n";
     text << "Choose an option:";
 
@@ -847,12 +817,10 @@ UIMessage buildHelpMessage() {
     return {text, keyboard.dump()};
 }
 
-} // namespace TelegramUI
+}
 
-// ==================== USER SESSION MANAGER ====================
 UserSessionManager g_sessionManager;
 
-// ==================== TELEGRAM ====================
 SendResult sendMsg(const std::string& c, const std::string& t, const std::string& reply_markup) {
     json j;
     j["chat_id"] = c;
@@ -926,7 +894,6 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
-// ==================== SAFE MESSAGE QUEUE ====================
 class SafeMessageQueue {
     std::atomic<size_t> queueSize{0};
     std::atomic<time_t> globalRetryAfter{0};
@@ -1019,7 +986,6 @@ public:
     }
 } g_msgQueue;
 
-// ==================== TOKENS & PRICES ====================
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
     auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
@@ -1052,7 +1018,6 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-// ==================== MATH ====================
 cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
     for (char c:h.substr(2,64)) { r<<=4; if (c>='0'&&c<='9') r|=(c-'0'); else if (c>='a'&&c<='f') r|=(c-'a'+10); else if (c>='A'&&c<='F') r|=(c-'A'+10); } return r;
@@ -1112,7 +1077,6 @@ std::string formatPriceUsd(const cpp_int& n) {
     return std::string(neg ? "-$" : "$") + dollarPart + "." + fracPart;
 }
 
-// ==================== BALANCE-DIFF CROSS-CHECK ====================
 std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
     if (blockNumber < 0) return std::nullopt;
     std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2);
@@ -1124,7 +1088,6 @@ std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const st
     return parseUint256(hex);
 }
 
-// ==================== ANALYZE TX ====================
 const std::set<std::string> SWAP_EVENT_TOPICS = {
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
@@ -1408,7 +1371,6 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     return msg;
 }
 
-// ==================== PROCESS BLOCK ====================
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
     auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
@@ -1480,7 +1442,6 @@ bool processBlock(long long bn) {
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
 }
 
-// ==================== CLEANUP ====================
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
@@ -1491,7 +1452,6 @@ void cleanupOldAlerts() {
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
 }
 
-// ==================== CALLBACK HANDLERS ====================
 void handleCallbackQuery(const json& callbackQuery) {
     if (!callbackQuery.contains("data") || !callbackQuery["data"].is_string()) return;
     if (!callbackQuery.contains("from") || !callbackQuery["from"].contains("id")) return;
@@ -1539,7 +1499,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "premium") {
-            // ⭐ Premium page (sales page or "Premium Active", built by the module).
+
             auto msg = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
@@ -1558,9 +1518,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
     }
     else if (action == "premium_buy") {
-        // "⭐ Buy Premium" / "🔄 Renew Premium": the module sends the Telegram
-        // Stars invoice; payment then arrives as pre_checkout_query +
-        // successful_payment updates handled in telegramLoop().
+
         if (!sendPremiumInvoice(chatId)) {
             replyInPlace(chatId, messageId,
                 "❌ Could not create the invoice. Please try again later.", "");
@@ -1656,7 +1614,7 @@ void handleCallbackQuery(const json& callbackQuery) {
                 case AddWhaleResult::OK: refreshWatchers(); feedback = "✅ Wallet added"; break;
                 case AddWhaleResult::ALREADY_EXISTS: feedback = "✅ Already tracking"; break;
                 case AddWhaleResult::LIMIT_REACHED:
-                    // Callback popups can't carry buttons, so the upgrade hint is text-only.
+
                     if (isPremium(chatId))
                         feedback = "⚠️ Wallet limit reached (50)";
                     else
@@ -1673,8 +1631,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "gt_open") {
         GlobalRankKind kind;
         if (parseGlobalRankKind(param, kind)) {
-            // Plan-gated depth: Top 10 for Free (with the upsell footer),
-            // Top 50 for Premium.
+
             auto msg = buildGlobalTopMessage(chatId, kind,
                                              premiumTopTradersLimit(chatId),
                                              !isPremium(chatId));
@@ -1710,7 +1667,6 @@ void handleCallbackQuery(const json& callbackQuery) {
     }
 }
 
-// ==================== TEXT INPUT HANDLERS ====================
 bool handleTextInput(const std::string& chatId, const std::string& text) {
     UserSession session = g_sessionManager.getSession(chatId);
 
@@ -1769,7 +1725,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
                 auto msg = TelegramUI::buildMainMenu(chatId);
                 sendMsg(chatId, "⚠️ You've reached the limit of 50 tracked wallets.\n\n" + msg.text, msg.keyboard);
             } else {
-                // "Free plan allows tracking only 1 wallet..." + ⭐ Upgrade to Premium
+
                 auto lim = buildWalletLimitMessage();
                 sendMsg(chatId, lim.text, lim.keyboard);
             }
@@ -1839,14 +1795,11 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
     return false;
 }
 
-// ==================== TELEGRAM LOOP ====================
 void telegramLoop() {
     long offset=getTgOffset(); std::cout << "[TG] Restored offset: " << offset << std::endl;
     while (running.load(std::memory_order_relaxed)) {
         try {
-            // allowed_updates now includes pre_checkout_query — without it the
-            // Telegram Stars payment flow never reaches the bot and the
-            // payment hangs on Telegram's side.
+
             auto raw=http("https://api.telegram.org/bot"+TG_TOKEN+"/getUpdates?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%2C%22pre_checkout_query%22%5D","",35);
             if (raw.empty()) continue; auto upd=json::parse(raw);
             if (!upd.contains("result")||!upd["result"].is_array()) continue;
@@ -1858,16 +1811,12 @@ void telegramLoop() {
                     handleCallbackQuery(u["callback_query"]);
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
                 }
-                // Telegram Stars: the pre-payment confirmation must be
-                // answered within 10 seconds or the payment is cancelled.
+
                 if (u.contains("pre_checkout_query")&&u["pre_checkout_query"].is_object()) {
                     handlePreCheckoutQuery(u["pre_checkout_query"]);
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
                 }
-                // A successful payment arrives as a message WITHOUT a text
-                // field, so it must be handled before the message.text check
-                // below (and before the rate limiter — a paid user's
-                // activation must never be dropped).
+
                 if (u.contains("message")&&u["message"].is_object()&&u["message"].contains("successful_payment")
                     &&u["message"].contains("chat")&&u["message"]["chat"].is_object()&&u["message"]["chat"].contains("id")) {
                     std::string pcid=std::to_string(u["message"]["chat"]["id"].get<long>());
@@ -2014,7 +1963,6 @@ void telegramLoop() {
     }
 }
 
-// ==================== MAIN ====================
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
@@ -2045,7 +1993,7 @@ int main() {
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); refreshWatchers(); /* expired Premium -> Free users drop to 1 active wallet within <=30 min (ТЗ №1) */ lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium();  lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
