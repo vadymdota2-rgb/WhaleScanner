@@ -25,6 +25,8 @@ void closeRankingDB();
 
 void cleanupOldTrades();
 
+void rankingCacheLoop();
+
 std::string resolveTokenArg(const std::string& arg);
 
 struct RankingMessage {
