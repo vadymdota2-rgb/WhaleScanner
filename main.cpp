@@ -27,6 +27,7 @@
 #include "ranking.h"
 #include "alert_settings.h"
 #include "premium.h"
+#include "message_queue.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -198,7 +199,6 @@ constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
 constexpr size_t MAX_WHALES_PER_USER = 50;
-constexpr size_t MAX_QUEUE_SIZE = 100000;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -893,98 +893,6 @@ void setupBotCommands() {
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
-
-class SafeMessageQueue {
-    std::atomic<size_t> queueSize{0};
-    std::atomic<time_t> globalRetryAfter{0};
-    std::atomic<bool> qRunning{true};
-    std::thread senderThread;
-    static constexpr int SEND_MS=33;
-
-    void initCounters() {
-        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-        if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
-            if (sqlite3_step(s)==SQLITE_ROW) queueSize.store(sqlite3_column_int64(s,0)); sqlite3_finalize(s); }
-    }
-    void updateStatus(int64_t id, int st, int rc, time_t nr) {
-        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-        if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=?")) return;
-        sqlite3_bind_int(s,1,st); sqlite3_bind_int(s,2,rc); sqlite3_bind_int64(s,3,nr); sqlite3_bind_int64(s,4,id);
-        sqlite3_step(s); sqlite3_finalize(s);
-    }
-    void scheduleRetry(int64_t id) {
-        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-        if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=CASE WHEN retry_count>=4 THEN 4 ELSE 3 END, retry_count=retry_count+1, next_retry_at=?+MIN(30*(1<<retry_count),600) WHERE id=? AND status!=4")) return;
-        sqlite3_bind_int64(s,1,time(nullptr)); sqlite3_bind_int64(s,2,id); sqlite3_step(s);
-        if (sqlite3_changes(db)>0) { sqlite3_stmt* c;
-            if (prepareOrLog(db,&c,"SELECT status FROM deliveries WHERE id=?")) {
-                sqlite3_bind_int64(c,1,id); if (sqlite3_step(c)==SQLITE_ROW&&sqlite3_column_int(c,0)==4) {
-                    std::cerr << "[QUEUE] Delivery #" << id << " FAILED after 5 retries" << std::endl;
-                    queueSize.fetch_sub(1,std::memory_order_relaxed); } sqlite3_finalize(c); } }
-        sqlite3_finalize(s);
-    }
-    void senderLoop() {
-        initCounters(); auto rec=queueSize.load();
-        if (rec>0) std::cout << "[QUEUE] Recovered " << rec << " pending deliveries" << std::endl;
-        while (qRunning.load(std::memory_order_relaxed)) {
-            time_t ra=globalRetryAfter.load(std::memory_order_relaxed);
-            if (ra>0&&time(nullptr)<ra) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
-            if (queueSize.load(std::memory_order_relaxed)==0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-            std::vector<std::tuple<int64_t,std::string,std::string>> batch;
-            { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-              if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.id ASC LIMIT 100")) continue;
-              sqlite3_bind_int64(s,1,time(nullptr));
-              while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
-              sqlite3_finalize(s); }
-            if (batch.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-            for (auto& [did,cid,msg]:batch) {
-                auto res=sendMsg(cid,msg);
-                if (res.ok) { updateStatus(did,1,0,0); queueSize.fetch_sub(1,std::memory_order_relaxed); }
-                else if (res.retryAfterSec>0) { globalRetryAfter.store(time(nullptr)+res.retryAfterSec); scheduleRetry(did);
-                    std::cerr << "[TG] 429: pausing " << res.retryAfterSec << "s" << std::endl; break; }
-                else if (res.deadUser) { updateStatus(did,2,0,0); if (cid != SERVICE_CHAT_ID) removeUser(cid); else std::cout << "[USERS] Skip removing service account" << std::endl; queueSize.fetch_sub(1,std::memory_order_relaxed); }
-                else scheduleRetry(did);
-                std::this_thread::sleep_for(std::chrono::milliseconds(SEND_MS));
-            }
-        }
-    }
-public:
-    void start() { qRunning.store(true); senderThread=std::thread(&SafeMessageQueue::senderLoop,this); }
-    void stop() { qRunning.store(false); if (senderThread.joinable()) senderThread.join(); }
-    size_t size() { return queueSize.load(std::memory_order_relaxed); }
-    void syncSize() {
-        std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-        if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status IN (0,3)")) {
-            if (sqlite3_step(s)==SQLITE_ROW) { size_t real=sqlite3_column_int64(s,0), atm=queueSize.load();
-                if (real!=atm) { std::cerr << "[QUEUE] Size drift: atomic="<<atm<<" real="<<real<<", correcting" << std::endl; queueSize.store(real); } } sqlite3_finalize(s); }
-    }
-    bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
-        if (recipients.empty()) return true;
-        size_t current = queueSize.load(std::memory_order_relaxed);
-        size_t batchSize = recipients.size();
-        if (current + batchSize > MAX_QUEUE_SIZE) {
-            logCritical("Queue OVERLOAD (" + std::to_string(current) + "+" +
-                        std::to_string(batchSize) + ">" + std::to_string(MAX_QUEUE_SIZE) +
-                        ") — alert rejected!");
-            return false;
-        }
-
-        auto txStart=std::chrono::steady_clock::now();
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
-        sqlite3_stmt* s;
-        if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at) VALUES(?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-        sqlite3_bind_text(s,1,text.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,time(nullptr));
-        if (sqlite3_step(s)!=SQLITE_DONE) { sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-        int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
-        if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at) VALUES(?,?,0,0,0)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-        for (auto& c:recipients) { sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); }
-        sqlite3_finalize(s); sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
-        auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-txStart).count();
-        if (ms>1000) std::cerr << "[DB] ⚠️ Slow enqueue: " << ms << "ms" << std::endl;
-        queueSize.fetch_add(batchSize,std::memory_order_relaxed); return true;
-    }
-} g_msgQueue;
 
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
@@ -1976,7 +1884,11 @@ int main() {
     auto lj=rpc("eth_blockNumber",{}); long long tmpLat;
     if (lj.is_string()&&hexToLL(lj.get<std::string>(),tmpLat)) { long long lat=tmpLat; if (lat-lb>FAST_SYNC_LAG) { std::cout << "[FAST SYNC] Lag " << (lat-lb) << ", skip to latest-5" << std::endl; lb=lat-5; saveLastBlock(lb); saveLastBlockHash(""); } }
     std::cout << "🐋 Started. Block: " << lb << ", Users: " << countUsers() << ", Watched addresses: " << initialWatcherAddrs << std::endl;
-    g_msgQueue.start(); std::thread tg(telegramLoop);
+    g_msgQueue.setDeadUserHandler([](const std::string& cid) {
+        if (cid != SERVICE_CHAT_ID) removeUser(cid);
+        else std::cout << "[USERS] Skip removing service account" << std::endl;
+    });
+    g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop);
     long long bsc=0; auto lcp=std::chrono::steady_clock::now(), lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
         try {
@@ -2005,6 +1917,7 @@ int main() {
     std::cout << "[SHUTDOWN] Stopping..." << std::endl;
     g_msgQueue.stop();
     tg.join();
+    rk.join();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
