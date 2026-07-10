@@ -9,12 +9,16 @@
 #include <algorithm>
 #include <cstdint>
 #include <ctime>
+#include <atomic>
+#include <thread>
+#include <chrono>
 #include "json.hpp"
 
 using json = nlohmann::json;
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
+extern std::atomic<bool> running;
 
 std::string toLower(std::string s);
 std::string trim(const std::string& s);
@@ -32,7 +36,7 @@ constexpr int MAX_GLOBAL_RANKED = 50;
 
 constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
-constexpr time_t CACHE_TTL_SECONDS = 15 * 60;
+constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
 const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
 
@@ -83,6 +87,11 @@ void initRankingDB() {
         CREATE TABLE IF NOT EXISTS ignored_wallets(
             wallet TEXT PRIMARY KEY,
             ignored_until INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ranking_cache(
+            cache_key TEXT PRIMARY KEY,
+            payload TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
         );
     )";
     char* err = nullptr;
@@ -273,14 +282,60 @@ std::vector<PnlRow> computeTopPnl(const std::string& token) {
     return results;
 }
 
-struct CachedRanking {
-    std::string token;
-    std::vector<PnlRow> rows;
-    time_t computedAt = 0;
-};
-
 std::mutex g_cacheMutex;
-std::map<std::string, CachedRanking> g_topPnlCache;
+std::map<std::string, std::string> g_lastTokenByChat;
+std::atomic<bool> g_forceRebuild{false};
+
+std::string rowsToJson(const std::vector<PnlRow>& rows) {
+    json a = json::array();
+    for (const PnlRow& r : rows) {
+        a.push_back({{"w", r.wallet}, {"p", r.pnlNanos}, {"r", r.roiPercent},
+                     {"wr", r.winRatePercent}, {"t", r.completedTrades}});
+    }
+    return a.dump();
+}
+
+bool rowsFromJson(const std::string& payload, std::vector<PnlRow>& out) {
+    try {
+        json a = json::parse(payload);
+        if (!a.is_array()) return false;
+        for (auto& e : a) {
+            PnlRow r;
+            r.wallet = e.value("w", "");
+            r.pnlNanos = e.value("p", static_cast<int64_t>(0));
+            r.roiPercent = e.value("r", 0.0);
+            r.winRatePercent = e.value("wr", 0);
+            r.completedTrades = e.value("t", 0);
+            out.push_back(r);
+        }
+        return true;
+    } catch (...) { return false; }
+}
+
+bool loadCachedPayload(const std::string& key, std::string& out) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "SELECT payload FROM ranking_cache WHERE cache_key=?")) return false;
+    sqlite3_bind_text(s, 1, key.c_str(), -1, SQLITE_TRANSIENT);
+    bool found = false;
+    if (sqlite3_step(s) == SQLITE_ROW) { out = safeColumnText(s, 0); found = true; }
+    sqlite3_finalize(s);
+    return found;
+}
+
+bool cacheReady() {
+    std::string tmp;
+    return loadCachedPayload("global_pnl", tmp);
+}
+
+RankingMessage buildGeneratingMessage() {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+    }));
+    return {"⏳ Rating is being generated.\n\nPlease try again in a minute.", keyboard.dump()};
+}
 
 RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page) {
     int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
@@ -445,16 +500,6 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
     return out;
 }
 
-const std::vector<PnlRow>& selectGlobalList(const GlobalRankings& r, GlobalRankKind kind) {
-    switch (kind) {
-        case GlobalRankKind::PNL: return r.byPnl;
-        case GlobalRankKind::ROI: return r.byRoi;
-        case GlobalRankKind::WIN_RATE: return r.byWinRate;
-        case GlobalRankKind::ACTIVE: return r.byActive;
-    }
-    return r.byPnl;
-}
-
 std::string globalTitle(GlobalRankKind kind) {
     switch (kind) {
         case GlobalRankKind::PNL: return "💵 Top PnL (30D)";
@@ -464,13 +509,6 @@ std::string globalTitle(GlobalRankKind kind) {
     }
     return "🏆 Top Traders (30D)";
 }
-
-struct CachedGlobalRanking {
-    GlobalRankings rankings;
-    time_t computedAt = 0;
-};
-
-std::map<std::string, CachedGlobalRanking> g_globalRankingCache;
 
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
                                 int maxRank, bool showUpgrade) {
@@ -523,6 +561,103 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     keyboard["inline_keyboard"].push_back(navRow);
 
     return {text.str(), keyboard.dump()};
+}
+
+RankingMessage buildTokenRankingFromCache(const std::string& token, int page) {
+    std::string payload;
+    if (!loadCachedPayload("token_" + token, payload)) {
+        if (!cacheReady()) return buildGeneratingMessage();
+        return renderPage(token, std::vector<PnlRow>{}, page);
+    }
+    std::vector<PnlRow> rows;
+    if (!rowsFromJson(payload, rows)) return buildGeneratingMessage();
+    return renderPage(token, rows, page);
+}
+
+RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade) {
+    std::string payload;
+    if (!loadCachedPayload("global_" + globalRankKindToString(kind), payload)) {
+        return buildGeneratingMessage();
+    }
+    std::vector<PnlRow> rows;
+    if (!rowsFromJson(payload, rows)) return buildGeneratingMessage();
+    return renderGlobalPage(kind, rows, page, maxRank, showUpgrade);
+}
+
+std::vector<std::string> listActiveTokens() {
+    std::vector<std::string> tokens;
+    long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
+
+    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
+    std::unique_lock<std::mutex> readLock, writeLock;
+    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
+    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(rdb, &s, "SELECT DISTINCT token FROM trades WHERE timestamp>=?")) return tokens;
+    sqlite3_bind_int64(s, 1, since);
+    while (sqlite3_step(s) == SQLITE_ROW) tokens.push_back(safeColumnText(s, 0));
+    sqlite3_finalize(s);
+    return tokens;
+}
+
+void rebuildAllRankings() {
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::vector<PnlRow> base = computeGlobalTop30D();
+    GlobalRankings g = buildGlobalRankings(base);
+
+    std::vector<std::pair<std::string, std::string>> entries;
+    entries.emplace_back("global_pnl", rowsToJson(g.byPnl));
+    entries.emplace_back("global_roi", rowsToJson(g.byRoi));
+    entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
+    entries.emplace_back("global_active", rowsToJson(g.byActive));
+
+    std::vector<std::string> tokens = listActiveTokens();
+    for (const std::string& tok : tokens) {
+        if (!running.load(std::memory_order_relaxed)) return;
+        entries.emplace_back("token_" + tok, rowsToJson(computeTopPnl(tok)));
+    }
+
+    long long now = static_cast<long long>(time(nullptr));
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            std::cerr << "[RANKING] cache rebuild: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+            return;
+        }
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s, "DELETE FROM ranking_cache")) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return;
+        }
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+        if (!prepareOrLog(db, &s,
+            "INSERT INTO ranking_cache(cache_key,payload,updated_at) VALUES(?,?,?)")) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            return;
+        }
+        bool ok = true;
+        for (const auto& e : entries) {
+            sqlite3_reset(s);
+            sqlite3_bind_text(s, 1, e.first.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s, 2, e.second.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 3, now);
+            if (sqlite3_step(s) != SQLITE_DONE) { ok = false; break; }
+        }
+        sqlite3_finalize(s);
+        if (!ok) {
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            std::cerr << "[RANKING] cache rebuild failed, rolled back" << std::endl;
+            return;
+        }
+        sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+    }
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::cout << "[RANKING] Cache rebuilt: " << entries.size() << " entrie(s), " << ms << "ms" << std::endl;
 }
 
 }
@@ -654,11 +789,7 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
         }
     }
 
-    if (blockedNow) {
-        std::lock_guard<std::mutex> c(g_cacheMutex);
-        g_topPnlCache.clear();
-        g_globalRankingCache.clear();
-    }
+    if (blockedNow) g_forceRebuild.store(true, std::memory_order_relaxed);
 }
 
 std::string resolveTokenArg(const std::string& argIn) {
@@ -684,29 +815,25 @@ RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& 
                 "has already seen in a trade.", ""};
     }
 
-    std::vector<PnlRow> rows = computeTopPnl(token);
-
     {
         std::lock_guard<std::mutex> l(g_cacheMutex);
-        g_topPnlCache[chatId] = CachedRanking{token, rows, time(nullptr)};
+        g_lastTokenByChat[chatId] = token;
     }
 
-    return renderPage(token, rows, page);
+    return buildTokenRankingFromCache(token, page);
 }
 
 RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
     std::string token;
-    std::vector<PnlRow> rows;
     {
         std::lock_guard<std::mutex> l(g_cacheMutex);
-        auto it = g_topPnlCache.find(chatId);
-        if (it == g_topPnlCache.end() || time(nullptr) - it->second.computedAt > CACHE_TTL_SECONDS) {
+        auto it = g_lastTokenByChat.find(chatId);
+        if (it == g_lastTokenByChat.end()) {
             return {"⏳ This ranking has expired. Please request it again (e.g. /toptrader TOKEN).", ""};
         }
-        token = it->second.token;
-        rows = it->second.rows;
+        token = it->second;
     }
-    return renderPage(token, rows, page);
+    return buildTokenRankingFromCache(token, page);
 }
 
 RankingMessage buildGlobalTopMenu() {
@@ -739,27 +866,24 @@ RankingMessage buildGlobalTopMenu() {
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
                                      int maxRank, bool showUpgrade) {
-    GlobalRankings rankings;
-    {
-        std::lock_guard<std::mutex> l(g_cacheMutex);
-        auto it = g_globalRankingCache.find(chatId);
-        if (it != g_globalRankingCache.end() && time(nullptr) - it->second.computedAt <= CACHE_TTL_SECONDS) {
-            rankings = it->second.rankings;
-        } else {
-            std::vector<PnlRow> base = computeGlobalTop30D();
-            rankings = buildGlobalRankings(base);
-            g_globalRankingCache[chatId] = CachedGlobalRanking{rankings, time(nullptr)};
-        }
-    }
-    return renderGlobalPage(kind, selectGlobalList(rankings, kind), 1, maxRank, showUpgrade);
+    (void)chatId;
+    return buildGlobalFromCache(kind, 1, maxRank, showUpgrade);
 }
 
 RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page,
                                   int maxRank, bool showUpgrade) {
-    std::lock_guard<std::mutex> l(g_cacheMutex);
-    auto it = g_globalRankingCache.find(chatId);
-    if (it == g_globalRankingCache.end() || time(nullptr) - it->second.computedAt > CACHE_TTL_SECONDS) {
-        return {"⏳ This ranking has expired. Please reopen 🏆 Top Traders from the menu.", ""};
+    (void)chatId;
+    return buildGlobalFromCache(kind, page, maxRank, showUpgrade);
+}
+
+void rankingCacheLoop() {
+    while (running.load(std::memory_order_relaxed)) {
+        rebuildAllRankings();
+        for (long long slept = 0;
+             running.load(std::memory_order_relaxed) && slept < REBUILD_INTERVAL_SECONDS;
+             slept++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            if (g_forceRebuild.exchange(false)) break;
+        }
     }
-    return renderGlobalPage(kind, selectGlobalList(it->second.rankings, kind), page, maxRank, showUpgrade);
 }
