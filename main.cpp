@@ -11,7 +11,6 @@
 #include <shared_mutex>
 #include <atomic>
 #include <memory>
-#include <optional>
 #include <csignal>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -181,6 +180,10 @@ const std::string CHANNEL_ID = []{
     const char* env = std::getenv("WHALE_CHANNEL_ID");
     return env ? std::string(env) : std::string();
 }();
+const std::string BOT_USERNAME = []{
+    const char* env = std::getenv("WHALE_BOT_USERNAME");
+    return (env && *env) ? std::string(env) : std::string("WalletTrackerAppBot");
+}();
 const std::string DB_FILE = "whale_bot.db";
 
 const std::vector<std::string> BSC_RPC_ENDPOINTS = {
@@ -198,7 +201,7 @@ const long long TX_TTL_BLOCKS = 1000;
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
-constexpr size_t MAX_WHALES_PER_USER = 50;
+constexpr int DIGEST_HOUR_UTC = 12;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -244,7 +247,6 @@ sqlite3* db = nullptr;
 std::map<std::string, std::string> TOKEN_SYMBOLS;
 std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
-std::map<std::string, std::pair<std::string, std::string>> POOL_TOKENS_CACHE;
 
 struct Watcher {
     std::string chatId;
@@ -429,6 +431,16 @@ void saveTgOffset(long o) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('tg_offset',?)")) return;
     std::string v=std::to_string(o); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+}
+long long getChannelDigestAt() {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='channel_digest_at'")) return 0;
+    long long t=0; if (sqlite3_step(s)==SQLITE_ROW) { std::string v=safeColumnText(s,0); try { if (!v.empty()) t=std::stoll(v); } catch (...) {} } sqlite3_finalize(s); return t;
+}
+void saveChannelDigestAt(long long t) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('channel_digest_at',?)")) return;
+    std::string v=std::to_string(t); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
 }
 long long getLastBlock() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -930,11 +942,6 @@ cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
     for (char c:h.substr(2,64)) { r<<=4; if (c>='0'&&c<='9') r|=(c-'0'); else if (c>='a'&&c<='f') r|=(c-'a'+10); else if (c>='A'&&c<='F') r|=(c-'A'+10); } return r;
 }
-std::string nthWord(const std::string& h, size_t wordIdx) {
-    size_t start = 2 + wordIdx*64;
-    if (h.length() < start + 64) return "";
-    return "0x" + h.substr(start, 64);
-}
 cpp_int hexToCppInt(const std::string& h) {
     if (h.size() < 2 || h[0] != '0' || h[1] != 'x') return 0;
     cpp_int r = 0;
@@ -945,15 +952,6 @@ cpp_int hexToCppInt(const std::string& h) {
         else if (c >= 'A' && c <= 'F') r |= (c - 'A' + 10);
     }
     return r;
-}
-cpp_int parseInt256(const std::string& h) {
-    cpp_int u = parseUint256(h);
-    cpp_int signBit = cpp_int(1) << 255;
-    if (u >= signBit) {
-        cpp_int modulus = cpp_int(1) << 256;
-        return u - modulus;
-    }
-    return u;
 }
 std::string formatAmount(const cpp_int& raw, int dec) {
     if (raw==0) return "0.00"; cpp_int d=1; for (int i=0;i<dec;i++) d*=10;
@@ -983,17 +981,6 @@ std::string formatPriceUsd(const cpp_int& n) {
     if (keep < 2) keep = 2;
     fracPart = fracPart.substr(0, keep);
     return std::string(neg ? "-$" : "$") + dollarPart + "." + fracPart;
-}
-
-std::optional<cpp_int> getTokenBalanceAtBlock(const std::string& token, const std::string& wallet, long long blockNumber) {
-    if (blockNumber < 0) return std::nullopt;
-    std::string walletPadded = std::string(24,'0') + toLower(wallet).substr(2);
-    std::stringstream bs; bs << "0x" << std::hex << blockNumber;
-    auto r = rpc("eth_call", {{{"to",token},{"data","0x70a08231"+walletPadded}}, bs.str()});
-    if (!r.is_string()) return std::nullopt;
-    const std::string& hex = r.get<std::string>();
-    if (hex.length() < 66) return std::nullopt;
-    return parseUint256(hex);
 }
 
 const std::set<std::string> SWAP_EVENT_TOPICS = {
@@ -1326,6 +1313,7 @@ bool processBlock(long long bn) {
         std::map<std::string, std::vector<std::string>> byLabel;
         for (auto& w : wit->second) {
             if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) continue;
+            if (w.chatId == SERVICE_CHAT_ID) continue;
             byLabel[w.label].push_back(w.chatId);
         }
 
@@ -1336,11 +1324,6 @@ bool processBlock(long long bn) {
             std::string msg = buildAlertMessage(label, res, hash);
             if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
         }
-        if (!CHANNEL_ID.empty()) {
-            std::string genericMsg = buildAlertMessage(mA, res, hash);
-            g_msgQueue.enqueueToRecipients(genericMsg, {CHANNEL_ID});
-        }
-
         if (anySent) {
             markTxProcessed(hash,bn); g_stats.alerts_sent.fetch_add(byLabel.size());
             std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " " << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
@@ -1904,8 +1887,27 @@ int main() {
                 bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) { g_msgQueue.syncSize(); lsq=std::chrono::steady_clock::now(); }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium();  lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) {
+                g_msgQueue.syncSize();
+                if (!CHANNEL_ID.empty()) {
+                    long long nowTs = static_cast<long long>(time(nullptr));
+                    if (nowTs / 86400 > getChannelDigestAt() / 86400 && (nowTs % 86400) >= DIGEST_HOUR_UTC * 3600) {
+                        auto digest = buildDailyChannelDigest();
+                        if (!digest.text.empty()) {
+                            if (!BOT_USERNAME.empty()) {
+                                while (!digest.text.empty() && (digest.text.back() == '\n' || digest.text.back() == ' ')) digest.text.pop_back();
+                                digest.text += "\n\n🤖 Track these wallets with @" + safeString(BOT_USERNAME, 32);
+                            }
+                            if (g_msgQueue.enqueueToRecipients(digest.text, {CHANNEL_ID})) {
+                                saveChannelDigestAt(nowTs);
+                                std::cout << "[CHANNEL] Daily Top 10 digest sent" << std::endl;
+                            }
+                        }
+                    }
+                }
+                lsq=std::chrono::steady_clock::now();
+            }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
