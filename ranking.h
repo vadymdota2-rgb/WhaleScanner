@@ -27,8 +27,6 @@ void cleanupOldTrades();
 
 void rankingCacheLoop();
 
-RankingMessage buildDailyChannelDigest();
-
 std::string resolveTokenArg(const std::string& arg);
 
 struct RankingMessage {
@@ -39,6 +37,8 @@ struct RankingMessage {
 RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page = 1);
 
 RankingMessage buildTopPnlPage(const std::string& chatId, int page);
+
+RankingMessage buildDailyChannelDigest();
 
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
