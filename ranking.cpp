@@ -876,6 +876,28 @@ RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind
     return buildGlobalFromCache(kind, page, maxRank, showUpgrade);
 }
 
+RankingMessage buildDailyChannelDigest() {
+    std::string payload;
+    if (!loadCachedPayload("global_pnl", payload)) return {"", ""};
+    std::vector<PnlRow> rows;
+    if (!rowsFromJson(payload, rows)) return {"", ""};
+    if (rows.empty()) return {"", ""};
+    if (rows.size() > 10) rows.resize(10);
+
+    std::stringstream text;
+    text << "🏆 <b>Daily Top 10 Traders (30D PnL)</b>\n\n";
+    for (size_t i = 0; i < rows.size(); i++) {
+        const PnlRow& r = rows[i];
+        text << rankLabel(static_cast<int>(i) + 1) << "\n";
+        text << "<code>" << safeString(r.wallet, 42) << "</code>\n";
+        text << "💵 " << formatUsdSigned(r.pnlNanos)
+             << " | 📈 " << formatPercentPlain(r.roiPercent)
+             << " | 🎯 " << r.winRatePercent << "%"
+             << " | 🔄 " << r.completedTrades << "\n\n";
+    }
+    return {text.str(), ""};
+}
+
 void rankingCacheLoop() {
     while (running.load(std::memory_order_relaxed)) {
         rebuildAllRankings();
