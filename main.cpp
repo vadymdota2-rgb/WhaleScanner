@@ -539,11 +539,18 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     }
 
     std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
+    if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[DB] addUserWhale BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return AddWhaleResult::ERROR;
+    }
     sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO whale_addresses(address) VALUES(?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
+    if (sqlite3_step(s)!=SQLITE_DONE) {
+        std::cerr << "[DB] whale_addresses INSERT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR;
+    }
+    sqlite3_finalize(s);
     long long whaleId=-1;
     if (!prepareOrLog(db,&s,"SELECT id FROM whale_addresses WHERE address=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,address.c_str(),-1,SQLITE_TRANSIENT);
@@ -559,14 +566,25 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!prepareOrLog(db,&s,"INSERT INTO user_whales(user_id,whale_id,label,created_at) VALUES(?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
     sqlite3_bind_text(s,3,label.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,4,time(nullptr));
-    sqlite3_step(s); sqlite3_finalize(s);
-    sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
+    if (sqlite3_step(s)!=SQLITE_DONE) {
+        std::cerr << "[DB] user_whales INSERT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR;
+    }
+    sqlite3_finalize(s);
+    if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[DB] addUserWhale COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        return AddWhaleResult::ERROR;
+    }
     return AddWhaleResult::OK;
 }
 
 bool removeUserWhale(const std::string& chatId, const std::string& address) {
     std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
+    if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[DB] removeUserWhale BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
     sqlite3_stmt* s;
     long long whaleId=-1;
     if (prepareOrLog(db,&s,"SELECT id FROM whale_addresses WHERE address=?")) {
@@ -578,13 +596,26 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
 
     if (!prepareOrLog(db,&s,"DELETE FROM user_whales WHERE user_id=? AND whale_id=?")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
-    sqlite3_step(s); bool removed = sqlite3_changes(db)>0; sqlite3_finalize(s);
-
-    if (prepareOrLog(db,&s,"DELETE FROM whale_addresses WHERE id=? AND NOT EXISTS (SELECT 1 FROM user_whales WHERE whale_id=?)")) {
-        sqlite3_bind_int64(s,1,whaleId); sqlite3_bind_int64(s,2,whaleId);
-        sqlite3_step(s); sqlite3_finalize(s);
+    if (sqlite3_step(s)!=SQLITE_DONE) {
+        std::cerr << "[DB] user_whales DELETE failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
     }
-    sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
+    bool removed = sqlite3_changes(db)>0; sqlite3_finalize(s);
+
+    if (!prepareOrLog(db,&s,"DELETE FROM whale_addresses WHERE id=? AND NOT EXISTS (SELECT 1 FROM user_whales WHERE whale_id=?)")) {
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
+    }
+    sqlite3_bind_int64(s,1,whaleId); sqlite3_bind_int64(s,2,whaleId);
+    if (sqlite3_step(s)!=SQLITE_DONE) {
+        std::cerr << "[DB] whale_addresses cleanup failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
+    }
+    sqlite3_finalize(s);
+    if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[DB] removeUserWhale COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        return false;
+    }
     return removed;
 }
 
@@ -593,7 +624,8 @@ void setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
     sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
+    if (sqlite3_step(s)!=SQLITE_DONE) std::cerr << "[DB] threshold UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
+    sqlite3_finalize(s);
 }
 
 void setUserThreshold(const std::string& chatId, double usd) {
