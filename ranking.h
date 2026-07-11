@@ -27,6 +27,8 @@ void cleanupOldTrades();
 
 void rankingCacheLoop();
 
+RankingMessage buildDailyChannelDigest();
+
 std::string resolveTokenArg(const std::string& arg);
 
 struct RankingMessage {
