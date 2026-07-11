@@ -35,13 +35,18 @@ void SafeMessageQueue::updateStatus(int64_t id, int st, int rc, time_t nr) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=?")) return;
     sqlite3_bind_int(s,1,st); sqlite3_bind_int(s,2,rc); sqlite3_bind_int64(s,3,nr); sqlite3_bind_int64(s,4,id);
-    sqlite3_step(s); sqlite3_finalize(s);
+    if (sqlite3_step(s)!=SQLITE_DONE) std::cerr << "[QUEUE] status UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
+    sqlite3_finalize(s);
 }
 
 void SafeMessageQueue::scheduleRetry(int64_t id) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=CASE WHEN retry_count>=4 THEN 4 ELSE 3 END, retry_count=retry_count+1, next_retry_at=?+MIN(30*(1<<retry_count),600) WHERE id=? AND status!=4")) return;
-    sqlite3_bind_int64(s,1,time(nullptr)); sqlite3_bind_int64(s,2,id); sqlite3_step(s);
+    sqlite3_bind_int64(s,1,time(nullptr)); sqlite3_bind_int64(s,2,id);
+    if (sqlite3_step(s)!=SQLITE_DONE) {
+        std::cerr << "[QUEUE] retry UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); return;
+    }
     if (sqlite3_changes(db)>0) { sqlite3_stmt* c;
         if (prepareOrLog(db,&c,"SELECT status FROM deliveries WHERE id=?")) {
             sqlite3_bind_int64(c,1,id); if (sqlite3_step(c)==SQLITE_ROW&&sqlite3_column_int(c,0)==4) {
@@ -102,15 +107,29 @@ bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::v
 
     auto txStart=std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr);
+    if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[QUEUE] BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
     sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at) VALUES(?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     sqlite3_bind_text(s,1,text.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,time(nullptr));
-    if (sqlite3_step(s)!=SQLITE_DONE) { sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+    if (sqlite3_step(s)!=SQLITE_DONE) { std::cerr << "[QUEUE] alert insert failed: " << sqlite3_errmsg(db) << std::endl; sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
     if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at) VALUES(?,?,0,0,0)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-    for (auto& c:recipients) { sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); }
-    sqlite3_finalize(s); sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr);
+    for (auto& c:recipients) {
+        sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT);
+        if (sqlite3_step(s)!=SQLITE_DONE) {
+            std::cerr << "[QUEUE] delivery insert failed: " << sqlite3_errmsg(db) << std::endl;
+            sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
+        }
+    }
+    sqlite3_finalize(s);
+    if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+        std::cerr << "[QUEUE] COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        return false;
+    }
     auto ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-txStart).count();
     if (ms>1000) std::cerr << "[DB] ⚠️ Slow enqueue: " << ms << "ms" << std::endl;
     queueSize.fetch_add(batchSize,std::memory_order_relaxed); return true;
