@@ -7,12 +7,11 @@
 #include <iostream>
 
 #include "alert_settings.h"
+#include "utils.h"
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
-bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql);
-std::string safeColumnText(sqlite3_stmt* stmt, int col);
 void logCritical(const std::string& msg);
 
 namespace {
