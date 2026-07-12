@@ -26,10 +26,11 @@ constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
 constexpr int MIN_COMPLETED_TRADES = 5;
 constexpr int MAX_RANKED_WALLETS = 20;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;
-constexpr int MAX_GLOBAL_RANKED = 50;
+constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
+constexpr int GLOBAL_PER_PAGE = 10;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
 const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
@@ -362,7 +363,7 @@ text << "<code>" << safeString(token, 42) << "</code>\n\n";
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
-            row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
+            row.push_back({{"text", "➕ Track #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
             row.push_back({{"text", "🔍 BscScan"}, {"url", "https://bscscan.com/address/" + r.wallet}});
             keyboard["inline_keyboard"].push_back(row);
         }
@@ -373,6 +374,9 @@ text << "<code>" << safeString(token, 42) << "</code>\n\n";
     navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
     if (page < totalPages) navRow.push_back({{"text", "Next ➡️"}, {"callback_data", "tt_page:" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:toptrader"}}
+    }));
 
     return {text.str(), keyboard.dump()};
 }
@@ -508,10 +512,10 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
                                 int maxRank, bool showUpgrade) {
     if (maxRank < 1) maxRank = 1;
     int visible = std::min(static_cast<int>(rows.size()), maxRank);
-    int totalPages = std::max(1, (visible + PER_PAGE - 1) / PER_PAGE);
+    int totalPages = std::max(1, (visible + GLOBAL_PER_PAGE - 1) / GLOBAL_PER_PAGE);
     page = std::max(1, std::min(page, totalPages));
-    int startIdx = (page - 1) * PER_PAGE;
-    int endIdx = std::min(visible, startIdx + PER_PAGE);
+    int startIdx = (page - 1) * GLOBAL_PER_PAGE;
+    int endIdx = std::min(visible, startIdx + GLOBAL_PER_PAGE);
 
     std::stringstream text;
     text << "🏆 <b>" << globalTitle(kind) << "</b>\n\n";
@@ -534,14 +538,14 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
-            row.push_back({{"text", "➕ Track"}, {"callback_data", "tt_track:" + r.wallet}});
+            row.push_back({{"text", "➕ Track #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
             keyboard["inline_keyboard"].push_back(row);
         }
     }
 
     if (showUpgrade && !rows.empty()) {
         text << "\n" << CARD_SEPARATOR << "\n";
-        text << "🔒 Unlock Top 50 with Premium.";
+        text << "🔒 Unlock Top 100 with Premium.";
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
         }));
@@ -553,6 +557,9 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
     if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", "← Back"}, {"callback_data", "menu:toptrader"}}
+    }));
 
     return {text.str(), keyboard.dump()};
 }
