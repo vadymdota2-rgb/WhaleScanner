@@ -13,19 +13,13 @@
 #include <thread>
 #include <chrono>
 #include "json.hpp"
+#include "utils.h"
 
 using json = nlohmann::json;
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
 extern std::atomic<bool> running;
-
-std::string toLower(std::string s);
-std::string trim(const std::string& s);
-bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql);
-std::string safeColumnText(sqlite3_stmt* stmt, int col);
-bool isValidAddress(const std::string& a);
-std::string safeString(const std::string& s, size_t maxLen);
 
 namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
