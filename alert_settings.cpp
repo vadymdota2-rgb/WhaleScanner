@@ -4,6 +4,7 @@
 #include <sstream>
 #include <cstdio>
 #include "json.hpp"
+#include "utils.h"
 
 using json = nlohmann::json;
 
@@ -104,7 +105,7 @@ std::string buildStatusText(ApplyResult result, uint64_t nanos) {
            "Current threshold:\n<b>" + formatUsdNanos(nanos) + "</b>";
 }
 
-} // namespace
+}
 
 TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
     std::stringstream text;
