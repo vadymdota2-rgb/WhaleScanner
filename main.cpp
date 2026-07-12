@@ -770,7 +770,8 @@ UIMessage buildHelpMessage() {
     text += "/remove 0x... — stop tracking a wallet\n";
     text += "/list — show your tracked wallets\n";
     text += "/limit 5000 — set alert threshold in USD\n";
-    text += "/toptrader CAKE — Top PnL (30D) leaderboard for a token\n\n";
+    text += "/toptrader CAKE — Top PnL (30D) leaderboard for a token\n";
+    text += "/top — open TOP Traders rankings\n\n";
     text += "Or just tap a button in the main menu.";
 
     return {text, keyboard.dump()};
@@ -847,6 +848,7 @@ void setupBotCommands() {
     cmds.push_back({{"command","list"},{"description","Show your tracked wallets"}});
     cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
     cmds.push_back({{"command","toptrader"},{"description","Top traders for a token: /toptrader TOKEN"}});
+    cmds.push_back({{"command","top"},{"description","Open TOP Traders rankings"}});
     cmds.push_back({{"command","premium"},{"description","Wallet Tracker Premium"}});
     cmds.push_back({{"command","help"},{"description","How this bot works"}});
     json j; j["commands"] = cmds;
@@ -1776,6 +1778,10 @@ void telegramLoop() {
                         else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
                     }
                     else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
+                    else if (txt=="/top") {
+                        auto msg = buildGlobalTopMenu();
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
                     else if (txt.find("/toptrader ")==0) {
                         std::string arg = trim(txt.substr(11));
                         if (arg.empty()) sendMsg(cid, "❌ Usage: /toptrader TOKEN (symbol or contract address)");
