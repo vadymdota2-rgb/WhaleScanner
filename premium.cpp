@@ -6,14 +6,13 @@
 #include <cstdio>
 #include <iostream>
 #include <sstream>
+#include "utils.h"
 
 using json = nlohmann::json;
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
-bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql);
-std::string safeColumnText(sqlite3_stmt* stmt, int col);
 std::string http(const std::string& url, const std::string& post, int timeout);
 void ensureUser(const std::string& chatId);
 void refreshWatchers();
