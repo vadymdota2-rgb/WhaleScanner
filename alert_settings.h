@@ -27,8 +27,6 @@ void replyInPlace(const std::string& chatId, long long messageId,
 
 void setUserThresholdNanos(const std::string& chatId, uint64_t nanos);
 uint64_t getUserThresholdNanos(const std::string& chatId);
-std::string formatThousands(uint64_t v);
-std::string trim(const std::string& s);
 void refreshWatchers();
 
 enum class UserState {
