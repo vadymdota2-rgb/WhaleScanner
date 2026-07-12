@@ -26,7 +26,7 @@ const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
 constexpr int    FREE_TOP_TRADERS    = 10;
-constexpr int    PREMIUM_TOP_TRADERS = 50;
+constexpr int    PREMIUM_TOP_TRADERS = 100;
 
 std::string g_botToken;
 
@@ -244,7 +244,7 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
              << "Unlock the full potential of Wallet Tracker.\n\n"
              << "<b>Premium includes:</b>\n"
              << "✅ Track up to 50 wallets\n"
-             << "✅ Access Top 50 Traders\n"
+             << "✅ Access Top 100 Traders\n"
              << "(Top 10 available for free)\n\n"
              << "<b>Subscription:</b>\n30 Days\n\n"
              << "<b>Price:</b>\n⭐ " << PREMIUM_PRICE_STARS << " Stars";
