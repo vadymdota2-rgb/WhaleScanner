@@ -393,6 +393,19 @@ size_t countUsers() {
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM users")) return 0;
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
+std::string shortAddress(const std::string& a) {
+    if (a.length() <= 12) return a;
+    return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
+}
+
+bool isTrackingWallet(const std::string& chatId, const std::string& address) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT 1 FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? AND wa.address=?")) return false;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,address.c_str(),-1,SQLITE_TRANSIENT);
+    bool e=sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s); return e;
+}
+
 size_t countUserWhales(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM user_whales WHERE user_id=?")) return 0;
@@ -565,7 +578,11 @@ std::string buildUserListText(const std::string& chatId) {
         sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
         while (sqlite3_step(s)==SQLITE_ROW) {
             any=true;
-            out << "• " << safeString(safeColumnText(s,1)) << "\n<code>" << safeString(safeColumnText(s,0)) << "</code>\n\n";
+            std::string addr = safeColumnText(s,0);
+            std::string label = safeColumnText(s,1);
+            std::string shortA = shortAddress(addr);
+            if (toLower(label) == toLower(addr)) out << "• <code>" << shortA << "</code>\n\n";
+            else out << "• " << safeString(label) << "\n<code>" << shortA << "</code>\n\n";
         }
         sqlite3_finalize(s);
     }
@@ -687,8 +704,12 @@ UIMessage buildWalletsList(const std::string& chatId) {
         std::string shortAddr = address.substr(0, 6) + "..." + address.substr(address.length() - 4);
 
         const char* marker = premium ? "🐋" : (idx == 0 ? "🔔" : "⏸");
-        text << marker << " <b>" << safeString(label, 32) << "</b>\n";
-        text << "<code>" << shortAddr << "</code>\n\n";
+        if (toLower(label) == address) {
+            text << marker << " <code>" << shortAddr << "</code>\n\n";
+        } else {
+            text << marker << " <b>" << safeString(label, 32) << "</b>\n";
+            text << "<code>" << shortAddr << "</code>\n\n";
+        }
         idx++;
 
         json row;
@@ -759,20 +780,23 @@ UIMessage buildHelpMessage() {
     }));
 
     std::string text = "❓ <b>Help</b>\n\n";
-    text += "🐋 <b>Wallet Tracker</b> monitors whale wallets on BNB Smart Chain and sends instant notifications.\n\n";
-    text += "<b>Features:</b>\n";
-    text += "• Track any wallet address\n";
-    text += "• Set a minimum alert threshold\n";
-    text += "• Instant notifications for swaps and transfers\n";
-    text += "• BNB Smart Chain network\n\n";
+    text += "🏆 Discover top on-chain traders, track wallets, and receive real-time trading alerts across supported networks.\n\n";
     text += "<b>Commands:</b>\n";
-    text += "/add 0x... Name — track a wallet\n";
-    text += "/remove 0x... — stop tracking a wallet\n";
-    text += "/list — show your tracked wallets\n";
-    text += "/limit 5000 — set alert threshold in USD\n";
-    text += "/toptrader CAKE — Top PnL (30D) leaderboard for a token\n";
-    text += "/top — open TOP Traders rankings\n\n";
-    text += "Or just tap a button in the main menu.";
+    text += "/top — Open TOP Traders\n";
+    text += "/toptrader &lt;token&gt; — Top traders for a token\n";
+    text += "/premium — View Premium plans\n";
+    text += "/add &lt;wallet&gt; &lt;name&gt; — Track a wallet\n";
+    text += "/remove &lt;wallet&gt; — Remove a wallet\n";
+    text += "/list — My tracked wallets\n";
+    text += "/limit &lt;USD&gt; — Set minimum alert amount\n\n";
+    text += "⭐ <b>Premium</b>\n";
+    text += "• Full access to Top 100 Traders\n";
+    text += "• Track up to 50 wallets\n";
+    text += "• Advanced features\n";
+    text += "• Priority access to new updates\n\n";
+    text += "📞 Support: @WalletTrackerHelp\n";
+    text += "📢 Channel: t.me/WalletTrackerOfficial\n\n";
+    text += "Use the main menu for quick access to all features.";
 
     return {text, keyboard.dump()};
 }
@@ -1445,26 +1469,23 @@ void handleCallbackQuery(const json& callbackQuery) {
     }
     else if (action == "tt_track") {
         std::string address = toLower(param);
-        std::string feedback;
         if (!isValidAddress(address)) {
-            feedback = "❌ Invalid address.";
-        } else {
-            auto res = addUserWhale(chatId, address, address);
-            switch (res) {
-                case AddWhaleResult::OK: refreshWatchers(); feedback = "✅ Wallet added"; break;
-                case AddWhaleResult::ALREADY_EXISTS: feedback = "✅ Already tracking"; break;
-                case AddWhaleResult::LIMIT_REACHED:
-
-                    if (isPremium(chatId))
-                        feedback = "⚠️ Wallet limit reached (50)";
-                    else
-                        feedback = "⚠️ Free plan allows tracking only 1 wallet. Upgrade to Premium — tap ⭐ Premium in the menu.";
-                    break;
-                case AddWhaleResult::BAD_ADDRESS: feedback = "❌ Invalid address."; break;
-                case AddWhaleResult::ERROR: feedback = "❌ Something went wrong."; break;
-            }
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Invalid address.", true);
         }
-        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
+        else if (isTrackingWallet(chatId, address)) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "✅ Already tracking", true);
+        }
+        else if (chatId != SERVICE_CHAT_ID && countUserWhales(chatId) >= premiumMaxWallets(chatId)) {
+            std::string feedback = isPremium(chatId)
+                ? "⚠️ Wallet limit reached (50)"
+                : "⚠️ Free plan allows tracking only 1 wallet. Upgrade to Premium — tap ⭐ Premium in the menu.";
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
+        }
+        else {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
+            g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address);
+            sendMsg(chatId, "🏷 Enter a name for this trader:", TelegramUI::buildCancelButton());
+        }
     }
     else if (action == "tt_noop") {
     }
@@ -1574,6 +1595,49 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
             sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
         }
 
+        return true;
+    }
+
+    if (session.state == UserState::AWAITING_TRACK_NAME) {
+        std::string address = session.pendingAddress;
+        std::string label = trim(text);
+
+        if (label.empty() || label == "-" || label == "." || toLower(label) == address) {
+            label = shortAddress(address);
+        }
+
+        if (label.length() > 32) {
+            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
+                    TelegramUI::buildCancelButton());
+            return true;
+        }
+
+        auto result = addUserWhale(chatId, address, label);
+
+        if (result == AddWhaleResult::OK) {
+            refreshWatchers();
+            g_sessionManager.clearSession(chatId);
+            auto msg = TelegramUI::buildMainMenu(chatId);
+            sendMsg(chatId, "✅ Wallet \"" + safeString(label, 32) + "\" is now being tracked.\n\n" + msg.text, msg.keyboard);
+        }
+        else if (result == AddWhaleResult::ALREADY_EXISTS) {
+            g_sessionManager.clearSession(chatId);
+            auto msg = TelegramUI::buildMainMenu(chatId);
+            sendMsg(chatId, "⚠️ You're already tracking this wallet.\n\n" + msg.text, msg.keyboard);
+        }
+        else if (result == AddWhaleResult::LIMIT_REACHED) {
+            g_sessionManager.clearSession(chatId);
+            if (isPremium(chatId)) {
+                auto msg = TelegramUI::buildMainMenu(chatId);
+                sendMsg(chatId, "⚠️ You've reached the limit of 50 tracked wallets.\n\n" + msg.text, msg.keyboard);
+            } else {
+                auto lim = buildWalletLimitMessage();
+                sendMsg(chatId, lim.text, lim.keyboard);
+            }
+        }
+        else {
+            sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
+        }
         return true;
     }
 
