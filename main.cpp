@@ -660,7 +660,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
     }));
 
     std::stringstream text;
-    text << "📊 <b>Wallet Tracker</b>\n\n";
+    text << "🚨 <b>Wallet Tracker</b>\n\n";
     if (walletCount == 0) {
         text << "You're not tracking any wallets yet.\nTap <b>Add Wallet</b> to start getting alerts.";
     } else {
@@ -672,7 +672,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
 
 UIMessage buildWelcomeMessage(const std::string& chatId) {
     auto m = buildMainMenu(chatId);
-    m.text = "📊 <b>Welcome to Wallet Tracker!</b>\n\n"
+    m.text = "🚨 <b>Welcome to Wallet Tracker!</b>\n\n"
              "Monitor whale wallets on BNB Smart Chain and get instant notifications for buys, sells and transfers.\n\n"
              "Tap a button below to get started:";
     return m;
