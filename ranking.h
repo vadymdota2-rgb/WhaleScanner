@@ -1,18 +1,7 @@
 #pragma once
 
 #include <string>
-#include <boost/multiprecision/cpp_int.hpp>
-
-using boost::multiprecision::cpp_int;
-
-struct TxResult {
-    bool valid, isSwap, isBuy;
-    cpp_int rawAmount, usdNanos;
-    std::string tokenAddr;
-    std::string venue;
-    std::string counterAddr;
-    cpp_int counterAmount;
-};
+#include "tx_analyzer.h"
 
 void initRankingDB();
 
