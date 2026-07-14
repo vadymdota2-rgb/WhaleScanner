@@ -2,6 +2,8 @@
 
 #include <string>
 #include <cstdint>
+#include <set>
+#include <map>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 
