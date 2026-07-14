@@ -1,25 +1,13 @@
 #pragma once
 
 #include <string>
-#include <cstdint>
 #include <set>
 #include <map>
+#include <cstdint>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 
 using boost::multiprecision::cpp_int;
-
-struct ChainContext {
-    std::string nativeSymbol;
-    std::string nativeMarker;
-    std::string wrappedNative;
-
-    std::set<std::string> stablecoins;
-    std::set<std::string> baseAssets;
-
-    std::map<std::string, std::string> routers;
-    std::set<std::string> bridges;
-};
 
 struct TxResult {
     bool valid, isSwap, isBuy;
@@ -30,25 +18,33 @@ struct TxResult {
     cpp_int counterAmount;
 };
 
+struct ChainContext {
+    std::string nativeSymbol;
+    std::string nativeMarker;
+    std::string wrappedNative;
+    std::set<std::string> baseAssets;
+    std::set<std::string> stablecoins;
+    std::map<std::string, std::string> routers;
+    std::set<std::string> bridges;
+};
+
+const ChainContext& chainCtx();
+void setChainContext(const ChainContext& ctx);
+ChainContext makeBscContext();
+
 extern const std::string WBNB_ADDR;
 extern const std::string NATIVE_BNB_MARKER;
 
-cpp_int parseUint256(const std::string&);
-cpp_int hexToCppInt(const std::string&);
-std::string formatAmount(const cpp_int&, int);
-cpp_int calcUsdNanos(const cpp_int&, int, uint64_t);
-std::string formatUsd(const cpp_int&);
-cpp_int calcUnitPriceNanos(const cpp_int&, const cpp_int&, int);
-std::string formatPriceUsd(const cpp_int&);
+bool isBaseAsset(const std::string& a);
+bool isStablecoin(const std::string& a);
+std::string lookupRouterLabel(const std::string& addr);
 
-ChainContext makeBscContext();
-const ChainContext& chainCtx();
-void setChainContext(const ChainContext&);
+cpp_int parseUint256(const std::string& h);
+cpp_int hexToCppInt(const std::string& h);
+std::string formatAmount(const cpp_int& raw, int dec);
+cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn);
+std::string formatUsd(const cpp_int& n);
+cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec);
+std::string formatPriceUsd(const cpp_int& n);
 
-bool isBaseAsset(const std::string&);
-bool isStablecoin(const std::string&);
-std::string lookupRouterLabel(const std::string&);
-
-TxResult analyzeTx(const nlohmann::json&,
-                   const nlohmann::json&,
-                   const std::string&);
+TxResult analyzeTx(const nlohmann::json& tx, const nlohmann::json& receipt, const std::string& wa);
