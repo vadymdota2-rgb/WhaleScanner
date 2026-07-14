@@ -12,6 +12,8 @@ using json = nlohmann::json;
 uint64_t getPriceNanos(const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
+std::string lookupRouterLabel(const std::string& addr);
+bool isBaseAsset(const std::string& a);
 
 cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
@@ -58,58 +60,7 @@ std::string formatPriceUsd(const cpp_int& n) {
     return std::string(neg ? "-$" : "$") + dollarPart + "." + fracPart;
 }
 
-const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
-const std::string NATIVE_BNB_MARKER = "native:bnb";
-
-ChainContext makeBscContext() {
-    ChainContext c;
-    c.nativeSymbol = "BNB";
-    c.nativeMarker = NATIVE_BNB_MARKER;
-    c.wrappedNative = WBNB_ADDR;
-    c.stablecoins = {
-        "0x55d398326f99059ff775485246999027b3197955",
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
-        "0xe9e7cea3dedca5984780bafc599bd69add087d56"
-    };
-    c.baseAssets = c.stablecoins;
-    c.baseAssets.insert(WBNB_ADDR);
-    c.baseAssets.insert("0xc5f0f7b66764f6ec8c8dff7ba683102295e16409");
-    c.routers = {
-        {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
-        {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
-        {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
-        {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
-        {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
-        {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
-        {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
-        {"0x6015126d7d23648c2e4466693b8deab005ffaba8", "OKX DEX"},
-        {"0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap"},
-        {"0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap"},
-        {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
-        {"0x3a6d8ca21d1cf76f653a67577fa0d27453350dd8", "BiSwap"},
-        {"0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7", "ApeSwap"},
-    };
-    return c;
-}
-
 namespace {
-ChainContext g_chain = makeBscContext();
-}
-
-const ChainContext& chainCtx() { return g_chain; }
-void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
-
-bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
-bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
-std::string lookupRouterLabel(const std::string& addr) {
-    auto it = g_chain.routers.find(toLower(addr));
-    return it != g_chain.routers.end() ? it->second : std::string();
-}
-
-namespace {
-
-const std::string ZERO_ADDR = "0x0000000000000000000000000000000000000000";
-const std::string DEAD_ADDR = "0x000000000000000000000000000000000000dead";
 
 const std::set<std::string> SWAP_EVENT_TOPICS = {
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
@@ -124,6 +75,7 @@ const std::string WBNB_WITHDRAWAL_TOPIC =
     "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
 
 }
+
 
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
@@ -142,11 +94,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
     bool anyTransferForWallet = false;
     std::string firstCounterpartAddr;
-    std::set<std::string> mintedIn;
-    std::set<std::string> burnedOut;
-    std::set<std::string> outCounterparties;
-    std::set<std::string> inCounterparties;
-    bool bridgeTouched = false;
 
     for (auto& l : receipt["logs"]) {
         if (!l.is_object()||!l.contains("topics")||!l["topics"].is_array()||l["topics"].empty()) continue;
@@ -167,7 +114,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             continue;
         }
 
-        if (logAddr == g_chain.wrappedNative && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
+        if (logAddr == WBNB_ADDR && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
             if (l.contains("data") && l["data"].is_string()) {
                 cpp_int wad = parseUint256(l["data"].get<std::string>());
                 if (t0 == WBNB_DEPOSIT_TOPIC) wbnbWrapped += wad; else wbnbUnwrapped += wad;
@@ -193,18 +140,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         touch(logAddr);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
-        if (to == wa) {
-            netFlow[logAddr] += amt;
-            if (fr == ZERO_ADDR) mintedIn.insert(logAddr);
-            else inCounterparties.insert(fr);
-        }
-        if (fr == wa) {
-            netFlow[logAddr] -= amt;
-            if (to == ZERO_ADDR || to == DEAD_ADDR) burnedOut.insert(logAddr);
-            else outCounterparties.insert(to);
-            if (g_chain.bridges.count(to)) bridgeTouched = true;
-        }
-        if (g_chain.bridges.count(fr)) bridgeTouched = true;
+        if (to == wa) netFlow[logAddr] += amt;
+        if (fr == wa) netFlow[logAddr] -= amt;
     }
 
     cpp_int nativeOut = 0;
@@ -234,11 +171,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
     }
 
-    if (!txTo.empty() && g_chain.bridges.count(txTo)) bridgeTouched = true;
     bool routerCall = !txTo.empty() && !lookupRouterLabel(txTo).empty();
     bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
     cpp_int nativeIn = 0;
-    if (walletIsSender && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
+    if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
     bool nativeInflowSignal = nativeIn > 0;
 
     bool anyIn = false, anyOut = false;
@@ -270,46 +206,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         }
     }
 
-    bool lpAdd = false, lpRemove = false;
-    {
-        bool sentBase = hasBaseOut || nativeOutflow;
-        bool sentNonBase = false, gotNonBase = false;
-        for (auto& tok : tokenOrder) {
-            if (isBaseAsset(tok)) continue;
-            cpp_int net = netFlow[tok];
-            if (net > 0) gotNonBase = true;
-            if (net < 0) sentNonBase = true;
-        }
-        bool gotBase = hasBaseIn || nativeInflowSignal;
-        for (auto& tok : tokenOrder) {
-            cpp_int net = netFlow[tok];
-            bool poolTokenIn = outCounterparties.count(tok) > 0;
-            bool poolTokenOut = inCounterparties.count(tok) > 0;
-            if (net > 0 && poolTokenIn && sentBase && sentNonBase) lpAdd = true;
-            if (net > 0 && mintedIn.count(tok) && poolTokenIn) lpAdd = true;
-            if (net < 0 && poolTokenOut && gotBase && gotNonBase) lpRemove = true;
-            if (net < 0 && burnedOut.count(tok) && gotBase && gotNonBase) lpRemove = true;
-        }
-    }
-
-    enum class Confidence { Unknown, Likely, Confirmed };
-    Confidence conf = Confidence::Unknown;
-
-    bool dexSignal = hasSwap || routerCall || nativeSwapSignal || nativeInflowSignal;
-    bool flowSwap = (
+    r.isSwap = (
+        twoSidedFlow ||
         (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal || nativeInflowSignal)) ||
-        (twoSidedFlow && dexSignal)
+        (hasBaseIn && hasBaseOut)
     );
-
-    if (flowSwap) conf = hasSwap ? Confidence::Confirmed : Confidence::Likely;
-    if (lpAdd || lpRemove || bridgeTouched) conf = Confidence::Unknown;
-    if (!bestNonBaseTok.empty()) {
-        cpp_int net = netFlow[bestNonBaseTok];
-        if (net > 0 && mintedIn.count(bestNonBaseTok) && !(hasBaseOut || nativeOutflow)) conf = Confidence::Unknown;
-        if (net < 0 && burnedOut.count(bestNonBaseTok) && !(hasBaseIn || nativeInflowSignal)) conf = Confidence::Unknown;
-    }
-
-    r.isSwap = (conf != Confidence::Unknown);
 
     if (!bestNonBaseTok.empty()) {
         r.tokenAddr = bestNonBaseTok;
@@ -345,7 +246,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
                 }
             }
             if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
-            if (bestCounterTok.empty() && conf == Confidence::Likely) { r.isSwap = false; conf = Confidence::Unknown; }
         }
     } else {
         std::string bestBaseTok; cpp_int bestBaseAbs = -1; cpp_int bestBaseNet = 0;
@@ -402,7 +302,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         }
     }
 
-    if (!r.isSwap && conf != Confidence::Unknown && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
+    if (!r.isSwap && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
         !isBaseAsset(r.tokenAddr) && (nativeSwapSignal || nativeInflowSignal)) {
         r.isSwap = true;
         if (r.counterAddr.empty()) {
@@ -412,15 +312,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     }
 
     int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
-    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.tokenAddr);
+    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(WBNB_ADDR) : getPriceNanos(r.tokenAddr);
     r.usdNanos = calcUsdNanos(r.rawAmount, tokenDec, tokenPrice);
-
-    if (r.isSwap && !r.counterAddr.empty() && r.counterAmount > 0) {
-        bool counterIsNative = (r.counterAddr == NATIVE_BNB_MARKER);
-        int counterDec = counterIsNative ? 18 : getDecimals(r.counterAddr);
-        uint64_t counterPrice = counterIsNative ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.counterAddr);
-        cpp_int counterUsd = calcUsdNanos(r.counterAmount, counterDec, counterPrice);
-        if (counterUsd > 0) r.usdNanos = counterUsd;
-    }
     return r;
 }
