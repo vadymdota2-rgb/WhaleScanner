@@ -9,6 +9,18 @@
 
 using boost::multiprecision::cpp_int;
 
+struct ChainContext {
+    std::string nativeSymbol;
+    std::string nativeMarker;
+    std::string wrappedNative;
+
+    std::set<std::string> stablecoins;
+    std::set<std::string> baseAssets;
+
+    std::map<std::string, std::string> routers;
+    std::set<std::string> bridges;
+};
+
 struct TxResult {
     bool valid, isSwap, isBuy;
     cpp_int rawAmount, usdNanos;
@@ -21,12 +33,22 @@ struct TxResult {
 extern const std::string WBNB_ADDR;
 extern const std::string NATIVE_BNB_MARKER;
 
-cpp_int parseUint256(const std::string& h);
-cpp_int hexToCppInt(const std::string& h);
-std::string formatAmount(const cpp_int& raw, int dec);
-cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn);
-std::string formatUsd(const cpp_int& n);
-cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec);
-std::string formatPriceUsd(const cpp_int& n);
+cpp_int parseUint256(const std::string&);
+cpp_int hexToCppInt(const std::string&);
+std::string formatAmount(const cpp_int&, int);
+cpp_int calcUsdNanos(const cpp_int&, int, uint64_t);
+std::string formatUsd(const cpp_int&);
+cpp_int calcUnitPriceNanos(const cpp_int&, const cpp_int&, int);
+std::string formatPriceUsd(const cpp_int&);
 
-TxResult analyzeTx(const nlohmann::json& tx, const nlohmann::json& receipt, const std::string& wa);
+ChainContext makeBscContext();
+const ChainContext& chainCtx();
+void setChainContext(const ChainContext&);
+
+bool isBaseAsset(const std::string&);
+bool isStablecoin(const std::string&);
+std::string lookupRouterLabel(const std::string&);
+
+TxResult analyzeTx(const nlohmann::json&,
+                   const nlohmann::json&,
+                   const std::string&);
