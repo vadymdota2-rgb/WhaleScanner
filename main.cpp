@@ -58,6 +58,81 @@ void recordCoverage(const TxResult& r) {
     else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
 }
 
+const bool LOG_INVARIANT_VIOLATIONS = []() {
+    const char* env = std::getenv("WHALE_LOG_INVARIANTS");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+std::mutex invariantLogMutex;
+
+void checkInvariants(const std::string& hash, const TxResult& r) {
+    if (!LOG_INVARIANT_VIOLATIONS) return;
+    std::vector<std::string> violations;
+    if (r.rawAmount < 0) violations.push_back("rawAmount is negative");
+    if (r.isSwap && r.tokenAddr.empty()) violations.push_back("isSwap=true but tokenAddr is empty");
+    if ((r.venue == "Wrap" || r.venue == "Unwrap") && r.tokenAddr != chainCtx().wrappedNative)
+        violations.push_back("Wrap/Unwrap venue but tokenAddr is not the chain's wrapped native");
+    if (r.isSwap && !r.isBuy && r.counterAmount == 0) violations.push_back("SELL with zero counterAmount (unresolved counter side)");
+    if (r.isSwap && r.counterAmount < 0) violations.push_back("counterAmount is negative");
+    if ((r.venue == "Add Liquidity" || r.venue == "Remove Liquidity") && r.isSwap)
+        violations.push_back("LP venue set but isSwap is still true");
+    if (violations.empty()) return;
+
+    std::stringstream ss;
+    ss << "hash=" << hash << " venue=" << r.venue << " isSwap=" << (r.isSwap?1:0) << " isBuy=" << (r.isBuy?1:0)
+       << " token=" << r.tokenAddr << " violations=[";
+    for (size_t i=0;i<violations.size();i++) { if (i) ss << "; "; ss << violations[i]; }
+    ss << "]";
+    std::lock_guard<std::mutex> lk(invariantLogMutex);
+    std::ofstream f("invariant_violations.log", std::ios::app);
+    if (f) f << ss.str() << "\n";
+}
+
+const bool LOG_UNKNOWN_TX = []() {
+    const char* env = std::getenv("WHALE_LOG_UNKNOWN");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+const bool LOG_LOW_CONFIDENCE = []() {
+    const char* env = std::getenv("WHALE_LOG_LOW_CONFIDENCE");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+std::mutex diagLogMutex;
+
+void appendDiagLog(const std::string& file, const std::string& hash, long long bn,
+                    const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
+    std::string from = (tx.contains("from") && tx["from"].is_string()) ? tx["from"].get<std::string>() : "";
+    std::string to = (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string()) ? tx["to"].get<std::string>() : "";
+    std::string input = (tx.contains("input") && tx["input"].is_string()) ? tx["input"].get<std::string>() : "";
+    std::string selector = (input.size() >= 10) ? input.substr(0, 10) : "";
+    std::set<std::string> topics0;
+    if (receipt.is_object() && receipt.contains("logs") && receipt["logs"].is_array()) {
+        for (auto& l : receipt["logs"]) {
+            if (l.is_object() && l.contains("topics") && l["topics"].is_array() && !l["topics"].empty() && l["topics"][0].is_string())
+                topics0.insert(l["topics"][0].get<std::string>());
+        }
+    }
+    std::stringstream ss;
+    ss << "hash=" << hash << " block=" << bn << " from=" << from << " to=" << to
+       << " router=" << to << " selector=" << selector
+       << " venue=" << res.venue << " isSwap=" << (res.isSwap ? 1 : 0) << " isBuy=" << (res.isBuy ? 1 : 0)
+       << " token=" << res.tokenAddr << " counter=" << res.counterAddr
+       << " usdNanos=" << res.usdNanos.convert_to<std::string>()
+       << " topics=[";
+    bool first = true;
+    for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
+    ss << "]";
+    std::lock_guard<std::mutex> lk(diagLogMutex);
+    std::ofstream f(file, std::ios::app);
+    if (f) f << ss.str() << "\n";
+}
+
+void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
+    if (LOG_UNKNOWN_TX) appendDiagLog("unknown_tx.log", hash, bn, tx, receipt, res);
+}
+
+void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
+    if (LOG_LOW_CONFIDENCE) appendDiagLog("low_confidence.log", hash, bn, tx, receipt, res);
+}
+
 const auto START_TIME = std::chrono::steady_clock::now();
 
 std::string getUptime() {
@@ -1084,6 +1159,10 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        recordCoverage(res);
+        checkInvariants(hash, res);
+        if (!res.isSwap && res.venue.empty()) logUnknownTx(hash, bn, tx, receipt, res);
+        if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
@@ -1593,6 +1672,15 @@ void telegramLoop() {
                             { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
+                            {
+                                uint64_t buy=g_stats.cov_buy.load(), sell=g_stats.cov_sell.load(), lpAdd=g_stats.cov_lp_add.load(),
+                                         lpRemove=g_stats.cov_lp_remove.load(), wrap=g_stats.cov_wrap.load(), unwrap=g_stats.cov_unwrap.load(),
+                                         xfer=g_stats.cov_transfer.load();
+                                uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer;
+                                ss2 << "\n\n📈 <b>Coverage</b> (valid tx: " << total << ")\n"
+                                    << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
+                                    << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap << "\n📤 Transfer/Unknown: " << xfer;
+                            }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
                         }
