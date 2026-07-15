@@ -262,6 +262,12 @@ const std::string WBNB_DEPOSIT_TOPIC =
     "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
 const std::string WBNB_WITHDRAWAL_TOPIC =
     "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
+const std::string V3_INCREASE_LIQUIDITY_TOPIC =
+    "0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f";
+const std::string V3_DECREASE_LIQUIDITY_TOPIC =
+    "0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4";
+const std::string V3_COLLECT_TOPIC =
+    "0x40d0efd1a53d60ecbf40971b9daf7dc90178c3aadc7aab1765632738fa8b8f01";
 
 }
 
@@ -281,6 +287,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     };
 
     bool anyTransferForWallet = false;
+    bool v3PositionIncrease = false, v3PositionDecrease = false, v3Collect = false;
     std::string firstCounterpartAddr;
     std::set<std::string> mintedIn;
     std::set<std::string> burnedOut;
@@ -313,6 +320,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             }
             continue;
         }
+
+        if (t0 == V3_INCREASE_LIQUIDITY_TOPIC) { v3PositionIncrease = true; continue; }
+        if (t0 == V3_DECREASE_LIQUIDITY_TOPIC) { v3PositionDecrease = true; continue; }
+        if (t0 == V3_COLLECT_TOPIC) { v3Collect = true; continue; }
 
         if (t0 != ERC20_TRANSFER_TOPIC) continue;
         if (l["topics"].size() != 3) continue;
@@ -437,6 +448,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             if (net < 0 && poolTokenOut && gotBase && gotNonBase) { lpRemove = true; break; }
         }
     }
+    if (v3PositionIncrease) lpAdd = true;
+    if (v3PositionDecrease) lpRemove = true;
+    if (v3Collect) lpRemove = true;
 
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
