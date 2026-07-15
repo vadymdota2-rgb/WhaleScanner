@@ -65,7 +65,13 @@ struct UniversalRouterCommands {
     bool hasWrap = false, hasUnwrap = false;
     bool hasV2Swap = false, hasV3Swap = false;
     bool hasSweep = false, hasTransfer = false;
+    bool hasPermit2 = false;
 };
+
+bool isGenericMulticallSelector(const std::string& input) {
+    if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return false;
+    return input.substr(2, 8) == "ac9650d8";
+}
 
 int hexNibble(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -110,6 +116,7 @@ UniversalRouterCommands parseExecuteCommands(const std::string& input) {
         else if (cmd == 0x00 || cmd == 0x01) out.hasV3Swap = true;
         else if (cmd == 0x04) out.hasSweep = true;
         else if (cmd == 0x05) out.hasTransfer = true;
+        else if (cmd == 0x02 || cmd == 0x03 || cmd == 0x0a || cmd == 0x0d) out.hasPermit2 = true;
     }
     return out;
 }
@@ -156,6 +163,9 @@ ChainContext makeBscContext() {
         {"0x19609b03c976cca288fbdae5c21d4290e9a4add7", "Wombat Exchange"},
         {"0x9f138be5aa5cc442ea7cc7d18cd9e30593ed90b9", "Odos"},
         {"0x8f8dd7db1bda5ed3da8c9daf3bfa471c12d58486", "DODO"},
+        {"0x7dae51bd3e3376b8c7c4900e9107f12be3af1ba8", "MDEX"},
+        {"0x114f84658c99aa6ea62e3160a87a16deaf7efe83", "WOOFi"},
+        {"0xcef5be73ae943b77f9bc08859367d923c030a269", "WOOFi"},
     };
     return c;
 }
@@ -293,6 +303,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     std::set<std::string> burnedOut;
     std::set<std::string> outCounterparties;
     std::set<std::string> inCounterparties;
+    std::map<std::string, std::set<std::string>> inSources;
 
     for (auto& l : receipt["logs"]) {
         if (!l.is_object()||!l.contains("topics")||!l["topics"].is_array()||l["topics"].empty()) continue;
@@ -345,6 +356,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
         if (to == wa) {
             netFlow[logAddr] += amt;
+            inSources[logAddr].insert(fr);
             if (fr == "0x0000000000000000000000000000000000000000") mintedIn.insert(logAddr);
             else inCounterparties.insert(fr);
         }
@@ -360,6 +372,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     std::string txTo;
     bool walletIsSender = false;
     UniversalRouterCommands urCmds;
+    bool isGenericMulticall = false;
     if (tx.is_object()) {
         if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
             txTo = toLower(tx["to"].get<std::string>());
@@ -369,8 +382,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             if (tx.contains("value") && tx["value"].is_string())
                 nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
-        if (walletIsSender && tx.contains("input") && tx["input"].is_string())
-            urCmds = parseExecuteCommands(tx["input"].get<std::string>());
+        if (walletIsSender && tx.contains("input") && tx["input"].is_string()) {
+            const std::string& inputStr = tx["input"].get<std::string>();
+            urCmds = parseExecuteCommands(inputStr);
+            isGenericMulticall = isGenericMulticallSelector(inputStr);
+        }
     }
     bool nativeOutflow = nativeOut > 0;
 
@@ -384,6 +400,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             int wrapDec = getDecimals(r.tokenAddr);
             uint64_t wrapPrice = getPriceNanos(r.tokenAddr);
             r.usdNanos = calcUsdNanos(r.rawAmount, wrapDec, wrapPrice);
+            r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
+            r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
+            r.dexActivityDetected = hasSwap || urCmds.present || isGenericMulticall || urCmds.hasPermit2;
             return r;
         }
         return r;
@@ -393,18 +412,18 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
     if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
-    if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
-        if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
-        else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
-        else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
-    }
     if (r.venue.empty() && urCmds.present) {
         if (urCmds.hasV3Swap) r.venue = "Universal Router (V3-style)";
         else if (urCmds.hasV2Swap) r.venue = "Universal Router (V2-style)";
         else r.venue = "Universal Router";
     }
+    if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
+        if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
+        else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
+        else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
+    }
 
-    bool routerCall = (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
+    bool routerCall = (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present || isGenericMulticall || urCmds.hasPermit2;
     bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
     cpp_int nativeIn = 0;
     if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
@@ -441,37 +460,53 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             if (net > 0 && poolTokenIn && sentBase && sentNonBase) { lpAdd = true; break; }
         }
     }
+    if (!lpAdd) {
+        for (auto& tok : tokenOrder) {
+            cpp_int net = netFlow[tok];
+            bool poolTokenIn = outCounterparties.count(tok) > 0;
+            if (net > 0 && poolTokenIn && mintedIn.count(tok)) { lpAdd = true; break; }
+        }
+    }
     if (!lpRemove) {
         for (auto& tok : tokenOrder) {
             cpp_int net = netFlow[tok];
             bool poolTokenOut = inCounterparties.count(tok) > 0;
-            if (net < 0 && poolTokenOut && gotBase && gotNonBase) { lpRemove = true; break; }
+            if (net < 0 && poolTokenOut) { lpRemove = true; break; }
         }
     }
     if (v3PositionIncrease) lpAdd = true;
     if (v3PositionDecrease) lpRemove = true;
     if (v3Collect) lpRemove = true;
 
+    r.lpMintOrBurnSeen = !mintedIn.empty() || !burnedOut.empty();
+    r.lpV3EventSeen = v3PositionIncrease || v3PositionDecrease || v3Collect;
+    for (auto& tok : tokenOrder) {
+        if (outCounterparties.count(tok) > 0 || inCounterparties.count(tok) > 0) { r.lpPoolIdentitySeen = true; break; }
+    }
+
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
+    bool bestNonBaseCoherent = false, bestNonBaseFromPool = false;
     bool hasBaseIn=false, hasBaseOut=false;
 
     for (auto& tok : tokenOrder) {
+        if (!isBaseAsset(tok)) continue;
         cpp_int net = netFlow[tok];
-        if (isBaseAsset(tok)) {
-            if (net > 0) hasBaseIn = true;
-            if (net < 0) hasBaseOut = true;
-        } else {
-            if (net <= 0) continue;
-            if (net > bestNonBaseAbs) { bestNonBaseAbs = net; bestNonBaseTok = tok; bestNonBaseNet = net; }
-        }
+        if (net > 0) hasBaseIn = true;
+        if (net < 0) hasBaseOut = true;
     }
-    if (bestNonBaseTok.empty()) {
-        for (auto& tok : tokenOrder) {
-            if (isBaseAsset(tok)) continue;
-            cpp_int net = netFlow[tok];
-            cpp_int absNet = net >= 0 ? net : -net;
-            if (absNet > bestNonBaseAbs) { bestNonBaseAbs = absNet; bestNonBaseTok = tok; bestNonBaseNet = net; }
-        }
+
+    for (auto& tok : tokenOrder) {
+        if (isBaseAsset(tok)) continue;
+        cpp_int net = netFlow[tok];
+        if (net == 0) continue;
+        cpp_int absNet = net >= 0 ? net : -net;
+        bool coherent = (net > 0 && hasBaseOut) || (net < 0 && hasBaseIn);
+        bool fromPool = (net > 0) && !swapLogAddr.empty() && inSources.count(tok) && inSources[tok].count(swapLogAddr) > 0;
+        bool better = bestNonBaseTok.empty() ||
+                      (coherent && !bestNonBaseCoherent) ||
+                      (coherent == bestNonBaseCoherent && fromPool && !bestNonBaseFromPool) ||
+                      (coherent == bestNonBaseCoherent && fromPool == bestNonBaseFromPool && absNet > bestNonBaseAbs);
+        if (better) { bestNonBaseAbs = absNet; bestNonBaseTok = tok; bestNonBaseNet = net; bestNonBaseCoherent = coherent; bestNonBaseFromPool = fromPool; }
     }
 
     r.isSwap = (
@@ -587,5 +622,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
     uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.tokenAddr);
     r.usdNanos = calcUsdNanos(r.rawAmount, tokenDec, tokenPrice);
+    r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
+    r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
+    r.dexActivityDetected = hasSwap || routerCall;
     return r;
 }
