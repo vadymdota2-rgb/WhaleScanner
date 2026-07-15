@@ -19,6 +19,9 @@ struct TxResult {
 };
 
 struct ChainContext {
+    std::string displayName;
+    std::string explorerUrl;
+    std::string explorerName;
     std::string nativeSymbol;
     std::string nativeMarker;
     std::string wrappedNative;
@@ -31,6 +34,9 @@ struct ChainContext {
 const ChainContext& chainCtx();
 void setChainContext(const ChainContext& ctx);
 ChainContext makeBscContext();
+ChainContext makeEthereumContext();
+ChainContext makeBaseContext();
+ChainContext makeArbitrumContext();
 
 extern const std::string WBNB_ADDR;
 extern const std::string NATIVE_BNB_MARKER;
