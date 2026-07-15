@@ -47,6 +47,14 @@ struct Stats {
     std::atomic<uint64_t> cov_wrap{0};
     std::atomic<uint64_t> cov_unwrap{0};
     std::atomic<uint64_t> cov_transfer{0};
+    std::atomic<uint64_t> cov_unknown{0};
+    std::atomic<uint64_t> sig_swap_event{0};
+    std::atomic<uint64_t> sig_universal_router{0};
+    std::atomic<uint64_t> sig_multicall{0};
+    std::atomic<uint64_t> sig_permit2{0};
+    std::atomic<uint64_t> sig_lp_mint_burn{0};
+    std::atomic<uint64_t> sig_lp_pool_identity{0};
+    std::atomic<uint64_t> sig_lp_v3_event{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
@@ -55,7 +63,15 @@ void recordCoverage(const TxResult& r) {
     else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
     else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
     else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
+    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
     else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+    if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
+    if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
+    if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
+    if (r.hasPermit2Signal) g_stats.sig_permit2.fetch_add(1, std::memory_order_relaxed);
+    if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
+    if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
+    if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -1161,7 +1177,7 @@ bool processBlock(long long bn) {
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         recordCoverage(res);
         checkInvariants(hash, res);
-        if (!res.isSwap && res.venue.empty()) logUnknownTx(hash, bn, tx, receipt, res);
+        if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
@@ -1675,11 +1691,20 @@ void telegramLoop() {
                             {
                                 uint64_t buy=g_stats.cov_buy.load(), sell=g_stats.cov_sell.load(), lpAdd=g_stats.cov_lp_add.load(),
                                          lpRemove=g_stats.cov_lp_remove.load(), wrap=g_stats.cov_wrap.load(), unwrap=g_stats.cov_unwrap.load(),
-                                         xfer=g_stats.cov_transfer.load();
-                                uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer;
+                                         xfer=g_stats.cov_transfer.load(), unk=g_stats.cov_unknown.load();
+                                uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer+unk;
                                 ss2 << "\n\n📈 <b>Coverage</b> (valid tx: " << total << ")\n"
                                     << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
-                                    << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap << "\n📤 Transfer/Unknown: " << xfer;
+                                    << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap
+                                    << "\n📤 Transfer: " << xfer << "\n❓ Unknown: " << unk
+                                    << "\n\n🔬 <b>Signals</b>\n💱 Swap Event: " << g_stats.sig_swap_event.load()
+                                    << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
+                                    << "\n📦 Multicall: " << g_stats.sig_multicall.load()
+                                    << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
+                                    << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
+                                    << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
+                                    << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
+                                    << "\nV3 events: " << g_stats.sig_lp_v3_event.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
