@@ -12,8 +12,6 @@ using json = nlohmann::json;
 uint64_t getPriceNanos(const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
-std::string lookupRouterLabel(const std::string& addr);
-bool isBaseAsset(const std::string& a);
 
 cpp_int parseUint256(const std::string& h) {
     if (h.length()<66) return 0; cpp_int r=0;
@@ -62,6 +60,197 @@ std::string formatPriceUsd(const cpp_int& n) {
 
 namespace {
 
+struct UniversalRouterCommands {
+    bool present = false;
+    bool hasWrap = false, hasUnwrap = false;
+    bool hasV2Swap = false, hasV3Swap = false;
+    bool hasSweep = false, hasTransfer = false;
+};
+
+int hexNibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+uint64_t hexWordToU64(const std::string& hexNo0x, size_t hexPos) {
+    if (hexNo0x.size() < hexPos + 64) return 0;
+    uint64_t v = 0;
+    for (size_t i = hexPos + 32; i < hexPos + 64; i++) v = (v << 4) | (uint64_t)hexNibble(hexNo0x[i]);
+    return v;
+}
+
+UniversalRouterCommands parseExecuteCommands(const std::string& input) {
+    UniversalRouterCommands out;
+    if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return out;
+    std::string selector = input.substr(2, 8);
+    if (selector != "3593564c" && selector != "24856bc3") return out;
+
+    std::string hexNo0x = input.substr(2);
+    if (hexNo0x.size() < 8 + 64) return out;
+
+    uint64_t offsetCommands = hexWordToU64(hexNo0x, 8);
+    size_t lenHexPos = 8 + offsetCommands * 2;
+    if (offsetCommands > hexNo0x.size() || hexNo0x.size() < lenHexPos + 64) return out;
+
+    uint64_t length = hexWordToU64(hexNo0x, lenHexPos);
+    if (length == 0 || length > 64) return out;
+
+    size_t dataHexPos = lenHexPos + 64;
+    if (hexNo0x.size() < dataHexPos + length * 2) return out;
+
+    out.present = true;
+    for (uint64_t i = 0; i < length; i++) {
+        int b = (hexNibble(hexNo0x[dataHexPos + i * 2]) << 4) | hexNibble(hexNo0x[dataHexPos + i * 2 + 1]);
+        int cmd = b & 0x3f;
+        if (cmd == 0x0b) out.hasWrap = true;
+        else if (cmd == 0x0c) out.hasUnwrap = true;
+        else if (cmd == 0x08 || cmd == 0x09) out.hasV2Swap = true;
+        else if (cmd == 0x00 || cmd == 0x01) out.hasV3Swap = true;
+        else if (cmd == 0x04) out.hasSweep = true;
+        else if (cmd == 0x05) out.hasTransfer = true;
+    }
+    return out;
+}
+
+}
+
+const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+const std::string NATIVE_BNB_MARKER = "native:bnb";
+
+ChainContext makeBscContext() {
+    ChainContext c;
+    c.displayName = "BNB Smart Chain";
+    c.explorerUrl = "https://bscscan.com";
+    c.explorerName = "BscScan";
+    c.nativeSymbol = "BNB";
+    c.nativeMarker = NATIVE_BNB_MARKER;
+    c.wrappedNative = WBNB_ADDR;
+    c.stablecoins = {
+        "0x55d398326f99059ff775485246999027b3197955",
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56"
+    };
+    c.baseAssets = c.stablecoins;
+    c.baseAssets.insert(WBNB_ADDR);
+    c.baseAssets.insert("0xc5f0f7b66764f6ec8c8dff7ba683102295e16409");
+    c.routers = {
+        {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
+        {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
+        {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
+        {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
+        {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
+        {"0x5dc88340e1c5c6366864ee415d6034cadd1a9897", "Uniswap (Universal Router)"},
+        {"0xec8b0f7ffe3ae75d7ffab09429e3675bb63503e4", "Uniswap (Universal Router)"},
+        {"0x1906c1d672b88cd1b9ac7593301ca990f94eae07", "Uniswap V4 (Universal Router)"},
+        {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
+        {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
+        {"0x6015126d7d23648c2e4466693b8deab005ffaba8", "OKX DEX"},
+        {"0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap"},
+        {"0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap"},
+        {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
+        {"0x3a6d8ca21d1cf76f653a67577fa0d27453350dd8", "BiSwap"},
+        {"0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7", "ApeSwap"},
+        {"0xcde540d7eafe93ac5fe6233bee57e1270d3e330f", "BakerySwap"},
+        {"0x19609b03c976cca288fbdae5c21d4290e9a4add7", "Wombat Exchange"},
+        {"0x9f138be5aa5cc442ea7cc7d18cd9e30593ed90b9", "Odos"},
+        {"0x8f8dd7db1bda5ed3da8c9daf3bfa471c12d58486", "DODO"},
+    };
+    return c;
+}
+
+ChainContext makeEthereumContext() {
+    ChainContext c;
+    const std::string WETH_ADDR = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
+    c.displayName = "Ethereum";
+    c.explorerUrl = "https://etherscan.io";
+    c.explorerName = "Etherscan";
+    c.nativeSymbol = "ETH";
+    c.nativeMarker = "native:eth";
+    c.wrappedNative = WETH_ADDR;
+    c.stablecoins = {
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "0xdac17f958d2ee523a2206206994597c13d831ec7",
+        "0x6b175474e89094c44da98b954eedeac495271d0f"
+    };
+    c.baseAssets = c.stablecoins;
+    c.baseAssets.insert(WETH_ADDR);
+    c.routers = {
+        {"0x7a250d5630b4cf539739df2c5dacb4c659f2488d", "Uniswap V2"},
+        {"0xe592427a0aece92de3edee1f18e0157c05861564", "Uniswap V3"},
+        {"0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b", "Uniswap (Universal Router)"},
+        {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
+        {"0x66a9893cc07d91d95644aedd05d03f95e1dba8af", "Uniswap V4 (Universal Router)"},
+    };
+    return c;
+}
+
+ChainContext makeBaseContext() {
+    ChainContext c;
+    const std::string WETH_ADDR = "0x4200000000000000000000000000000000000006";
+    c.displayName = "Base";
+    c.explorerUrl = "https://basescan.org";
+    c.explorerName = "BaseScan";
+    c.nativeSymbol = "ETH";
+    c.nativeMarker = "native:eth";
+    c.wrappedNative = WETH_ADDR;
+    c.stablecoins = {
+        "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2",
+        "0x50c5725949a6f0c72e6c4a641f24049a917db0cb"
+    };
+    c.baseAssets = c.stablecoins;
+    c.baseAssets.insert(WETH_ADDR);
+    c.routers = {
+        {"0x198ef79f1f515f02dfe9e3115ed9fc07183f02fc", "Uniswap (Universal Router)"},
+        {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
+        {"0x6ff5693b99212da76ad316178a184ab56d299b43", "Uniswap V4 (Universal Router)"},
+    };
+    return c;
+}
+
+ChainContext makeArbitrumContext() {
+    ChainContext c;
+    const std::string WETH_ADDR = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+    c.displayName = "Arbitrum One";
+    c.explorerUrl = "https://arbiscan.io";
+    c.explorerName = "Arbiscan";
+    c.nativeSymbol = "ETH";
+    c.nativeMarker = "native:eth";
+    c.wrappedNative = WETH_ADDR;
+    c.stablecoins = {
+        "0xaf88d065e77c8cc2239327c5edb3a432268e5831",
+        "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9",
+        "0xda10009cbd5d07dd0cecc66161fc93d7c9000da1"
+    };
+    c.baseAssets = c.stablecoins;
+    c.baseAssets.insert(WETH_ADDR);
+    c.routers = {
+        {"0x4c60051384bd2d3c01bfc845cf5f4b44bcbe9de5", "Uniswap (Universal Router)"},
+        {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
+        {"0xe592427a0aece92de3edee1f18e0157c05861564", "Uniswap V3"},
+        {"0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45", "Uniswap V3 (Router 2)"},
+    };
+    return c;
+}
+
+namespace {
+ChainContext g_chain = makeBscContext();
+}
+
+const ChainContext& chainCtx() { return g_chain; }
+void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
+
+bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
+bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
+std::string lookupRouterLabel(const std::string& addr) {
+    auto it = g_chain.routers.find(toLower(addr));
+    return it != g_chain.routers.end() ? it->second : std::string();
+}
+
+namespace {
+
 const std::set<std::string> SWAP_EVENT_TOPICS = {
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
@@ -75,7 +264,6 @@ const std::string WBNB_WITHDRAWAL_TOPIC =
     "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
 
 }
-
 
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
@@ -94,6 +282,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
     bool anyTransferForWallet = false;
     std::string firstCounterpartAddr;
+    std::set<std::string> mintedIn;
+    std::set<std::string> burnedOut;
+    std::set<std::string> outCounterparties;
+    std::set<std::string> inCounterparties;
 
     for (auto& l : receipt["logs"]) {
         if (!l.is_object()||!l.contains("topics")||!l["topics"].is_array()||l["topics"].empty()) continue;
@@ -114,7 +306,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             continue;
         }
 
-        if (logAddr == WBNB_ADDR && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
+        if (logAddr == g_chain.wrappedNative && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
             if (l.contains("data") && l["data"].is_string()) {
                 cpp_int wad = parseUint256(l["data"].get<std::string>());
                 if (t0 == WBNB_DEPOSIT_TOPIC) wbnbWrapped += wad; else wbnbUnwrapped += wad;
@@ -140,13 +332,23 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         touch(logAddr);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
-        if (to == wa) netFlow[logAddr] += amt;
-        if (fr == wa) netFlow[logAddr] -= amt;
+        if (to == wa) {
+            netFlow[logAddr] += amt;
+            if (fr == "0x0000000000000000000000000000000000000000") mintedIn.insert(logAddr);
+            else inCounterparties.insert(fr);
+        }
+        if (fr == wa) {
+            netFlow[logAddr] -= amt;
+            if (to == "0x0000000000000000000000000000000000000000" ||
+                to == "0x000000000000000000000000000000000000dead") burnedOut.insert(logAddr);
+            else outCounterparties.insert(to);
+        }
     }
 
     cpp_int nativeOut = 0;
     std::string txTo;
     bool walletIsSender = false;
+    UniversalRouterCommands urCmds;
     if (tx.is_object()) {
         if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
             txTo = toLower(tx["to"].get<std::string>());
@@ -156,10 +358,25 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             if (tx.contains("value") && tx["value"].is_string())
                 nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
+        if (walletIsSender && tx.contains("input") && tx["input"].is_string())
+            urCmds = parseExecuteCommands(tx["input"].get<std::string>());
     }
     bool nativeOutflow = nativeOut > 0;
 
-    if (!anyTransferForWallet) return r;
+    if (!anyTransferForWallet) {
+        if (walletIsSender && (wbnbWrapped > 0 || wbnbUnwrapped > 0)) {
+            r.valid = true;
+            r.isSwap = false;
+            r.tokenAddr = g_chain.wrappedNative;
+            if (wbnbWrapped > 0) { r.venue = "Wrap"; r.rawAmount = wbnbWrapped; r.isBuy = true; }
+            else { r.venue = "Unwrap"; r.rawAmount = wbnbUnwrapped; r.isBuy = false; }
+            int wrapDec = getDecimals(r.tokenAddr);
+            uint64_t wrapPrice = getPriceNanos(r.tokenAddr);
+            r.usdNanos = calcUsdNanos(r.rawAmount, wrapDec, wrapPrice);
+            return r;
+        }
+        return r;
+    }
     r.valid = true;
 
     if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
@@ -170,8 +387,13 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
         else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
     }
+    if (r.venue.empty() && urCmds.present) {
+        if (urCmds.hasV3Swap) r.venue = "Universal Router (V3-style)";
+        else if (urCmds.hasV2Swap) r.venue = "Universal Router (V2-style)";
+        else r.venue = "Universal Router";
+    }
 
-    bool routerCall = !txTo.empty() && !lookupRouterLabel(txTo).empty();
+    bool routerCall = (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
     bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
     cpp_int nativeIn = 0;
     if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
@@ -183,6 +405,38 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (netFlow[tok] < 0) anyOut = true;
     }
     bool twoSidedFlow = anyIn && anyOut;
+
+    bool sentBase = false, sentNonBase = false, gotBase = false, gotNonBase = false;
+    for (auto& tok : tokenOrder) {
+        cpp_int net = netFlow[tok];
+        if (isBaseAsset(tok)) {
+            if (net > 0) gotBase = true;
+            if (net < 0) sentBase = true;
+        } else {
+            if (net > 0) gotNonBase = true;
+            if (net < 0) sentNonBase = true;
+        }
+    }
+    bool lpAdd = false, lpRemove = false;
+    for (auto& tok : tokenOrder) {
+        cpp_int net = netFlow[tok];
+        if (net > 0 && mintedIn.count(tok) && sentBase && sentNonBase) lpAdd = true;
+        if (net < 0 && burnedOut.count(tok) && gotBase && gotNonBase) lpRemove = true;
+    }
+    if (!lpAdd) {
+        for (auto& tok : tokenOrder) {
+            cpp_int net = netFlow[tok];
+            bool poolTokenIn = outCounterparties.count(tok) > 0;
+            if (net > 0 && poolTokenIn && sentBase && sentNonBase) { lpAdd = true; break; }
+        }
+    }
+    if (!lpRemove) {
+        for (auto& tok : tokenOrder) {
+            cpp_int net = netFlow[tok];
+            bool poolTokenOut = inCounterparties.count(tok) > 0;
+            if (net < 0 && poolTokenOut && gotBase && gotNonBase) { lpRemove = true; break; }
+        }
+    }
 
     std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
     bool hasBaseIn=false, hasBaseOut=false;
@@ -211,6 +465,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal || nativeInflowSignal)) ||
         (hasBaseIn && hasBaseOut)
     );
+
+    if (lpAdd || lpRemove) {
+        r.isSwap = false;
+        r.venue = lpAdd ? "Add Liquidity" : "Remove Liquidity";
+    }
 
     if (!bestNonBaseTok.empty()) {
         r.tokenAddr = bestNonBaseTok;
@@ -302,7 +561,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         }
     }
 
-    if (!r.isSwap && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
+    if (!r.isSwap && !lpAdd && !lpRemove && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
         !isBaseAsset(r.tokenAddr) && (nativeSwapSignal || nativeInflowSignal)) {
         r.isSwap = true;
         if (r.counterAddr.empty()) {
@@ -312,7 +571,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     }
 
     int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
-    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(WBNB_ADDR) : getPriceNanos(r.tokenAddr);
+    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.tokenAddr);
     r.usdNanos = calcUsdNanos(r.rawAmount, tokenDec, tokenPrice);
     return r;
 }
