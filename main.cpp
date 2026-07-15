@@ -40,7 +40,23 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
+    std::atomic<uint64_t> cov_buy{0};
+    std::atomic<uint64_t> cov_sell{0};
+    std::atomic<uint64_t> cov_lp_add{0};
+    std::atomic<uint64_t> cov_lp_remove{0};
+    std::atomic<uint64_t> cov_wrap{0};
+    std::atomic<uint64_t> cov_unwrap{0};
+    std::atomic<uint64_t> cov_transfer{0};
 } g_stats;
+
+void recordCoverage(const TxResult& r) {
+    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
+    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+}
 
 const auto START_TIME = std::chrono::steady_clock::now();
 
@@ -109,6 +125,21 @@ const std::vector<std::string> BSC_RPC_ENDPOINTS = {
     "https://bsc.publicnode.com",
     "https://binance.llamarpc.com"
 };
+const std::vector<std::string> ETHEREUM_RPC_ENDPOINTS = {
+    "https://eth.llamarpc.com",
+    "https://ethereum.publicnode.com",
+    "https://rpc.ankr.com/eth",
+    "https://cloudflare-eth.com"
+};
+const std::vector<std::string> BASE_RPC_ENDPOINTS = {
+    "https://mainnet.base.org",
+    "https://base.publicnode.com"
+};
+const std::vector<std::string> ARBITRUM_RPC_ENDPOINTS = {
+    "https://arbitrum.llamarpc.com",
+    "https://arbitrum-one.publicnode.com"
+};
+std::vector<std::string> RPC_ENDPOINTS = BSC_RPC_ENDPOINTS;
 std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
@@ -121,39 +152,6 @@ constexpr int DIGEST_HOUR_UTC = 12;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
-
-const std::set<std::string> BASE_ASSETS = {
-    "0x55d398326f99059ff775485246999027b3197955",
-    "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
-    "0xe9e7cea3dedca5984780bafc599bd69add087d56",
-    "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",
-    "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409"
-};
-bool isBaseAsset(const std::string& a) { return BASE_ASSETS.count(toLower(a)) > 0; }
-
-const std::map<std::string, std::string> KNOWN_ROUTERS = {
-    {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
-    {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
-    {"0x1b81d678ffb9c0263b24a97847620c99d213eb14", "PancakeSwap V3 (Swap Router)"},
-    {"0x1a0a18ac4becddbd6389559687d1a73d8927e416", "PancakeSwap (Universal Router)"},
-    {"0xd9c500dff816a1da21a48a732d3498bf09dc9aeb", "PancakeSwap (Universal Router 2)"},
-    {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
-    {"0x9333c74bdd1e118634fe5664aca7a9710b108bab", "OKX DEX"},
-    {"0x6015126d7d23648c2e4466693b8deab005ffaba8", "OKX DEX"},
-    {"0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap"},
-    {"0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap"},
-    {"0x6352a56caadc4f1e25cd6c75970fa768a3304e64", "OpenOcean"},
-    {"0x3a6d8ca21d1cf76f653a67577fa0d27453350dd8", "BiSwap"},
-    {"0xcf0febd3f17cef5b47b0cd257acf6025c5bff3b7", "ApeSwap"},
-};
-
-std::string lookupRouterLabel(const std::string& addr) {
-    auto it = KNOWN_ROUTERS.find(toLower(addr));
-    return it != KNOWN_ROUTERS.end() ? it->second : std::string();
-}
-
-const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
-const std::string NATIVE_BNB_MARKER = "native:bnb";
 
 std::atomic<bool> running{true};
 void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
@@ -208,7 +206,7 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
 
 json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
-    auto res = http(BSC_RPC_ENDPOINTS[idx % BSC_RPC_ENDPOINTS.size()], r.dump());
+    auto res = http(RPC_ENDPOINTS[idx % RPC_ENDPOINTS.size()], r.dump());
     try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) return p["result"]; } catch (...) {}
     return nullptr;
 }
@@ -217,16 +215,16 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     std::string body = r.dump();
     for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
-        size_t idx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
-        auto res = http(BSC_RPC_ENDPOINTS[idx], body);
+        size_t idx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
+        auto res = http(RPC_ENDPOINTS[idx], body);
         bool valid = false;
         try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) { valid=true; return p["result"]; } } catch (...) {}
         if (!valid) {
             g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
             g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
             size_t cur = rpcIndex.load(std::memory_order_relaxed);
-            rpcIndex.store((cur+1) % BSC_RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-            std::cerr << "[RPC] Switching to " << ((cur+1)%BSC_RPC_ENDPOINTS.size()) << " after failure on " << BSC_RPC_ENDPOINTS[cur] << std::endl;
+            rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+            std::cerr << "[RPC] Switching to " << ((cur+1)%RPC_ENDPOINTS.size()) << " after failure on " << RPC_ENDPOINTS[cur] << std::endl;
         }
         if (a < maxRetries-1) std::this_thread::sleep_for(std::chrono::milliseconds((1<<a)*500));
     }
@@ -674,7 +672,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
 UIMessage buildWelcomeMessage(const std::string& chatId) {
     auto m = buildMainMenu(chatId);
     m.text = "🚨 <b>Welcome to Wallet Tracker!</b>\n\n"
-             "Monitor whale wallets on BNB Smart Chain and get instant notifications for buys, sells and transfers.\n\n"
+             "Monitor whale wallets on " + chainCtx().displayName + " and get instant notifications for buys, sells and transfers.\n\n"
              "Tap a button below to get started:";
     return m;
 }
@@ -932,13 +930,20 @@ uint64_t getPriceNanos(const std::string& token) {
 }
 
 std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
+    bool tokenIsNative = (res.tokenAddr == NATIVE_BNB_MARKER);
+    std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
+    int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
     std::string msg="💼 <b>"+safeString(label)+"</b>\n\n";
-    msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🚨 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
+    if (res.venue == "Add Liquidity") msg+="🌊 <b>ADD LIQUIDITY</b>";
+    else if (res.venue == "Remove Liquidity") msg+="🌊 <b>REMOVE LIQUIDITY</b>";
+    else if (res.venue == "Wrap") msg+="🔄 <b>WRAP " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Unwrap") msg+="🔄 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>";
+    else msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🚨 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
     msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
-    msg+="🪙 Token: <b>"+safeString(getSymbol(res.tokenAddr),32)+"</b>\n";
-    msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,getDecimals(res.tokenAddr))+"</b>\n";
+    msg+="🪙 Token: <b>"+tokenSymbol+"</b>\n";
+    msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
     if (res.isSwap) {
-        cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, getDecimals(res.tokenAddr));
+        cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
         std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
         msg += "💵 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
     }
@@ -947,7 +952,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         std::string counterAmountStr, counterSymbol;
         if (res.counterAddr == NATIVE_BNB_MARKER) {
             counterAmountStr = formatAmount(res.counterAmount, 18);
-            counterSymbol = "BNB";
+            counterSymbol = chainCtx().nativeSymbol;
         } else {
             counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
             counterSymbol = safeString(getSymbol(res.counterAddr), 16);
@@ -955,10 +960,10 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
+    if (!tokenIsNative) msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
     msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
     msg+="💼 Wallet: <b>"+safeString(label)+"</b>\n\n";
-    msg+="🔗 <a href=\"https://bscscan.com/tx/"+hash+"\">Transaction</a>";
+    msg+="🔗 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">Transaction</a>";
     return msg;
 }
 
@@ -1052,7 +1057,7 @@ bool processBlock(long long bn) {
         hexToLL(block["timestamp"].get<std::string>(), blockTs);
     if (!ep.empty()&&ph!=ep&&bn>1) {
         g_stats.reorg_verifications.fetch_add(1); std::cerr << "[REORG?] Mismatch at " << bn << ", verifying..." << std::endl;
-        size_t ai=(rpcIndex.load(std::memory_order_relaxed)+1)%BSC_RPC_ENDPOINTS.size();
+        size_t ai=(rpcIndex.load(std::memory_order_relaxed)+1)%RPC_ENDPOINTS.size();
         auto vb=rpcOnEndpoint(ai,"eth_getBlockByNumber",{ss.str(),false});
         std::string vp=vb.is_object()?vb.value("parentHash",""): "";
         if (vp==ep) std::cerr << "[REORG] False positive" << std::endl;
@@ -1560,7 +1565,7 @@ void telegramLoop() {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
                         } else {
-                            size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % BSC_RPC_ENDPOINTS.size();
+                            size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
                             int diskFree = getDiskFreePercent();
                             time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
                             bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
@@ -1568,7 +1573,7 @@ void telegramLoop() {
                                 << "Block: <code>" << getLastBlock() << "</code>\n"
                                 << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
                                 << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
-                                << "RPC endpoint: <code>" << safeString(BSC_RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
+                                << "RPC endpoint: <code>" << safeString(RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
                                 << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
                             if (diskFree >= 0) {
                                 ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
@@ -1675,6 +1680,15 @@ void telegramLoop() {
 int main() {
     if (curl_global_init(CURL_GLOBAL_DEFAULT)!=CURLE_OK) { std::cerr << "[FATAL] curl init failed" << std::endl; return 1; }
     std::signal(SIGINT,signalHandler); std::signal(SIGTERM,signalHandler);
+    {
+        const char* chainEnv = std::getenv("WHALE_CHAIN");
+        std::string chainName = chainEnv ? toLower(std::string(chainEnv)) : "bsc";
+        if (chainName == "ethereum" || chainName == "eth") { setChainContext(makeEthereumContext()); RPC_ENDPOINTS = ETHEREUM_RPC_ENDPOINTS; }
+        else if (chainName == "base") { setChainContext(makeBaseContext()); RPC_ENDPOINTS = BASE_RPC_ENDPOINTS; }
+        else if (chainName == "arbitrum" || chainName == "arb") { setChainContext(makeArbitrumContext()); RPC_ENDPOINTS = ARBITRUM_RPC_ENDPOINTS; }
+        else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
+        std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
+    }
     initDB(); initRankingDB(); initPremium(TG_TOKEN, SERVICE_CHAT_ID); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
