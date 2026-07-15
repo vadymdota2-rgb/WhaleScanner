@@ -16,6 +16,14 @@ struct TxResult {
     std::string venue;
     std::string counterAddr;
     cpp_int counterAmount;
+    bool hasSwapEvent = false;
+    bool isUniversalRouter = false;
+    bool isGenericMulticall = false;
+    bool hasPermit2Signal = false;
+    bool dexActivityDetected = false;
+    bool lpMintOrBurnSeen = false;
+    bool lpPoolIdentitySeen = false;
+    bool lpV3EventSeen = false;
 };
 
 struct ChainContext {
