@@ -1935,10 +1935,16 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     DecodedIntent decoded = decodeTransactionInput(tx);
 
+    if (tx.contains("input") && tx["input"].is_string()) {
+        const std::string rawInput = tx["input"].get<std::string>();
+        if (isHexString(rawInput) && rawInput.size() >= 10)
+            result.decodedSelector = toLower(rawInput.substr(2, 8));
+    }
+
     auto applyDecoded = [&](TxResult& r) {
         r.calldataDecoded = decoded.valid;
         r.calldataSwap = decoded.swap;
-        r.decodedSelector = decoded.selector;
+        if (!decoded.selector.empty()) r.decodedSelector = decoded.selector;
         r.decodedFunction = decoded.functionName;
         r.decodedTokenIn = decoded.tokenIn;
         r.decodedTokenOut = decoded.tokenOut;
@@ -1973,6 +1979,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                 nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
     }
+
+    result.callTarget = txTo;
 
     UniversalRouterCommands ur = {};
     if (tx.contains("input") && tx["input"].is_string())
@@ -2492,6 +2500,26 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         result.usdNanos = calcUsdNanos(result.rawAmount, decimals, price);
     }
 
+    result.unsupportedSelector =
+        walletIsSender &&
+        !result.decodedSelector.empty() &&
+        result.decodedSelector != "00000000" &&
+        !decoded.valid;
+
+    // Exclusive source attribution for final swap classification.
+    if (result.isSwap) {
+        if (result.graphRecovered) {
+            result.classifiedByGraph = true;
+        } else if (result.calldataRecovered || result.calldataMatched) {
+            result.classifiedByCalldata = true;
+        } else if (twoSidedFlow || hasBaseIn || hasBaseOut ||
+                   nativeSwapSignal || nativeInflowSignal) {
+            result.classifiedByDirectFlow = true;
+        } else {
+            result.classifiedByFallback = true;
+        }
+    }
+
     const bool decodedWalletIntent =
         decoded.valid &&
         (
@@ -2558,6 +2586,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                 result.unknownReason = "SUBPLAN_NO_FLOW_MATCH";
             else if (decoded.valid && decoded.v4 && !decoded.v4ActionsDecoded)
                 result.unknownReason = "V4_ACTIONS_UNDECODED";
+            else if (result.unsupportedSelector)
+                result.unknownReason = "UNSUPPORTED_SELECTOR";
             else if (result.transferGraphSeen && result.graphAmbiguous)
                 result.unknownReason = "GRAPH_AMBIGUOUS_PATH";
             else if (result.transferGraphSeen &&
