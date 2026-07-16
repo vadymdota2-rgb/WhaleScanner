@@ -55,9 +55,6 @@ struct Stats {
     std::atomic<uint64_t> sig_lp_mint_burn{0};
     std::atomic<uint64_t> sig_lp_pool_identity{0};
     std::atomic<uint64_t> sig_lp_v3_event{0};
-    std::atomic<uint64_t> unk_no_counter_flow{0};
-    std::atomic<uint64_t> unk_unknown_router{0};
-    std::atomic<uint64_t> unk_other{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
@@ -75,9 +72,6 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-    if (r.unknownReason == "NO_COUNTER_FLOW") g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNKNOWN_ROUTER") g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "OTHER") g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -138,7 +132,6 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " venue=" << res.venue << " isSwap=" << (res.isSwap ? 1 : 0) << " isBuy=" << (res.isBuy ? 1 : 0)
        << " token=" << res.tokenAddr << " counter=" << res.counterAddr
        << " usdNanos=" << res.usdNanos.convert_to<std::string>()
-       << " whyUnknown=" << (res.unknownReason.empty() ? "-" : res.unknownReason)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1711,11 +1704,7 @@ void telegramLoop() {
                                     << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
                                     << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
-                                    << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
-                                    << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "No counter flow: " << g_stats.unk_no_counter_flow.load()
-                                    << "\nUnknown router: " << g_stats.unk_unknown_router.load()
-                                    << "\nOther: " << g_stats.unk_other.load();
+                                    << "\nV3 events: " << g_stats.sig_lp_v3_event.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
