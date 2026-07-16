@@ -3,6 +3,7 @@
 #include <string>
 #include <set>
 #include <map>
+#include <vector>
 #include <cstdint>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
@@ -10,21 +11,53 @@
 using boost::multiprecision::cpp_int;
 
 struct TxResult {
-    bool valid, isSwap, isBuy;
-    cpp_int rawAmount, usdNanos;
+    bool valid = false;
+    bool isSwap = false;
+    bool isBuy = false;
+
+    cpp_int rawAmount = 0;
+    cpp_int usdNanos = 0;
+
     std::string tokenAddr;
     std::string venue;
     std::string counterAddr;
-    cpp_int counterAmount;
+    cpp_int counterAmount = 0;
+
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
     bool isGenericMulticall = false;
     bool hasPermit2Signal = false;
     bool dexActivityDetected = false;
+
     bool lpMintOrBurnSeen = false;
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
+
     std::string unknownReason;
+};
+
+enum class RouterType {
+    UNKNOWN,
+    V2,
+    V3,
+    V4,
+    UNIVERSAL,
+    AGGREGATOR,
+    BRIDGE,
+    STAKING,
+    NFT
+};
+
+struct ProtocolInfo {
+    std::string protocol;
+    std::string version;
+    RouterType routerType = RouterType::UNKNOWN;
+    bool supportsV2 = false;
+    bool supportsV3 = false;
+    bool supportsV4 = false;
+    bool supportsPermit2 = false;
+    bool supportsMulticall = false;
+    bool supportsUniversalRouter = false;
 };
 
 struct ChainContext {
@@ -34,14 +67,25 @@ struct ChainContext {
     std::string nativeSymbol;
     std::string nativeMarker;
     std::string wrappedNative;
+
     std::set<std::string> baseAssets;
     std::set<std::string> stablecoins;
+
+    // Backward-compatible registry used by the rest of the project.
     std::map<std::string, std::string> routers;
+
+    // Extended registries for new analyzer pipeline.
+    std::map<std::string, ProtocolInfo> protocols;
+    std::set<std::string> aggregators;
     std::set<std::string> bridges;
+    std::set<std::string> staking;
+    std::set<std::string> permit2;
+    std::set<std::string> multicall;
 };
 
 const ChainContext& chainCtx();
 void setChainContext(const ChainContext& ctx);
+
 ChainContext makeBscContext();
 ChainContext makeEthereumContext();
 ChainContext makeBaseContext();
@@ -62,4 +106,8 @@ std::string formatUsd(const cpp_int& n);
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec);
 std::string formatPriceUsd(const cpp_int& n);
 
-TxResult analyzeTx(const nlohmann::json& tx, const nlohmann::json& receipt, const std::string& wa);
+TxResult analyzeTx(
+    const nlohmann::json& tx,
+    const nlohmann::json& receipt,
+    const std::string& walletAddress
+);
