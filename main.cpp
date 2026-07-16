@@ -82,6 +82,15 @@ struct Stats {
     std::atomic<uint64_t> unk_subplan_no_match{0};
     std::atomic<uint64_t> unk_v4_actions_undecoded{0};
     std::atomic<uint64_t> unk_other{0};
+
+    std::atomic<uint64_t> graph_seen{0};
+    std::atomic<uint64_t> graph_path_to_pool{0};
+    std::atomic<uint64_t> graph_path_from_pool{0};
+    std::atomic<uint64_t> graph_recovered{0};
+    std::atomic<uint64_t> graph_ambiguous{0};
+    std::atomic<uint64_t> unk_graph_no_pool_path{0};
+    std::atomic<uint64_t> unk_graph_ambiguous{0};
+    std::atomic<uint64_t> unk_no_direct_counter{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
@@ -123,6 +132,12 @@ void recordCoverage(const TxResult& r) {
     if (r.acrossBridgeDecoded) g_stats.decoded_across_bridge.fetch_add(1, std::memory_order_relaxed);
     if (r.v4ActionsDecoded) g_stats.decoded_v4_actions.fetch_add(1, std::memory_order_relaxed);
 
+    if (r.transferGraphSeen) g_stats.graph_seen.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphPathToPool) g_stats.graph_path_to_pool.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphPathFromPool) g_stats.graph_path_from_pool.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphRecovered) g_stats.graph_recovered.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphAmbiguous) g_stats.graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
+
     const bool finalUnknown =
         !r.isSwap &&
         r.dexActivityDetected &&
@@ -135,6 +150,12 @@ void recordCoverage(const TxResult& r) {
 
     if (r.unknownReason == "NO_COUNTER_FLOW")
         g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "NO_DIRECT_COUNTER_FLOW")
+        g_stats.unk_no_direct_counter.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "GRAPH_NO_POOL_PATH")
+        g_stats.unk_graph_no_pool_path.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "GRAPH_AMBIGUOUS_PATH")
+        g_stats.unk_graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
     else if (r.unknownReason == "UNKNOWN_ROUTER")
         g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
     else if (r.unknownReason == "DECODED_NO_RECEIPT_MATCH")
@@ -223,6 +244,11 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " function=" << (res.decodedFunction.empty() ? "-" : res.decodedFunction)
        << " decodedIn=" << (res.decodedTokenIn.empty() ? "-" : res.decodedTokenIn)
        << " decodedOut=" << (res.decodedTokenOut.empty() ? "-" : res.decodedTokenOut)
+       << " graphSeen=" << (res.transferGraphSeen ? 1 : 0)
+       << " graphToPool=" << (res.graphPathToPool ? 1 : 0)
+       << " graphFromPool=" << (res.graphPathFromPool ? 1 : 0)
+       << " graphRecovered=" << (res.graphRecovered ? 1 : 0)
+       << " graphAmbiguous=" << (res.graphAmbiguous ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1835,8 +1861,17 @@ void telegramLoop() {
                                     << "\nUniversal subplans: " << g_stats.decoded_subplans.load()
                                     << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
                                     << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
+                                    << "\n\n🕸 <b>Receipt transfer graph</b>\n"
+                                    << "Graph tx: " << g_stats.graph_seen.load()
+                                    << "\nPath wallet → pool: " << g_stats.graph_path_to_pool.load()
+                                    << "\nPath pool → recipient: " << g_stats.graph_path_from_pool.load()
+                                    << "\nRecovered BUY/SELL: " << g_stats.graph_recovered.load()
+                                    << "\nAmbiguous paths: " << g_stats.graph_ambiguous.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "No counter flow: " << g_stats.unk_no_counter_flow.load()
+                                    << "No counter flow (legacy): " << g_stats.unk_no_counter_flow.load()
+                                    << "\nNo direct counter flow: " << g_stats.unk_no_direct_counter.load()
+                                    << "\nGraph no pool path: " << g_stats.unk_graph_no_pool_path.load()
+                                    << "\nGraph ambiguous: " << g_stats.unk_graph_ambiguous.load()
                                     << "\nUnknown router: " << g_stats.unk_unknown_router.load()
                                     << "\nDecoded/no receipt match: " << g_stats.unk_decoded_no_match.load()
                                     << "\nPermit2/no swap match: " << g_stats.unk_permit2_no_match.load()
