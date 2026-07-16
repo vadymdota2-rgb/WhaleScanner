@@ -33,6 +33,17 @@ struct TxResult {
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
 
+    // Calldata decoder diagnostics. These fields do not change the public
+    // analyzeTx(...) entry point and are safe for optional statistics.
+    bool calldataDecoded = false;
+    bool calldataSwap = false;
+    bool calldataMatched = false;
+    bool calldataRecovered = false;
+    std::string decodedSelector;
+    std::string decodedFunction;
+    std::string decodedTokenIn;
+    std::string decodedTokenOut;
+
     std::string unknownReason;
 };
 
