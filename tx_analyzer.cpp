@@ -1250,6 +1250,153 @@ DecodedIntent decodeV4Envelope(const json& tx, const AbiReader& abi,
     return d;
 }
 
+
+DecodedIntent decodeStandardTokenCall(const json& tx, const AbiReader& abi,
+                                      const std::string& tokenContract,
+                                      const std::string& protocol) {
+    DecodedIntent d;
+    d.selector = abi.selector();
+    d.router = tokenContract;
+    d.protocol = protocol;
+    d.operation = TxOperation::TRANSFER;
+
+    if (tx.contains("value") && tx["value"].is_string())
+        d.nativeValue = hexToCppInt(tx["value"].get<std::string>());
+
+    // transfer(address,uint256)
+    if (d.selector == "a9059cbb") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.functionName = "ERC20.transfer";
+        d.tokenIn = tokenContract;
+        d.tokenOut = tokenContract;
+        abi.readAddress(0, d.recipient);
+        abi.readUint(1, d.amountIn);
+        return d;
+    }
+
+    // transferFrom(address,address,uint256)
+    if (d.selector == "23b872dd") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.functionName = "ERC20.transferFrom";
+        d.tokenIn = tokenContract;
+        d.tokenOut = tokenContract;
+        std::string from;
+        abi.readAddress(0, from);
+        abi.readAddress(1, d.recipient);
+        abi.readUint(2, d.amountIn);
+        d.secondaryToken = from;
+        return d;
+    }
+
+    // approve(address,uint256)
+    if (d.selector == "095ea7b3") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.approvalCall = true;
+        d.functionName = "ERC20.approve";
+        d.tokenIn = tokenContract;
+        abi.readAddress(0, d.recipient);
+        abi.readUint(1, d.amountIn);
+        return d;
+    }
+
+    // increaseAllowance(address,uint256)
+    if (d.selector == "39509351") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.approvalCall = true;
+        d.functionName = "ERC20.increaseAllowance";
+        d.tokenIn = tokenContract;
+        abi.readAddress(0, d.recipient);
+        abi.readUint(1, d.amountIn);
+        return d;
+    }
+
+    // decreaseAllowance(address,uint256)
+    if (d.selector == "a457c2d7") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.approvalCall = true;
+        d.functionName = "ERC20.decreaseAllowance";
+        d.tokenIn = tokenContract;
+        abi.readAddress(0, d.recipient);
+        abi.readUint(1, d.amountIn);
+        return d;
+    }
+
+    // EIP-2612 permit(address,address,uint256,uint256,uint8,bytes32,bytes32)
+    if (d.selector == "d505accf") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.approvalCall = true;
+        d.functionName = "ERC20.permit";
+        d.tokenIn = tokenContract;
+        std::string owner;
+        abi.readAddress(0, owner);
+        abi.readAddress(1, d.recipient);
+        abi.readUint(2, d.amountIn);
+        d.secondaryToken = owner;
+        return d;
+    }
+
+    // DAI-style permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)
+    if (d.selector == "8fcbaf0c") {
+        d.valid = true;
+        d.standardTokenCall = true;
+        d.approvalCall = true;
+        d.functionName = "ERC20.permitDaiStyle";
+        d.tokenIn = tokenContract;
+        std::string holder;
+        abi.readAddress(0, holder);
+        abi.readAddress(1, d.recipient);
+        d.secondaryToken = holder;
+        return d;
+    }
+
+    return d;
+}
+
+DecodedIntent decodeOkxDagSwap(const json& tx, const AbiReader& abi,
+                               const std::string& router,
+                               const std::string& protocol) {
+    DecodedIntent d;
+    if (abi.selector() != "f2c42696") return d;
+
+    d.valid = true;
+    d.swap = true;
+    d.exactInput = true;
+    d.aggregator = true;
+    d.okxDagSwap = true;
+    d.operation = TxOperation::SWAP_EXACT_IN;
+    d.selector = abi.selector();
+    d.functionName = "OKX.dagSwapByOrderId";
+    d.router = router;
+    d.protocol = protocol.empty() ? "OKX DEX" : protocol;
+
+    // dagSwapByOrderId(uint256 orderId, tuple baseRequest, tuple[] paths)
+    // The BaseRequest tuple is flattened directly after orderId:
+    // tokenIn, tokenOut, amountIn, minAmountOut, deadline, ...
+    abi.readAddress(1, d.tokenIn);
+    abi.readAddress(2, d.tokenOut);
+    abi.readUint(3, d.amountIn);
+    abi.readUint(4, d.amountOutMin);
+
+    if (d.tokenIn == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        d.tokenIn = chainCtx().nativeMarker;
+    if (d.tokenOut == "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+        d.tokenOut = chainCtx().nativeMarker;
+
+    if (!d.tokenIn.empty() && !d.tokenOut.empty())
+        d.path = {d.tokenIn, d.tokenOut};
+
+    if (tx.contains("value") && tx["value"].is_string())
+        d.nativeValue = hexToCppInt(tx["value"].get<std::string>());
+
+    return d;
+}
+
 DecodedIntent decodePermit2(const json& tx, const AbiReader& abi,
                             const std::string& router, const std::string& protocol) {
     DecodedIntent d;
@@ -1470,7 +1617,13 @@ DecodedIntent decodeRecursive(const json& tx, const std::string& input,
     json nestedTx = tx;
     nestedTx["input"] = input;
 
-    DecodedIntent d = decodeV2(nestedTx, abi, router, protocol);
+    DecodedIntent d = decodeOkxDagSwap(nestedTx, abi, router, protocol);
+    if (d.valid) return d;
+
+    d = decodeStandardTokenCall(nestedTx, abi, router, protocol);
+    if (d.valid) return d;
+
+    d = decodeV2(nestedTx, abi, router, protocol);
     if (d.valid) return d;
 
     d = decodeV3(nestedTx, abi, router, protocol);
@@ -1718,6 +1871,8 @@ ChainContext makeBscContext() {
               {"OKX", "", "Aggregator"});
     addRouter(c, "0x6015126d7d23648c2e4466693b8deab005ffaba8", "OKX DEX",
               {"OKX", "", "Aggregator"});
+    addRouter(c, "0x62ccef0b4545166f721caa9fee13c1d3767e27dc", "OKX DEX Router 2",
+              {"OKX", "Router 2", "Aggregator"});
     addRouter(c, "0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap",
               {"KyberSwap", "", "Aggregator"});
     addRouter(c, "0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap",
@@ -1736,6 +1891,14 @@ ChainContext makeBscContext() {
         {"f78dc253", "1inch.unoswapTo"},
         {"e449022e", "1inch.unoswapTo2"},
         {"415565b0", "0x.transformERC20"},
+        {"f2c42696", "OKX.dagSwapByOrderId"},
+        {"a9059cbb", "ERC20.transfer"},
+        {"23b872dd", "ERC20.transferFrom"},
+        {"095ea7b3", "ERC20.approve"},
+        {"39509351", "ERC20.increaseAllowance"},
+        {"a457c2d7", "ERC20.decreaseAllowance"},
+        {"d505accf", "ERC20.permit"},
+        {"8fcbaf0c", "ERC20.permitDaiStyle"},
         {"3593564c", "UniversalRouter.execute"},
         {"24856bc3", "UniversalRouter.execute"},
         {"ac9650d8", "multicall(bytes[])"},
@@ -1747,7 +1910,8 @@ ChainContext makeBscContext() {
         {"3593564c", "UniversalRouter.execute"}
     };
     c.aggregatorSwapSelectors = {
-        "12aa3caf", "0502b1c5", "f78dc253", "e449022e", "415565b0"
+        "12aa3caf", "0502b1c5", "f78dc253", "e449022e", "415565b0",
+        "f2c42696"
     };
 
     return c;
@@ -1962,6 +2126,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (decoded.universalSubPlan) r.universalSubPlanDecoded = true;
         if (decoded.acrossBridge) r.acrossBridgeDecoded = true;
         if (decoded.v4ActionsDecoded) r.v4ActionsDecoded = true;
+        if (decoded.standardTokenCall) r.standardTokenCall = true;
+        if (decoded.approvalCall) r.approvalCall = true;
+        if (decoded.selfCall) r.selfCall = true;
+        if (decoded.okxDagSwap) r.okxDagSwapDecoded = true;
     };
 
     std::string txTo;
@@ -2500,8 +2668,15 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         result.usdNanos = calcUsdNanos(result.rawAmount, decimals, price);
     }
 
+    result.selfCall =
+        walletIsSender &&
+        !result.callTarget.empty() &&
+        result.callTarget == wallet;
+
     result.unsupportedSelector =
         walletIsSender &&
+        !result.selfCall &&
+        !result.standardTokenCall &&
         !result.decodedSelector.empty() &&
         result.decodedSelector != "00000000" &&
         !decoded.valid;
