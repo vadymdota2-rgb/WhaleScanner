@@ -1442,9 +1442,25 @@ SemanticMatch fallbackAnalyze(
 TxResult buildResult(
     const DecodedCall& decoded,
     const ParsedReceipt& receipt,
-    const SemanticMatch& match
+    const SemanticMatch& match,
+    bool matchedByDecodedPipeline
 ) {
     TxResult result;
+    result.calldataDecoded = decoded.recognized;
+    result.calldataSwap =
+        decoded.operation == Operation::SWAP_EXACT_IN ||
+        decoded.operation == Operation::SWAP_EXACT_OUT ||
+        resolveIntent(decoded) == Intent::BUY ||
+        resolveIntent(decoded) == Intent::SELL ||
+        resolveIntent(decoded) == Intent::TOKEN_SWAP;
+    result.calldataMatched = matchedByDecodedPipeline && match.matched;
+    result.calldataRecovered =
+        matchedByDecodedPipeline && match.matched && match.isSwap;
+    result.decodedSelector = decoded.selector;
+    result.decodedFunction = decoded.functionName;
+    result.decodedTokenIn = decoded.tokenIn;
+    result.decodedTokenOut = decoded.tokenOut;
+
     result.valid = receipt.valid &&
                    (receipt.hasWalletTransfer ||
                     receipt.wrappedNative > 0 ||
@@ -1480,7 +1496,12 @@ TxResult buildResult(
     }
 
     if (!match.matched) {
-        result.unknownReason = match.reason.empty() ? "OTHER" : match.reason;
+        if (result.calldataSwap &&
+            (match.reason.empty() || match.reason == "NO_COUNTER_FLOW")) {
+            result.unknownReason = "DECODED_NO_RECEIPT_MATCH";
+        } else {
+            result.unknownReason = match.reason.empty() ? "OTHER" : match.reason;
+        }
         return result;
     }
 
@@ -1514,9 +1535,14 @@ TxResult buildResult(
     }
 
     if (!result.isSwap &&
-        result.venue.empty() &&
+        result.venue != "Add Liquidity" &&
+        result.venue != "Remove Liquidity" &&
+        result.venue != "Wrap" &&
+        result.venue != "Unwrap" &&
         result.dexActivityDetected) {
-        result.unknownReason = "NO_COUNTER_FLOW";
+        result.unknownReason = result.calldataSwap
+            ? "DECODED_NO_RECEIPT_MATCH"
+            : "NO_COUNTER_FLOW";
     }
     return result;
 }
@@ -1834,8 +1860,10 @@ TxResult analyzeTx(
 
     // 5. Match requested intent to what actually happened.
     SemanticMatch match;
+    bool matchedByDecodedPipeline = false;
     if (decoded.recognized && intent != Intent::UNKNOWN) {
         match = semanticMatch(tx, decoded, intent, parsed, flows);
+        matchedByDecodedPipeline = match.matched;
     }
 
     // 6. Existing receipt/net-flow approach remains the safety net.
@@ -1845,5 +1873,5 @@ TxResult analyzeTx(
     }
 
     // 7. Build the unchanged public TxResult.
-    return buildResult(decoded, parsed, match);
+    return buildResult(decoded, parsed, match, matchedByDecodedPipeline);
 }
