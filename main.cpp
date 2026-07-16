@@ -106,6 +106,7 @@ struct Stats {
     std::atomic<uint64_t> token_approval_calls{0};
     std::atomic<uint64_t> self_calls{0};
     std::atomic<uint64_t> okx_dag_swaps{0};
+    std::atomic<uint64_t> targeted_executor_swaps{0};
 } g_stats;
 
 std::mutex selectorStatsMutex;
@@ -225,6 +226,8 @@ void recordCoverage(const TxResult& r) {
         g_stats.self_calls.fetch_add(1, std::memory_order_relaxed);
     if (r.okxDagSwapDecoded)
         g_stats.okx_dag_swaps.fetch_add(1, std::memory_order_relaxed);
+    if (r.targetedExecutorDecoded)
+        g_stats.targeted_executor_swaps.fetch_add(1, std::memory_order_relaxed);
 
     if (r.unsupportedSelector) {
         g_stats.unsupported_selectors.fetch_add(1, std::memory_order_relaxed);
@@ -356,6 +359,7 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " approvalCall=" << (res.approvalCall ? 1 : 0)
        << " selfCall=" << (res.selfCall ? 1 : 0)
        << " okxDagSwap=" << (res.okxDagSwapDecoded ? 1 : 0)
+       << " targetedExecutor=" << (res.targetedExecutorDecoded ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1976,6 +1980,7 @@ void telegramLoop() {
                                     << "\nERC20 approval calls: " << g_stats.token_approval_calls.load()
                                     << "\nWallet self-calls: " << g_stats.self_calls.load()
                                     << "\nOKX dag swaps: " << g_stats.okx_dag_swaps.load()
+                                    << "\nTargeted executor swaps: " << g_stats.targeted_executor_swaps.load()
                                     << "\n\n🧭 <b>Swap classification source</b>\n"
                                     << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
                                     << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
