@@ -43,6 +43,10 @@ struct DecodedIntent {
     bool universalSubPlan = false;
     bool acrossBridge = false;
     bool v4ActionsDecoded = false;
+    bool standardTokenCall = false;
+    bool approvalCall = false;
+    bool selfCall = false;
+    bool okxDagSwap = false;
 
     TxOperation operation = TxOperation::UNKNOWN;
 
@@ -117,6 +121,11 @@ struct TxResult {
     bool classifiedByCalldata = false;
     bool classifiedByGraph = false;
     bool classifiedByFallback = false;
+
+    bool standardTokenCall = false;
+    bool approvalCall = false;
+    bool selfCall = false;
+    bool okxDagSwapDecoded = false;
 
     std::string callTarget;
     std::string decodedSelector;
