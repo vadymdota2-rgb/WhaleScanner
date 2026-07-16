@@ -101,6 +101,11 @@ struct Stats {
     std::atomic<uint64_t> classified_fallback{0};
     std::atomic<uint64_t> unsupported_selectors{0};
     std::atomic<uint64_t> unk_unsupported_selector{0};
+
+    std::atomic<uint64_t> token_transfer_calls{0};
+    std::atomic<uint64_t> token_approval_calls{0};
+    std::atomic<uint64_t> self_calls{0};
+    std::atomic<uint64_t> okx_dag_swaps{0};
 } g_stats;
 
 std::mutex selectorStatsMutex;
@@ -124,8 +129,13 @@ std::string buildSelectorStatsText(size_t limit = 30) {
     std::sort(rows.begin(), rows.end(),
         [](const auto& a, const auto& b) { return a.second > b.second; });
 
+    uint64_t total = 0;
+    for (const auto& row : rows) total += row.second;
+
     std::stringstream out;
-    out << "🧬 <b>Unsupported selectors</b>\n\n";
+    out << "🧬 <b>Unsupported selectors</b>\n"
+        << "Total: <b>" << total << "</b>\n"
+        << "Unique selector/target pairs: <b>" << rows.size() << "</b>\n\n";
     if (rows.empty()) {
         out << "No unsupported wallet call selectors recorded.";
         return out.str();
@@ -205,6 +215,17 @@ void recordCoverage(const TxResult& r) {
         g_stats.classified_graph.fetch_add(1, std::memory_order_relaxed);
     if (r.classifiedByFallback)
         g_stats.classified_fallback.fetch_add(1, std::memory_order_relaxed);
+    if (r.standardTokenCall) {
+        if (r.approvalCall)
+            g_stats.token_approval_calls.fetch_add(1, std::memory_order_relaxed);
+        else
+            g_stats.token_transfer_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (r.selfCall)
+        g_stats.self_calls.fetch_add(1, std::memory_order_relaxed);
+    if (r.okxDagSwapDecoded)
+        g_stats.okx_dag_swaps.fetch_add(1, std::memory_order_relaxed);
+
     if (r.unsupportedSelector) {
         g_stats.unsupported_selectors.fetch_add(1, std::memory_order_relaxed);
         recordSelectorStat(r);
@@ -331,6 +352,10 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " byCalldata=" << (res.classifiedByCalldata ? 1 : 0)
        << " byGraph=" << (res.classifiedByGraph ? 1 : 0)
        << " byFallback=" << (res.classifiedByFallback ? 1 : 0)
+       << " standardTokenCall=" << (res.standardTokenCall ? 1 : 0)
+       << " approvalCall=" << (res.approvalCall ? 1 : 0)
+       << " selfCall=" << (res.selfCall ? 1 : 0)
+       << " okxDagSwap=" << (res.okxDagSwapDecoded ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1946,6 +1971,11 @@ void telegramLoop() {
                                     << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
                                     << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
                                     << "\nUnsupported selectors: " << g_stats.unsupported_selectors.load()
+                                    << "\n\n📦 <b>Standard calls</b>\n"
+                                    << "ERC20 transfer calls: " << g_stats.token_transfer_calls.load()
+                                    << "\nERC20 approval calls: " << g_stats.token_approval_calls.load()
+                                    << "\nWallet self-calls: " << g_stats.self_calls.load()
+                                    << "\nOKX dag swaps: " << g_stats.okx_dag_swaps.load()
                                     << "\n\n🧭 <b>Swap classification source</b>\n"
                                     << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
                                     << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
