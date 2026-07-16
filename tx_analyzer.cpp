@@ -1358,6 +1358,45 @@ DecodedIntent decodeStandardTokenCall(const json& tx, const AbiReader& abi,
     return d;
 }
 
+
+DecodedIntent decodeTargetedExecutorCall(const json& tx, const AbiReader& abi,
+                                         const std::string& router,
+                                         const std::string& protocol) {
+    DecodedIntent d;
+    const std::string selector = abi.selector();
+
+    const bool selector76 =
+        router == "0x2caec2e2e8d915f8783a8a147f22d779b42933b7" &&
+        selector == "76fdd5ec";
+
+    const bool selector8e =
+        router == "0x218c18d02f0723291ce93aa5c0e5eb709903179a" &&
+        selector == "8e3b3c41";
+
+    if (!selector76 && !selector8e) return d;
+
+    d.valid = true;
+    d.swap = true;
+    d.exactInput = true;
+    d.aggregator = true;
+    d.targetedExecutor = true;
+    d.operation = TxOperation::SWAP_EXACT_IN;
+    d.selector = selector;
+    d.router = router;
+    d.protocol = protocol.empty() ? "Targeted Trading Executor" : protocol;
+    d.functionName = selector76
+        ? "TargetedExecutor.executeSwap76"
+        : "TargetedExecutor.executeSwap8e";
+
+    if (tx.contains("value") && tx["value"].is_string())
+        d.nativeValue = hexToCppInt(tx["value"].get<std::string>());
+
+    // These contracts use private/opaque calldata layouts. Do not guess token
+    // offsets. The decoder establishes operation family and protocol identity;
+    // actual token direction and amounts remain receipt-derived.
+    return d;
+}
+
 DecodedIntent decodeOkxDagSwap(const json& tx, const AbiReader& abi,
                                const std::string& router,
                                const std::string& protocol) {
@@ -1617,7 +1656,12 @@ DecodedIntent decodeRecursive(const json& tx, const std::string& input,
     json nestedTx = tx;
     nestedTx["input"] = input;
 
-    DecodedIntent d = decodeOkxDagSwap(nestedTx, abi, router, protocol);
+    DecodedIntent d = decodeTargetedExecutorCall(
+        nestedTx, abi, router, protocol
+    );
+    if (d.valid) return d;
+
+    d = decodeOkxDagSwap(nestedTx, abi, router, protocol);
     if (d.valid) return d;
 
     d = decodeStandardTokenCall(nestedTx, abi, router, protocol);
@@ -1873,6 +1917,12 @@ ChainContext makeBscContext() {
               {"OKX", "", "Aggregator"});
     addRouter(c, "0x62ccef0b4545166f721caa9fee13c1d3767e27dc", "OKX DEX Router 2",
               {"OKX", "Router 2", "Aggregator"});
+    addRouter(c, "0x2caec2e2e8d915f8783a8a147f22d779b42933b7",
+              "Private Trading Executor 76",
+              {"Private Executor", "76", "Aggregator"});
+    addRouter(c, "0x218c18d02f0723291ce93aa5c0e5eb709903179a",
+              "Private Trading Executor 8E",
+              {"Private Executor", "8E", "Aggregator"});
     addRouter(c, "0x6131b5fae19ea4f9d964eac0408e4408b66337b5", "KyberSwap",
               {"KyberSwap", "", "Aggregator"});
     addRouter(c, "0xdf1a1b60f2d438842916c0adc43748768353ec25", "KyberSwap",
@@ -1892,6 +1942,8 @@ ChainContext makeBscContext() {
         {"e449022e", "1inch.unoswapTo2"},
         {"415565b0", "0x.transformERC20"},
         {"f2c42696", "OKX.dagSwapByOrderId"},
+        {"76fdd5ec", "TargetedExecutor.executeSwap76"},
+        {"8e3b3c41", "TargetedExecutor.executeSwap8e"},
         {"a9059cbb", "ERC20.transfer"},
         {"23b872dd", "ERC20.transferFrom"},
         {"095ea7b3", "ERC20.approve"},
@@ -2130,6 +2182,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (decoded.approvalCall) r.approvalCall = true;
         if (decoded.selfCall) r.selfCall = true;
         if (decoded.okxDagSwap) r.okxDagSwapDecoded = true;
+        if (decoded.targetedExecutor) r.targetedExecutorDecoded = true;
     };
 
     std::string txTo;
