@@ -91,6 +91,9 @@ struct Stats {
     std::atomic<uint64_t> unk_graph_no_pool_path{0};
     std::atomic<uint64_t> unk_graph_ambiguous{0};
     std::atomic<uint64_t> unk_no_direct_counter{0};
+
+    std::atomic<uint64_t> sig_wallet_swap_related{0};
+    std::atomic<uint64_t> sig_unrelated_swap_event{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
@@ -137,6 +140,11 @@ void recordCoverage(const TxResult& r) {
     if (r.graphPathFromPool) g_stats.graph_path_from_pool.fetch_add(1, std::memory_order_relaxed);
     if (r.graphRecovered) g_stats.graph_recovered.fetch_add(1, std::memory_order_relaxed);
     if (r.graphAmbiguous) g_stats.graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.walletSwapRelated)
+        g_stats.sig_wallet_swap_related.fetch_add(1, std::memory_order_relaxed);
+    if (r.unrelatedSwapEvent)
+        g_stats.sig_unrelated_swap_event.fetch_add(1, std::memory_order_relaxed);
 
     const bool finalUnknown =
         !r.isSwap &&
@@ -249,6 +257,8 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " graphFromPool=" << (res.graphPathFromPool ? 1 : 0)
        << " graphRecovered=" << (res.graphRecovered ? 1 : 0)
        << " graphAmbiguous=" << (res.graphAmbiguous ? 1 : 0)
+       << " walletSwapRelated=" << (res.walletSwapRelated ? 1 : 0)
+       << " unrelatedSwapEvent=" << (res.unrelatedSwapEvent ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1844,6 +1854,8 @@ void telegramLoop() {
                                     << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
                                     << "\n📦 Multicall: " << g_stats.sig_multicall.load()
                                     << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
+                                    << "\n✅ Wallet-related swap: " << g_stats.sig_wallet_swap_related.load()
+                                    << "\n⚪ Unrelated swap event: " << g_stats.sig_unrelated_swap_event.load()
                                     << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
                                     << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
