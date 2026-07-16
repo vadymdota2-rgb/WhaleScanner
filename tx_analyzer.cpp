@@ -2098,8 +2098,16 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     result.lpV3EventSeen = parsed.v3Increase || parsed.v3Decrease || parsed.v3Collect;
     result.lpPoolIdentitySeen = false;
     for (const auto& token : parsed.tokenOrder) {
-        if (sourceMatchesPool(parsed, token, parsed.netFlow[token] > 0) ||
-            graphMatchesPool(parsed, token, wallet, parsed.netFlow[token] > 0, {wallet})) {
+        const cpp_int net = parsed.netFlow[token];
+        if (net == 0) continue;
+
+        GraphPathResult poolPath;
+        const bool directPool = sourceMatchesPool(parsed, token, net > 0);
+        const bool graphPool = graphMatchesPool(
+            parsed, token, wallet, net > 0, {wallet}, &poolPath
+        );
+
+        if (directPool || graphPool) {
             result.lpPoolIdentitySeen = true;
             break;
         }
@@ -2483,6 +2491,49 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             : getPriceNanos(result.tokenAddr);
         result.usdNanos = calcUsdNanos(result.rawAmount, decimals, price);
     }
+
+    const bool decodedWalletIntent =
+        decoded.valid &&
+        (
+            decoded.swap ||
+            decoded.liquidity ||
+            decoded.bridge ||
+            decoded.operation == TxOperation::WRAP_NATIVE ||
+            decoded.operation == TxOperation::UNWRAP_NATIVE
+        ) &&
+        (
+            walletIsSender ||
+            (!decoded.recipient.empty() && toLower(decoded.recipient) == wallet)
+        );
+
+    result.walletSwapRelated =
+        result.isSwap ||
+        result.venue == "Add Liquidity" ||
+        result.venue == "Remove Liquidity" ||
+        result.venue == "Wrap" ||
+        result.venue == "Unwrap" ||
+        result.graphPathToPool ||
+        result.graphPathFromPool ||
+        result.graphRecovered ||
+        result.calldataMatched ||
+        result.calldataRecovered ||
+        decodedWalletIntent ||
+        (
+            walletIsSender &&
+            (
+                knownRouter ||
+                ur.present ||
+                decoded.multicall ||
+                decoded.permit2
+            )
+        );
+
+    result.unrelatedSwapEvent =
+        parsed.hasSwapEvent && !result.walletSwapRelated;
+
+    // A Swap event anywhere in the receipt is only diagnostic. It is DEX
+    // activity only after correlation with the tracked wallet.
+    result.dexActivityDetected = result.walletSwapRelated;
 
     if (!result.isSwap &&
         result.venue != "Add Liquidity" &&
