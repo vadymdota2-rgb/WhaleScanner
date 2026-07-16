@@ -156,6 +156,31 @@ void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::j
     if (LOG_LOW_CONFIDENCE) appendDiagLog("low_confidence.log", hash, bn, tx, receipt, res);
 }
 
+const bool LOG_SWAPLESS_TRADE = []() {
+    const char* env = std::getenv("WHALE_LOG_SWAPLESS_TRADE");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+
+void logSwaplessTrade(const std::string& hash, const nlohmann::json& receipt, const TxResult& res) {
+    if (!LOG_SWAPLESS_TRADE) return;
+    std::stringstream ss;
+    ss << "hash=" << hash << " isBuy=" << (res.isBuy ? 1 : 0) << " venue=" << res.venue << " topics0=[";
+    bool first = true;
+    if (receipt.is_object() && receipt.contains("logs") && receipt["logs"].is_array()) {
+        for (auto& l : receipt["logs"]) {
+            if (l.is_object() && l.contains("topics") && l["topics"].is_array() && !l["topics"].empty() && l["topics"][0].is_string()) {
+                if (!first) ss << ",";
+                ss << l["topics"][0].get<std::string>();
+                first = false;
+            }
+        }
+    }
+    ss << "]";
+    std::lock_guard<std::mutex> lk(diagLogMutex);
+    std::ofstream f("swapless_trade.log", std::ios::app);
+    if (f) f << ss.str() << "\n";
+}
+
 const auto START_TIME = std::chrono::steady_clock::now();
 
 std::string getUptime() {
@@ -1186,6 +1211,7 @@ bool processBlock(long long bn) {
         checkInvariants(hash, res);
         if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
+        if (res.isSwap && !res.hasSwapEvent) logSwaplessTrade(hash, receipt, res);
 
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
