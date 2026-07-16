@@ -106,9 +106,6 @@ struct Stats {
     std::atomic<uint64_t> token_approval_calls{0};
     std::atomic<uint64_t> self_calls{0};
     std::atomic<uint64_t> okx_dag_swaps{0};
-
-    std::atomic<uint64_t> unsupported_selector_samples_logged{0};
-    std::atomic<uint64_t> unsupported_selector_samples_skipped{0};
 } g_stats;
 
 std::mutex selectorStatsMutex;
@@ -374,239 +371,6 @@ void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& t
 
 void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     if (LOG_LOW_CONFIDENCE) appendDiagLog("low_confidence.log", hash, bn, tx, receipt, res);
-}
-
-const bool LOG_UNSUPPORTED_SELECTORS = []() {
-    const char* env = std::getenv("WHALE_LOG_UNSUPPORTED_SELECTORS");
-    if (!env) return true;
-    const std::string value = toLower(std::string(env));
-    return value != "0" && value != "false" && value != "off";
-}();
-
-constexpr size_t UNSUPPORTED_SELECTOR_MAX_SAMPLES_PER_PAIR = 25;
-constexpr uintmax_t UNSUPPORTED_SELECTOR_LOG_ROTATE_BYTES =
-    100ULL * 1024ULL * 1024ULL;
-
-std::mutex unsupportedSelectorLogMutex;
-std::unordered_map<std::string, size_t> unsupportedSelectorSampleCounts;
-
-std::string topicAddress(const nlohmann::json& topic) {
-    if (!topic.is_string()) return "";
-    const std::string value = toLower(topic.get<std::string>());
-    if (value.size() < 42) return "";
-    return "0x" + value.substr(value.size() - 40);
-}
-
-void rotateUnsupportedSelectorLogIfNeeded(const std::string& path) {
-    std::error_code ec;
-    const uintmax_t size = std::filesystem::file_size(path, ec);
-    if (ec || size < UNSUPPORTED_SELECTOR_LOG_ROTATE_BYTES) return;
-
-    const std::string rotated = path + ".1";
-    std::filesystem::remove(rotated, ec);
-    ec.clear();
-    std::filesystem::rename(path, rotated, ec);
-    if (ec) {
-        std::cerr << "[SELECTOR LOG] Rotation failed: " << ec.message() << std::endl;
-    }
-}
-
-void logUnsupportedSelectorTx(const std::string& hash,
-                              long long blockNumber,
-                              const std::string& trackedWallet,
-                              const nlohmann::json& tx,
-                              const nlohmann::json& receipt,
-                              const TxResult& result) {
-    if (!LOG_UNSUPPORTED_SELECTORS || !result.unsupportedSelector) return;
-
-    const std::string selector = result.decodedSelector.empty()
-        ? std::string("-") : toLower(result.decodedSelector);
-    const std::string target = result.callTarget.empty()
-        ? std::string("-") : toLower(result.callTarget);
-    const std::string sampleKey = selector + "|" + target;
-
-    std::lock_guard<std::mutex> lock(unsupportedSelectorLogMutex);
-
-    size_t& sampleCount = unsupportedSelectorSampleCounts[sampleKey];
-    if (sampleCount >= UNSUPPORTED_SELECTOR_MAX_SAMPLES_PER_PAIR) {
-        g_stats.unsupported_selector_samples_skipped.fetch_add(
-            1, std::memory_order_relaxed);
-        return;
-    }
-    sampleCount++;
-
-    nlohmann::json row;
-    row["timestamp"] = static_cast<long long>(time(nullptr));
-    row["chain"] = chainCtx().displayName;
-    row["block"] = blockNumber;
-    row["hash"] = hash;
-    row["trackedWallet"] = trackedWallet;
-    row["selector"] = selector;
-    row["target"] = target;
-    row["sampleNumberForPair"] = sampleCount;
-
-    nlohmann::json txInfo;
-    txInfo["from"] =
-        (tx.contains("from") && tx["from"].is_string())
-            ? tx["from"].get<std::string>() : "";
-    txInfo["to"] =
-        (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
-            ? tx["to"].get<std::string>() : "";
-    txInfo["value"] =
-        (tx.contains("value") && tx["value"].is_string())
-            ? tx["value"].get<std::string>() : "0x0";
-    txInfo["input"] =
-        (tx.contains("input") && tx["input"].is_string())
-            ? tx["input"].get<std::string>() : "0x";
-    txInfo["gas"] =
-        (tx.contains("gas") && tx["gas"].is_string())
-            ? tx["gas"].get<std::string>() : "";
-    txInfo["gasPrice"] =
-        (tx.contains("gasPrice") && tx["gasPrice"].is_string())
-            ? tx["gasPrice"].get<std::string>() : "";
-    txInfo["maxFeePerGas"] =
-        (tx.contains("maxFeePerGas") && tx["maxFeePerGas"].is_string())
-            ? tx["maxFeePerGas"].get<std::string>() : "";
-    txInfo["maxPriorityFeePerGas"] =
-        (tx.contains("maxPriorityFeePerGas") &&
-         tx["maxPriorityFeePerGas"].is_string())
-            ? tx["maxPriorityFeePerGas"].get<std::string>() : "";
-    txInfo["nonce"] =
-        (tx.contains("nonce") && tx["nonce"].is_string())
-            ? tx["nonce"].get<std::string>() : "";
-    row["tx"] = std::move(txInfo);
-
-    nlohmann::json resultInfo;
-    resultInfo["valid"] = result.valid;
-    resultInfo["isSwap"] = result.isSwap;
-    resultInfo["isBuy"] = result.isBuy;
-    resultInfo["venue"] = result.venue;
-    resultInfo["tokenAddr"] = result.tokenAddr;
-    resultInfo["counterAddr"] = result.counterAddr;
-    resultInfo["rawAmount"] = result.rawAmount.convert_to<std::string>();
-    resultInfo["counterAmount"] = result.counterAmount.convert_to<std::string>();
-    resultInfo["usdNanos"] = result.usdNanos.convert_to<std::string>();
-    resultInfo["hasSwapEvent"] = result.hasSwapEvent;
-    resultInfo["walletSwapRelated"] = result.walletSwapRelated;
-    resultInfo["unrelatedSwapEvent"] = result.unrelatedSwapEvent;
-    resultInfo["unknownReason"] = result.unknownReason;
-    resultInfo["decodedFunction"] = result.decodedFunction;
-    resultInfo["decodedTokenIn"] = result.decodedTokenIn;
-    resultInfo["decodedTokenOut"] = result.decodedTokenOut;
-    resultInfo["classifiedByDirectFlow"] = result.classifiedByDirectFlow;
-    resultInfo["classifiedByCalldata"] = result.classifiedByCalldata;
-    resultInfo["classifiedByGraph"] = result.classifiedByGraph;
-    resultInfo["classifiedByFallback"] = result.classifiedByFallback;
-    row["analysis"] = std::move(resultInfo);
-
-    nlohmann::json receiptInfo;
-    receiptInfo["status"] =
-        (receipt.contains("status") && receipt["status"].is_string())
-            ? receipt["status"].get<std::string>() : "";
-    receiptInfo["gasUsed"] =
-        (receipt.contains("gasUsed") && receipt["gasUsed"].is_string())
-            ? receipt["gasUsed"].get<std::string>() : "";
-    receiptInfo["contractAddress"] =
-        (receipt.contains("contractAddress") &&
-         !receipt["contractAddress"].is_null() &&
-         receipt["contractAddress"].is_string())
-            ? receipt["contractAddress"].get<std::string>() : "";
-
-    nlohmann::json topics = nlohmann::json::array();
-    nlohmann::json transfers = nlohmann::json::array();
-    nlohmann::json swapEvents = nlohmann::json::array();
-    nlohmann::json rawLogs = nlohmann::json::array();
-    std::set<std::string> uniqueTopics;
-
-    if (receipt.is_object() &&
-        receipt.contains("logs") &&
-        receipt["logs"].is_array()) {
-        receiptInfo["logCount"] = receipt["logs"].size();
-
-        for (size_t index = 0; index < receipt["logs"].size(); ++index) {
-            const auto& log = receipt["logs"][index];
-            if (!log.is_object()) continue;
-
-            const std::string address =
-                (log.contains("address") && log["address"].is_string())
-                    ? toLower(log["address"].get<std::string>()) : "";
-
-            std::string topic0;
-            if (log.contains("topics") &&
-                log["topics"].is_array() &&
-                !log["topics"].empty() &&
-                log["topics"][0].is_string()) {
-                topic0 = toLower(log["topics"][0].get<std::string>());
-                uniqueTopics.insert(topic0);
-            }
-
-            if (topic0 == ERC20_TRANSFER_TOPIC &&
-                log["topics"].size() == 3 &&
-                log["topics"][1].is_string() &&
-                log["topics"][2].is_string() &&
-                log.contains("data") &&
-                log["data"].is_string()) {
-                nlohmann::json transfer;
-                transfer["logIndex"] = index;
-                transfer["token"] = address;
-                transfer["from"] = topicAddress(log["topics"][1]);
-                transfer["to"] = topicAddress(log["topics"][2]);
-                transfer["amountRaw"] =
-                    parseUint256(log["data"].get<std::string>())
-                        .convert_to<std::string>();
-                transfers.push_back(std::move(transfer));
-            }
-
-            if (SWAP_EVENT_TOPICS.count(topic0)) {
-                nlohmann::json swap;
-                swap["logIndex"] = index;
-                swap["pool"] = address;
-                swap["topic0"] = topic0;
-                swap["topics"] =
-                    log.contains("topics")
-                        ? log["topics"] : nlohmann::json::array();
-                swap["data"] =
-                    (log.contains("data") && log["data"].is_string())
-                        ? log["data"].get<std::string>() : "0x";
-                swapEvents.push_back(std::move(swap));
-            }
-
-            // Keep every raw receipt log for exact ABI reconstruction.
-            nlohmann::json raw;
-            raw["logIndex"] = index;
-            raw["address"] = address;
-            raw["topics"] =
-                log.contains("topics")
-                    ? log["topics"] : nlohmann::json::array();
-            raw["data"] =
-                (log.contains("data") && log["data"].is_string())
-                    ? log["data"].get<std::string>() : "0x";
-            rawLogs.push_back(std::move(raw));
-        }
-    } else {
-        receiptInfo["logCount"] = 0;
-    }
-
-    for (const std::string& topic : uniqueTopics) topics.push_back(topic);
-
-    receiptInfo["uniqueTopics0"] = std::move(topics);
-    receiptInfo["erc20Transfers"] = std::move(transfers);
-    receiptInfo["swapEvents"] = std::move(swapEvents);
-    receiptInfo["rawLogs"] = std::move(rawLogs);
-    row["receipt"] = std::move(receiptInfo);
-
-    const std::string file = "unsupported_selector_calls.jsonl";
-    rotateUnsupportedSelectorLogIfNeeded(file);
-
-    std::ofstream output(file, std::ios::app);
-    if (!output) {
-        std::cerr << "[SELECTOR LOG] Cannot open " << file << std::endl;
-        return;
-    }
-
-    output << row.dump() << "\n";
-    g_stats.unsupported_selector_samples_logged.fetch_add(
-        1, std::memory_order_relaxed);
 }
 
 const bool LOG_SWAPLESS_TRADE = []() {
@@ -1661,7 +1425,6 @@ bool processBlock(long long bn) {
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         recordCoverage(res);
-        logUnsupportedSelectorTx(hash, bn, mA, tx, receipt, res);
         checkInvariants(hash, res);
         if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
@@ -2213,8 +1976,6 @@ void telegramLoop() {
                                     << "\nERC20 approval calls: " << g_stats.token_approval_calls.load()
                                     << "\nWallet self-calls: " << g_stats.self_calls.load()
                                     << "\nOKX dag swaps: " << g_stats.okx_dag_swaps.load()
-                                    << "\nUnsupported samples logged: " << g_stats.unsupported_selector_samples_logged.load()
-                                    << "\nUnsupported samples skipped: " << g_stats.unsupported_selector_samples_skipped.load()
                                     << "\n\n🧭 <b>Swap classification source</b>\n"
                                     << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
                                     << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
@@ -2251,12 +2012,7 @@ void telegramLoop() {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
                         } else {
-                            std::string selectorText = buildSelectorStatsText();
-                            selectorText +=
-                                "\n\n📄 Detailed samples: "
-                                "<code>unsupported_selector_calls.jsonl</code>"
-                                "\nUp to 25 full samples per selector/target pair.";
-                            sendMsg(cid, selectorText);
+                            sendMsg(cid, buildSelectorStatsText());
                         }
                     }
                     else if (txt=="/help") {
