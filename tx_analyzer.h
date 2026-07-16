@@ -103,6 +103,12 @@ struct TxResult {
     bool acrossBridgeDecoded = false;
     bool v4ActionsDecoded = false;
 
+    bool transferGraphSeen = false;
+    bool graphPathToPool = false;
+    bool graphPathFromPool = false;
+    bool graphRecovered = false;
+    bool graphAmbiguous = false;
+
     std::string decodedSelector;
     std::string decodedFunction;
     std::string decodedTokenIn;
