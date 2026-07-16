@@ -94,7 +94,58 @@ struct Stats {
 
     std::atomic<uint64_t> sig_wallet_swap_related{0};
     std::atomic<uint64_t> sig_unrelated_swap_event{0};
+
+    std::atomic<uint64_t> classified_direct_flow{0};
+    std::atomic<uint64_t> classified_calldata{0};
+    std::atomic<uint64_t> classified_graph{0};
+    std::atomic<uint64_t> classified_fallback{0};
+    std::atomic<uint64_t> unsupported_selectors{0};
+    std::atomic<uint64_t> unk_unsupported_selector{0};
 } g_stats;
+
+std::mutex selectorStatsMutex;
+std::unordered_map<std::string, uint64_t> selectorStats;
+
+void recordSelectorStat(const TxResult& r) {
+    if (!r.unsupportedSelector || r.decodedSelector.empty()) return;
+    const std::string key = r.decodedSelector + "|" + r.callTarget;
+    std::lock_guard<std::mutex> lock(selectorStatsMutex);
+    selectorStats[key]++;
+}
+
+std::string buildSelectorStatsText(size_t limit = 30) {
+    std::vector<std::pair<std::string, uint64_t>> rows;
+    {
+        std::lock_guard<std::mutex> lock(selectorStatsMutex);
+        rows.reserve(selectorStats.size());
+        for (const auto& item : selectorStats) rows.push_back(item);
+    }
+
+    std::sort(rows.begin(), rows.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::stringstream out;
+    out << "🧬 <b>Unsupported selectors</b>\n\n";
+    if (rows.empty()) {
+        out << "No unsupported wallet call selectors recorded.";
+        return out.str();
+    }
+
+    const size_t count = std::min(limit, rows.size());
+    for (size_t i = 0; i < count; ++i) {
+        const std::string& key = rows[i].first;
+        const size_t sep = key.find('|');
+        const std::string selector = sep == std::string::npos ? key : key.substr(0, sep);
+        const std::string target = sep == std::string::npos ? "" : key.substr(sep + 1);
+
+        out << "<b>" << rows[i].second << "×</b> <code>0x"
+            << safeString(selector, 8) << "</code>";
+        if (!target.empty())
+            out << " → <code>" << safeString(target, 42) << "</code>";
+        out << "\n";
+    }
+    return out.str();
+}
 
 void recordCoverage(const TxResult& r) {
     if (r.venue == "Add Liquidity") {
@@ -146,6 +197,19 @@ void recordCoverage(const TxResult& r) {
     if (r.unrelatedSwapEvent)
         g_stats.sig_unrelated_swap_event.fetch_add(1, std::memory_order_relaxed);
 
+    if (r.classifiedByDirectFlow)
+        g_stats.classified_direct_flow.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByCalldata)
+        g_stats.classified_calldata.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByGraph)
+        g_stats.classified_graph.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByFallback)
+        g_stats.classified_fallback.fetch_add(1, std::memory_order_relaxed);
+    if (r.unsupportedSelector) {
+        g_stats.unsupported_selectors.fetch_add(1, std::memory_order_relaxed);
+        recordSelectorStat(r);
+    }
+
     const bool finalUnknown =
         !r.isSwap &&
         r.dexActivityDetected &&
@@ -182,6 +246,8 @@ void recordCoverage(const TxResult& r) {
         g_stats.unk_subplan_no_match.fetch_add(1, std::memory_order_relaxed);
     else if (r.unknownReason == "V4_ACTIONS_UNDECODED")
         g_stats.unk_v4_actions_undecoded.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNSUPPORTED_SELECTOR")
+        g_stats.unk_unsupported_selector.fetch_add(1, std::memory_order_relaxed);
     else
         g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
 }
@@ -259,6 +325,12 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " graphAmbiguous=" << (res.graphAmbiguous ? 1 : 0)
        << " walletSwapRelated=" << (res.walletSwapRelated ? 1 : 0)
        << " unrelatedSwapEvent=" << (res.unrelatedSwapEvent ? 1 : 0)
+       << " unsupportedSelector=" << (res.unsupportedSelector ? 1 : 0)
+       << " target=" << (res.callTarget.empty() ? "-" : res.callTarget)
+       << " byDirect=" << (res.classifiedByDirectFlow ? 1 : 0)
+       << " byCalldata=" << (res.classifiedByCalldata ? 1 : 0)
+       << " byGraph=" << (res.classifiedByGraph ? 1 : 0)
+       << " byFallback=" << (res.classifiedByFallback ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1873,6 +1945,12 @@ void telegramLoop() {
                                     << "\nUniversal subplans: " << g_stats.decoded_subplans.load()
                                     << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
                                     << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
+                                    << "\nUnsupported selectors: " << g_stats.unsupported_selectors.load()
+                                    << "\n\n🧭 <b>Swap classification source</b>\n"
+                                    << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
+                                    << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
+                                    << "\nTransfer graph: " << g_stats.classified_graph.load()
+                                    << "\nFallback: " << g_stats.classified_fallback.load()
                                     << "\n\n🕸 <b>Receipt transfer graph</b>\n"
                                     << "Graph tx: " << g_stats.graph_seen.load()
                                     << "\nPath wallet → pool: " << g_stats.graph_path_to_pool.load()
@@ -1893,10 +1971,18 @@ void telegramLoop() {
                                     << "\nMulticall/no match: " << g_stats.unk_multicall_no_match.load()
                                     << "\nSubplan/no match: " << g_stats.unk_subplan_no_match.load()
                                     << "\nV4 actions undecoded: " << g_stats.unk_v4_actions_undecoded.load()
+                                    << "\nUnsupported selector: " << g_stats.unk_unsupported_selector.load()
                                     << "\nOther: " << g_stats.unk_other.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
+                        }
+                    }
+                    else if (txt=="/selectors") {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            sendMsg(cid, buildSelectorStatsText());
                         }
                     }
                     else if (txt=="/help") {
