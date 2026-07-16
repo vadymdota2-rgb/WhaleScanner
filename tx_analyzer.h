@@ -10,6 +10,62 @@
 
 using boost::multiprecision::cpp_int;
 
+enum class TxOperation {
+    UNKNOWN,
+    SWAP_EXACT_IN,
+    SWAP_EXACT_OUT,
+    WRAP_NATIVE,
+    UNWRAP_NATIVE,
+    ADD_LIQUIDITY,
+    REMOVE_LIQUIDITY,
+    TRANSFER,
+    BRIDGE,
+    STAKE,
+    UNSTAKE,
+    CLAIM,
+    NFT
+};
+
+struct DecodedIntent {
+    bool valid = false;
+    bool swap = false;
+    bool exactInput = false;
+    bool exactOutput = false;
+    bool multicall = false;
+    bool universalRouter = false;
+    bool permit2 = false;
+    bool malformed = false;
+    bool bridge = false;
+    bool liquidity = false;
+    bool aggregator = false;
+    bool v4 = false;
+    bool targetedMulticall = false;
+    bool universalSubPlan = false;
+    bool acrossBridge = false;
+    bool v4ActionsDecoded = false;
+
+    TxOperation operation = TxOperation::UNKNOWN;
+
+    std::string selector;
+    std::string functionName;
+    std::string protocol;
+    std::string router;
+    std::string recipient;
+
+    std::string tokenIn;
+    std::string tokenOut;
+    std::string secondaryToken;
+    std::vector<std::string> path;
+
+    cpp_int amountIn = 0;
+    cpp_int amountOut = 0;
+    cpp_int amountOutMin = 0;
+    cpp_int amountInMax = 0;
+    cpp_int nativeValue = 0;
+
+    std::vector<DecodedIntent> children;
+};
+
 struct TxResult {
     bool valid = false;
     bool isSwap = false;
@@ -33,36 +89,32 @@ struct TxResult {
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
 
-    // Calldata decoder diagnostics. These fields do not change the public
-    // analyzeTx(...) entry point and are safe for optional statistics.
     bool calldataDecoded = false;
     bool calldataSwap = false;
     bool calldataMatched = false;
     bool calldataRecovered = false;
+    bool permit2Decoded = false;
+    bool liquidityDecoded = false;
+    bool bridgeDecoded = false;
+    bool aggregatorDecoded = false;
+    bool v4Decoded = false;
+    bool targetedMulticallDecoded = false;
+    bool universalSubPlanDecoded = false;
+    bool acrossBridgeDecoded = false;
+    bool v4ActionsDecoded = false;
+
     std::string decodedSelector;
     std::string decodedFunction;
     std::string decodedTokenIn;
     std::string decodedTokenOut;
-
     std::string unknownReason;
 };
 
-enum class RouterType {
-    UNKNOWN,
-    V2,
-    V3,
-    V4,
-    UNIVERSAL,
-    AGGREGATOR,
-    BRIDGE,
-    STAKING,
-    NFT
-};
-
-struct ProtocolInfo {
+struct RouterInfo {
     std::string protocol;
     std::string version;
-    RouterType routerType = RouterType::UNKNOWN;
+    std::string routerType;
+
     bool supportsV2 = false;
     bool supportsV3 = false;
     bool supportsV4 = false;
@@ -82,16 +134,21 @@ struct ChainContext {
     std::set<std::string> baseAssets;
     std::set<std::string> stablecoins;
 
-    // Backward-compatible registry used by the rest of the project.
+    // Backward-compatible registry.
     std::map<std::string, std::string> routers;
 
-    // Extended registries for new analyzer pipeline.
-    std::map<std::string, ProtocolInfo> protocols;
+    // Extended registries for future stages.
+    std::map<std::string, RouterInfo> routerInfo;
     std::set<std::string> aggregators;
     std::set<std::string> bridges;
     std::set<std::string> staking;
-    std::set<std::string> permit2;
-    std::set<std::string> multicall;
+    std::set<std::string> permit2Contracts;
+    std::set<std::string> multicallContracts;
+
+    // selector -> human-readable function name / operation hint.
+    std::map<std::string, std::string> selectorNames;
+    std::set<std::string> aggregatorSwapSelectors;
+    std::set<std::string> bridgeSelectors;
 };
 
 const ChainContext& chainCtx();
@@ -107,6 +164,8 @@ extern const std::string NATIVE_BNB_MARKER;
 
 bool isBaseAsset(const std::string& a);
 bool isStablecoin(const std::string& a);
+bool isNativeAsset(const std::string& a);
+bool isQuoteAsset(const std::string& a);
 std::string lookupRouterLabel(const std::string& addr);
 
 cpp_int parseUint256(const std::string& h);
@@ -116,6 +175,8 @@ cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn);
 std::string formatUsd(const cpp_int& n);
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec);
 std::string formatPriceUsd(const cpp_int& n);
+
+DecodedIntent decodeTransactionInput(const nlohmann::json& tx);
 
 TxResult analyzeTx(
     const nlohmann::json& tx,
