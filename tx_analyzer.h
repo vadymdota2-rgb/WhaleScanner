@@ -25,8 +25,6 @@ struct TxResult {
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
     std::string unknownReason;
-    bool calldataDecoded = false;
-    bool intentGuided = false;
 };
 
 struct ChainContext {
