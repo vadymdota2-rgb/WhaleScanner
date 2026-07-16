@@ -40,7 +40,6 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
-
     std::atomic<uint64_t> cov_buy{0};
     std::atomic<uint64_t> cov_sell{0};
     std::atomic<uint64_t> cov_lp_add{0};
@@ -49,7 +48,6 @@ struct Stats {
     std::atomic<uint64_t> cov_unwrap{0};
     std::atomic<uint64_t> cov_transfer{0};
     std::atomic<uint64_t> cov_unknown{0};
-
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
     std::atomic<uint64_t> sig_multicall{0};
@@ -57,125 +55,19 @@ struct Stats {
     std::atomic<uint64_t> sig_lp_mint_burn{0};
     std::atomic<uint64_t> sig_lp_pool_identity{0};
     std::atomic<uint64_t> sig_lp_v3_event{0};
-
-    std::atomic<uint64_t> decoded_calls{0};
-    std::atomic<uint64_t> decoded_swaps{0};
-    std::atomic<uint64_t> decoded_recovered{0};
-    std::atomic<uint64_t> decoded_permit2{0};
-    std::atomic<uint64_t> decoded_liquidity{0};
-    std::atomic<uint64_t> decoded_bridge{0};
-    std::atomic<uint64_t> decoded_aggregator{0};
-    std::atomic<uint64_t> decoded_v4{0};
-    std::atomic<uint64_t> decoded_targeted_multicall{0};
-    std::atomic<uint64_t> decoded_subplans{0};
-    std::atomic<uint64_t> decoded_across_bridge{0};
-    std::atomic<uint64_t> decoded_v4_actions{0};
-
     std::atomic<uint64_t> unk_no_counter_flow{0};
     std::atomic<uint64_t> unk_unknown_router{0};
-    std::atomic<uint64_t> unk_decoded_no_match{0};
-    std::atomic<uint64_t> unk_permit2_no_match{0};
-    std::atomic<uint64_t> unk_bridge_flow{0};
-    std::atomic<uint64_t> unk_aggregator_no_match{0};
-    std::atomic<uint64_t> unk_v4_no_match{0};
-    std::atomic<uint64_t> unk_multicall_no_match{0};
-    std::atomic<uint64_t> unk_subplan_no_match{0};
-    std::atomic<uint64_t> unk_v4_actions_undecoded{0};
     std::atomic<uint64_t> unk_other{0};
-
-    std::atomic<uint64_t> graph_seen{0};
-    std::atomic<uint64_t> graph_path_to_pool{0};
-    std::atomic<uint64_t> graph_path_from_pool{0};
-    std::atomic<uint64_t> graph_recovered{0};
-    std::atomic<uint64_t> graph_ambiguous{0};
-    std::atomic<uint64_t> unk_graph_no_pool_path{0};
-    std::atomic<uint64_t> unk_graph_ambiguous{0};
-    std::atomic<uint64_t> unk_no_direct_counter{0};
-
-    std::atomic<uint64_t> sig_wallet_swap_related{0};
-    std::atomic<uint64_t> sig_unrelated_swap_event{0};
-
-    std::atomic<uint64_t> classified_direct_flow{0};
-    std::atomic<uint64_t> classified_calldata{0};
-    std::atomic<uint64_t> classified_graph{0};
-    std::atomic<uint64_t> classified_fallback{0};
-    std::atomic<uint64_t> unsupported_selectors{0};
-    std::atomic<uint64_t> unk_unsupported_selector{0};
-
-    std::atomic<uint64_t> token_transfer_calls{0};
-    std::atomic<uint64_t> token_approval_calls{0};
-    std::atomic<uint64_t> self_calls{0};
-    std::atomic<uint64_t> okx_dag_swaps{0};
-    std::atomic<uint64_t> targeted_executor_swaps{0};
 } g_stats;
 
-std::mutex selectorStatsMutex;
-std::unordered_map<std::string, uint64_t> selectorStats;
-
-void recordSelectorStat(const TxResult& r) {
-    if (!r.unsupportedSelector || r.decodedSelector.empty()) return;
-    const std::string key = r.decodedSelector + "|" + r.callTarget;
-    std::lock_guard<std::mutex> lock(selectorStatsMutex);
-    selectorStats[key]++;
-}
-
-std::string buildSelectorStatsText(size_t limit = 30) {
-    std::vector<std::pair<std::string, uint64_t>> rows;
-    {
-        std::lock_guard<std::mutex> lock(selectorStatsMutex);
-        rows.reserve(selectorStats.size());
-        for (const auto& item : selectorStats) rows.push_back(item);
-    }
-
-    std::sort(rows.begin(), rows.end(),
-        [](const auto& a, const auto& b) { return a.second > b.second; });
-
-    uint64_t total = 0;
-    for (const auto& row : rows) total += row.second;
-
-    std::stringstream out;
-    out << "🧬 <b>Unsupported selectors</b>\n"
-        << "Total: <b>" << total << "</b>\n"
-        << "Unique selector/target pairs: <b>" << rows.size() << "</b>\n\n";
-    if (rows.empty()) {
-        out << "No unsupported wallet call selectors recorded.";
-        return out.str();
-    }
-
-    const size_t count = std::min(limit, rows.size());
-    for (size_t i = 0; i < count; ++i) {
-        const std::string& key = rows[i].first;
-        const size_t sep = key.find('|');
-        const std::string selector = sep == std::string::npos ? key : key.substr(0, sep);
-        const std::string target = sep == std::string::npos ? "" : key.substr(sep + 1);
-
-        out << "<b>" << rows[i].second << "×</b> <code>0x"
-            << safeString(selector, 8) << "</code>";
-        if (!target.empty())
-            out << " → <code>" << safeString(target, 42) << "</code>";
-        out << "\n";
-    }
-    return out.str();
-}
-
 void recordCoverage(const TxResult& r) {
-    if (r.venue == "Add Liquidity") {
-        g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
-    } else if (r.venue == "Remove Liquidity") {
-        g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
-    } else if (r.venue == "Wrap") {
-        g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
-    } else if (r.venue == "Unwrap") {
-        g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
-    } else if (r.isSwap) {
-        if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed);
-        else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed);
-    } else if (r.dexActivityDetected) {
-        g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
-    }
-
+    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
+    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
+    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -183,97 +75,9 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-
-    if (r.calldataDecoded) g_stats.decoded_calls.fetch_add(1, std::memory_order_relaxed);
-    if (r.calldataSwap) g_stats.decoded_swaps.fetch_add(1, std::memory_order_relaxed);
-    if (r.calldataRecovered) g_stats.decoded_recovered.fetch_add(1, std::memory_order_relaxed);
-    if (r.permit2Decoded) g_stats.decoded_permit2.fetch_add(1, std::memory_order_relaxed);
-    if (r.liquidityDecoded) g_stats.decoded_liquidity.fetch_add(1, std::memory_order_relaxed);
-    if (r.bridgeDecoded) g_stats.decoded_bridge.fetch_add(1, std::memory_order_relaxed);
-    if (r.aggregatorDecoded) g_stats.decoded_aggregator.fetch_add(1, std::memory_order_relaxed);
-    if (r.v4Decoded) g_stats.decoded_v4.fetch_add(1, std::memory_order_relaxed);
-    if (r.targetedMulticallDecoded) g_stats.decoded_targeted_multicall.fetch_add(1, std::memory_order_relaxed);
-    if (r.universalSubPlanDecoded) g_stats.decoded_subplans.fetch_add(1, std::memory_order_relaxed);
-    if (r.acrossBridgeDecoded) g_stats.decoded_across_bridge.fetch_add(1, std::memory_order_relaxed);
-    if (r.v4ActionsDecoded) g_stats.decoded_v4_actions.fetch_add(1, std::memory_order_relaxed);
-
-    if (r.transferGraphSeen) g_stats.graph_seen.fetch_add(1, std::memory_order_relaxed);
-    if (r.graphPathToPool) g_stats.graph_path_to_pool.fetch_add(1, std::memory_order_relaxed);
-    if (r.graphPathFromPool) g_stats.graph_path_from_pool.fetch_add(1, std::memory_order_relaxed);
-    if (r.graphRecovered) g_stats.graph_recovered.fetch_add(1, std::memory_order_relaxed);
-    if (r.graphAmbiguous) g_stats.graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
-
-    if (r.walletSwapRelated)
-        g_stats.sig_wallet_swap_related.fetch_add(1, std::memory_order_relaxed);
-    if (r.unrelatedSwapEvent)
-        g_stats.sig_unrelated_swap_event.fetch_add(1, std::memory_order_relaxed);
-
-    if (r.classifiedByDirectFlow)
-        g_stats.classified_direct_flow.fetch_add(1, std::memory_order_relaxed);
-    if (r.classifiedByCalldata)
-        g_stats.classified_calldata.fetch_add(1, std::memory_order_relaxed);
-    if (r.classifiedByGraph)
-        g_stats.classified_graph.fetch_add(1, std::memory_order_relaxed);
-    if (r.classifiedByFallback)
-        g_stats.classified_fallback.fetch_add(1, std::memory_order_relaxed);
-    if (r.standardTokenCall) {
-        if (r.approvalCall)
-            g_stats.token_approval_calls.fetch_add(1, std::memory_order_relaxed);
-        else
-            g_stats.token_transfer_calls.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (r.selfCall)
-        g_stats.self_calls.fetch_add(1, std::memory_order_relaxed);
-    if (r.okxDagSwapDecoded)
-        g_stats.okx_dag_swaps.fetch_add(1, std::memory_order_relaxed);
-    if (r.targetedExecutorDecoded)
-        g_stats.targeted_executor_swaps.fetch_add(1, std::memory_order_relaxed);
-
-    if (r.unsupportedSelector) {
-        g_stats.unsupported_selectors.fetch_add(1, std::memory_order_relaxed);
-        recordSelectorStat(r);
-    }
-
-    const bool finalUnknown =
-        !r.isSwap &&
-        r.dexActivityDetected &&
-        r.venue != "Add Liquidity" &&
-        r.venue != "Remove Liquidity" &&
-        r.venue != "Wrap" &&
-        r.venue != "Unwrap";
-
-    if (!finalUnknown) return;
-
-    if (r.unknownReason == "NO_COUNTER_FLOW")
-        g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "NO_DIRECT_COUNTER_FLOW")
-        g_stats.unk_no_direct_counter.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "GRAPH_NO_POOL_PATH")
-        g_stats.unk_graph_no_pool_path.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "GRAPH_AMBIGUOUS_PATH")
-        g_stats.unk_graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNKNOWN_ROUTER")
-        g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "DECODED_NO_RECEIPT_MATCH")
-        g_stats.unk_decoded_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "PERMIT2_NO_SWAP_MATCH")
-        g_stats.unk_permit2_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "BRIDGE_FLOW")
-        g_stats.unk_bridge_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "AGGREGATOR_NO_FLOW_MATCH")
-        g_stats.unk_aggregator_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "V4_NO_FLOW_MATCH")
-        g_stats.unk_v4_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "MULTICALL_NO_FLOW_MATCH")
-        g_stats.unk_multicall_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "SUBPLAN_NO_FLOW_MATCH")
-        g_stats.unk_subplan_no_match.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "V4_ACTIONS_UNDECODED")
-        g_stats.unk_v4_actions_undecoded.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNSUPPORTED_SELECTOR")
-        g_stats.unk_unsupported_selector.fetch_add(1, std::memory_order_relaxed);
-    else
-        g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
+    if (r.unknownReason == "NO_COUNTER_FLOW") g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNKNOWN_ROUTER") g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "OTHER") g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -335,31 +139,6 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " token=" << res.tokenAddr << " counter=" << res.counterAddr
        << " usdNanos=" << res.usdNanos.convert_to<std::string>()
        << " whyUnknown=" << (res.unknownReason.empty() ? "-" : res.unknownReason)
-       << " decoded=" << (res.calldataDecoded ? 1 : 0)
-       << " decodedSwap=" << (res.calldataSwap ? 1 : 0)
-       << " recovered=" << (res.calldataRecovered ? 1 : 0)
-       << " selector=" << (res.decodedSelector.empty() ? "-" : res.decodedSelector)
-       << " function=" << (res.decodedFunction.empty() ? "-" : res.decodedFunction)
-       << " decodedIn=" << (res.decodedTokenIn.empty() ? "-" : res.decodedTokenIn)
-       << " decodedOut=" << (res.decodedTokenOut.empty() ? "-" : res.decodedTokenOut)
-       << " graphSeen=" << (res.transferGraphSeen ? 1 : 0)
-       << " graphToPool=" << (res.graphPathToPool ? 1 : 0)
-       << " graphFromPool=" << (res.graphPathFromPool ? 1 : 0)
-       << " graphRecovered=" << (res.graphRecovered ? 1 : 0)
-       << " graphAmbiguous=" << (res.graphAmbiguous ? 1 : 0)
-       << " walletSwapRelated=" << (res.walletSwapRelated ? 1 : 0)
-       << " unrelatedSwapEvent=" << (res.unrelatedSwapEvent ? 1 : 0)
-       << " unsupportedSelector=" << (res.unsupportedSelector ? 1 : 0)
-       << " target=" << (res.callTarget.empty() ? "-" : res.callTarget)
-       << " byDirect=" << (res.classifiedByDirectFlow ? 1 : 0)
-       << " byCalldata=" << (res.classifiedByCalldata ? 1 : 0)
-       << " byGraph=" << (res.classifiedByGraph ? 1 : 0)
-       << " byFallback=" << (res.classifiedByFallback ? 1 : 0)
-       << " standardTokenCall=" << (res.standardTokenCall ? 1 : 0)
-       << " approvalCall=" << (res.approvalCall ? 1 : 0)
-       << " selfCall=" << (res.selfCall ? 1 : 0)
-       << " okxDagSwap=" << (res.okxDagSwapDecoded ? 1 : 0)
-       << " targetedExecutor=" << (res.targetedExecutorDecoded ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1955,69 +1734,17 @@ void telegramLoop() {
                                     << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
                                     << "\n📦 Multicall: " << g_stats.sig_multicall.load()
                                     << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
-                                    << "\n✅ Wallet-related swap: " << g_stats.sig_wallet_swap_related.load()
-                                    << "\n⚪ Unrelated swap event: " << g_stats.sig_unrelated_swap_event.load()
                                     << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
                                     << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
-                                    << "\n\n🧩 <b>Calldata decoder</b>\n"
-                                    << "Decoded calls: " << g_stats.decoded_calls.load()
-                                    << "\nDecoded swaps: " << g_stats.decoded_swaps.load()
-                                    << "\nRecovered BUY/SELL: " << g_stats.decoded_recovered.load()
-                                    << "\nPermit2 decoded: " << g_stats.decoded_permit2.load()
-                                    << "\nLiquidity decoded: " << g_stats.decoded_liquidity.load()
-                                    << "\nBridge decoded: " << g_stats.decoded_bridge.load()
-                                    << "\nAggregator decoded: " << g_stats.decoded_aggregator.load()
-                                    << "\nV4 decoded: " << g_stats.decoded_v4.load()
-                                    << "\nTargeted multicall: " << g_stats.decoded_targeted_multicall.load()
-                                    << "\nUniversal subplans: " << g_stats.decoded_subplans.load()
-                                    << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
-                                    << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
-                                    << "\nUnsupported selectors: " << g_stats.unsupported_selectors.load()
-                                    << "\n\n📦 <b>Standard calls</b>\n"
-                                    << "ERC20 transfer calls: " << g_stats.token_transfer_calls.load()
-                                    << "\nERC20 approval calls: " << g_stats.token_approval_calls.load()
-                                    << "\nWallet self-calls: " << g_stats.self_calls.load()
-                                    << "\nOKX dag swaps: " << g_stats.okx_dag_swaps.load()
-                                    << "\nTargeted executor swaps: " << g_stats.targeted_executor_swaps.load()
-                                    << "\n\n🧭 <b>Swap classification source</b>\n"
-                                    << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
-                                    << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
-                                    << "\nTransfer graph: " << g_stats.classified_graph.load()
-                                    << "\nFallback: " << g_stats.classified_fallback.load()
-                                    << "\n\n🕸 <b>Receipt transfer graph</b>\n"
-                                    << "Graph tx: " << g_stats.graph_seen.load()
-                                    << "\nPath wallet → pool: " << g_stats.graph_path_to_pool.load()
-                                    << "\nPath pool → recipient: " << g_stats.graph_path_from_pool.load()
-                                    << "\nRecovered BUY/SELL: " << g_stats.graph_recovered.load()
-                                    << "\nAmbiguous paths: " << g_stats.graph_ambiguous.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "No counter flow (legacy): " << g_stats.unk_no_counter_flow.load()
-                                    << "\nNo direct counter flow: " << g_stats.unk_no_direct_counter.load()
-                                    << "\nGraph no pool path: " << g_stats.unk_graph_no_pool_path.load()
-                                    << "\nGraph ambiguous: " << g_stats.unk_graph_ambiguous.load()
+                                    << "No counter flow: " << g_stats.unk_no_counter_flow.load()
                                     << "\nUnknown router: " << g_stats.unk_unknown_router.load()
-                                    << "\nDecoded/no receipt match: " << g_stats.unk_decoded_no_match.load()
-                                    << "\nPermit2/no swap match: " << g_stats.unk_permit2_no_match.load()
-                                    << "\nBridge flow: " << g_stats.unk_bridge_flow.load()
-                                    << "\nAggregator/no match: " << g_stats.unk_aggregator_no_match.load()
-                                    << "\nV4/no match: " << g_stats.unk_v4_no_match.load()
-                                    << "\nMulticall/no match: " << g_stats.unk_multicall_no_match.load()
-                                    << "\nSubplan/no match: " << g_stats.unk_subplan_no_match.load()
-                                    << "\nV4 actions undecoded: " << g_stats.unk_v4_actions_undecoded.load()
-                                    << "\nUnsupported selector: " << g_stats.unk_unsupported_selector.load()
                                     << "\nOther: " << g_stats.unk_other.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
-                        }
-                    }
-                    else if (txt=="/selectors") {
-                        if (cid != OWNER_CHAT_ID) {
-                            sendMsg(cid, "Access denied.");
-                        } else {
-                            sendMsg(cid, buildSelectorStatsText());
                         }
                     }
                     else if (txt=="/help") {
