@@ -24,7 +24,6 @@ struct TxResult {
     bool lpMintOrBurnSeen = false;
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
-    std::string unknownReason;
 };
 
 struct ChainContext {
