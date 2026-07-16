@@ -47,6 +47,7 @@ struct DecodedIntent {
     bool approvalCall = false;
     bool selfCall = false;
     bool okxDagSwap = false;
+    bool targetedExecutor = false;
 
     TxOperation operation = TxOperation::UNKNOWN;
 
@@ -126,6 +127,7 @@ struct TxResult {
     bool approvalCall = false;
     bool selfCall = false;
     bool okxDagSwapDecoded = false;
+    bool targetedExecutorDecoded = false;
 
     std::string callTarget;
     std::string decodedSelector;
