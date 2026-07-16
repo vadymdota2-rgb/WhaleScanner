@@ -437,6 +437,14 @@ UniversalRouterCommands parseExecuteCommands(const std::string& input) {
     return out;
 }
 
+struct TransferEdge {
+    std::string token;
+    std::string from;
+    std::string to;
+    cpp_int amount = 0;
+    size_t logIndex = 0;
+};
+
 struct ParsedReceipt {
     bool valid = false;
     bool anyWalletTransfer = false;
@@ -457,6 +465,7 @@ struct ParsedReceipt {
     std::map<std::string, std::set<std::string>> outDestinations;
     std::set<std::string> inCounterparties;
     std::set<std::string> outCounterparties;
+    std::vector<TransferEdge> transfers;
 
     std::string firstCounterparty;
     size_t firstSwapDataHexLen = 0;
@@ -493,7 +502,8 @@ ParsedReceipt parseReceipt(const json& receipt, const std::string& wallet) {
         }
     };
 
-    for (const auto& log : receipt["logs"]) {
+    for (size_t logIndex = 0; logIndex < receipt["logs"].size(); ++logIndex) {
+        const auto& log = receipt["logs"][logIndex];
         if (!log.is_object() || !log.contains("topics") || !log["topics"].is_array() ||
             log["topics"].empty() || !log["topics"][0].is_string()) continue;
 
@@ -540,10 +550,13 @@ ParsedReceipt parseReceipt(const json& receipt, const std::string& wallet) {
 
         const std::string from = "0x" + toLower(t1.substr(26));
         const std::string to = "0x" + toLower(t2.substr(26));
-        if (from != wallet && to != wallet) continue;
 
         const cpp_int amount = parseUint256(log["data"].get<std::string>());
         if (amount == 0) continue;
+
+        out.transfers.push_back(TransferEdge{logAddr, from, to, amount, logIndex});
+
+        if (from != wallet && to != wallet) continue;
 
         touch(logAddr);
         out.anyWalletTransfer = true;
@@ -578,6 +591,109 @@ bool sourceMatchesPool(const ParsedReceipt& p, const std::string& token, bool in
         if (p.swapPools.count(addr)) return true;
     }
     return false;
+}
+
+
+struct GraphPathResult {
+    bool found = false;
+    bool ambiguous = false;
+    cpp_int amount = 0;
+    std::vector<size_t> edges;
+};
+
+bool isGraphTerminal(const std::string& address) {
+    return address.empty() || address == ZERO_ADDR || address == DEAD_ADDR;
+}
+
+void dfsTransferPath(const ParsedReceipt& parsed,
+                     const std::string& token,
+                     const std::string& current,
+                     const std::set<std::string>& targets,
+                     size_t minLogIndex,
+                     int depth,
+                     std::set<std::string>& visitedAddresses,
+                     std::vector<size_t>& path,
+                     std::vector<std::vector<size_t>>& matches) {
+    if (depth > 6 || matches.size() > 4) return;
+    if (targets.count(current)) {
+        matches.push_back(path);
+        return;
+    }
+    if (isGraphTerminal(current) || visitedAddresses.count(current)) return;
+
+    visitedAddresses.insert(current);
+    for (size_t i = 0; i < parsed.transfers.size(); ++i) {
+        const TransferEdge& edge = parsed.transfers[i];
+        if (edge.token != token || edge.from != current || edge.logIndex < minLogIndex) continue;
+        if (isGraphTerminal(edge.to)) continue;
+
+        path.push_back(i);
+        dfsTransferPath(
+            parsed, token, edge.to, targets, edge.logIndex + 1,
+            depth + 1, visitedAddresses, path, matches
+        );
+        path.pop_back();
+    }
+    visitedAddresses.erase(current);
+}
+
+GraphPathResult findTransferPath(const ParsedReceipt& parsed,
+                                 const std::string& token,
+                                 const std::set<std::string>& starts,
+                                 const std::set<std::string>& targets) {
+    GraphPathResult result;
+    std::vector<std::vector<size_t>> matches;
+
+    for (const std::string& start : starts) {
+        if (isGraphTerminal(start)) continue;
+        std::set<std::string> visited;
+        std::vector<size_t> path;
+        dfsTransferPath(parsed, token, start, targets, 0, 0, visited, path, matches);
+        if (matches.size() > 4) break;
+    }
+
+    if (matches.empty()) return result;
+    result.found = true;
+    result.ambiguous = matches.size() > 1;
+
+    // Prefer the shortest route. Its limiting amount is the minimum edge amount.
+    const auto best = std::min_element(
+        matches.begin(), matches.end(),
+        [](const auto& a, const auto& b) { return a.size() < b.size(); }
+    );
+    result.edges = *best;
+
+    if (!result.edges.empty()) {
+        result.amount = parsed.transfers[result.edges.front()].amount;
+        for (size_t edgeIndex : result.edges)
+            result.amount = std::min(result.amount, parsed.transfers[edgeIndex].amount);
+    }
+    return result;
+}
+
+GraphPathResult walletToPoolPath(const ParsedReceipt& parsed,
+                                 const std::string& token,
+                                 const std::string& wallet) {
+    return findTransferPath(parsed, token, {wallet}, parsed.swapPools);
+}
+
+GraphPathResult poolToRecipientsPath(const ParsedReceipt& parsed,
+                                     const std::string& token,
+                                     const std::set<std::string>& recipients) {
+    return findTransferPath(parsed, token, parsed.swapPools, recipients);
+}
+
+bool graphMatchesPool(const ParsedReceipt& parsed,
+                      const std::string& token,
+                      const std::string& wallet,
+                      bool incoming,
+                      const std::set<std::string>& recipients,
+                      GraphPathResult* detail = nullptr) {
+    GraphPathResult path = incoming
+        ? poolToRecipientsPath(parsed, token, recipients)
+        : walletToPoolPath(parsed, token, wallet);
+    if (detail) *detail = path;
+    return path.found;
 }
 
 DecodedIntent decodeV2(const json& tx, const AbiReader& abi,
@@ -1982,7 +2098,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     result.lpV3EventSeen = parsed.v3Increase || parsed.v3Decrease || parsed.v3Collect;
     result.lpPoolIdentitySeen = false;
     for (const auto& token : parsed.tokenOrder) {
-        if (sourceMatchesPool(parsed, token, parsed.netFlow[token] > 0)) {
+        if (sourceMatchesPool(parsed, token, parsed.netFlow[token] > 0) ||
+            graphMatchesPool(parsed, token, wallet, parsed.netFlow[token] > 0, {wallet})) {
             result.lpPoolIdentitySeen = true;
             break;
         }
@@ -2003,7 +2120,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         const bool coherent =
             (net > 0 && (hasBaseOut || nativeSwapSignal)) ||
             (net < 0 && (hasBaseIn || nativeInflowSignal));
-        const bool poolRelated = sourceMatchesPool(parsed, token, net > 0);
+        const bool poolRelated =
+            sourceMatchesPool(parsed, token, net > 0) ||
+            graphMatchesPool(parsed, token, wallet, net > 0, {wallet});
 
         const bool better =
             bestNonBase.empty() ||
@@ -2223,6 +2342,140 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         }
     }
 
+    // Receipt transfer-graph recovery. This handles wallet -> router -> pool and
+    // pool -> router -> recipient chains that direct wallet netFlow cannot pair.
+    if (!result.isSwap && !lpAdd && !lpRemove && parsed.hasSwapEvent) {
+        result.transferGraphSeen = !parsed.transfers.empty();
+
+        std::set<std::string> recipients = {wallet};
+        if (decoded.valid && !decoded.recipient.empty())
+            recipients.insert(toLower(decoded.recipient));
+
+        struct Candidate {
+            std::string token;
+            cpp_int net = 0;
+            cpp_int amount = 0;
+            bool incoming = false;
+            bool ambiguous = false;
+        };
+
+        std::vector<Candidate> candidates;
+        for (const std::string& token : parsed.tokenOrder) {
+            if (isBaseAsset(token)) continue;
+            const cpp_int net = parsed.netFlow[token];
+            if (net == 0) continue;
+
+            GraphPathResult path;
+            const bool incoming = net > 0;
+            if (!graphMatchesPool(parsed, token, wallet, incoming, recipients, &path))
+                continue;
+
+            if (incoming) result.graphPathFromPool = true;
+            else result.graphPathToPool = true;
+
+            candidates.push_back(Candidate{
+                token, net, path.amount > 0 ? path.amount : absInt(net),
+                incoming, path.ambiguous
+            });
+        }
+
+        if (candidates.size() == 1) {
+            const Candidate& main = candidates.front();
+            const bool intentSupportsSwap =
+                decoded.swap || routerCall || knownRouter || ur.present;
+
+            bool directionSupported = false;
+            if (main.incoming) {
+                directionSupported =
+                    nativeSwapSignal || hasBaseOut ||
+                    (decoded.swap && (decoded.tokenOut.empty() ||
+                     toLower(decoded.tokenOut) == main.token));
+            } else {
+                directionSupported =
+                    nativeInflowSignal || hasBaseIn ||
+                    intentSupportsSwap;
+            }
+
+            if (directionSupported) {
+                result.isSwap = true;
+                result.isBuy = main.incoming;
+                result.tokenAddr = main.token;
+                result.rawAmount = absInt(main.net);
+                if (result.rawAmount == 0) result.rawAmount = main.amount;
+                result.graphRecovered = result.rawAmount > 0;
+                result.graphAmbiguous = main.ambiguous;
+
+                // First try a directly observed opposite wallet flow.
+                cpp_int bestCounterAmount = 0;
+                std::string bestCounter;
+                for (const std::string& token : parsed.tokenOrder) {
+                    if (token == main.token) continue;
+                    const cpp_int net = parsed.netFlow[token];
+                    if ((result.isBuy && net >= 0) || (!result.isBuy && net <= 0))
+                        continue;
+
+                    const cpp_int magnitude = absInt(net);
+                    if (bestCounter.empty() ||
+                        (isBaseAsset(token) && !isBaseAsset(bestCounter)) ||
+                        (isBaseAsset(token) == isBaseAsset(bestCounter) &&
+                         magnitude > bestCounterAmount)) {
+                        bestCounter = token;
+                        bestCounterAmount = magnitude;
+                    }
+                }
+
+                // Then search the full transfer graph for the missing counter side.
+                if (bestCounter.empty()) {
+                    for (const TransferEdge& edge : parsed.transfers) {
+                        if (edge.token == main.token || isGraphTerminal(edge.token)) continue;
+
+                        GraphPathResult counterPath = result.isBuy
+                            ? walletToPoolPath(parsed, edge.token, wallet)
+                            : poolToRecipientsPath(parsed, edge.token, recipients);
+
+                        if (!counterPath.found || counterPath.amount <= 0) continue;
+                        if (bestCounter.empty() ||
+                            (isBaseAsset(edge.token) && !isBaseAsset(bestCounter)) ||
+                            (isBaseAsset(edge.token) == isBaseAsset(bestCounter) &&
+                             counterPath.amount > bestCounterAmount)) {
+                            bestCounter = edge.token;
+                            bestCounterAmount = counterPath.amount;
+                            result.graphAmbiguous =
+                                result.graphAmbiguous || counterPath.ambiguous;
+                        }
+                    }
+                }
+
+                if (bestCounter.empty() && result.isBuy && nativeSwapSignal) {
+                    bestCounter = chainCtx().nativeMarker;
+                    bestCounterAmount = nativeOut;
+                } else if (bestCounter.empty() && !result.isBuy && nativeInflowSignal) {
+                    bestCounter = chainCtx().nativeMarker;
+                    bestCounterAmount = nativeIn;
+                } else if (bestCounter.empty() && decoded.swap) {
+                    bestCounter = result.isBuy ? decoded.tokenIn : decoded.tokenOut;
+                    if (result.isBuy)
+                        bestCounterAmount = decoded.amountIn > 0
+                            ? decoded.amountIn : decoded.amountInMax;
+                    else
+                        bestCounterAmount = decoded.amountOut > 0
+                            ? decoded.amountOut : decoded.amountOutMin;
+                }
+
+                result.counterAddr = bestCounter;
+                result.counterAmount = bestCounterAmount;
+                result.calldataMatched = result.calldataMatched || decoded.swap;
+
+                if (result.venue.empty())
+                    result.venue = decoded.protocol.empty()
+                        ? "Receipt Transfer Graph"
+                        : decoded.protocol;
+            }
+        } else if (candidates.size() > 1) {
+            result.graphAmbiguous = true;
+        }
+    }
+
     if (!result.tokenAddr.empty()) {
         const int decimals = isNativeAsset(result.tokenAddr) ? 18 : getDecimals(result.tokenAddr);
         const uint64_t price = isNativeAsset(result.tokenAddr)
@@ -2254,8 +2507,13 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                 result.unknownReason = "SUBPLAN_NO_FLOW_MATCH";
             else if (decoded.valid && decoded.v4 && !decoded.v4ActionsDecoded)
                 result.unknownReason = "V4_ACTIONS_UNDECODED";
+            else if (result.transferGraphSeen && result.graphAmbiguous)
+                result.unknownReason = "GRAPH_AMBIGUOUS_PATH";
+            else if (result.transferGraphSeen &&
+                     !result.graphPathToPool && !result.graphPathFromPool)
+                result.unknownReason = "GRAPH_NO_POOL_PATH";
             else
-                result.unknownReason = "NO_COUNTER_FLOW";
+                result.unknownReason = "NO_DIRECT_COUNTER_FLOW";
         } else if (parsed.hasSwapEvent && !routerCall) {
             result.unknownReason = "UNKNOWN_ROUTER";
         } else {
