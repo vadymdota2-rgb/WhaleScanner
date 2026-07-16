@@ -112,6 +112,13 @@ struct TxResult {
     bool walletSwapRelated = false;
     bool unrelatedSwapEvent = false;
 
+    bool unsupportedSelector = false;
+    bool classifiedByDirectFlow = false;
+    bool classifiedByCalldata = false;
+    bool classifiedByGraph = false;
+    bool classifiedByFallback = false;
+
+    std::string callTarget;
     std::string decodedSelector;
     std::string decodedFunction;
     std::string decodedTokenIn;
