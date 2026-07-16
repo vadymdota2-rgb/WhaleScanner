@@ -879,6 +879,9 @@ V4ActionSummary decodeV4ActionsPayload(const std::string& payload) {
     return summary;
 }
 
+DecodedIntent decodeLiquidity(const json& tx, const AbiReader& abi,
+                              const std::string& router, const std::string& protocol);
+
 DecodedIntent decodeUniversal(const json& tx, const AbiReader& abi,
                               const std::string& router, const std::string& protocol,
                               int depth) {
