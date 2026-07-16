@@ -109,6 +109,9 @@ struct TxResult {
     bool graphRecovered = false;
     bool graphAmbiguous = false;
 
+    bool walletSwapRelated = false;
+    bool unrelatedSwapEvent = false;
+
     std::string decodedSelector;
     std::string decodedFunction;
     std::string decodedTokenIn;
