@@ -286,7 +286,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
     bool hasSwap=false;
     std::string swapLogAddr;
-    std::set<std::string> allSwapPoolAddrs;
     size_t swapLogDataHexLen=0;
     cpp_int wbnbWrapped = 0;
     cpp_int wbnbUnwrapped = 0;
@@ -315,7 +314,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
         if (SWAP_EVENT_TOPICS.count(t0)) {
             hasSwap = true;
-            if (!logAddr.empty()) allSwapPoolAddrs.insert(logAddr);
             if (swapLogAddr.empty()) {
                 swapLogAddr = logAddr;
                 if (l.contains("data") && l["data"].is_string()) {
@@ -411,7 +409,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     }
     r.valid = true;
 
-    if (r.venue.empty()) for (auto& addr : allSwapPoolAddrs) { r.venue = lookupRouterLabel(addr); if (!r.venue.empty()) break; }
+    if (!swapLogAddr.empty()) r.venue = lookupRouterLabel(swapLogAddr);
     if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
     if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
     if (r.venue.empty() && urCmds.present) {
@@ -503,8 +501,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (net == 0) continue;
         cpp_int absNet = net >= 0 ? net : -net;
         bool coherent = (net > 0 && hasBaseOut) || (net < 0 && hasBaseIn);
-        bool fromPool = (net > 0) && inSources.count(tok) &&
-                         [&]() { for (auto& s : inSources[tok]) if (allSwapPoolAddrs.count(s)) return true; return false; }();
+        bool fromPool = (net > 0) && !swapLogAddr.empty() && inSources.count(tok) && inSources[tok].count(swapLogAddr) > 0;
         bool better = bestNonBaseTok.empty() ||
                       (coherent && !bestNonBaseCoherent) ||
                       (coherent == bestNonBaseCoherent && fromPool && !bestNonBaseFromPool) ||
@@ -628,10 +625,5 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
     r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
     r.dexActivityDetected = hasSwap || routerCall;
-    if (!r.isSwap && r.venue.empty() && r.dexActivityDetected) {
-        if (!twoSidedFlow) r.unknownReason = "NO_COUNTER_FLOW";
-        else if (hasSwap && !routerCall) r.unknownReason = "UNKNOWN_ROUTER";
-        else r.unknownReason = "OTHER";
-    }
     return r;
 }
