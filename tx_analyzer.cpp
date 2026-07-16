@@ -68,150 +68,6 @@ struct UniversalRouterCommands {
     bool hasPermit2 = false;
 };
 
-enum class CallIntent { NONE, BUY, SELL, TOKEN_SWAP };
-
-struct DecodedCall {
-    bool decoded = false;
-    std::string function;
-    std::string protocol;
-    CallIntent intent = CallIntent::NONE;
-    std::string tokenIn, tokenOut;
-    bool nativeIn = false, nativeOut = false;
-    bool viaMulticall = false;
-};
-
-struct V2SelInfo { int pathWord; bool ethIn; bool ethOut; const char* name; };
-const std::map<std::string, V2SelInfo> V2_SELECTORS = {
-    {"7ff36ab5", {1, true,  false, "swapExactETHForTokens"}},
-    {"b6f9de95", {1, true,  false, "swapExactETHForTokensSupportingFeeOnTransferTokens"}},
-    {"fb3bdb41", {1, true,  false, "swapETHForExactTokens"}},
-    {"18cbafe5", {2, false, true,  "swapExactTokensForETH"}},
-    {"791ac947", {2, false, true,  "swapExactTokensForETHSupportingFeeOnTransferTokens"}},
-    {"4a25d94a", {2, false, true,  "swapTokensForExactETH"}},
-    {"38ed1739", {2, false, false, "swapExactTokensForTokens"}},
-    {"5c11d795", {2, false, false, "swapExactTokensForTokensSupportingFeeOnTransferTokens"}},
-    {"8803dbee", {2, false, false, "swapTokensForExactTokens"}},
-};
-const std::map<std::string, const char*> V3_SINGLE_SELECTORS = {
-    {"414bf389", "exactInputSingle"},
-    {"04e45aaf", "exactInputSingle"},
-    {"db3e2198", "exactOutputSingle"},
-    {"09b81346", "exactOutputSingle"},
-};
-const std::map<std::string, bool> V3_PATH_SELECTORS = {
-    {"c04b8d59", false},
-    {"b858183f", false},
-    {"f28c0498", true},
-    {"5023b4df", true},
-};
-
-std::string wordAddr(const std::string& args, size_t wordIdx) {
-    size_t pos = wordIdx * 64;
-    if (args.size() < pos + 64) return "";
-    return "0x" + toLower(args.substr(pos + 24, 40));
-}
-
-std::vector<std::string> decodeAddressArray(const std::string& args, int offsetWordIdx) {
-    std::vector<std::string> out;
-    uint64_t off = hexWordToU64(args, (size_t)offsetWordIdx * 64);
-    size_t lenPos = off * 2;
-    if (off > args.size() || args.size() < lenPos + 64) return out;
-    uint64_t len = hexWordToU64(args, lenPos);
-    if (len == 0 || len > 8) return out;
-    if (args.size() < lenPos + 64 + len * 64) return out;
-    for (uint64_t i = 0; i < len; i++) out.push_back("0x" + toLower(args.substr(lenPos + 64 + i * 64 + 24, 40)));
-    return out;
-}
-
-CallIntent intentFromPair(const std::string& tIn, const std::string& tOut) {
-    if (tIn.empty() || tOut.empty()) return CallIntent::NONE;
-    bool bIn = isBaseAsset(tIn), bOut = isBaseAsset(tOut);
-    if (bIn && !bOut) return CallIntent::BUY;
-    if (!bIn && bOut) return CallIntent::SELL;
-    if (!bIn && !bOut) return CallIntent::TOKEN_SWAP;
-    return CallIntent::NONE;
-}
-
-DecodedCall decodeCall(const std::string& input, int depth) {
-    DecodedCall dc;
-    if (depth > 3) return dc;
-    if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return dc;
-    std::string sel = toLower(input.substr(2, 8));
-    std::string args = input.substr(10);
-
-    auto v2 = V2_SELECTORS.find(sel);
-    if (v2 != V2_SELECTORS.end()) {
-        auto path = decodeAddressArray(args, v2->second.pathWord);
-        if (path.size() < 2) return dc;
-        dc.decoded = true; dc.function = v2->second.name; dc.protocol = "V2 Router";
-        dc.tokenIn = path.front(); dc.tokenOut = path.back();
-        dc.nativeIn = v2->second.ethIn; dc.nativeOut = v2->second.ethOut;
-        if (dc.nativeIn) dc.intent = CallIntent::BUY;
-        else if (dc.nativeOut) dc.intent = CallIntent::SELL;
-        else dc.intent = intentFromPair(dc.tokenIn, dc.tokenOut);
-        return dc;
-    }
-
-    auto v3s = V3_SINGLE_SELECTORS.find(sel);
-    if (v3s != V3_SINGLE_SELECTORS.end()) {
-        std::string tIn = wordAddr(args, 0), tOut = wordAddr(args, 1);
-        if (tIn.empty() || tOut.empty()) return dc;
-        dc.decoded = true; dc.function = v3s->second; dc.protocol = "V3 Router";
-        dc.tokenIn = tIn; dc.tokenOut = tOut;
-        dc.intent = intentFromPair(tIn, tOut);
-        return dc;
-    }
-
-    auto v3p = V3_PATH_SELECTORS.find(sel);
-    if (v3p != V3_PATH_SELECTORS.end()) {
-        uint64_t structOff = hexWordToU64(args, 0);
-        size_t sPos = structOff * 2;
-        if (structOff > args.size() || args.size() < sPos + 64) return dc;
-        uint64_t pathOff = hexWordToU64(args, sPos);
-        size_t lenPos = sPos + pathOff * 2;
-        if (args.size() < lenPos + 64) return dc;
-        uint64_t byteLen = hexWordToU64(args, lenPos);
-        if (byteLen < 43 || byteLen > 200 || args.size() < lenPos + 64 + byteLen * 2) return dc;
-        std::string first = "0x" + toLower(args.substr(lenPos + 64, 40));
-        std::string last = "0x" + toLower(args.substr(lenPos + 64 + (byteLen - 20) * 2, 40));
-        dc.decoded = true; dc.protocol = "V3 Router";
-        if (v3p->second) { dc.function = "exactOutput"; dc.tokenIn = last; dc.tokenOut = first; }
-        else { dc.function = "exactInput"; dc.tokenIn = first; dc.tokenOut = last; }
-        dc.intent = intentFromPair(dc.tokenIn, dc.tokenOut);
-        return dc;
-    }
-
-    int arrWord = -1;
-    if (sel == "ac9650d8") arrWord = 0;
-    else if (sel == "5ae401dc") arrWord = 1;
-    if (arrWord >= 0) {
-        uint64_t arrOff = hexWordToU64(args, (size_t)arrWord * 64);
-        size_t lenPos = arrOff * 2;
-        if (arrOff > args.size() || args.size() < lenPos + 64) return dc;
-        uint64_t n = hexWordToU64(args, lenPos);
-        if (n == 0 || n > 16) return dc;
-        size_t dataStart = lenPos + 64;
-        for (uint64_t i = 0; i < n; i++) {
-            if (args.size() < dataStart + i * 64 + 64) break;
-            uint64_t elemOff = hexWordToU64(args, dataStart + i * 64);
-            size_t ePos = dataStart + elemOff * 2;
-            if (args.size() < ePos + 64) continue;
-            uint64_t eLen = hexWordToU64(args, ePos);
-            if (eLen < 4 || args.size() < ePos + 64 + eLen * 2) continue;
-            DecodedCall inner = decodeCall("0x" + args.substr(ePos + 64, eLen * 2), depth + 1);
-            if (inner.decoded) { inner.viaMulticall = true; return inner; }
-        }
-        return dc;
-    }
-
-    if (sel == "3593564c" || sel == "24856bc3") {
-        dc.decoded = true; dc.function = "execute"; dc.protocol = "Universal Router";
-        return dc;
-    }
-
-    return dc;
-}
-
 bool isGenericMulticallSelector(const std::string& input) {
     if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return false;
     return input.substr(2, 8) == "ac9650d8";
@@ -520,7 +376,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     std::string txTo;
     bool walletIsSender = false;
     UniversalRouterCommands urCmds;
-    DecodedCall dc;
     bool isGenericMulticall = false;
     if (tx.is_object()) {
         if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
@@ -532,10 +387,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
                 nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
         if (walletIsSender && tx.contains("input") && tx["input"].is_string()) {
-            const std::string inputStr = tx["input"].get<std::string>();
+            const std::string& inputStr = tx["input"].get<std::string>();
             urCmds = parseExecuteCommands(inputStr);
             isGenericMulticall = isGenericMulticallSelector(inputStr);
-            dc = decodeCall(inputStr, 0);
         }
     }
     bool nativeOutflow = nativeOut > 0;
@@ -770,35 +624,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
             else if (!r.isBuy && nativeInflowSignal) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeIn; }
         }
     }
-
-    if (dc.decoded && !r.isSwap && r.venue.empty() && dc.intent != CallIntent::NONE) {
-        if ((dc.intent == CallIntent::BUY || dc.intent == CallIntent::TOKEN_SWAP) && !dc.tokenOut.empty()) {
-            auto it = netFlow.find(dc.tokenOut);
-            if (it != netFlow.end() && it->second > 0) {
-                r.isSwap = true; r.isBuy = true; r.tokenAddr = dc.tokenOut; r.rawAmount = it->second;
-                r.intentGuided = true;
-                if (r.counterAddr.empty()) {
-                    auto cit = netFlow.find(dc.tokenIn);
-                    if (!dc.tokenIn.empty() && cit != netFlow.end() && cit->second < 0) { r.counterAddr = dc.tokenIn; r.counterAmount = -cit->second; }
-                    else if (dc.nativeIn && nativeOut > 0) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeOut; }
-                }
-            }
-        } else if (dc.intent == CallIntent::SELL && !dc.tokenIn.empty()) {
-            auto it = netFlow.find(dc.tokenIn);
-            if (it != netFlow.end() && it->second < 0) {
-                r.isSwap = true; r.isBuy = false; r.tokenAddr = dc.tokenIn; r.rawAmount = -it->second;
-                r.intentGuided = true;
-                if (r.counterAddr.empty()) {
-                    auto cit = netFlow.find(dc.tokenOut);
-                    if (!dc.tokenOut.empty() && cit != netFlow.end() && cit->second > 0) { r.counterAddr = dc.tokenOut; r.counterAmount = cit->second; }
-                    else if (dc.nativeOut && wbnbUnwrapped > 0) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = wbnbUnwrapped; }
-                }
-            }
-        }
-    }
-    if (r.isSwap && r.venue.empty() && dc.decoded && !dc.protocol.empty())
-        r.venue = dc.viaMulticall ? (dc.protocol + std::string(" (multicall)")) : (dc.protocol + std::string(" call"));
-    r.calldataDecoded = dc.decoded;
 
     int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
     uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.tokenAddr);
