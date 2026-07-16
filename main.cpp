@@ -40,6 +40,7 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
+
     std::atomic<uint64_t> cov_buy{0};
     std::atomic<uint64_t> cov_sell{0};
     std::atomic<uint64_t> cov_lp_add{0};
@@ -48,6 +49,7 @@ struct Stats {
     std::atomic<uint64_t> cov_unwrap{0};
     std::atomic<uint64_t> cov_transfer{0};
     std::atomic<uint64_t> cov_unknown{0};
+
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
     std::atomic<uint64_t> sig_multicall{0};
@@ -55,19 +57,51 @@ struct Stats {
     std::atomic<uint64_t> sig_lp_mint_burn{0};
     std::atomic<uint64_t> sig_lp_pool_identity{0};
     std::atomic<uint64_t> sig_lp_v3_event{0};
+
+    std::atomic<uint64_t> decoded_calls{0};
+    std::atomic<uint64_t> decoded_swaps{0};
+    std::atomic<uint64_t> decoded_recovered{0};
+    std::atomic<uint64_t> decoded_permit2{0};
+    std::atomic<uint64_t> decoded_liquidity{0};
+    std::atomic<uint64_t> decoded_bridge{0};
+    std::atomic<uint64_t> decoded_aggregator{0};
+    std::atomic<uint64_t> decoded_v4{0};
+    std::atomic<uint64_t> decoded_targeted_multicall{0};
+    std::atomic<uint64_t> decoded_subplans{0};
+    std::atomic<uint64_t> decoded_across_bridge{0};
+    std::atomic<uint64_t> decoded_v4_actions{0};
+
     std::atomic<uint64_t> unk_no_counter_flow{0};
     std::atomic<uint64_t> unk_unknown_router{0};
+    std::atomic<uint64_t> unk_decoded_no_match{0};
+    std::atomic<uint64_t> unk_permit2_no_match{0};
+    std::atomic<uint64_t> unk_bridge_flow{0};
+    std::atomic<uint64_t> unk_aggregator_no_match{0};
+    std::atomic<uint64_t> unk_v4_no_match{0};
+    std::atomic<uint64_t> unk_multicall_no_match{0};
+    std::atomic<uint64_t> unk_subplan_no_match{0};
+    std::atomic<uint64_t> unk_v4_actions_undecoded{0};
     std::atomic<uint64_t> unk_other{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
-    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
-    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
-    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+    if (r.venue == "Add Liquidity") {
+        g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Remove Liquidity") {
+        g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Wrap") {
+        g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Unwrap") {
+        g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.isSwap) {
+        if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed);
+        else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.dexActivityDetected) {
+        g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -75,9 +109,52 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-    if (r.unknownReason == "NO_COUNTER_FLOW") g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNKNOWN_ROUTER") g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "OTHER") g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.calldataDecoded) g_stats.decoded_calls.fetch_add(1, std::memory_order_relaxed);
+    if (r.calldataSwap) g_stats.decoded_swaps.fetch_add(1, std::memory_order_relaxed);
+    if (r.calldataRecovered) g_stats.decoded_recovered.fetch_add(1, std::memory_order_relaxed);
+    if (r.permit2Decoded) g_stats.decoded_permit2.fetch_add(1, std::memory_order_relaxed);
+    if (r.liquidityDecoded) g_stats.decoded_liquidity.fetch_add(1, std::memory_order_relaxed);
+    if (r.bridgeDecoded) g_stats.decoded_bridge.fetch_add(1, std::memory_order_relaxed);
+    if (r.aggregatorDecoded) g_stats.decoded_aggregator.fetch_add(1, std::memory_order_relaxed);
+    if (r.v4Decoded) g_stats.decoded_v4.fetch_add(1, std::memory_order_relaxed);
+    if (r.targetedMulticallDecoded) g_stats.decoded_targeted_multicall.fetch_add(1, std::memory_order_relaxed);
+    if (r.universalSubPlanDecoded) g_stats.decoded_subplans.fetch_add(1, std::memory_order_relaxed);
+    if (r.acrossBridgeDecoded) g_stats.decoded_across_bridge.fetch_add(1, std::memory_order_relaxed);
+    if (r.v4ActionsDecoded) g_stats.decoded_v4_actions.fetch_add(1, std::memory_order_relaxed);
+
+    const bool finalUnknown =
+        !r.isSwap &&
+        r.dexActivityDetected &&
+        r.venue != "Add Liquidity" &&
+        r.venue != "Remove Liquidity" &&
+        r.venue != "Wrap" &&
+        r.venue != "Unwrap";
+
+    if (!finalUnknown) return;
+
+    if (r.unknownReason == "NO_COUNTER_FLOW")
+        g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNKNOWN_ROUTER")
+        g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "DECODED_NO_RECEIPT_MATCH")
+        g_stats.unk_decoded_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "PERMIT2_NO_SWAP_MATCH")
+        g_stats.unk_permit2_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "BRIDGE_FLOW")
+        g_stats.unk_bridge_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "AGGREGATOR_NO_FLOW_MATCH")
+        g_stats.unk_aggregator_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "V4_NO_FLOW_MATCH")
+        g_stats.unk_v4_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "MULTICALL_NO_FLOW_MATCH")
+        g_stats.unk_multicall_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "SUBPLAN_NO_FLOW_MATCH")
+        g_stats.unk_subplan_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "V4_ACTIONS_UNDECODED")
+        g_stats.unk_v4_actions_undecoded.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -139,6 +216,13 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " token=" << res.tokenAddr << " counter=" << res.counterAddr
        << " usdNanos=" << res.usdNanos.convert_to<std::string>()
        << " whyUnknown=" << (res.unknownReason.empty() ? "-" : res.unknownReason)
+       << " decoded=" << (res.calldataDecoded ? 1 : 0)
+       << " decodedSwap=" << (res.calldataSwap ? 1 : 0)
+       << " recovered=" << (res.calldataRecovered ? 1 : 0)
+       << " selector=" << (res.decodedSelector.empty() ? "-" : res.decodedSelector)
+       << " function=" << (res.decodedFunction.empty() ? "-" : res.decodedFunction)
+       << " decodedIn=" << (res.decodedTokenIn.empty() ? "-" : res.decodedTokenIn)
+       << " decodedOut=" << (res.decodedTokenOut.empty() ? "-" : res.decodedTokenOut)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -1738,9 +1822,30 @@ void telegramLoop() {
                                     << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
+                                    << "\n\n🧩 <b>Calldata decoder</b>\n"
+                                    << "Decoded calls: " << g_stats.decoded_calls.load()
+                                    << "\nDecoded swaps: " << g_stats.decoded_swaps.load()
+                                    << "\nRecovered BUY/SELL: " << g_stats.decoded_recovered.load()
+                                    << "\nPermit2 decoded: " << g_stats.decoded_permit2.load()
+                                    << "\nLiquidity decoded: " << g_stats.decoded_liquidity.load()
+                                    << "\nBridge decoded: " << g_stats.decoded_bridge.load()
+                                    << "\nAggregator decoded: " << g_stats.decoded_aggregator.load()
+                                    << "\nV4 decoded: " << g_stats.decoded_v4.load()
+                                    << "\nTargeted multicall: " << g_stats.decoded_targeted_multicall.load()
+                                    << "\nUniversal subplans: " << g_stats.decoded_subplans.load()
+                                    << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
+                                    << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
                                     << "No counter flow: " << g_stats.unk_no_counter_flow.load()
                                     << "\nUnknown router: " << g_stats.unk_unknown_router.load()
+                                    << "\nDecoded/no receipt match: " << g_stats.unk_decoded_no_match.load()
+                                    << "\nPermit2/no swap match: " << g_stats.unk_permit2_no_match.load()
+                                    << "\nBridge flow: " << g_stats.unk_bridge_flow.load()
+                                    << "\nAggregator/no match: " << g_stats.unk_aggregator_no_match.load()
+                                    << "\nV4/no match: " << g_stats.unk_v4_no_match.load()
+                                    << "\nMulticall/no match: " << g_stats.unk_multicall_no_match.load()
+                                    << "\nSubplan/no match: " << g_stats.unk_subplan_no_match.load()
+                                    << "\nV4 actions undecoded: " << g_stats.unk_v4_actions_undecoded.load()
                                     << "\nOther: " << g_stats.unk_other.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
