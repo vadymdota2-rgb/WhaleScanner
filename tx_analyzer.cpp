@@ -438,7 +438,8 @@ bool anyNegative(const std::map<std::string, cpp_int>& net) {
 }
 
 cpp_int magnitude(cpp_int value) {
-    return value < 0 ? -value : value;
+    if (value < 0) value = -value;
+    return value;
 }
 
 std::string strongestToken(
@@ -1129,8 +1130,8 @@ std::string formatAmount(const cpp_int& raw, int decimals) {
     cpp_int divisor = 1;
     for (int i = 0; i < decimals; ++i) divisor *= 10;
 
-    const cpp_int integer = divisor == 0 ? raw : raw / divisor;
-    cpp_int fraction = divisor == 0 ? 0 : raw % divisor;
+    const cpp_int integer = raw / divisor;
+    cpp_int fraction = raw % divisor;
     if (fraction < 0) fraction = -fraction;
 
     std::string fractionText = fraction.convert_to<std::string>();
@@ -1167,7 +1168,8 @@ cpp_int calcUsdNanos(
 
 std::string formatUsd(const cpp_int& nanos) {
     const bool negative = nanos < 0;
-    cpp_int absolute = negative ? -nanos : nanos;
+    cpp_int absolute = nanos;
+    if (absolute < 0) absolute = -absolute;
 
     std::string text = absolute.convert_to<std::string>();
     while (text.size() < 10) text.insert(text.begin(), '0');
@@ -1198,7 +1200,8 @@ cpp_int calcUnitPriceNanos(
 
 std::string formatPriceUsd(const cpp_int& nanos) {
     const bool negative = nanos < 0;
-    cpp_int absolute = negative ? -nanos : nanos;
+    cpp_int absolute = nanos;
+    if (absolute < 0) absolute = -absolute;
 
     std::string text = absolute.convert_to<std::string>();
     while (text.size() < 10) text.insert(text.begin(), '0');
