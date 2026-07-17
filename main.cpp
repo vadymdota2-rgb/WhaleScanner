@@ -40,6 +40,7 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
+
     std::atomic<uint64_t> cov_buy{0};
     std::atomic<uint64_t> cov_sell{0};
     std::atomic<uint64_t> cov_lp_add{0};
@@ -48,6 +49,7 @@ struct Stats {
     std::atomic<uint64_t> cov_unwrap{0};
     std::atomic<uint64_t> cov_transfer{0};
     std::atomic<uint64_t> cov_unknown{0};
+
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
     std::atomic<uint64_t> sig_multicall{0};
@@ -55,19 +57,124 @@ struct Stats {
     std::atomic<uint64_t> sig_lp_mint_burn{0};
     std::atomic<uint64_t> sig_lp_pool_identity{0};
     std::atomic<uint64_t> sig_lp_v3_event{0};
+
+    std::atomic<uint64_t> decoded_calls{0};
+    std::atomic<uint64_t> decoded_swaps{0};
+    std::atomic<uint64_t> decoded_recovered{0};
+    std::atomic<uint64_t> decoded_permit2{0};
+    std::atomic<uint64_t> decoded_liquidity{0};
+    std::atomic<uint64_t> decoded_bridge{0};
+    std::atomic<uint64_t> decoded_aggregator{0};
+    std::atomic<uint64_t> decoded_v4{0};
+    std::atomic<uint64_t> decoded_targeted_multicall{0};
+    std::atomic<uint64_t> decoded_subplans{0};
+    std::atomic<uint64_t> decoded_across_bridge{0};
+    std::atomic<uint64_t> decoded_v4_actions{0};
+
     std::atomic<uint64_t> unk_no_counter_flow{0};
     std::atomic<uint64_t> unk_unknown_router{0};
+    std::atomic<uint64_t> unk_decoded_no_match{0};
+    std::atomic<uint64_t> unk_permit2_no_match{0};
+    std::atomic<uint64_t> unk_bridge_flow{0};
+    std::atomic<uint64_t> unk_aggregator_no_match{0};
+    std::atomic<uint64_t> unk_v4_no_match{0};
+    std::atomic<uint64_t> unk_multicall_no_match{0};
+    std::atomic<uint64_t> unk_subplan_no_match{0};
+    std::atomic<uint64_t> unk_v4_actions_undecoded{0};
     std::atomic<uint64_t> unk_other{0};
+
+    std::atomic<uint64_t> graph_seen{0};
+    std::atomic<uint64_t> graph_path_to_pool{0};
+    std::atomic<uint64_t> graph_path_from_pool{0};
+    std::atomic<uint64_t> graph_recovered{0};
+    std::atomic<uint64_t> graph_ambiguous{0};
+    std::atomic<uint64_t> unk_graph_no_pool_path{0};
+    std::atomic<uint64_t> unk_graph_ambiguous{0};
+    std::atomic<uint64_t> unk_no_direct_counter{0};
+
+    std::atomic<uint64_t> sig_wallet_swap_related{0};
+    std::atomic<uint64_t> sig_unrelated_swap_event{0};
+
+    std::atomic<uint64_t> classified_direct_flow{0};
+    std::atomic<uint64_t> classified_calldata{0};
+    std::atomic<uint64_t> classified_graph{0};
+    std::atomic<uint64_t> classified_fallback{0};
+    std::atomic<uint64_t> unsupported_selectors{0};
+    std::atomic<uint64_t> unk_unsupported_selector{0};
+
+    std::atomic<uint64_t> token_transfer_calls{0};
+    std::atomic<uint64_t> token_approval_calls{0};
+    std::atomic<uint64_t> self_calls{0};
+    std::atomic<uint64_t> okx_dag_swaps{0};
 } g_stats;
 
+std::mutex selectorStatsMutex;
+std::unordered_map<std::string, uint64_t> selectorStats;
+
+void recordSelectorStat(const TxResult& r) {
+    if (!r.unsupportedSelector || r.decodedSelector.empty()) return;
+    const std::string key = r.decodedSelector + "|" + r.callTarget;
+    std::lock_guard<std::mutex> lock(selectorStatsMutex);
+    selectorStats[key]++;
+}
+
+std::string buildSelectorStatsText(size_t limit = 30) {
+    std::vector<std::pair<std::string, uint64_t>> rows;
+    {
+        std::lock_guard<std::mutex> lock(selectorStatsMutex);
+        rows.reserve(selectorStats.size());
+        for (const auto& item : selectorStats) rows.push_back(item);
+    }
+
+    std::sort(rows.begin(), rows.end(),
+        [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    uint64_t total = 0;
+    for (const auto& row : rows) total += row.second;
+
+    std::stringstream out;
+    out << "🧬 <b>Unsupported selectors</b>\n"
+        << "Total: <b>" << total << "</b>\n"
+        << "Unique selector/target pairs: <b>" << rows.size() << "</b>\n\n";
+    if (rows.empty()) {
+        out << "No unsupported wallet call selectors recorded.";
+        return out.str();
+    }
+
+    const size_t count = std::min(limit, rows.size());
+    for (size_t i = 0; i < count; ++i) {
+        const std::string& key = rows[i].first;
+        const size_t sep = key.find('|');
+        const std::string selector = sep == std::string::npos ? key : key.substr(0, sep);
+        const std::string target = sep == std::string::npos ? "" : key.substr(sep + 1);
+
+        out << "<b>" << rows[i].second << "×</b> <code>0x"
+            << safeString(selector, 8) << "</code>";
+        if (!target.empty())
+            out << " → <code>" << safeString(target, 42) << "</code>";
+        out << "\n";
+    }
+    return out.str();
+}
+
 void recordCoverage(const TxResult& r) {
-    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
-    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
-    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+    if (r.venue == "Add Liquidity") {
+        g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Remove Liquidity") {
+        g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Wrap") {
+        g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.venue == "Unwrap") {
+        g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.isSwap) {
+        if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed);
+        else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed);
+    } else if (r.dexActivityDetected) {
+        g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+    }
+
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -75,9 +182,95 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-    if (r.unknownReason == "NO_COUNTER_FLOW") g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNKNOWN_ROUTER") g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "OTHER") g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.calldataDecoded) g_stats.decoded_calls.fetch_add(1, std::memory_order_relaxed);
+    if (r.calldataSwap) g_stats.decoded_swaps.fetch_add(1, std::memory_order_relaxed);
+    if (r.calldataRecovered) g_stats.decoded_recovered.fetch_add(1, std::memory_order_relaxed);
+    if (r.permit2Decoded) g_stats.decoded_permit2.fetch_add(1, std::memory_order_relaxed);
+    if (r.liquidityDecoded) g_stats.decoded_liquidity.fetch_add(1, std::memory_order_relaxed);
+    if (r.bridgeDecoded) g_stats.decoded_bridge.fetch_add(1, std::memory_order_relaxed);
+    if (r.aggregatorDecoded) g_stats.decoded_aggregator.fetch_add(1, std::memory_order_relaxed);
+    if (r.v4Decoded) g_stats.decoded_v4.fetch_add(1, std::memory_order_relaxed);
+    if (r.targetedMulticallDecoded) g_stats.decoded_targeted_multicall.fetch_add(1, std::memory_order_relaxed);
+    if (r.universalSubPlanDecoded) g_stats.decoded_subplans.fetch_add(1, std::memory_order_relaxed);
+    if (r.acrossBridgeDecoded) g_stats.decoded_across_bridge.fetch_add(1, std::memory_order_relaxed);
+    if (r.v4ActionsDecoded) g_stats.decoded_v4_actions.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.transferGraphSeen) g_stats.graph_seen.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphPathToPool) g_stats.graph_path_to_pool.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphPathFromPool) g_stats.graph_path_from_pool.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphRecovered) g_stats.graph_recovered.fetch_add(1, std::memory_order_relaxed);
+    if (r.graphAmbiguous) g_stats.graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.walletSwapRelated)
+        g_stats.sig_wallet_swap_related.fetch_add(1, std::memory_order_relaxed);
+    if (r.unrelatedSwapEvent)
+        g_stats.sig_unrelated_swap_event.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.classifiedByDirectFlow)
+        g_stats.classified_direct_flow.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByCalldata)
+        g_stats.classified_calldata.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByGraph)
+        g_stats.classified_graph.fetch_add(1, std::memory_order_relaxed);
+    if (r.classifiedByFallback)
+        g_stats.classified_fallback.fetch_add(1, std::memory_order_relaxed);
+    if (r.standardTokenCall) {
+        if (r.approvalCall)
+            g_stats.token_approval_calls.fetch_add(1, std::memory_order_relaxed);
+        else
+            g_stats.token_transfer_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (r.selfCall)
+        g_stats.self_calls.fetch_add(1, std::memory_order_relaxed);
+    if (r.okxDagSwapDecoded)
+        g_stats.okx_dag_swaps.fetch_add(1, std::memory_order_relaxed);
+
+    if (r.unsupportedSelector) {
+        g_stats.unsupported_selectors.fetch_add(1, std::memory_order_relaxed);
+        recordSelectorStat(r);
+    }
+
+    const bool finalUnknown =
+        !r.isSwap &&
+        r.dexActivityDetected &&
+        r.venue != "Add Liquidity" &&
+        r.venue != "Remove Liquidity" &&
+        r.venue != "Wrap" &&
+        r.venue != "Unwrap";
+
+    if (!finalUnknown) return;
+
+    if (r.unknownReason == "NO_COUNTER_FLOW")
+        g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "NO_DIRECT_COUNTER_FLOW")
+        g_stats.unk_no_direct_counter.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "GRAPH_NO_POOL_PATH")
+        g_stats.unk_graph_no_pool_path.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "GRAPH_AMBIGUOUS_PATH")
+        g_stats.unk_graph_ambiguous.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNKNOWN_ROUTER")
+        g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "DECODED_NO_RECEIPT_MATCH")
+        g_stats.unk_decoded_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "PERMIT2_NO_SWAP_MATCH")
+        g_stats.unk_permit2_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "BRIDGE_FLOW")
+        g_stats.unk_bridge_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "AGGREGATOR_NO_FLOW_MATCH")
+        g_stats.unk_aggregator_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "V4_NO_FLOW_MATCH")
+        g_stats.unk_v4_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "MULTICALL_NO_FLOW_MATCH")
+        g_stats.unk_multicall_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "SUBPLAN_NO_FLOW_MATCH")
+        g_stats.unk_subplan_no_match.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "V4_ACTIONS_UNDECODED")
+        g_stats.unk_v4_actions_undecoded.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNSUPPORTED_SELECTOR")
+        g_stats.unk_unsupported_selector.fetch_add(1, std::memory_order_relaxed);
+    else
+        g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -139,6 +332,30 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
        << " token=" << res.tokenAddr << " counter=" << res.counterAddr
        << " usdNanos=" << res.usdNanos.convert_to<std::string>()
        << " whyUnknown=" << (res.unknownReason.empty() ? "-" : res.unknownReason)
+       << " decoded=" << (res.calldataDecoded ? 1 : 0)
+       << " decodedSwap=" << (res.calldataSwap ? 1 : 0)
+       << " recovered=" << (res.calldataRecovered ? 1 : 0)
+       << " selector=" << (res.decodedSelector.empty() ? "-" : res.decodedSelector)
+       << " function=" << (res.decodedFunction.empty() ? "-" : res.decodedFunction)
+       << " decodedIn=" << (res.decodedTokenIn.empty() ? "-" : res.decodedTokenIn)
+       << " decodedOut=" << (res.decodedTokenOut.empty() ? "-" : res.decodedTokenOut)
+       << " graphSeen=" << (res.transferGraphSeen ? 1 : 0)
+       << " graphToPool=" << (res.graphPathToPool ? 1 : 0)
+       << " graphFromPool=" << (res.graphPathFromPool ? 1 : 0)
+       << " graphRecovered=" << (res.graphRecovered ? 1 : 0)
+       << " graphAmbiguous=" << (res.graphAmbiguous ? 1 : 0)
+       << " walletSwapRelated=" << (res.walletSwapRelated ? 1 : 0)
+       << " unrelatedSwapEvent=" << (res.unrelatedSwapEvent ? 1 : 0)
+       << " unsupportedSelector=" << (res.unsupportedSelector ? 1 : 0)
+       << " target=" << (res.callTarget.empty() ? "-" : res.callTarget)
+       << " byDirect=" << (res.classifiedByDirectFlow ? 1 : 0)
+       << " byCalldata=" << (res.classifiedByCalldata ? 1 : 0)
+       << " byGraph=" << (res.classifiedByGraph ? 1 : 0)
+       << " byFallback=" << (res.classifiedByFallback ? 1 : 0)
+       << " standardTokenCall=" << (res.standardTokenCall ? 1 : 0)
+       << " approvalCall=" << (res.approvalCall ? 1 : 0)
+       << " selfCall=" << (res.selfCall ? 1 : 0)
+       << " okxDagSwap=" << (res.okxDagSwapDecoded ? 1 : 0)
        << " topics=[";
     bool first = true;
     for (auto& t : topics0) { if (!first) ss << ","; ss << t; first = false; }
@@ -154,6 +371,31 @@ void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& t
 
 void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     if (LOG_LOW_CONFIDENCE) appendDiagLog("low_confidence.log", hash, bn, tx, receipt, res);
+}
+
+const bool LOG_SWAPLESS_TRADE = []() {
+    const char* env = std::getenv("WHALE_LOG_SWAPLESS_TRADE");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+
+void logSwaplessTrade(const std::string& hash, const nlohmann::json& receipt, const TxResult& res) {
+    if (!LOG_SWAPLESS_TRADE) return;
+    std::stringstream ss;
+    ss << "hash=" << hash << " isBuy=" << (res.isBuy ? 1 : 0) << " venue=" << res.venue << " topics0=[";
+    bool first = true;
+    if (receipt.is_object() && receipt.contains("logs") && receipt["logs"].is_array()) {
+        for (auto& l : receipt["logs"]) {
+            if (l.is_object() && l.contains("topics") && l["topics"].is_array() && !l["topics"].empty() && l["topics"][0].is_string()) {
+                if (!first) ss << ",";
+                ss << l["topics"][0].get<std::string>();
+                first = false;
+            }
+        }
+    }
+    ss << "]";
+    std::lock_guard<std::mutex> lk(diagLogMutex);
+    std::ofstream f("swapless_trade.log", std::ios::app);
+    if (f) f << ss.str() << "\n";
 }
 
 const auto START_TIME = std::chrono::steady_clock::now();
@@ -327,6 +569,211 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
         if (a < maxRetries-1) std::this_thread::sleep_for(std::chrono::milliseconds((1<<a)*500));
     }
     return nullptr;
+}
+
+
+const bool WHALE_ENABLE_TRACE = []() {
+    const char* env = std::getenv("WHALE_ENABLE_TRACE");
+    return env && (std::string(env) == "1" || toLower(std::string(env)) == "true");
+}();
+
+const int WHALE_TRACE_TIMEOUT_SECONDS = []() {
+    const char* env = std::getenv("WHALE_TRACE_TIMEOUT_SECONDS");
+    if (!env) return 8;
+    try { return std::clamp(std::stoi(env), 2, 30); }
+    catch (...) { return 8; }
+}();
+
+std::atomic<uint64_t> g_trace_requested{0};
+std::atomic<uint64_t> g_trace_success{0};
+std::atomic<uint64_t> g_trace_failed{0};
+
+json getTransactionTrace(const std::string& hash) {
+    if (!WHALE_ENABLE_TRACE) return nullptr;
+
+    g_trace_requested.fetch_add(1, std::memory_order_relaxed);
+
+    json request;
+    request["jsonrpc"] = "2.0";
+    request["method"] = "debug_traceTransaction";
+    request["params"] = json::array({
+        hash,
+        {
+            {"tracer", "callTracer"},
+            {"timeout", std::to_string(WHALE_TRACE_TIMEOUT_SECONDS) + "s"},
+            {"tracerConfig", {{"onlyTopCall", false}, {"withLog", false}}}
+        }
+    });
+    request["id"] = 1;
+
+    const std::string body = request.dump();
+
+    // Trace support varies by provider, so try every configured endpoint once.
+    for (size_t attempt = 0;
+         attempt < RPC_ENDPOINTS.size() && running.load(std::memory_order_relaxed);
+         ++attempt) {
+        const size_t idx =
+            (rpcIndex.load(std::memory_order_relaxed) + attempt) %
+            RPC_ENDPOINTS.size();
+
+        const std::string response =
+            http(RPC_ENDPOINTS[idx], body, WHALE_TRACE_TIMEOUT_SECONDS + 2);
+
+        try {
+            const json parsed = json::parse(response);
+            if (parsed.contains("result") &&
+                parsed["result"].is_object()) {
+                g_trace_success.fetch_add(1, std::memory_order_relaxed);
+                return parsed["result"];
+            }
+        } catch (...) {
+        }
+    }
+
+    g_trace_failed.fetch_add(1, std::memory_order_relaxed);
+    return nullptr;
+}
+
+TxResult toLegacyResult(const TxResultV2& r) {
+    TxResult out{};
+    out.valid = r.valid;
+    out.isSwap = r.isSwap();
+    out.venue = r.venue;
+    out.tokenAddr = r.tokenAddr;
+    out.counterAddr = r.counterAddr;
+    out.rawAmount = r.rawAmount;
+    out.counterAmount = r.counterAmount;
+    out.usdNanos = r.usdNanos;
+    out.isBuy = r.isBuy;
+    out.hasSwapEvent = r.hasSwapEvent;
+    out.isUniversalRouter = r.isUniversalRouter;
+    out.isGenericMulticall = r.isGenericMulticall;
+    out.hasPermit2Signal = r.hasPermit2Signal;
+    out.dexActivityDetected = r.dexActivityDetected;
+    out.lpMintOrBurnSeen = r.lpMintOrBurnSeen;
+    out.lpV3EventSeen = r.lpV3EventSeen;
+    out.lpPoolIdentitySeen = r.lpPoolIdentitySeen;
+    out.unknownReason = r.unknownReason;
+
+    // Keep the legacy main's expected venue names.
+    if (r.type == TxType::LP_ADD) out.venue = "Add Liquidity";
+    else if (r.type == TxType::LP_REMOVE) out.venue = "Remove Liquidity";
+    else if (r.type == TxType::WRAP) out.venue = "Wrap";
+    else if (r.type == TxType::UNWRAP) out.venue = "Unwrap";
+
+    return out;
+}
+
+int analyzerResultScore(const TxResultV2& r) {
+    if (!r.valid) return -1000;
+
+    int score = 0;
+    if (r.type == TxType::SWAP) score += 60;
+    else if (r.type == TxType::LP_ADD || r.type == TxType::LP_REMOVE) score += 45;
+    else if (r.type == TxType::WRAP || r.type == TxType::UNWRAP) score += 35;
+    else if (r.type == TxType::TRANSFER) score += 20;
+
+    if (!r.tokenAddr.empty() && r.rawAmount > 0) score += 15;
+    if (!r.counterAddr.empty() && r.counterAmount > 0) score += 20;
+    if (r.hasSwapEvent) score += 5;
+    if (!r.venue.empty()) score += 5;
+
+    switch (r.confidence) {
+        case ConfidenceLevel::CERTAIN: score += 20; break;
+        case ConfidenceLevel::HIGH: score += 15; break;
+        case ConfidenceLevel::MEDIUM: score += 8; break;
+        case ConfidenceLevel::LOW: score += 2; break;
+        default: break;
+    }
+
+    // A SELL without the received side is incomplete and must not replace
+    // a better receipt-only result.
+    if (r.type == TxType::SWAP && !r.isBuy &&
+        (r.counterAddr.empty() || r.counterAmount <= 0)) {
+        score -= 30;
+    }
+
+    return score;
+}
+
+bool needsTraceRecovery(const TxResultV2& r) {
+    if (!WHALE_ENABLE_TRACE || !r.valid) return false;
+
+    if (r.type == TxType::SWAP) {
+        if (r.counterAddr.empty() || r.counterAmount <= 0) return true;
+        if (r.confidence == ConfidenceLevel::LOW ||
+            r.confidence == ConfidenceLevel::GUESS) return true;
+    }
+
+    if (r.dexActivityDetected &&
+        (r.type == TxType::UNKNOWN || r.type == TxType::TRANSFER)) {
+        return true;
+    }
+
+    if (r.hasSwapEvent && r.type != TxType::SWAP) return true;
+    return false;
+}
+
+struct MainPriceOracle final : IPriceOracle {
+    uint64_t getPriceNanos(
+        const std::string& tokenAddr
+    ) const override {
+        return ::getPriceNanos(tokenAddr);
+    }
+};
+
+struct MainTokenRegistry final : ITokenRegistry {
+    int getDecimals(
+        const std::string& tokenAddr
+    ) const override {
+        return ::getDecimals(tokenAddr);
+    }
+
+    std::string getSymbol(
+        const std::string& tokenAddr
+    ) const override {
+        return ::getSymbol(tokenAddr);
+    }
+};
+
+TxResult analyzeWatchedTransaction(
+    const json& tx,
+    const json& receipt,
+    const std::string& wallet
+) {
+    static MainPriceOracle prices;
+    static MainTokenRegistry tokens;
+
+    AnalysisInput baseInput;
+    baseInput.tx = tx;
+    baseInput.receipt = receipt;
+    baseInput.chain = chainCtx();
+    baseInput.prices = &prices;
+    baseInput.tokens = &tokens;
+
+    TxResultV2 receiptResult = analyzeTxV2(baseInput, wallet);
+    TxResultV2 selected = receiptResult;
+
+    if (needsTraceRecovery(receiptResult) &&
+        tx.contains("hash") && tx["hash"].is_string()) {
+        const json trace = getTransactionTrace(tx["hash"].get<std::string>());
+
+        if (trace.is_object()) {
+            AnalysisInput tracedInput = baseInput;
+            tracedInput.trace = trace;
+
+            TxResultV2 tracedResult = analyzeTxV2(tracedInput, wallet);
+
+            // Trace is supplemental. Never blindly replace a good receipt
+            // classification with a weaker trace classification.
+            if (analyzerResultScore(tracedResult) >
+                analyzerResultScore(receiptResult)) {
+                selected = std::move(tracedResult);
+            }
+        }
+    }
+
+    return toLegacyResult(selected);
 }
 
 void initDB() {
@@ -1028,7 +1475,7 @@ uint64_t getPriceNanos(const std::string& token) {
 }
 
 std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
-    bool tokenIsNative = (res.tokenAddr == NATIVE_BNB_MARKER);
+    bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
     std::string msg="💼 <b>"+safeString(label)+"</b>\n\n";
@@ -1048,7 +1495,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
         std::string counterAmountStr, counterSymbol;
-        if (res.counterAddr == NATIVE_BNB_MARKER) {
+        if (res.counterAddr == chainCtx().nativeMarker) {
             counterAmountStr = formatAmount(res.counterAmount, 18);
             counterSymbol = chainCtx().nativeSymbol;
         } else {
@@ -1066,7 +1513,12 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
 }
 
 namespace {
-constexpr long long AGGREGATION_WINDOW_SECONDS = 120;
+const long long AGGREGATION_WINDOW_SECONDS = []() {
+    const char* env = std::getenv("WHALE_AGGREGATION_SECONDS");
+    if (!env) return 10LL;
+    try { return std::clamp(std::stoll(env), 0LL, 300LL); }
+    catch (...) { return 10LL; }
+}();
 
 struct PendingAlert {
     std::string wallet;
@@ -1089,13 +1541,72 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
         if (!watchers) return;
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) return;
-        for (auto& w : wit->second) {
-            if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) continue;
-            if (w.chatId == SERVICE_CHAT_ID) continue;
+        for (const auto& w : wit->second) {
+            if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) {
+                continue;
+            }
+
+            if (w.chatId == SERVICE_CHAT_ID) {
+                /*
+                 * SERVICE_CHAT_ID wallets are global broadcast wallets.
+                 * Use each real user's own threshold instead of the service
+                 * account threshold.
+                 */
+                std::lock_guard<std::mutex> dbLock(dbMutex);
+                sqlite3_stmt* stmt = nullptr;
+
+                if (prepareOrLog(
+                        db,
+                        &stmt,
+                        "SELECT chat_id, threshold_nanos FROM users "
+                        "WHERE chat_id <> ?"
+                    )) {
+                    sqlite3_bind_text(
+                        stmt, 1, SERVICE_CHAT_ID.c_str(),
+                        -1, SQLITE_TRANSIENT
+                    );
+
+                    auto& recipients = byLabel[w.label];
+                    while (sqlite3_step(stmt) == SQLITE_ROW) {
+                        std::string chatId = safeColumnText(stmt, 0);
+                        cpp_int userThreshold =
+                            sqlite3_column_int64(stmt, 1);
+
+                        if (!chatId.empty() &&
+                            res.usdNanos >= userThreshold) {
+                            recipients.push_back(chatId);
+                        }
+                    }
+                    sqlite3_finalize(stmt);
+                }
+                continue;
+            }
+
             byLabel[w.label].push_back(w.chatId);
         }
+
+        for (auto& [label, recipients] : byLabel) {
+            std::sort(recipients.begin(), recipients.end());
+            recipients.erase(
+                std::unique(recipients.begin(), recipients.end()),
+                recipients.end()
+            );
+        }
     }
-    if (byLabel.empty()) return;
+    for (auto it = byLabel.begin(); it != byLabel.end(); ) {
+        if (it->second.empty()) it = byLabel.erase(it);
+        else ++it;
+    }
+
+    if (byLabel.empty()) {
+        std::cerr << "[ALERT_DROP] no eligible recipients"
+                  << " wallet=" << mA
+                  << " hash=" << hash
+                  << " usdNanos="
+                  << res.usdNanos.convert_to<std::string>()
+                  << std::endl;
+        return;
+    }
 
     bool anySent = false;
     for (auto& [label, chatIds] : byLabel) {
@@ -1103,11 +1614,26 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
-        g_stats.alerts_sent.fetch_add(byLabel.size());
-        std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " "
-                  << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
-                  << " -> " << byLabel.size() << " label group(s)" << std::endl;
-    } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
+        size_t recipientCount = 0;
+        for (const auto& [label, chatIds] : byLabel)
+            recipientCount += chatIds.size();
+
+        g_stats.alerts_sent.fetch_add(
+            recipientCount,
+            std::memory_order_relaxed
+        );
+
+        std::cout << "[OK] " << mA << " "
+                  << (res.isSwap ? (res.isBuy ? "BUY" : "SELL")
+                                 : "TRANSFER")
+                  << " " << formatUsd(res.usdNanos)
+                  << " " << getSymbol(res.tokenAddr)
+                  << " -> " << recipientCount
+                  << " recipient(s)" << std::endl;
+    } else {
+        std::cerr << "[WARN] Broadcast enqueue failed for "
+                  << hash << std::endl;
+    }
 }
 
 void bufferSwap(const std::string& mA, const TxResult& res, const std::string& hash,
@@ -1181,19 +1707,50 @@ bool processBlock(long long bn) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-        TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        TxResult res = analyzeWatchedTransaction(tx, receipt, mA);
+        if (!res.valid) {
+            markTxProcessed(hash, bn);
+            continue;
+        }
         recordCoverage(res);
         checkInvariants(hash, res);
         if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
+        if (res.isSwap && !res.hasSwapEvent) logSwaplessTrade(hash, receipt, res);
 
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
-        else dispatchAlert(mA, res, hash);
+        bool alertable = !res.tokenAddr.empty() &&
+                         res.rawAmount > 0 &&
+                         res.usdNanos > 0;
+
+        if (res.isSwap && !res.isBuy &&
+            (res.counterAddr.empty() || res.counterAmount <= 0)) {
+            alertable = false;
+            std::cerr << "[ALERT_DROP] unresolved SELL counter flow"
+                      << " wallet=" << mA
+                      << " hash=" << hash << std::endl;
+        }
+
+        if (alertable) {
+            if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
+            else dispatchAlert(mA, res, hash);
+        } else {
+            std::cerr << "[ALERT_DROP] incomplete result"
+                      << " wallet=" << mA
+                      << " hash=" << hash
+                      << " swap=" << (res.isSwap ? 1 : 0)
+                      << " buy=" << (res.isBuy ? 1 : 0)
+                      << " token=" << res.tokenAddr
+                      << " raw="
+                      << res.rawAmount.convert_to<std::string>()
+                      << " usd="
+                      << res.usdNanos.convert_to<std::string>()
+                      << std::endl;
+        }
         markTxProcessed(hash,bn);
     }
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
@@ -1694,7 +2251,7 @@ void telegramLoop() {
                             size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
                             { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
-                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
+                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n🧬 Trace: " << g_trace_success.load() << "/" << g_trace_requested.load() << " (fail " << g_trace_failed.load() << ")" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
                             {
                                 uint64_t buy=g_stats.cov_buy.load(), sell=g_stats.cov_sell.load(), lpAdd=g_stats.cov_lp_add.load(),
                                          lpRemove=g_stats.cov_lp_remove.load(), wrap=g_stats.cov_wrap.load(), unwrap=g_stats.cov_unwrap.load(),
@@ -1708,17 +2265,68 @@ void telegramLoop() {
                                     << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
                                     << "\n📦 Multicall: " << g_stats.sig_multicall.load()
                                     << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
+                                    << "\n✅ Wallet-related swap: " << g_stats.sig_wallet_swap_related.load()
+                                    << "\n⚪ Unrelated swap event: " << g_stats.sig_unrelated_swap_event.load()
                                     << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
                                     << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
+                                    << "\n\n🧩 <b>Calldata decoder</b>\n"
+                                    << "Decoded calls: " << g_stats.decoded_calls.load()
+                                    << "\nDecoded swaps: " << g_stats.decoded_swaps.load()
+                                    << "\nRecovered BUY/SELL: " << g_stats.decoded_recovered.load()
+                                    << "\nPermit2 decoded: " << g_stats.decoded_permit2.load()
+                                    << "\nLiquidity decoded: " << g_stats.decoded_liquidity.load()
+                                    << "\nBridge decoded: " << g_stats.decoded_bridge.load()
+                                    << "\nAggregator decoded: " << g_stats.decoded_aggregator.load()
+                                    << "\nV4 decoded: " << g_stats.decoded_v4.load()
+                                    << "\nTargeted multicall: " << g_stats.decoded_targeted_multicall.load()
+                                    << "\nUniversal subplans: " << g_stats.decoded_subplans.load()
+                                    << "\nAcross commands: " << g_stats.decoded_across_bridge.load()
+                                    << "\nV4 actions: " << g_stats.decoded_v4_actions.load()
+                                    << "\nUnsupported selectors: " << g_stats.unsupported_selectors.load()
+                                    << "\n\n📦 <b>Standard calls</b>\n"
+                                    << "ERC20 transfer calls: " << g_stats.token_transfer_calls.load()
+                                    << "\nERC20 approval calls: " << g_stats.token_approval_calls.load()
+                                    << "\nWallet self-calls: " << g_stats.self_calls.load()
+                                    << "\nOKX dag swaps: " << g_stats.okx_dag_swaps.load()
+                                    << "\n\n🧭 <b>Swap classification source</b>\n"
+                                    << "Direct receipt flow: " << g_stats.classified_direct_flow.load()
+                                    << "\nCalldata + receipt: " << g_stats.classified_calldata.load()
+                                    << "\nTransfer graph: " << g_stats.classified_graph.load()
+                                    << "\nFallback: " << g_stats.classified_fallback.load()
+                                    << "\n\n🕸 <b>Receipt transfer graph</b>\n"
+                                    << "Graph tx: " << g_stats.graph_seen.load()
+                                    << "\nPath wallet → pool: " << g_stats.graph_path_to_pool.load()
+                                    << "\nPath pool → recipient: " << g_stats.graph_path_from_pool.load()
+                                    << "\nRecovered BUY/SELL: " << g_stats.graph_recovered.load()
+                                    << "\nAmbiguous paths: " << g_stats.graph_ambiguous.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "No counter flow: " << g_stats.unk_no_counter_flow.load()
+                                    << "No counter flow (legacy): " << g_stats.unk_no_counter_flow.load()
+                                    << "\nNo direct counter flow: " << g_stats.unk_no_direct_counter.load()
+                                    << "\nGraph no pool path: " << g_stats.unk_graph_no_pool_path.load()
+                                    << "\nGraph ambiguous: " << g_stats.unk_graph_ambiguous.load()
                                     << "\nUnknown router: " << g_stats.unk_unknown_router.load()
+                                    << "\nDecoded/no receipt match: " << g_stats.unk_decoded_no_match.load()
+                                    << "\nPermit2/no swap match: " << g_stats.unk_permit2_no_match.load()
+                                    << "\nBridge flow: " << g_stats.unk_bridge_flow.load()
+                                    << "\nAggregator/no match: " << g_stats.unk_aggregator_no_match.load()
+                                    << "\nV4/no match: " << g_stats.unk_v4_no_match.load()
+                                    << "\nMulticall/no match: " << g_stats.unk_multicall_no_match.load()
+                                    << "\nSubplan/no match: " << g_stats.unk_subplan_no_match.load()
+                                    << "\nV4 actions undecoded: " << g_stats.unk_v4_actions_undecoded.load()
+                                    << "\nUnsupported selector: " << g_stats.unk_unsupported_selector.load()
                                     << "\nOther: " << g_stats.unk_other.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
+                        }
+                    }
+                    else if (txt=="/selectors") {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            sendMsg(cid, buildSelectorStatsText());
                         }
                     }
                     else if (txt=="/help") {
@@ -1812,6 +2420,13 @@ int main() {
         else if (chainName == "arbitrum" || chainName == "arb") { setChainContext(makeArbitrumContext()); RPC_ENDPOINTS = ARBITRUM_RPC_ENDPOINTS; }
         else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
+        std::cout << "[ANALYZER] V2 trace="
+                  << (WHALE_ENABLE_TRACE ? "enabled" : "disabled")
+                  << " mode=on-demand timeout="
+                  << WHALE_TRACE_TIMEOUT_SECONDS << "s"
+                  << " aggregation="
+                  << AGGREGATION_WINDOW_SECONDS << "s"
+                  << std::endl;
     }
     initDB(); initRankingDB(); initPremium(TG_TOKEN, SERVICE_CHAT_ID); loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
