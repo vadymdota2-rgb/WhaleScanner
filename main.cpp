@@ -714,6 +714,10 @@ bool needsTraceRecovery(const TxResultV2& r) {
     return false;
 }
 
+uint64_t getPriceNanos(const std::string& token);
+int getDecimals(const std::string& addr);
+std::string getSymbol(const std::string& addr);
+
 struct MainPriceOracle final : IPriceOracle {
     uint64_t getPriceNanos(
         const std::string& tokenAddr
@@ -744,12 +748,14 @@ TxResult analyzeWatchedTransaction(
     static MainPriceOracle prices;
     static MainTokenRegistry tokens;
 
-    AnalysisInput baseInput;
-    baseInput.tx = tx;
-    baseInput.receipt = receipt;
-    baseInput.chain = chainCtx();
-    baseInput.prices = &prices;
-    baseInput.tokens = &tokens;
+    AnalysisInput baseInput{
+        tx,
+        receipt,
+        std::nullopt,
+        chainCtx(),
+        &prices,
+        &tokens
+    };
 
     TxResultV2 receiptResult = analyzeTxV2(baseInput, wallet);
     TxResultV2 selected = receiptResult;
@@ -759,10 +765,17 @@ TxResult analyzeWatchedTransaction(
         const json trace = getTransactionTrace(tx["hash"].get<std::string>());
 
         if (trace.is_object()) {
-            AnalysisInput tracedInput = baseInput;
-            tracedInput.trace = trace;
+            AnalysisInput tracedInput{
+                tx,
+                receipt,
+                trace,
+                chainCtx(),
+                &prices,
+                &tokens
+            };
 
-            TxResultV2 tracedResult = analyzeTxV2(tracedInput, wallet);
+            TxResultV2 tracedResult =
+                analyzeTxV2(tracedInput, wallet);
 
             // Trace is supplemental. Never blindly replace a good receipt
             // classification with a weaker trace classification.
@@ -1718,7 +1731,7 @@ bool processBlock(long long bn) {
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
         if (res.isSwap && !res.hasSwapEvent) logSwaplessTrade(hash, receipt, res);
 
-        if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
+        if (chainCtx().isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
