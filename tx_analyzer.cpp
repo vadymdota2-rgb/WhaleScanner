@@ -88,6 +88,12 @@ struct FlowBook {
     cpp_int walletWrapped = 0;
     cpp_int walletUnwrapped = 0;
 
+    // Receipt-only recovery for token -> native swaps. Wrapped-native
+    // Withdrawal is often emitted for the router, followed by an internal
+    // native transfer to the wallet. It is only used with strong swap evidence.
+    cpp_int routerUnwrapCandidate = 0;
+    std::string routerUnwrapAccount;
+
     void receive(
         const std::string& token,
         const cpp_int& amount,
@@ -386,20 +392,38 @@ FlowBook reconstructFlows(
     }
 
     /*
-     * Deposit(address,uint256) / Withdrawal(address,uint256) are only
-     * attributed when the indexed account is the watched wallet.
+     * Deposit/Withdrawal account is indexed. Direct wallet wrap/unwrap is
+     * tracked separately. For router-owned Withdrawal we keep a conservative
+     * candidate used only when the wallet sent a non-base token and the same
+     * transaction has strong DEX evidence.
      */
+    const std::string txTo = normalizedAddress(tx, "to");
     for (const auto& log : indexed.wrappedEvents) {
         if (log.topics.size() < 2) continue;
-        if (topicAddress(log.topics[1]) != wallet) continue;
 
+        const std::string account = topicAddress(log.topics[1]);
         const auto amount = parseUint256Opt(log.data);
-        if (!amount) continue;
+        if (!amount || *amount <= 0) continue;
 
-        if (log.topic0 == WRAPPED_DEPOSIT) {
-            flows.walletWrapped += *amount;
-        } else {
-            flows.walletUnwrapped += *amount;
+        if (account == wallet) {
+            if (log.topic0 == WRAPPED_DEPOSIT) {
+                flows.walletWrapped += *amount;
+            } else {
+                flows.walletUnwrapped += *amount;
+            }
+            continue;
+        }
+
+        if (log.topic0 == WRAPPED_WITHDRAWAL) {
+            const bool accountIsTxTarget =
+                !txTo.empty() && account == txTo;
+            const bool accountIsKnownRouter =
+                chain.routers.count(account) > 0;
+
+            if (accountIsTxTarget || accountIsKnownRouter) {
+                flows.routerUnwrapCandidate += *amount;
+                flows.routerUnwrapAccount = account;
+            }
         }
     }
 
@@ -624,6 +648,9 @@ TxResult analyzeInternal(
     if (universal.present) addEvidence(result, "UNIVERSAL_ROUTER");
     if (result.hasPermit2Signal) addEvidence(result, "PERMIT2");
     if (trace != nullptr) addEvidence(result, "NATIVE_TRACE");
+    if (flows.routerUnwrapCandidate > 0) {
+        addEvidence(result, "ROUTER_UNWRAP_CANDIDATE");
+    }
 
     /*
      * Pool identity means that a wallet token transfer directly touched
@@ -654,7 +681,11 @@ TxResult analyzeInternal(
 
     const bool hasTokenIn = anyPositive(flows.net);
     const bool hasTokenOut = anyNegative(flows.net);
-    const bool hasNativeIn = flows.traceNativeIn > 0;
+    const bool hasTraceNativeIn = flows.traceNativeIn > 0;
+    const bool hasRouterUnwrapCandidate =
+        flows.routerUnwrapCandidate > 0;
+    const bool hasNativeIn =
+        hasTraceNativeIn || hasRouterUnwrapCandidate;
     const bool hasNativeOut =
         flows.txNativeOut > 0 ||
         flows.traceNativeInternalOut > 0;
@@ -880,7 +911,18 @@ TxResult analyzeInternal(
                 );
             if (result.counterAddr.empty() && hasNativeIn) {
                 result.counterAddr = chain.nativeMarker;
-                result.counterAmount = flows.traceNativeIn;
+                result.counterAmount =
+                    hasTraceNativeIn
+                        ? flows.traceNativeIn
+                        : flows.routerUnwrapCandidate;
+
+                if (!hasTraceNativeIn &&
+                    flows.routerUnwrapCandidate > 0) {
+                    addEvidence(
+                        result,
+                        "SELL_NATIVE_INFERRED_FROM_ROUTER_UNWRAP"
+                    );
+                }
             }
         } else {
             /*
@@ -970,6 +1012,88 @@ TxResult analyzeInternal(
                 result.unknownReason = "UNKNOWN_ROUTER";
             }
 
+            setUsdValue(result, chain);
+            return result;
+        }
+    }
+
+    /*
+     * One-sided swap recovery.
+     *
+     * This handles execute/aggregator transactions where receipts expose the
+     * watched wallet's token side but the counter side is hidden behind the
+     * router. We never create a zero-counter SELL. A SELL is recovered only
+     * when a router-owned wrapped-native Withdrawal supplies a concrete amount.
+     */
+    if (
+        !result.isSwap &&
+        result.walletWasSender &&
+        protocolEvidence
+    ) {
+        const std::string receivedNonBase =
+            strongestToken(
+                flows.net,
+                chain,
+                true,
+                true
+            );
+        const std::string sentNonBase =
+            strongestToken(
+                flows.net,
+                chain,
+                true,
+                false
+            );
+
+        // Partial BUY: useful for execute/Permit2 paths where the outgoing
+        // counter flow is not visible. tx.value-based buys were already
+        // classified above, so this branch is intentionally MEDIUM.
+        if (
+            !receivedNonBase.empty() &&
+            !hasTokenOut &&
+            !hasNativeOut
+        ) {
+            result.isSwap = true;
+            result.isBuy = true;
+            result.classification = "BUY_PARTIAL_FLOW";
+            result.confidence = "MEDIUM";
+            result.tokenAddr = receivedNonBase;
+            result.rawAmount =
+                tokenMagnitude(
+                    flows.net,
+                    receivedNonBase
+                );
+            result.unknownReason = "MISSING_COUNTER_OUTFLOW";
+            addEvidence(result, "ONE_SIDED_ROUTER_BUY");
+            setUsdValue(result, chain);
+            return result;
+        }
+
+        // Partial SELL is promoted only when the router unwrap amount gives a
+        // non-zero received native amount. This satisfies the bot invariant.
+        if (
+            !sentNonBase.empty() &&
+            !hasTokenIn &&
+            flows.routerUnwrapCandidate > 0
+        ) {
+            result.isSwap = true;
+            result.isBuy = false;
+            result.classification = "SELL_ROUTER_UNWRAP";
+            result.confidence = "MEDIUM";
+            result.tokenAddr = sentNonBase;
+            result.rawAmount =
+                tokenMagnitude(
+                    flows.net,
+                    sentNonBase
+                );
+            result.counterAddr = chain.nativeMarker;
+            result.counterAmount =
+                flows.routerUnwrapCandidate;
+            result.unknownReason.clear();
+            addEvidence(
+                result,
+                "ONE_SIDED_SELL_WITH_ROUTER_UNWRAP"
+            );
             setUsdValue(result, chain);
             return result;
         }
