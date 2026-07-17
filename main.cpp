@@ -531,6 +531,108 @@ json getTransactionTrace(const std::string& hash) {
     return nullptr;
 }
 
+int analyzerResultScore(const TxResult& result) {
+    if (!result.valid) return -1000;
+    if (result.failed) return 100;
+
+    int score = 0;
+
+    if (result.isSwap) score += 100;
+    if (result.classification == "BUY" ||
+        result.classification == "SELL") {
+        score += 50;
+    } else if (result.classification == "BUY_PARTIAL_FLOW" ||
+               result.classification == "SELL_ROUTER_UNWRAP" ||
+               result.classification == "TOKEN_TO_TOKEN_SWAP") {
+        score += 30;
+    } else if (result.classification == "TRANSFER") {
+        score += 5;
+    } else if (result.classification == "UNKNOWN") {
+        score -= 20;
+    }
+
+    if (!result.tokenAddr.empty() && result.rawAmount > 0) score += 20;
+    if (!result.counterAddr.empty() && result.counterAmount > 0) score += 30;
+
+    if (result.confidence == "HIGH") score += 30;
+    else if (result.confidence == "MEDIUM") score += 15;
+    else if (result.confidence == "LOW") score -= 10;
+
+    if (result.hasSwapEvent) score += 5;
+    if (result.unknownReason.empty()) score += 5;
+    else if (result.unknownReason == "NO_COUNTER_FLOW" ||
+             result.unknownReason == "MISSING_COUNTER_INFLOW" ||
+             result.unknownReason == "MISSING_COUNTER_OUTFLOW") {
+        score -= 5;
+    } else {
+        score -= 10;
+    }
+
+    return score;
+}
+
+bool shouldUseTracedResult(
+    const TxResult& receiptResult,
+    const TxResult& tracedResult
+) {
+    if (!tracedResult.valid) return false;
+
+    /*
+     * Never let trace downgrade a clear receipt BUY/SELL into TRANSFER or
+     * UNKNOWN. Some providers return incomplete/truncated callTracer trees.
+     */
+    if (receiptResult.isSwap && !tracedResult.isSwap) {
+        return false;
+    }
+
+    /*
+     * Preserve a complete receipt swap unless trace adds useful information.
+     */
+    const bool receiptComplete =
+        receiptResult.isSwap &&
+        !receiptResult.tokenAddr.empty() &&
+        receiptResult.rawAmount > 0 &&
+        !receiptResult.counterAddr.empty() &&
+        receiptResult.counterAmount > 0;
+
+    const bool tracedComplete =
+        tracedResult.isSwap &&
+        !tracedResult.tokenAddr.empty() &&
+        tracedResult.rawAmount > 0 &&
+        !tracedResult.counterAddr.empty() &&
+        tracedResult.counterAmount > 0;
+
+    if (receiptComplete && !tracedComplete) {
+        return false;
+    }
+
+    return analyzerResultScore(tracedResult) >
+           analyzerResultScore(receiptResult);
+}
+
+bool shouldSuppressSwapAlert(const TxResult& result) {
+    if (!result.isSwap) return false;
+
+    /*
+     * Do not suppress normal swaps merely because venue is unknown or
+     * confidence is LOW. Suppress only structurally unusable results.
+     */
+    if (result.tokenAddr.empty() || result.rawAmount <= 0) {
+        return true;
+    }
+
+    if (!result.isBuy &&
+        (result.counterAddr.empty() || result.counterAmount <= 0)) {
+        return true;
+    }
+
+    /*
+     * Partial BUY is allowed: the bot can show Bought without a misleading
+     * Spent line. Ordinary two-sided BUY/SELL remains visible.
+     */
+    return false;
+}
+
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
         std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
@@ -1406,7 +1508,7 @@ bool processBlock(long long bn) {
                         mA
                     );
 
-                if (traced.valid) {
+                if (shouldUseTracedResult(res, traced)) {
                     res = std::move(traced);
                 }
             }
@@ -1440,10 +1542,11 @@ bool processBlock(long long bn) {
         }
 
         /*
-         * LOW-confidence swaps are diagnostic only. This prevents false
-         * alerts from one-sided router activity.
+         * Keep ordinary BUY/SELL visible. Drop only malformed swaps that
+         * cannot produce a safe alert.
          */
-        if (res.isSwap && res.confidence == "LOW") {
+        if (shouldSuppressSwapAlert(res)) {
+            logLowConfidenceTx(hash, bn, tx, receipt, res);
             markTxProcessed(hash, bn);
             continue;
         }
