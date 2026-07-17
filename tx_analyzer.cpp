@@ -68,6 +68,61 @@ struct UniversalRouterCommands {
     bool hasPermit2 = false;
 };
 
+
+struct TransferEdge {
+    std::string from;
+    std::string to;
+    cpp_int amount;
+};
+
+bool graphReachable(
+    const std::map<std::string, std::vector<TransferEdge>>& edgesByToken,
+    const std::string& token,
+    const std::string& start,
+    const std::set<std::string>& targets,
+    int maxDepth = 6
+) {
+    auto it = edgesByToken.find(token);
+    if (it == edgesByToken.end() || start.empty() || targets.empty()) return false;
+
+    std::set<std::string> visited;
+    std::vector<std::pair<std::string, int>> queue;
+    queue.push_back({start, 0});
+    visited.insert(start);
+
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        const std::string& node = queue[qi].first;
+        const int depth = queue[qi].second;
+        if (targets.count(node)) return true;
+        if (depth >= maxDepth) continue;
+
+        for (const auto& edge : it->second) {
+            if (edge.amount <= 0 || edge.from != node) continue;
+            if (targets.count(edge.to)) return true;
+            if (visited.insert(edge.to).second)
+                queue.push_back({edge.to, depth + 1});
+        }
+    }
+    return false;
+}
+
+bool tokenPathTouchesSwapPool(
+    const std::map<std::string, std::vector<TransferEdge>>& edgesByToken,
+    const std::string& token,
+    const std::string& wallet,
+    const std::set<std::string>& pools,
+    bool incoming
+) {
+    if (incoming) {
+        for (const auto& pool : pools) {
+            if (graphReachable(edgesByToken, token, pool, {wallet}))
+                return true;
+        }
+        return false;
+    }
+    return graphReachable(edgesByToken, token, wallet, pools);
+}
+
 bool isGenericMulticallSelector(const std::string& input) {
     if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return false;
     return input.substr(2, 8) == "ac9650d8";
@@ -293,6 +348,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
     std::map<std::string, cpp_int> netFlow;
     std::vector<std::string> tokenOrder;
+
+    // Complete ERC-20 transfer graph for the receipt.
+    // Net flow still comes only from the tracked wallet, while this graph
+    // connects it to pools through Permit2/router/executor contracts.
+    std::map<std::string, std::vector<TransferEdge>> edgesByToken;
     auto touch = [&](const std::string& tok) {
         if (netFlow.find(tok) == netFlow.end()) { netFlow[tok] = 0; tokenOrder.push_back(tok); }
     };
@@ -351,9 +411,14 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
 
         std::string fr = "0x"+toLower(t1.substr(26));
         std::string to = "0x"+toLower(t2.substr(26));
-        if (fr != wa && to != wa) continue;
         cpp_int amt = parseUint256(dataField);
         if (amt == 0) continue;
+
+        // Index every transfer, including transfers between intermediate
+        // contracts that do not directly mention the tracked wallet.
+        edgesByToken[logAddr].push_back({fr, to, amt});
+
+        if (fr != wa && to != wa) continue;
         touch(logAddr);
         anyTransferForWallet = true;
         if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
@@ -505,9 +570,20 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (net == 0) continue;
         cpp_int absNet = net >= 0 ? net : -net;
         bool coherent = (net > 0 && (hasBaseOut || nativeSwapSignal)) || (net < 0 && (hasBaseIn || nativeInflowSignal));
-        bool fromPool = (net > 0)
-            ? (inSources.count(tok) && [&]() { for (auto& s : inSources[tok]) if (allSwapPoolAddrs.count(s)) return true; return false; }())
-            : (outDestinations.count(tok) && [&]() { for (auto& d : outDestinations[tok]) if (allSwapPoolAddrs.count(d)) return true; return false; }());
+        bool fromPool = tokenPathTouchesSwapPool(
+            edgesByToken,
+            tok,
+            wa,
+            allSwapPoolAddrs,
+            net > 0
+        );
+
+        // Direct pool counterpart remains a fallback.
+        if (!fromPool) {
+            fromPool = (net > 0)
+                ? (inSources.count(tok) && [&]() { for (auto& s : inSources[tok]) if (allSwapPoolAddrs.count(s)) return true; return false; }())
+                : (outDestinations.count(tok) && [&]() { for (auto& d : outDestinations[tok]) if (allSwapPoolAddrs.count(d)) return true; return false; }());
+        }
         bool better = bestNonBaseTok.empty() ||
                       (coherent && !bestNonBaseCoherent) ||
                       (coherent == bestNonBaseCoherent && fromPool && !bestNonBaseFromPool) ||
@@ -515,11 +591,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
         if (better) { bestNonBaseAbs = absNet; bestNonBaseTok = tok; bestNonBaseNet = net; bestNonBaseCoherent = coherent; bestNonBaseFromPool = fromPool; }
     }
 
-    // Swap event is authoritative for BUY/SELL when the tracked wallet
-    // has a non-base token flow. Selector/router/Permit2 decoding is not
-    // required for classification.
+    // Swap event is authoritative when the tracked wallet has a
+    // non-base token flow. Router/selector/counter-flow decoding is optional.
     const bool swapEventWithWalletTokenFlow =
-        hasSwap && !bestNonBaseTok.empty() && bestNonBaseNet != 0;
+        hasSwap &&
+        !bestNonBaseTok.empty() &&
+        bestNonBaseNet != 0;
 
     r.isSwap = (
         swapEventWithWalletTokenFlow ||
@@ -638,12 +715,14 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
     r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
     r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
     r.dexActivityDetected = hasSwap || routerCall;
-    if (r.isSwap && r.venue.empty()) {
-        r.venue = hasSwap ? "DEX Pool" : "DEX";
-    }
 
+    if (r.isSwap && r.venue.empty())
+        r.venue = hasSwap ? "DEX Pool" : "DEX";
+
+    // Missing quote/counter flow does not invalidate an already recognized
+    // BUY/SELL. It only leaves counterAddr/counterAmount empty.
     if (!r.isSwap && r.venue.empty() && r.dexActivityDetected) {
-        if (!twoSidedFlow) r.unknownReason = "NO_COUNTER_FLOW";
+        if (!twoSidedFlow) r.unknownReason = "NO_WALLET_TOKEN_FLOW";
         else if (hasSwap && !routerCall) r.unknownReason = "UNKNOWN_ROUTER";
         else r.unknownReason = "OTHER";
     }
