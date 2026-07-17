@@ -11,7 +11,6 @@
 #include <shared_mutex>
 #include <atomic>
 #include <memory>
-#include <optional>
 #include <csignal>
 #include <cstdlib>
 #include <curl/curl.h>
@@ -61,19 +60,14 @@ struct Stats {
     std::atomic<uint64_t> unk_other{0};
 } g_stats;
 
-void recordCoverage(const TxResultV2& r) {
-    switch (r.type) {
-        case TxType::SWAP:
-            if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed);
-            else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed);
-            break;
-        case TxType::LP_ADD: g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed); break;
-        case TxType::LP_REMOVE: g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed); break;
-        case TxType::WRAP: g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed); break;
-        case TxType::UNWRAP: g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed); break;
-        case TxType::TRANSFER: g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed); break;
-        default: g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed); break;
-    }
+void recordCoverage(const TxResult& r) {
+    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
+    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
+    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -92,23 +86,22 @@ const bool LOG_INVARIANT_VIOLATIONS = []() {
 }();
 std::mutex invariantLogMutex;
 
-void checkInvariants(const std::string& hash, const TxResultV2& r) {
+void checkInvariants(const std::string& hash, const TxResult& r) {
     if (!LOG_INVARIANT_VIOLATIONS) return;
     std::vector<std::string> violations;
     if (r.rawAmount < 0) violations.push_back("rawAmount is negative");
-    if (r.isSwap() && r.tokenAddr.empty()) violations.push_back("type=SWAP but tokenAddr is empty");
-    if ((r.type == TxType::WRAP || r.type == TxType::UNWRAP) && r.tokenAddr != chainCtx().wrappedNative)
-        violations.push_back("WRAP/UNWRAP but tokenAddr is not wrapped native");
-    if (r.isSwap() && !r.isBuy && r.counterAmount == 0) violations.push_back("SELL with zero counterAmount");
-    if (r.isSwap() && r.counterAmount < 0) violations.push_back("counterAmount is negative");
-    if (r.isLP() && r.isSwap()) violations.push_back("LP transaction is also marked as SWAP");
-    if (r.type == TxType::FAILED && !r.reverted) violations.push_back("FAILED type but reverted=false");
+    if (r.isSwap && r.tokenAddr.empty()) violations.push_back("isSwap=true but tokenAddr is empty");
+    if ((r.venue == "Wrap" || r.venue == "Unwrap") && r.tokenAddr != chainCtx().wrappedNative)
+        violations.push_back("Wrap/Unwrap venue but tokenAddr is not the chain's wrapped native");
+    if (r.isSwap && !r.isBuy && r.counterAmount == 0) violations.push_back("SELL with zero counterAmount (unresolved counter side)");
+    if (r.isSwap && r.counterAmount < 0) violations.push_back("counterAmount is negative");
+    if ((r.venue == "Add Liquidity" || r.venue == "Remove Liquidity") && r.isSwap)
+        violations.push_back("LP venue set but isSwap is still true");
     if (violations.empty()) return;
 
     std::stringstream ss;
-    ss << "hash=" << hash << " type=" << r.typeString() << " venue=" << r.venue
-       << " isBuy=" << (r.isBuy?1:0) << " token=" << r.tokenAddr
-       << " confidence=" << r.confidenceString() << " violations=[";
+    ss << "hash=" << hash << " venue=" << r.venue << " isSwap=" << (r.isSwap?1:0) << " isBuy=" << (r.isBuy?1:0)
+       << " token=" << r.tokenAddr << " violations=[";
     for (size_t i=0;i<violations.size();i++) { if (i) ss << "; "; ss << violations[i]; }
     ss << "]";
     std::lock_guard<std::mutex> lk(invariantLogMutex);
@@ -127,7 +120,7 @@ const bool LOG_LOW_CONFIDENCE = []() {
 std::mutex diagLogMutex;
 
 void appendDiagLog(const std::string& file, const std::string& hash, long long bn,
-                    const nlohmann::json& tx, const nlohmann::json& receipt, const TxResultV2& res) {
+                    const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     std::string from = (tx.contains("from") && tx["from"].is_string()) ? tx["from"].get<std::string>() : "";
     std::string to = (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string()) ? tx["to"].get<std::string>() : "";
     std::string input = (tx.contains("input") && tx["input"].is_string()) ? tx["input"].get<std::string>() : "";
@@ -142,8 +135,7 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
     std::stringstream ss;
     ss << "hash=" << hash << " block=" << bn << " from=" << from << " to=" << to
        << " router=" << to << " selector=" << selector
-       << " type=" << res.typeString() << " venue=" << res.venue << " isSwap=" << (res.isSwap() ? 1 : 0) << " isBuy=" << (res.isBuy ? 1 : 0)
-       << " confidence=" << res.confidenceString()
+       << " venue=" << res.venue << " isSwap=" << (res.isSwap ? 1 : 0) << " isBuy=" << (res.isBuy ? 1 : 0)
        << " token=" << res.tokenAddr << " counter=" << res.counterAddr
        << " usdNanos=" << res.usdNanos.convert_to<std::string>()
        << " whyUnknown=" << (res.unknownReason.empty() ? "-" : res.unknownReason)
@@ -156,11 +148,11 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
     if (f) f << ss.str() << "\n";
 }
 
-void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResultV2& res) {
+void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     if (LOG_UNKNOWN_TX) appendDiagLog("unknown_tx.log", hash, bn, tx, receipt, res);
 }
 
-void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResultV2& res) {
+void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     if (LOG_LOW_CONFIDENCE) appendDiagLog("low_confidence.log", hash, bn, tx, receipt, res);
 }
 
@@ -1022,20 +1014,12 @@ std::string getSymbol(const std::string& addr) {
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
-std::string coinGeckoPlatform() {
-    std::string name = toLower(chainCtx().displayName);
-    if (name == "ethereum") return "ethereum";
-    if (name == "base") return "base";
-    if (name.find("arbitrum") != std::string::npos) return "arbitrum-one";
-    return "binance-smart-chain";
-}
-
 uint64_t getPriceNanos(const std::string& token) {
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
     double p=0; auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
     try { auto j=json::parse(r); if (j.contains("pairs")&&j["pairs"].is_array()&&!j["pairs"].empty()&&j["pairs"][0].contains("priceUsd")&&j["pairs"][0]["priceUsd"].is_string()) p=std::stod(j["pairs"][0]["priceUsd"].get<std::string>()); } catch (...) {}
-    if (p==0) { auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/"+coinGeckoPlatform()+"?contract_addresses="+token+"&vs_currencies=usd");
+    if (p==0) { auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain?contract_addresses="+token+"&vs_currencies=usd");
         try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) p=j2[a]["usd"].get<double>(); } catch (...) {} }
     uint64_t n=static_cast<uint64_t>(p*1000000000.0);
     if (n>0) { { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; } saveTokenPrice(a,n); }
@@ -1043,95 +1027,37 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-namespace {
-class MainPriceOracle final : public IPriceOracle {
-public:
-    uint64_t getPriceNanos(const std::string& tokenAddr) const override { return ::getPriceNanos(tokenAddr); }
-};
-
-class MainTokenRegistry final : public ITokenRegistry {
-public:
-    int getDecimals(const std::string& tokenAddr) const override { return ::getDecimals(tokenAddr); }
-    std::string getSymbol(const std::string& tokenAddr) const override { return ::getSymbol(tokenAddr); }
-    bool isKnown(const std::string& tokenAddr) const override {
-        const std::string addr = toLower(tokenAddr);
-        std::lock_guard<std::mutex> lock(cacheMutex);
-        return TOKEN_DECIMALS.count(addr) > 0 || TOKEN_SYMBOLS.count(addr) > 0;
-    }
-};
-
-const MainPriceOracle g_analyzerPrices;
-const MainTokenRegistry g_analyzerTokens;
-
-TxResultV2 analyzeTrackedTx(const json& tx, const json& receipt, const std::string& wallet) {
-    AnalysisInput input{tx, receipt, std::nullopt, chainCtx(), &g_analyzerPrices, &g_analyzerTokens};
-    return analyzeTxV2(input, wallet);
-}
-
-TxResult makeLegacyResult(const TxResultV2& r) {
-    TxResult out;
-    out.valid = r.valid;
-    out.isSwap = r.isSwap();
-    out.venue = r.venue;
-    out.tokenAddr = r.tokenAddr;
-    out.counterAddr = r.counterAddr;
-    out.rawAmount = r.rawAmount;
-    out.counterAmount = r.counterAmount;
-    out.usdNanos = r.usdNanos;
-    out.isBuy = r.isBuy;
-    out.hasSwapEvent = r.hasSwapEvent;
-    out.isUniversalRouter = r.isUniversalRouter;
-    out.isGenericMulticall = r.isGenericMulticall;
-    out.hasPermit2Signal = r.hasPermit2Signal;
-    out.dexActivityDetected = r.dexActivityDetected;
-    out.lpMintOrBurnSeen = r.lpMintOrBurnSeen;
-    out.lpV3EventSeen = r.lpV3EventSeen;
-    out.lpPoolIdentitySeen = r.lpPoolIdentitySeen;
-    out.unknownReason = r.unknownReason;
-    return out;
-}
-} // namespace
-
-std::string buildAlertMessage(const std::string& label, const TxResultV2& res, const std::string& hash) {
-    bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
+std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
+    bool tokenIsNative = (res.tokenAddr == NATIVE_BNB_MARKER);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
     std::string msg="💼 <b>"+safeString(label)+"</b>\n\n";
-    switch (res.type) {
-        case TxType::SWAP: msg += res.isBuy ? "🟢 <b>BUY</b>" : "🚨 <b>SELL</b>"; break;
-        case TxType::LP_ADD: msg += "🌊 <b>ADD LIQUIDITY</b>"; break;
-        case TxType::LP_REMOVE: msg += "🌊 <b>REMOVE LIQUIDITY</b>"; break;
-        case TxType::WRAP: msg += "🔄 <b>WRAP " + chainCtx().nativeSymbol + "</b>"; break;
-        case TxType::UNWRAP: msg += "🔄 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>"; break;
-        case TxType::BRIDGE: msg += "🌉 <b>BRIDGE</b>"; break;
-        case TxType::STAKE: msg += "🔒 <b>STAKE</b>"; break;
-        case TxType::UNSTAKE: msg += "🔓 <b>UNSTAKE</b>"; break;
-        case TxType::NFT_TRADE: msg += "🖼 <b>NFT TRADE</b>"; break;
-        case TxType::APPROVE: msg += "✅ <b>APPROVAL</b>"; break;
-        case TxType::TRANSFER: msg += res.isBuy ? "📥 <b>RECEIVE</b>" : "📤 <b>TRANSFER</b>"; break;
-        default: msg += "⚙️ <b>" + res.typeString() + "</b>"; break;
-    }
+    if (res.venue == "Add Liquidity") msg+="🌊 <b>ADD LIQUIDITY</b>";
+    else if (res.venue == "Remove Liquidity") msg+="🌊 <b>REMOVE LIQUIDITY</b>";
+    else if (res.venue == "Wrap") msg+="🔄 <b>WRAP " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Unwrap") msg+="🔄 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>";
+    else msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🚨 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
     msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
     msg+="🪙 Token: <b>"+tokenSymbol+"</b>\n";
     msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
-    if (res.isSwap()) {
+    if (res.isSwap) {
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
         std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
         msg += "💵 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
     }
-    if (res.isSwap() && !res.counterAddr.empty()) {
+    if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
         std::string counterAmountStr, counterSymbol;
-        if (res.counterAddr == chainCtx().nativeMarker) {
+        if (res.counterAddr == NATIVE_BNB_MARKER) {
             counterAmountStr = formatAmount(res.counterAmount, 18);
             counterSymbol = chainCtx().nativeSymbol;
         } else {
             counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
             counterSymbol = safeString(getSymbol(res.counterAddr), 16);
         }
-        msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" + counterAmountStr + " " + counterSymbol + "</b>\n";
+        msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
+               counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    if (!res.venue.empty()) msg += "🏛 Venue: <b>" + safeString(res.venue, 48) + "</b>\n";
     if (!tokenIsNative) msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
     msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
     msg+="💼 Wallet: <b>"+safeString(label)+"</b>\n\n";
@@ -1144,7 +1070,7 @@ constexpr long long AGGREGATION_WINDOW_SECONDS = 120;
 
 struct PendingAlert {
     std::string wallet;
-    TxResultV2 agg;
+    TxResult agg;
     std::string hash;
     long long block = 0;
     long long blockTs = 0;
@@ -1155,7 +1081,7 @@ std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
 std::mutex g_pendingMutex;
 }
 
-void dispatchAlert(const std::string& mA, const TxResultV2& res, const std::string& hash) {
+void dispatchAlert(const std::string& mA, const TxResult& res, const std::string& hash) {
     std::map<std::string, std::vector<std::string>> byLabel;
     {
         std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
@@ -1178,13 +1104,13 @@ void dispatchAlert(const std::string& mA, const TxResultV2& res, const std::stri
     }
     if (anySent) {
         g_stats.alerts_sent.fetch_add(byLabel.size());
-        std::cout << "[OK] " << mA << " " << (res.isSwap()?(res.isBuy?"BUY":"SELL"):res.typeString()) << " "
+        std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " "
                   << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
                   << " -> " << byLabel.size() << " label group(s)" << std::endl;
     } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
 }
 
-void bufferSwap(const std::string& mA, const TxResultV2& res, const std::string& hash,
+void bufferSwap(const std::string& mA, const TxResult& res, const std::string& hash,
                 long long block, long long blockTs) {
     std::string key = mA + "|" + toLower(res.tokenAddr) + "|" + (res.isBuy ? "b" : "s");
     std::lock_guard<std::mutex> l(g_pendingMutex);
@@ -1193,7 +1119,7 @@ void bufferSwap(const std::string& mA, const TxResultV2& res, const std::string&
         g_pendingAlerts.emplace(key, PendingAlert{mA, res, hash, block, blockTs, std::chrono::steady_clock::now()});
         return;
     }
-    TxResultV2& a = it->second.agg;
+    TxResult& a = it->second.agg;
     a.usdNanos += res.usdNanos;
     a.rawAmount += res.rawAmount;
     if (a.counterAddr == res.counterAddr) a.counterAmount += res.counterAmount;
@@ -1214,8 +1140,7 @@ void flushPendingAlerts(bool force) {
         }
     }
     for (const PendingAlert& p : ready) {
-        TxResult legacy = makeLegacyResult(p.agg);
-        saveTrade(p.wallet, legacy, p.hash, p.block, p.blockTs);
+        saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
         dispatchAlert(p.wallet, p.agg, p.hash);
     }
 }
@@ -1256,22 +1181,18 @@ bool processBlock(long long bn) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-        TxResultV2 res = analyzeTrackedTx(tx, receipt, mA);
-        if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         recordCoverage(res);
         checkInvariants(hash, res);
-        if (res.type == TxType::FAILED || res.reverted) { markTxProcessed(hash,bn); continue; }
-        if (res.type == TxType::UNKNOWN || res.type == TxType::CONTRACT_CALL)
-            logUnknownTx(hash, bn, tx, receipt, res);
-        if (res.confidence <= ConfidenceLevel::LOW)
-            logLowConfidenceTx(hash, bn, tx, receipt, res);
+        if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
+        if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
-        if (chainCtx().isBaseAsset(res.tokenAddr) && res.type == TxType::TRANSFER) { markTxProcessed(hash,bn); continue; }
+        if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        if (res.isSwap()) bufferSwap(mA, res, hash, bn, blockTs);
+        if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
         else dispatchAlert(mA, res, hash);
         markTxProcessed(hash,bn);
     }
