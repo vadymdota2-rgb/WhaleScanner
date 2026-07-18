@@ -134,6 +134,54 @@ cpp_int absInt(const cpp_int& v) {
     return v < 0 ? -v : v;
 }
 
+cpp_int pow10Int(int n) {
+    cpp_int r = 1;
+    for (int i = 0; i < n; ++i) r *= 10;
+    return r;
+}
+
+struct FlowRank {
+    cpp_int usdNanos = 0;
+    cpp_int normalized18 = 0;
+    cpp_int raw = 0;
+    bool hasPrice = false;
+};
+
+FlowRank rankFlow(const std::string& token, const cpp_int& rawAmount) {
+    FlowRank rank;
+    rank.raw = absInt(rawAmount);
+
+    int decimals = getDecimals(token);
+    if (decimals < 0) decimals = 18;
+    if (decimals <= 18) rank.normalized18 = rank.raw * pow10Int(18 - decimals);
+    else rank.normalized18 = rank.raw / pow10Int(decimals - 18);
+
+    const uint64_t priceNanos = getPriceNanos(token);
+    if (priceNanos > 0) {
+        rank.hasPrice = true;
+        rank.usdNanos = calcUsdNanos(rank.raw, decimals, priceNanos);
+    }
+    return rank;
+}
+
+bool betterRank(const FlowRank& candidate, const FlowRank& current) {
+    if (candidate.hasPrice != current.hasPrice) return candidate.hasPrice;
+    if (candidate.hasPrice && candidate.usdNanos != current.usdNanos)
+        return candidate.usdNanos > current.usdNanos;
+    if (candidate.normalized18 != current.normalized18)
+        return candidate.normalized18 > current.normalized18;
+    return candidate.raw > current.raw;
+}
+
+bool receiptSucceeded(const json& receipt) {
+    if (!receipt.contains("status")) return true;
+    const auto& status = receipt["status"];
+    if (status.is_string()) return hexToCppInt(status.get<std::string>()) != 0;
+    if (status.is_number_integer()) return status.get<long long>() != 0;
+    if (status.is_number_unsigned()) return status.get<unsigned long long>() != 0;
+    return true;
+}
+
 std::string topicAddress(const std::string& topic) {
     if (topic.size() < 66) return "";
     return "0x" + toLower(topic.substr(topic.size() - 40));
@@ -346,8 +394,14 @@ const std::string V3_COLLECT_TOPIC =
 
 TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walletArg) {
     TxResult r{};
-    if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array())
+    if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array()) {
+        r.unknownReason = "INVALID_RECEIPT";
         return r;
+    }
+    if (!receiptSucceeded(receipt)) {
+        r.unknownReason = "TX_REVERTED";
+        return r;
+    }
 
     const std::string wallet = toLower(walletArg);
     const std::string zero = "0x0000000000000000000000000000000000000000";
@@ -365,6 +419,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     std::set<std::string> swapPools;
     std::set<std::string> mintedToWallet;
     std::set<std::string> burnedFromWallet;
+    std::set<std::string> lpEventContracts;
 
     auto touch = [&](const std::string& token) {
         if (!netFlow.count(token)) {
@@ -402,14 +457,17 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
         if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC) {
             v3Increase = true;
+            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
             continue;
         }
         if (topic0 == V3_DECREASE_LIQUIDITY_TOPIC) {
             v3Decrease = true;
+            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
             continue;
         }
         if (topic0 == V3_COLLECT_TOPIC) {
             v3Collect = true;
+            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
             continue;
         }
 
@@ -540,8 +598,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     if (!hasWalletFlow) {
         if (dexSignal) {
             r.valid = true;
-            r.unknownReason = "NO_COUNTER_FLOW";
+            r.unknownReason = hasSwap
+                ? "SWAP_EVENT_WITHOUT_WALLET_FLOW"
+                : "DEX_SIGNAL_WITHOUT_WALLET_FLOW";
             if (r.venue.empty()) r.venue = "DEX activity";
+        } else {
+            r.unknownReason = "NO_WALLET_FLOW";
         }
         return r;
     }
@@ -566,39 +628,84 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         }
     }
 
-    bool lpAdd = v3Increase;
-    bool lpRemove = v3Decrease || v3Collect;
+    int outgoingAssets = 0;
+    int incomingAssets = 0;
+    for (const auto& token : tokenOrder) {
+        if (netFlow[token] < 0) ++outgoingAssets;
+        if (netFlow[token] > 0) ++incomingAssets;
+    }
 
-    if (!lpAdd && sentBase && sentNonBase) {
-        for (const auto& token : mintedToWallet) {
-            if (netFlow[token] > 0) {
-                lpAdd = true;
+    auto flowTouchesAnyContract = [&](const std::string& token, bool incoming) {
+        return flowLinkedToPool(graph, token, wallet, lpEventContracts, incoming);
+    };
+
+    bool v3AddLinked = false;
+    bool v3RemoveLinked = false;
+    if (v3Increase && outgoingAssets >= 2) {
+        for (const auto& token : tokenOrder) {
+            if (netFlow[token] < 0 && flowTouchesAnyContract(token, false)) {
+                v3AddLinked = true;
+                break;
+            }
+        }
+    }
+    if ((v3Decrease || v3Collect) && incomingAssets >= 2) {
+        for (const auto& token : tokenOrder) {
+            if (netFlow[token] > 0 && flowTouchesAnyContract(token, true)) {
+                v3RemoveLinked = true;
                 break;
             }
         }
     }
 
-    if (!lpRemove && gotBase && gotNonBase) {
-        for (const auto& token : burnedFromWallet) {
-            if (netFlow[token] < 0) {
-                lpRemove = true;
-                break;
-            }
+    bool v2AddLinked = false;
+    for (const auto& lpToken : mintedToWallet) {
+        if (!swapPools.count(lpToken) || netFlow[lpToken] <= 0) continue;
+        int linkedOutgoing = 0;
+        for (const auto& token : tokenOrder) {
+            if (token == lpToken || netFlow[token] >= 0) continue;
+            if (flowLinkedToPool(graph, token, wallet, {lpToken}, false))
+                ++linkedOutgoing;
+        }
+        if (linkedOutgoing >= 2) {
+            v2AddLinked = true;
+            break;
         }
     }
+
+    bool v2RemoveLinked = false;
+    for (const auto& lpToken : burnedFromWallet) {
+        if (!swapPools.count(lpToken) || netFlow[lpToken] >= 0) continue;
+        int linkedIncoming = 0;
+        for (const auto& token : tokenOrder) {
+            if (token == lpToken || netFlow[token] <= 0) continue;
+            if (flowLinkedToPool(graph, token, wallet, {lpToken}, true))
+                ++linkedIncoming;
+        }
+        if (linkedIncoming >= 2) {
+            v2RemoveLinked = true;
+            break;
+        }
+    }
+
+    const bool lpAdd = v3AddLinked || v2AddLinked;
+    const bool lpRemove = v3RemoveLinked || v2RemoveLinked;
 
     if (lpAdd || lpRemove) {
         r.isSwap = false;
         r.venue = lpAdd ? "Add Liquidity" : "Remove Liquidity";
 
         // Show the largest absolute wallet flow as the representative amount.
-        cpp_int best = -1;
+        FlowRank bestRank;
+        bool haveBest = false;
         for (const auto& token : tokenOrder) {
-            const cpp_int a = absInt(netFlow[token]);
-            if (a > best) {
-                best = a;
+            if (netFlow[token] == 0) continue;
+            const FlowRank candidate = rankFlow(token, netFlow[token]);
+            if (!haveBest || betterRank(candidate, bestRank)) {
+                haveBest = true;
+                bestRank = candidate;
                 r.tokenAddr = token;
-                r.rawAmount = a;
+                r.rawAmount = absInt(netFlow[token]);
                 r.isBuy = netFlow[token] > 0;
             }
         }
@@ -624,13 +731,15 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     // ---------------------------------------------------------------------
     std::string mainToken;
     cpp_int mainNet = 0;
-    cpp_int mainAbs = -1;
+    cpp_int mainAbs = 0;
+    FlowRank mainRank;
     bool mainPoolLinked = false;
 
     for (const auto& token : tokenOrder) {
         if (isBaseAsset(token) || netFlow[token] == 0) continue;
 
         const cpp_int a = absInt(netFlow[token]);
+        const FlowRank candidateRank = rankFlow(token, netFlow[token]);
         const bool poolLinked = flowLinkedToPool(
             graph, token, wallet, swapPools, netFlow[token] > 0
         );
@@ -638,12 +747,13 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         const bool better =
             mainToken.empty() ||
             (poolLinked && !mainPoolLinked) ||
-            (poolLinked == mainPoolLinked && a > mainAbs);
+            (poolLinked == mainPoolLinked && betterRank(candidateRank, mainRank));
 
         if (better) {
             mainToken = token;
             mainNet = netFlow[token];
             mainAbs = a;
+            mainRank = candidateRank;
             mainPoolLinked = poolLinked;
         }
     }
@@ -663,11 +773,19 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (mainNet < 0 && unwrappedForWallet > 0) hasOppositeFlow = true;
     }
 
-    const bool flowLooksLikeSwap =
+    const bool confirmedSwap =
         !mainToken.empty() &&
-        (hasSwap || mainPoolLinked || hasOppositeFlow);
+        (mainPoolLinked || (hasSwap && hasOppositeFlow));
+
+    const bool inferredRouterSwap =
+        !confirmedSwap && !mainToken.empty() &&
+        hasOppositeFlow && knownRouter;
+
+    const bool flowLooksLikeSwap = confirmedSwap || inferredRouterSwap;
 
     if (flowLooksLikeSwap) {
+        if (inferredRouterSwap)
+            r.unknownReason = "SWAP_INFERRED_FROM_FLOW";
         r.isSwap = true;
         r.tokenAddr = mainToken;
         r.rawAmount = mainAbs;
@@ -675,7 +793,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
         // Counter asset is informational and may legitimately be absent.
         std::string counter;
-        cpp_int counterAbs = -1;
+        cpp_int counterAbs = 0;
+        FlowRank counterRank;
 
         for (const auto& token : tokenOrder) {
             if (token == mainToken || netFlow[token] == 0) continue;
@@ -685,12 +804,14 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             if (!opposite) continue;
 
             const cpp_int a = absInt(netFlow[token]);
+            const FlowRank candidateRank = rankFlow(token, netFlow[token]);
             const bool preferBase = isBaseAsset(token);
             const bool currentBase = !counter.empty() && isBaseAsset(counter);
             if (counter.empty() || (preferBase && !currentBase) ||
-                (preferBase == currentBase && a > counterAbs)) {
+                (preferBase == currentBase && betterRank(candidateRank, counterRank))) {
                 counter = token;
                 counterAbs = a;
+                counterRank = candidateRank;
             }
         }
 
@@ -706,6 +827,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (!counter.empty()) {
             r.counterAddr = counter;
             r.counterAmount = counterAbs;
+        } else if (!r.isBuy) {
+            // A token SELL can be confirmed by the receipt while the native
+            // proceeds remain invisible without transaction traces.
+            r.unknownReason = "NATIVE_COUNTER_REQUIRES_TRACE";
         }
 
         r.venue = lookupRouterLabel(txTo);
@@ -726,24 +851,28 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     // ---------------------------------------------------------------------
     // 5. Ordinary transfer. Select the strongest direct wallet net flow.
     // ---------------------------------------------------------------------
-    cpp_int bestAbs = -1;
+    FlowRank bestTransferRank;
+    bool haveTransfer = false;
     for (const auto& token : tokenOrder) {
         if (netFlow[token] == 0) continue;
-        const cpp_int a = absInt(netFlow[token]);
-        if (a > bestAbs) {
-            bestAbs = a;
+        const FlowRank candidate = rankFlow(token, netFlow[token]);
+        if (!haveTransfer || betterRank(candidate, bestTransferRank)) {
+            haveTransfer = true;
+            bestTransferRank = candidate;
             r.tokenAddr = token;
-            r.rawAmount = a;
+            r.rawAmount = absInt(netFlow[token]);
             r.isBuy = netFlow[token] > 0;
         }
     }
 
     r.isSwap = false;
     if (dexSignal && mainToken.empty()) {
-        // A DEX event occurred, but no non-base wallet flow exists.
-        // Keep it Unknown rather than lying about BUY/SELL.
-        r.unknownReason = "NO_COUNTER_FLOW";
+        r.unknownReason = "ONLY_BASE_ASSET_FLOW";
         if (r.venue.empty()) r.venue = "DEX activity";
+    } else if (!mainToken.empty() && hasOppositeFlow && !flowLooksLikeSwap) {
+        r.unknownReason = "UNCONFIRMED_OPPOSITE_FLOW";
+    } else if ((v3Increase || v3Decrease || v3Collect) && !lpAdd && !lpRemove) {
+        r.unknownReason = "LP_EVENT_NOT_LINKED_TO_WALLET";
     }
 
     if (!r.tokenAddr.empty()) {
@@ -755,3 +884,4 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     return r;
 }
+
