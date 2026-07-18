@@ -377,7 +377,6 @@ ChainContext makeEthereumContext() {
         {"0xef1c6e67703c7bd7107eed8303fbe6ec2554bf6b", "Uniswap (Universal Router)"},
         {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
         {"0x66a9893cc07d91d95644aedd05d03f95e1dba8af", "Uniswap V4 (Universal Router)"},
-        {"0x1111111254eeb25477b68fb85ed929f73a960582", "1inch"},
     };
     return c;
 }
@@ -438,9 +437,7 @@ ChainContext g_chain = makeBscContext();
 const ChainContext& chainCtx() { return g_chain; }
 void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
 
-bool isBaseAsset(const std::string& a) { 
-    return g_chain.baseAssets.count(toLower(a)) > 0 || a == g_chain.nativeMarker; 
-}
+bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
 bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
 std::string lookupRouterLabel(const std::string& addr) {
     auto it = g_chain.routers.find(toLower(addr));
@@ -489,7 +486,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     const std::string dead = "0x000000000000000000000000000000000000dead";
 
     // ---------------------------------------------------------------------
-    // 1. Collect token flows and events
+    // 1. Collect facts. Financial classification is based on wallet net flow.
+    // Router decoding below is retained only as metadata/diagnostics.
     // ---------------------------------------------------------------------
     std::map<std::string, cpp_int> netFlow;
     std::map<std::string, cpp_int> grossIn;
@@ -519,34 +517,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     bool v3Collect = false;
     cpp_int wrappedForWallet = 0;
     cpp_int unwrappedForWallet = 0;
-
-    // Determine tx.to early for router detection
-    std::string txTo;
-    bool walletIsSender = false;
-    cpp_int nativeOut = 0;
-    UniversalRouterCommands urCmds;
-    bool genericMulticall = false;
-
-    if (tx.is_object()) {
-        if (tx.contains("to") && tx["to"].is_string())
-            txTo = toLower(tx["to"].get<std::string>());
-
-        if (tx.contains("from") && tx["from"].is_string() &&
-            toLower(tx["from"].get<std::string>()) == wallet) {
-            walletIsSender = true;
-            if (tx.contains("value") && tx["value"].is_string())
-                nativeOut = hexToCppInt(tx["value"].get<std::string>());
-        }
-
-        if (walletIsSender && tx.contains("input") && tx["input"].is_string()) {
-            const std::string input = tx["input"].get<std::string>();
-            urCmds = parseExecuteCommands(input);
-            genericMulticall = isGenericMulticallSelector(input);
-        }
-    }
-
-    const bool knownRouter =
-        (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
 
     for (const auto& log : receipt["logs"]) {
         if (!log.is_object() || !log.contains("topics") ||
@@ -599,23 +569,22 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             continue;
         }
 
-        // FIX: Ignore WETH deposit/withdrawal events when tx is through a known router
-        // Routers wrap/unwrap ETH internally as part of swap execution
+        // WETH/WBNB Deposit/Withdrawal events have the beneficiary/owner in
+        // topics[1]. Count only events belonging to the tracked wallet.
         if (logAddr == g_chain.wrappedNative &&
             (topic0 == WBNB_DEPOSIT_TOPIC || topic0 == WBNB_WITHDRAWAL_TOPIC)) {
-            if (!knownRouter) {
-                if (log["topics"].size() >= 2 && log["topics"][1].is_string() &&
-                    topicAddress(log["topics"][1].get<std::string>()) == wallet &&
-                    log.contains("data") && log["data"].is_string()) {
-                    cpp_int amount = parseUint256(log["data"].get<std::string>());
-                    if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
-                    else unwrappedForWallet += amount;
-                }
+            if (log["topics"].size() >= 2 && log["topics"][1].is_string() &&
+                topicAddress(log["topics"][1].get<std::string>()) == wallet &&
+                log.contains("data") && log["data"].is_string()) {
+                cpp_int amount = parseUint256(log["data"].get<std::string>());
+                if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
+                else unwrappedForWallet += amount;
             }
             continue;
         }
 
-        // ERC-721 Transfer (NFT for V3 positions)
+        // ERC-721 Transfer has four topics. Preserve manager + tokenId +
+        // direction so V3 liquidity events can be tied to the tracked wallet.
         if (topic0 == ERC20_TRANSFER_TOPIC && !logAddr.empty() &&
             log["topics"].size() == 4 &&
             log["topics"][1].is_string() &&
@@ -641,8 +610,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         const cpp_int amount = parseUint256(log["data"].get<std::string>());
         if (from.empty() || to.empty() || amount <= 0) continue;
 
+        // The complete graph is diagnostic evidence that a wallet flow is
+        // connected to a pool through Permit2/router/executor contracts.
         graph[logAddr].push_back({from, to, amount});
 
+        // The actual BUY/SELL amount is always wallet net flow.
         if (from != wallet && to != wallet) continue;
 
         touch(logAddr);
@@ -658,23 +630,52 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         }
     }
 
+    std::string txTo;
+    bool walletIsSender = false;
+    cpp_int nativeOut = 0;
+    UniversalRouterCommands urCmds;
+    bool genericMulticall = false;
+
+    if (tx.is_object()) {
+        if (tx.contains("to") && tx["to"].is_string())
+            txTo = toLower(tx["to"].get<std::string>());
+
+        if (tx.contains("from") && tx["from"].is_string() &&
+            toLower(tx["from"].get<std::string>()) == wallet) {
+            walletIsSender = true;
+            if (tx.contains("value") && tx["value"].is_string())
+                nativeOut = hexToCppInt(tx["value"].get<std::string>());
+        }
+
+        // Metadata only. These signals never decide BUY versus SELL.
+        if (walletIsSender && tx.contains("input") && tx["input"].is_string()) {
+            const std::string input = tx["input"].get<std::string>();
+            urCmds = parseExecuteCommands(input);
+            genericMulticall = isGenericMulticallSelector(input);
+        }
+    }
+
+    const bool knownRouter =
+        (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
     const bool dexSignal = hasSwap || knownRouter || genericMulticall || urCmds.hasPermit2;
 
     r.hasSwapEvent = hasSwap;
     r.isUniversalRouter = urCmds.present;
     r.isGenericMulticall = genericMulticall;
     r.hasPermit2Signal = urCmds.hasPermit2;
+    // Router/Permit2/multicall are metadata only. Confirm financial DEX
+    // activity later from swap or LP evidence.
     r.dexActivityDetected = hasSwap;
     r.lpMintOrBurnSeen = !mintedToWallet.empty() || !burnedFromWallet.empty();
     r.lpV3EventSeen = v3Increase || v3Decrease || v3Collect;
     r.lpPoolIdentitySeen = !swapPools.empty();
 
     // ---------------------------------------------------------------------
-    // 2. Pure wrap/unwrap detection
+    // 2. Pure wrap/unwrap. Do this before ordinary transfer classification.
     // ---------------------------------------------------------------------
     bool hasNonWrappedFlow = false;
     for (const auto& token : tokenOrder) {
-        if (token != g_chain.wrappedNative && token != g_chain.nativeMarker && netFlow[token] != 0) {
+        if (token != g_chain.wrappedNative && netFlow[token] != 0) {
             hasNonWrappedFlow = true;
             break;
         }
@@ -701,9 +702,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         return r;
     }
 
-    // ---------------------------------------------------------------------
-    // 3. Check wallet has any flow
-    // ---------------------------------------------------------------------
+    // No wallet asset movement means there is nothing financially classifiable.
     bool hasWalletFlow = false;
     for (const auto& token : tokenOrder) {
         if (netFlow[token] != 0) {
@@ -727,7 +726,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     r.valid = true;
 
     // ---------------------------------------------------------------------
-    // 4. LP detection
+    // 3. LP detection. It remains event/flow based, not router-selector based.
     // ---------------------------------------------------------------------
     int outgoingAssets = 0;
     int incomingAssets = 0;
@@ -736,6 +735,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (netFlow[token] > 0) ++incomingAssets;
     }
 
+    // V2 pair events identify the pool directly. Require the matching LP-token
+    // flow plus two underlying assets connected to that same pair.
     bool v2AddLinked = false;
     for (const auto& pool : v2MintPools) {
         if (netFlow[pool] <= 0 && !mintedToWallet.count(pool)) continue;
@@ -760,6 +761,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (linkedIncoming >= 2) { v2RemoveLinked = true; break; }
     }
 
+    // V3 event ownership/linkage:
+    // 1) strongest evidence: the same manager + tokenId NFT moves to/from wallet;
+    // 2) existing positions usually do not move the NFT, so require at least
+    //    two wallet token flows sharing one direct counterparty.
     const int commonOutgoingCounterpartyCount =
         maxCommonWalletCounterpartyTokenCount(
             graph, tokenOrder, netFlow, wallet, false
@@ -806,6 +811,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         r.isSwap = false;
         r.venue = lpAdd ? "Add Liquidity" : "Remove Liquidity";
 
+        // Show the largest absolute wallet flow as the representative amount.
         FlowRank bestRank;
         bool haveBest = false;
         for (const auto& token : tokenOrder) {
@@ -830,7 +836,14 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     }
 
     // ---------------------------------------------------------------------
-    // 5. BUY/SELL detection
+    // 4. Flow-first BUY/SELL.
+    //
+    // Main asset = strongest non-base wallet net flow.
+    // Positive non-base flow => BUY.
+    // Negative non-base flow => SELL.
+    //
+    // Swap event/pool linkage confirms that this is a swap. Router decoding
+    // is not required and never determines direction.
     // ---------------------------------------------------------------------
     std::string mainToken;
     cpp_int mainNet = 0;
@@ -861,7 +874,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         }
     }
 
-    // FIX: Check for opposite flow including native currency
     bool hasOppositeFlow = false;
     if (!mainToken.empty()) {
         for (const auto& token : tokenOrder) {
@@ -873,9 +885,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             }
         }
 
-        // BUY: spent native currency
         if (mainNet > 0 && nativeOut > 0) hasOppositeFlow = true;
-        // SELL: received native currency via unwrap
         if (mainNet < 0 && unwrappedForWallet > 0) hasOppositeFlow = true;
     }
 
@@ -898,7 +908,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         r.rawAmount = mainAbs;
         r.isBuy = mainNet > 0;
 
-        // Find counter asset
+        // Counter asset is informational and may legitimately be absent.
         std::string counter;
         cpp_int counterAbs = 0;
         FlowRank counterRank;
@@ -922,7 +932,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             }
         }
 
-        // FIX: Use native currency as counter when appropriate
         if (counter.empty() && r.isBuy && nativeOut > 0) {
             counter = g_chain.nativeMarker;
             counterAbs = nativeOut;
@@ -936,6 +945,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             r.counterAddr = counter;
             r.counterAmount = counterAbs;
         } else if (!r.isBuy) {
+            // A token SELL can be confirmed by the receipt while the native
+            // proceeds remain invisible without transaction traces.
             r.diagnosticReason = "NATIVE_COUNTER_REQUIRES_TRACE";
         }
 
@@ -955,7 +966,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     }
 
     // ---------------------------------------------------------------------
-    // 6. Ordinary transfer
+    // 5. Ordinary transfer. Select the strongest direct wallet net flow.
     // ---------------------------------------------------------------------
     FlowRank bestTransferRank;
     bool haveTransfer = false;
@@ -997,3 +1008,4 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     return r;
 }
+
