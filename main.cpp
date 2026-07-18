@@ -1217,7 +1217,7 @@ bool processBlock(long long bn) {
         checkInvariants(hash, res);
         if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.venue == "DEX interaction") logBeneficiaries(hash, tx, res);
-        if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
+        if (res.isSwap && (res.venue.empty() || res.venue == "DEX Pool" || res.venue == "DEX" || res.venue == "Universal Router")) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
         if (res.tokenAddr.empty()) { markTxProcessed(hash,bn); continue; }
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
