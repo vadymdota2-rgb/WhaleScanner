@@ -40,14 +40,7 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
-    std::atomic<uint64_t> cov_buy{0};
-    std::atomic<uint64_t> cov_sell{0};
-    std::atomic<uint64_t> cov_lp_add{0};
-    std::atomic<uint64_t> cov_lp_remove{0};
-    std::atomic<uint64_t> cov_wrap{0};
-    std::atomic<uint64_t> cov_unwrap{0};
-    std::atomic<uint64_t> cov_transfer{0};
-    std::atomic<uint64_t> cov_unknown{0};
+
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
     std::atomic<uint64_t> sig_multicall{0};
@@ -64,14 +57,23 @@ struct Stats {
     std::atomic<uint64_t> diag_native_counter{0};
 } g_stats;
 
-void recordCoverage(const TxResult& r) {
-    if (r.venue == "Add Liquidity") g_stats.cov_lp_add.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Remove Liquidity") g_stats.cov_lp_remove.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Wrap") g_stats.cov_wrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.venue == "Unwrap") g_stats.cov_unwrap.fetch_add(1, std::memory_order_relaxed);
-    else if (r.isSwap) { if (r.isBuy) g_stats.cov_buy.fetch_add(1, std::memory_order_relaxed); else g_stats.cov_sell.fetch_add(1, std::memory_order_relaxed); }
-    else if (r.dexActivityDetected) g_stats.cov_unknown.fetch_add(1, std::memory_order_relaxed);
-    else g_stats.cov_transfer.fetch_add(1, std::memory_order_relaxed);
+struct CoverageSet {
+    std::atomic<uint64_t> buy{0}, sell{0}, lp_add{0}, lp_remove{0}, wrap{0}, unwrap{0},
+                          transfer{0}, interaction{0}, arbitrage{0}, unknown{0};
+};
+CoverageSet g_covUser, g_covSvc;
+
+void recordCoverage(const TxResult& r, bool serviceOnly) {
+    CoverageSet& c = serviceOnly ? g_covSvc : g_covUser;
+    if (r.venue == "Add Liquidity") c.lp_add.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Remove Liquidity") c.lp_remove.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Wrap") c.wrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Unwrap") c.unwrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.isSwap) { if (r.isBuy) c.buy.fetch_add(1, std::memory_order_relaxed); else c.sell.fetch_add(1, std::memory_order_relaxed); }
+    else if (r.venue == "DEX interaction") c.interaction.fetch_add(1, std::memory_order_relaxed);
+    else if (r.venue == "Arbitrage") c.arbitrage.fetch_add(1, std::memory_order_relaxed);
+    else if (!r.unknownReason.empty()) c.unknown.fetch_add(1, std::memory_order_relaxed);
+    else c.transfer.fetch_add(1, std::memory_order_relaxed);
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -79,9 +81,9 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-    if (r.unknownReason == "SWAP_EVENT_WITHOUT_WALLET_FLOW" || r.unknownReason == "DEX_SIGNAL_WITHOUT_WALLET_FLOW") g_stats.unk_swap_no_wallet_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "ONLY_BASE_ASSET_FLOW") g_stats.unk_only_base_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNCONFIRMED_OPPOSITE_FLOW") g_stats.unk_unconfirmed_opposite.fetch_add(1, std::memory_order_relaxed);
+    if (r.diagnosticReason == "SWAP_EVENT_WITHOUT_WALLET_FLOW" || r.diagnosticReason == "DEX_SIGNAL_WITHOUT_WALLET_FLOW") g_stats.unk_swap_no_wallet_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.diagnosticReason == "ONLY_BASE_ASSET_FLOW") g_stats.unk_only_base_flow.fetch_add(1, std::memory_order_relaxed);
+    if (r.unknownReason == "UNCONFIRMED_OPPOSITE_FLOW") g_stats.unk_unconfirmed_opposite.fetch_add(1, std::memory_order_relaxed);
     else if (r.unknownReason == "LP_EVENT_NOT_LINKED_TO_WALLET") g_stats.unk_lp_not_linked.fetch_add(1, std::memory_order_relaxed);
     else if (!r.unknownReason.empty()) g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
     if (r.diagnosticReason == "SWAP_INFERRED_FROM_FLOW") g_stats.diag_swap_inferred.fetch_add(1, std::memory_order_relaxed);
@@ -158,6 +160,21 @@ void appendDiagLog(const std::string& file, const std::string& hash, long long b
 
 void logUnknownTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
     if (LOG_UNKNOWN_TX) appendDiagLog("unknown_tx.log", hash, bn, tx, receipt, res);
+}
+
+const bool LOG_BENEFICIARY = []() {
+    const char* env = std::getenv("WHALE_LOG_BENEFICIARY");
+    return env && (std::string(env) == "1" || std::string(env) == "true");
+}();
+std::mutex beneficiaryLogMutex;
+void logBeneficiaries(const std::string& hash, const nlohmann::json& tx, const TxResult& res) {
+    if (!LOG_BENEFICIARY || res.flowBeneficiaries.empty()) return;
+    std::string to = (tx.is_object() && tx.contains("to") && tx["to"].is_string()) ? tx["to"].get<std::string>() : "";
+    std::stringstream ss;
+    ss << "hash=" << hash << " to=" << to << " beneficiaries=[" << res.flowBeneficiaries << "]";
+    std::lock_guard<std::mutex> lk(beneficiaryLogMutex);
+    std::ofstream f("beneficiary.log", std::ios::app);
+    if (f) f << ss.str() << "\n";
 }
 
 void logLowConfidenceTx(const std::string& hash, long long bn, const nlohmann::json& tx, const nlohmann::json& receipt, const TxResult& res) {
@@ -1190,9 +1207,16 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        recordCoverage(res);
+        bool svcOnly = false;
+        { auto cw = watchers->find(mA);
+          if (cw != watchers->end() && !cw->second.empty()) {
+              svcOnly = true;
+              for (const auto& w : cw->second) if (w.chatId != SERVICE_CHAT_ID) { svcOnly = false; break; }
+          } }
+        recordCoverage(res, svcOnly);
         checkInvariants(hash, res);
         if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
+        if (res.venue == "DEX interaction") logBeneficiaries(hash, tx, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
         if (res.tokenAddr.empty()) { markTxProcessed(hash,bn); continue; }
@@ -1705,15 +1729,21 @@ void telegramLoop() {
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
                             {
-                                uint64_t buy=g_stats.cov_buy.load(), sell=g_stats.cov_sell.load(), lpAdd=g_stats.cov_lp_add.load(),
-                                         lpRemove=g_stats.cov_lp_remove.load(), wrap=g_stats.cov_wrap.load(), unwrap=g_stats.cov_unwrap.load(),
-                                         xfer=g_stats.cov_transfer.load(), unk=g_stats.cov_unknown.load();
-                                uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer+unk;
-                                ss2 << "\n\n📈 <b>Coverage</b> (valid tx: " << total << ")\n"
-                                    << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
-                                    << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap
-                                    << "\n📤 Transfer: " << xfer << "\n❓ Unknown: " << unk
-                                    << "\n\n🔬 <b>Signals</b>\n💱 Swap Event: " << g_stats.sig_swap_event.load()
+                                auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
+                                    uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
+                                             wrap=c.wrap.load(), unwrap=c.unwrap.load(), xfer=c.transfer.load(),
+                                             inter=c.interaction.load(), arb=c.arbitrage.load(), unk=c.unknown.load();
+                                    uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer+inter+arb+unk;
+                                    out << "\n\n" << title << " (valid tx: " << total << ")\n"
+                                        << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell
+                                        << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
+                                        << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap
+                                        << "\n📤 Transfer: " << xfer << "\n🤝 Interaction: " << inter
+                                        << "\n♻️ Arbitrage: " << arb << "\n❓ Unknown: " << unk;
+                                };
+                                renderCov(ss2, "📈 <b>Coverage — users</b>", g_covUser);
+                                renderCov(ss2, "🤖 <b>Coverage — service</b>", g_covSvc);
+                                ss2 << "\n\n🔬 <b>Signals</b>\n💱 Swap Event: " << g_stats.sig_swap_event.load()
                                     << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
                                     << "\n📦 Multicall: " << g_stats.sig_multicall.load()
                                     << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
@@ -1722,13 +1752,13 @@ void telegramLoop() {
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
-                                    << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
-                                    << "\nUnconfirmed opposite: " << g_stats.unk_unconfirmed_opposite.load()
+                                    << "Unconfirmed opposite: " << g_stats.unk_unconfirmed_opposite.load()
                                     << "\nLP not linked: " << g_stats.unk_lp_not_linked.load()
                                     << "\nOther: " << g_stats.unk_other.load()
                                     << "\n\n\xF0\x9F\xA9\xBA <b>Diagnostics</b>\n"
-                                    << "Swap inferred from flow: " << g_stats.diag_swap_inferred.load()
+                                    << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
+                                    << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
+                                    << "\nSwap inferred from flow: " << g_stats.diag_swap_inferred.load()
                                     << "\nNative counter needs trace: " << g_stats.diag_native_counter.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
