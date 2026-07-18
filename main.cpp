@@ -55,9 +55,13 @@ struct Stats {
     std::atomic<uint64_t> sig_lp_mint_burn{0};
     std::atomic<uint64_t> sig_lp_pool_identity{0};
     std::atomic<uint64_t> sig_lp_v3_event{0};
-    std::atomic<uint64_t> unk_no_counter_flow{0};
-    std::atomic<uint64_t> unk_unknown_router{0};
+    std::atomic<uint64_t> unk_swap_no_wallet_flow{0};
+    std::atomic<uint64_t> unk_only_base_flow{0};
+    std::atomic<uint64_t> unk_unconfirmed_opposite{0};
+    std::atomic<uint64_t> unk_lp_not_linked{0};
     std::atomic<uint64_t> unk_other{0};
+    std::atomic<uint64_t> diag_swap_inferred{0};
+    std::atomic<uint64_t> diag_native_counter{0};
 } g_stats;
 
 void recordCoverage(const TxResult& r) {
@@ -75,9 +79,13 @@ void recordCoverage(const TxResult& r) {
     if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
-    if (r.unknownReason == "NO_COUNTER_FLOW") g_stats.unk_no_counter_flow.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "UNKNOWN_ROUTER") g_stats.unk_unknown_router.fetch_add(1, std::memory_order_relaxed);
-    else if (r.unknownReason == "OTHER") g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
+    if (r.unknownReason == "SWAP_EVENT_WITHOUT_WALLET_FLOW" || r.unknownReason == "DEX_SIGNAL_WITHOUT_WALLET_FLOW") g_stats.unk_swap_no_wallet_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "ONLY_BASE_ASSET_FLOW") g_stats.unk_only_base_flow.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "UNCONFIRMED_OPPOSITE_FLOW") g_stats.unk_unconfirmed_opposite.fetch_add(1, std::memory_order_relaxed);
+    else if (r.unknownReason == "LP_EVENT_NOT_LINKED_TO_WALLET") g_stats.unk_lp_not_linked.fetch_add(1, std::memory_order_relaxed);
+    else if (!r.unknownReason.empty()) g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
+    if (r.diagnosticReason == "SWAP_INFERRED_FROM_FLOW") g_stats.diag_swap_inferred.fetch_add(1, std::memory_order_relaxed);
+    else if (r.diagnosticReason == "NATIVE_COUNTER_REQUIRES_TRACE") g_stats.diag_native_counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -93,7 +101,7 @@ void checkInvariants(const std::string& hash, const TxResult& r) {
     if (r.isSwap && r.tokenAddr.empty()) violations.push_back("isSwap=true but tokenAddr is empty");
     if ((r.venue == "Wrap" || r.venue == "Unwrap") && r.tokenAddr != chainCtx().wrappedNative)
         violations.push_back("Wrap/Unwrap venue but tokenAddr is not the chain's wrapped native");
-    if (r.isSwap && !r.isBuy && r.counterAmount == 0) violations.push_back("SELL with zero counterAmount (unresolved counter side)");
+    if (r.isSwap && !r.isBuy && r.counterAmount == 0 && r.diagnosticReason != "NATIVE_COUNTER_REQUIRES_TRACE") violations.push_back("SELL with zero counterAmount (unresolved counter side)");
     if (r.isSwap && r.counterAmount < 0) violations.push_back("counterAmount is negative");
     if ((r.venue == "Add Liquidity" || r.venue == "Remove Liquidity") && r.isSwap)
         violations.push_back("LP venue set but isSwap is still true");
@@ -1028,7 +1036,7 @@ uint64_t getPriceNanos(const std::string& token) {
 }
 
 std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
-    bool tokenIsNative = (res.tokenAddr == NATIVE_BNB_MARKER);
+    bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
     std::string msg="💼 <b>"+safeString(label)+"</b>\n\n";
@@ -1048,7 +1056,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
         std::string counterAmountStr, counterSymbol;
-        if (res.counterAddr == NATIVE_BNB_MARKER) {
+        if (res.counterAddr == chainCtx().nativeMarker) {
             counterAmountStr = formatAmount(res.counterAmount, 18);
             counterSymbol = chainCtx().nativeSymbol;
         } else {
@@ -1184,9 +1192,10 @@ bool processBlock(long long bn) {
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
         recordCoverage(res);
         checkInvariants(hash, res);
-        if (!res.isSwap && res.venue.empty() && res.dexActivityDetected) logUnknownTx(hash, bn, tx, receipt, res);
+        if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.isSwap && res.venue.empty()) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
+        if (res.tokenAddr.empty()) { markTxProcessed(hash,bn); continue; }
         if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
 
         auto wit = watchers->find(mA);
@@ -1713,9 +1722,14 @@ void telegramLoop() {
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "No counter flow: " << g_stats.unk_no_counter_flow.load()
-                                    << "\nUnknown router: " << g_stats.unk_unknown_router.load()
-                                    << "\nOther: " << g_stats.unk_other.load();
+                                    << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
+                                    << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
+                                    << "\nUnconfirmed opposite: " << g_stats.unk_unconfirmed_opposite.load()
+                                    << "\nLP not linked: " << g_stats.unk_lp_not_linked.load()
+                                    << "\nOther: " << g_stats.unk_other.load()
+                                    << "\n\n\xF0\x9F\xA9\xBA <b>Diagnostics</b>\n"
+                                    << "Swap inferred from flow: " << g_stats.diag_swap_inferred.load()
+                                    << "\nNative counter needs trace: " << g_stats.diag_native_counter.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
