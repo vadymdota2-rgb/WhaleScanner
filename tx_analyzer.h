@@ -26,6 +26,7 @@ struct TxResult {
     bool lpV3EventSeen = false;
     std::string unknownReason;
     std::string diagnosticReason;
+    std::string flowBeneficiaries;
 };
 
 struct ChainContext {
@@ -48,8 +49,6 @@ ChainContext makeEthereumContext();
 ChainContext makeBaseContext();
 ChainContext makeArbitrumContext();
 
-extern const std::string WBNB_ADDR;
-extern const std::string NATIVE_BNB_MARKER;
 
 bool isBaseAsset(const std::string& a);
 bool isStablecoin(const std::string& a);
