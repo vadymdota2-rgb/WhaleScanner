@@ -351,6 +351,12 @@ ChainContext makeBscContext() {
         {"0x114f84658c99aa6ea62e3160a87a16deaf7efe83", "WOOFi"},
         {"0xcef5be73ae943b77f9bc08859367d923c030a269", "WOOFi"},
     };
+    c.bridges = {
+        "0x4a364f8c717caad9a442737eb7b8a55cc6cf18d8",
+        "0x6694340fc020c5e6b96567843da2df01b2ce1eb6",
+        "0x78bc5ee9f11d133a08b331c2e18fe81be0ed02dc",
+        "0xdd90e5e87a2081dcf0391920868ebc2ffb81a1af",
+    };
     return c;
 }
 
@@ -979,6 +985,18 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         r.unknownReason = "LP_EVENT_NOT_LINKED_TO_WALLET";
         r.tokenAddr.clear();
         r.rawAmount = 0;
+    }
+    if (!r.isSwap && r.venue.empty() && r.unknownReason.empty() && !r.tokenAddr.empty() && !g_chain.bridges.empty()) {
+        if (g_chain.bridges.count(txTo)) r.venue = r.isBuy ? "Bridge In" : "Bridge Out";
+        else {
+            auto git = graph.find(r.tokenAddr);
+            if (git != graph.end()) {
+                for (const auto& e : git->second) {
+                    if (e.from == wallet && g_chain.bridges.count(e.to)) { r.venue = "Bridge Out"; break; }
+                    if (e.to == wallet && g_chain.bridges.count(e.from)) { r.venue = "Bridge In"; break; }
+                }
+            }
+        }
     }
 
     if (!r.tokenAddr.empty()) {
