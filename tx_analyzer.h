@@ -10,15 +10,12 @@
 using boost::multiprecision::cpp_int;
 
 struct TxResult {
-    bool valid = false;
-    bool isSwap = false;
-    bool isBuy = false;
-    cpp_int rawAmount = 0;
-    cpp_int usdNanos = 0;
+    bool valid, isSwap, isBuy;
+    cpp_int rawAmount, usdNanos;
     std::string tokenAddr;
     std::string venue;
     std::string counterAddr;
-    cpp_int counterAmount = 0;
+    cpp_int counterAmount;
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
     bool isGenericMulticall = false;
@@ -41,6 +38,7 @@ struct ChainContext {
     std::set<std::string> baseAssets;
     std::set<std::string> stablecoins;
     std::map<std::string, std::string> routers;
+    std::set<std::string> bridges;
 };
 
 const ChainContext& chainCtx();
