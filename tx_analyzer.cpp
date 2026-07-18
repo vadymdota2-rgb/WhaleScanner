@@ -68,61 +68,6 @@ struct UniversalRouterCommands {
     bool hasPermit2 = false;
 };
 
-
-struct TransferEdge {
-    std::string from;
-    std::string to;
-    cpp_int amount;
-};
-
-bool graphReachable(
-    const std::map<std::string, std::vector<TransferEdge>>& edgesByToken,
-    const std::string& token,
-    const std::string& start,
-    const std::set<std::string>& targets,
-    int maxDepth = 6
-) {
-    auto it = edgesByToken.find(token);
-    if (it == edgesByToken.end() || start.empty() || targets.empty()) return false;
-
-    std::set<std::string> visited;
-    std::vector<std::pair<std::string, int>> queue;
-    queue.push_back({start, 0});
-    visited.insert(start);
-
-    for (size_t qi = 0; qi < queue.size(); ++qi) {
-        const std::string& node = queue[qi].first;
-        const int depth = queue[qi].second;
-        if (targets.count(node)) return true;
-        if (depth >= maxDepth) continue;
-
-        for (const auto& edge : it->second) {
-            if (edge.amount <= 0 || edge.from != node) continue;
-            if (targets.count(edge.to)) return true;
-            if (visited.insert(edge.to).second)
-                queue.push_back({edge.to, depth + 1});
-        }
-    }
-    return false;
-}
-
-bool tokenPathTouchesSwapPool(
-    const std::map<std::string, std::vector<TransferEdge>>& edgesByToken,
-    const std::string& token,
-    const std::string& wallet,
-    const std::set<std::string>& pools,
-    bool incoming
-) {
-    if (incoming) {
-        for (const auto& pool : pools) {
-            if (graphReachable(edgesByToken, token, pool, {wallet}))
-                return true;
-        }
-        return false;
-    }
-    return graphReachable(edgesByToken, token, wallet, pools);
-}
-
 bool isGenericMulticallSelector(const std::string& input) {
     if (input.size() < 10 || input[0] != '0' || input[1] != 'x') return false;
     return input.substr(2, 8) == "ac9650d8";
@@ -176,6 +121,69 @@ UniversalRouterCommands parseExecuteCommands(const std::string& input) {
     return out;
 }
 
+}
+
+
+struct FlowEdge {
+    std::string from;
+    std::string to;
+    cpp_int amount;
+};
+
+cpp_int absInt(const cpp_int& v) {
+    return v < 0 ? -v : v;
+}
+
+std::string topicAddress(const std::string& topic) {
+    if (topic.size() < 66) return "";
+    return "0x" + toLower(topic.substr(topic.size() - 40));
+}
+
+bool reachesAny(
+    const std::map<std::string, std::vector<FlowEdge>>& graph,
+    const std::string& token,
+    const std::string& start,
+    const std::set<std::string>& targets,
+    int maxDepth = 8
+) {
+    auto it = graph.find(token);
+    if (it == graph.end() || start.empty() || targets.empty()) return false;
+
+    std::set<std::string> seen;
+    std::vector<std::pair<std::string, int>> queue;
+    queue.push_back({start, 0});
+    seen.insert(start);
+
+    for (size_t qi = 0; qi < queue.size(); ++qi) {
+        const std::string node = queue[qi].first;
+        const int depth = queue[qi].second;
+        if (targets.count(node)) return true;
+        if (depth >= maxDepth) continue;
+
+        for (const auto& edge : it->second) {
+            if (edge.amount <= 0 || edge.from != node) continue;
+            if (targets.count(edge.to)) return true;
+            if (seen.insert(edge.to).second)
+                queue.push_back({edge.to, depth + 1});
+        }
+    }
+    return false;
+}
+
+bool flowLinkedToPool(
+    const std::map<std::string, std::vector<FlowEdge>>& graph,
+    const std::string& token,
+    const std::string& wallet,
+    const std::set<std::string>& pools,
+    bool incoming
+) {
+    if (incoming) {
+        for (const auto& pool : pools) {
+            if (reachesAny(graph, token, pool, {wallet})) return true;
+        }
+        return false;
+    }
+    return reachesAny(graph, token, wallet, pools);
 }
 
 const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
@@ -336,395 +344,414 @@ const std::string V3_COLLECT_TOPIC =
 
 }
 
-TxResult analyzeTx(const json& tx, const json& receipt, const std::string& wa) {
-    TxResult r={}; if (receipt.is_null()||!receipt.is_object()||!receipt.contains("logs")||!receipt["logs"].is_array()) return r;
+TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walletArg) {
+    TxResult r{};
+    if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array())
+        return r;
 
-    bool hasSwap=false;
-    std::string swapLogAddr;
-    std::set<std::string> allSwapPoolAddrs;
-    size_t swapLogDataHexLen=0;
-    cpp_int wbnbWrapped = 0;
-    cpp_int wbnbUnwrapped = 0;
+    const std::string wallet = toLower(walletArg);
+    const std::string zero = "0x0000000000000000000000000000000000000000";
+    const std::string dead = "0x000000000000000000000000000000000000dead";
 
+    // ---------------------------------------------------------------------
+    // 1. Collect facts. Financial classification is based on wallet net flow.
+    // Router decoding below is retained only as metadata/diagnostics.
+    // ---------------------------------------------------------------------
     std::map<std::string, cpp_int> netFlow;
+    std::map<std::string, cpp_int> grossIn;
+    std::map<std::string, cpp_int> grossOut;
+    std::map<std::string, std::vector<FlowEdge>> graph;
     std::vector<std::string> tokenOrder;
+    std::set<std::string> swapPools;
+    std::set<std::string> mintedToWallet;
+    std::set<std::string> burnedFromWallet;
 
-    // Complete ERC-20 transfer graph for the receipt.
-    // Net flow still comes only from the tracked wallet, while this graph
-    // connects it to pools through Permit2/router/executor contracts.
-    std::map<std::string, std::vector<TransferEdge>> edgesByToken;
-    auto touch = [&](const std::string& tok) {
-        if (netFlow.find(tok) == netFlow.end()) { netFlow[tok] = 0; tokenOrder.push_back(tok); }
+    auto touch = [&](const std::string& token) {
+        if (!netFlow.count(token)) {
+            netFlow[token] = 0;
+            grossIn[token] = 0;
+            grossOut[token] = 0;
+            tokenOrder.push_back(token);
+        }
     };
 
-    bool anyTransferForWallet = false;
-    bool v3PositionIncrease = false, v3PositionDecrease = false, v3Collect = false;
-    std::string firstCounterpartAddr;
-    std::set<std::string> mintedIn;
-    std::set<std::string> burnedOut;
-    std::set<std::string> outCounterparties;
-    std::set<std::string> inCounterparties;
-    std::map<std::string, std::set<std::string>> inSources;
-    std::map<std::string, std::set<std::string>> outDestinations;
+    bool hasSwap = false;
+    bool v3Increase = false;
+    bool v3Decrease = false;
+    bool v3Collect = false;
+    cpp_int wrappedForWallet = 0;
+    cpp_int unwrappedForWallet = 0;
 
-    for (auto& l : receipt["logs"]) {
-        if (!l.is_object()||!l.contains("topics")||!l["topics"].is_array()||l["topics"].empty()) continue;
-        if (!l["topics"][0].is_string()) continue;
-        const std::string t0 = l["topics"][0].get<std::string>();
-        std::string logAddr = (l.contains("address") && l["address"].is_string())
-            ? toLower(l["address"].get<std::string>()) : "";
+    for (const auto& log : receipt["logs"]) {
+        if (!log.is_object() || !log.contains("topics") ||
+            !log["topics"].is_array() || log["topics"].empty() ||
+            !log["topics"][0].is_string())
+            continue;
 
-        if (SWAP_EVENT_TOPICS.count(t0)) {
+        const std::string topic0 = toLower(log["topics"][0].get<std::string>());
+        const std::string logAddr =
+            (log.contains("address") && log["address"].is_string())
+                ? toLower(log["address"].get<std::string>())
+                : "";
+
+        if (SWAP_EVENT_TOPICS.count(topic0)) {
             hasSwap = true;
-            if (!logAddr.empty()) allSwapPoolAddrs.insert(logAddr);
-            if (swapLogAddr.empty()) {
-                swapLogAddr = logAddr;
-                if (l.contains("data") && l["data"].is_string()) {
-                    const std::string& d = l["data"].get_ref<const std::string&>();
-                    swapLogDataHexLen = d.size() >= 2 ? d.size() - 2 : 0;
-                }
+            if (!logAddr.empty()) swapPools.insert(logAddr);
+            continue;
+        }
+
+        if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC) {
+            v3Increase = true;
+            continue;
+        }
+        if (topic0 == V3_DECREASE_LIQUIDITY_TOPIC) {
+            v3Decrease = true;
+            continue;
+        }
+        if (topic0 == V3_COLLECT_TOPIC) {
+            v3Collect = true;
+            continue;
+        }
+
+        // WETH/WBNB Deposit/Withdrawal events have the beneficiary/owner in
+        // topics[1]. Count only events belonging to the tracked wallet.
+        if (logAddr == g_chain.wrappedNative &&
+            (topic0 == WBNB_DEPOSIT_TOPIC || topic0 == WBNB_WITHDRAWAL_TOPIC)) {
+            if (log["topics"].size() >= 2 && log["topics"][1].is_string() &&
+                topicAddress(log["topics"][1].get<std::string>()) == wallet &&
+                log.contains("data") && log["data"].is_string()) {
+                cpp_int amount = parseUint256(log["data"].get<std::string>());
+                if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
+                else unwrappedForWallet += amount;
             }
             continue;
         }
 
-        if (logAddr == g_chain.wrappedNative && (t0 == WBNB_DEPOSIT_TOPIC || t0 == WBNB_WITHDRAWAL_TOPIC)) {
-            if (l.contains("data") && l["data"].is_string()) {
-                cpp_int wad = parseUint256(l["data"].get<std::string>());
-                if (t0 == WBNB_DEPOSIT_TOPIC) wbnbWrapped += wad; else wbnbUnwrapped += wad;
-            }
+        if (topic0 != ERC20_TRANSFER_TOPIC || logAddr.empty() ||
+            log["topics"].size() != 3 ||
+            !log["topics"][1].is_string() || !log["topics"][2].is_string() ||
+            !log.contains("data") || !log["data"].is_string())
             continue;
-        }
 
-        if (t0 == V3_INCREASE_LIQUIDITY_TOPIC) { v3PositionIncrease = true; continue; }
-        if (t0 == V3_DECREASE_LIQUIDITY_TOPIC) { v3PositionDecrease = true; continue; }
-        if (t0 == V3_COLLECT_TOPIC) { v3Collect = true; continue; }
+        const std::string from = topicAddress(log["topics"][1].get<std::string>());
+        const std::string to = topicAddress(log["topics"][2].get<std::string>());
+        const cpp_int amount = parseUint256(log["data"].get<std::string>());
+        if (from.empty() || to.empty() || amount <= 0) continue;
 
-        if (t0 != ERC20_TRANSFER_TOPIC) continue;
-        if (l["topics"].size() != 3) continue;
-        if (!l.contains("data")||!l["data"].is_string()) continue;
-        if (!l["topics"][1].is_string()||!l["topics"][2].is_string()||logAddr.empty()) continue;
+        // The complete graph is diagnostic evidence that a wallet flow is
+        // connected to a pool through Permit2/router/executor contracts.
+        graph[logAddr].push_back({from, to, amount});
 
-        const std::string& t1 = l["topics"][1].get_ref<const std::string&>();
-        const std::string& t2 = l["topics"][2].get_ref<const std::string&>();
-        const std::string& dataField = l["data"].get_ref<const std::string&>();
-        if (t1.length() < 66 || t2.length() < 66) continue;
+        // The actual BUY/SELL amount is always wallet net flow.
+        if (from != wallet && to != wallet) continue;
 
-        std::string fr = "0x"+toLower(t1.substr(26));
-        std::string to = "0x"+toLower(t2.substr(26));
-        cpp_int amt = parseUint256(dataField);
-        if (amt == 0) continue;
-
-        // Index every transfer, including transfers between intermediate
-        // contracts that do not directly mention the tracked wallet.
-        edgesByToken[logAddr].push_back({fr, to, amt});
-
-        if (fr != wa && to != wa) continue;
         touch(logAddr);
-        anyTransferForWallet = true;
-        if (firstCounterpartAddr.empty()) firstCounterpartAddr = (to == wa) ? fr : to;
-        if (to == wa) {
-            netFlow[logAddr] += amt;
-            inSources[logAddr].insert(fr);
-            if (fr == "0x0000000000000000000000000000000000000000") mintedIn.insert(logAddr);
-            else inCounterparties.insert(fr);
+        if (to == wallet) {
+            netFlow[logAddr] += amount;
+            grossIn[logAddr] += amount;
+            if (from == zero) mintedToWallet.insert(logAddr);
         }
-        if (fr == wa) {
-            netFlow[logAddr] -= amt;
-            outDestinations[logAddr].insert(to);
-            if (to == "0x0000000000000000000000000000000000000000" ||
-                to == "0x000000000000000000000000000000000000dead") burnedOut.insert(logAddr);
-            else outCounterparties.insert(to);
+        if (from == wallet) {
+            netFlow[logAddr] -= amount;
+            grossOut[logAddr] += amount;
+            if (to == zero || to == dead) burnedFromWallet.insert(logAddr);
         }
     }
 
-    cpp_int nativeOut = 0;
     std::string txTo;
     bool walletIsSender = false;
+    cpp_int nativeOut = 0;
     UniversalRouterCommands urCmds;
-    bool isGenericMulticall = false;
+    bool genericMulticall = false;
+
     if (tx.is_object()) {
-        if (tx.contains("to") && !tx["to"].is_null() && tx["to"].is_string())
+        if (tx.contains("to") && tx["to"].is_string())
             txTo = toLower(tx["to"].get<std::string>());
+
         if (tx.contains("from") && tx["from"].is_string() &&
-            toLower(tx["from"].get<std::string>()) == wa) {
+            toLower(tx["from"].get<std::string>()) == wallet) {
             walletIsSender = true;
             if (tx.contains("value") && tx["value"].is_string())
                 nativeOut = hexToCppInt(tx["value"].get<std::string>());
         }
+
+        // Metadata only. These signals never decide BUY versus SELL.
         if (walletIsSender && tx.contains("input") && tx["input"].is_string()) {
-            const std::string& inputStr = tx["input"].get<std::string>();
-            urCmds = parseExecuteCommands(inputStr);
-            isGenericMulticall = isGenericMulticallSelector(inputStr);
+            const std::string input = tx["input"].get<std::string>();
+            urCmds = parseExecuteCommands(input);
+            genericMulticall = isGenericMulticallSelector(input);
         }
     }
-    bool nativeOutflow = nativeOut > 0;
 
-    if (!anyTransferForWallet) {
-        if (walletIsSender && (wbnbWrapped > 0 || wbnbUnwrapped > 0)) {
+    const bool knownRouter =
+        (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
+    const bool dexSignal = hasSwap || knownRouter || genericMulticall || urCmds.hasPermit2;
+
+    r.hasSwapEvent = hasSwap;
+    r.isUniversalRouter = urCmds.present;
+    r.isGenericMulticall = genericMulticall;
+    r.hasPermit2Signal = urCmds.hasPermit2;
+    r.dexActivityDetected = dexSignal;
+    r.lpMintOrBurnSeen = !mintedToWallet.empty() || !burnedFromWallet.empty();
+    r.lpV3EventSeen = v3Increase || v3Decrease || v3Collect;
+    r.lpPoolIdentitySeen = !swapPools.empty();
+
+    // ---------------------------------------------------------------------
+    // 2. Pure wrap/unwrap. Do this before ordinary transfer classification.
+    // ---------------------------------------------------------------------
+    bool hasNonWrappedFlow = false;
+    for (const auto& token : tokenOrder) {
+        if (token != g_chain.wrappedNative && netFlow[token] != 0) {
+            hasNonWrappedFlow = true;
+            break;
+        }
+    }
+
+    if (!hasSwap && !hasNonWrappedFlow &&
+        (wrappedForWallet > 0 || unwrappedForWallet > 0)) {
+        r.valid = true;
+        r.isSwap = false;
+        r.tokenAddr = g_chain.wrappedNative;
+
+        if (wrappedForWallet >= unwrappedForWallet) {
+            r.venue = "Wrap";
+            r.rawAmount = wrappedForWallet;
+            r.isBuy = true;
+        } else {
+            r.venue = "Unwrap";
+            r.rawAmount = unwrappedForWallet;
+            r.isBuy = false;
+        }
+
+        const int dec = getDecimals(r.tokenAddr);
+        r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
+        return r;
+    }
+
+    // No wallet asset movement means there is nothing financially classifiable.
+    bool hasWalletFlow = false;
+    for (const auto& token : tokenOrder) {
+        if (netFlow[token] != 0) {
+            hasWalletFlow = true;
+            break;
+        }
+    }
+
+    if (!hasWalletFlow) {
+        if (dexSignal) {
             r.valid = true;
-            r.isSwap = false;
-            r.tokenAddr = g_chain.wrappedNative;
-            if (wbnbWrapped > 0) { r.venue = "Wrap"; r.rawAmount = wbnbWrapped; r.isBuy = true; }
-            else { r.venue = "Unwrap"; r.rawAmount = wbnbUnwrapped; r.isBuy = false; }
-            int wrapDec = getDecimals(r.tokenAddr);
-            uint64_t wrapPrice = getPriceNanos(r.tokenAddr);
-            r.usdNanos = calcUsdNanos(r.rawAmount, wrapDec, wrapPrice);
-            r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
-            r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
-            r.dexActivityDetected = hasSwap || urCmds.present || isGenericMulticall || urCmds.hasPermit2;
-            return r;
+            r.unknownReason = "NO_COUNTER_FLOW";
+            if (r.venue.empty()) r.venue = "DEX activity";
         }
         return r;
     }
     r.valid = true;
 
-    if (r.venue.empty()) for (auto& addr : allSwapPoolAddrs) { r.venue = lookupRouterLabel(addr); if (!r.venue.empty()) break; }
-    if (r.venue.empty() && !firstCounterpartAddr.empty()) r.venue = lookupRouterLabel(firstCounterpartAddr);
-    if (r.venue.empty() && !txTo.empty()) r.venue = lookupRouterLabel(txTo);
-    if (r.venue.empty() && urCmds.present) {
-        if (urCmds.hasV3Swap) r.venue = "Universal Router (V3-style)";
-        else if (urCmds.hasV2Swap) r.venue = "Universal Router (V2-style)";
-        else r.venue = "Universal Router";
-    }
-    if (r.venue.empty() && hasSwap && swapLogDataHexLen > 0) {
-        if (swapLogDataHexLen == 256) r.venue = "unknown pool (V2-style)";
-        else if (swapLogDataHexLen == 320) r.venue = "unknown pool (V3-style)";
-        else if (swapLogDataHexLen == 448) r.venue = "unknown pool (V3-style)";
-    }
+    // ---------------------------------------------------------------------
+    // 3. LP detection. It remains event/flow based, not router-selector based.
+    // ---------------------------------------------------------------------
+    bool sentBase = false;
+    bool sentNonBase = false;
+    bool gotBase = false;
+    bool gotNonBase = false;
 
-    bool routerCall = (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present || isGenericMulticall || urCmds.hasPermit2;
-    bool nativeSwapSignal = nativeOutflow && (routerCall || hasSwap || wbnbWrapped > 0);
-    cpp_int nativeIn = 0;
-    if (walletIsSender && hasSwap && wbnbUnwrapped > 0) nativeIn = wbnbUnwrapped;
-    bool nativeInflowSignal = nativeIn > 0;
-
-    bool anyIn = false, anyOut = false;
-    for (auto& tok : tokenOrder) {
-        if (netFlow[tok] > 0) anyIn = true;
-        if (netFlow[tok] < 0) anyOut = true;
-    }
-    bool twoSidedFlow = anyIn && anyOut;
-
-    bool sentBase = false, sentNonBase = false, gotBase = false, gotNonBase = false;
-    for (auto& tok : tokenOrder) {
-        cpp_int net = netFlow[tok];
-        if (isBaseAsset(tok)) {
-            if (net > 0) gotBase = true;
-            if (net < 0) sentBase = true;
+    for (const auto& token : tokenOrder) {
+        const cpp_int n = netFlow[token];
+        if (isBaseAsset(token)) {
+            sentBase = sentBase || n < 0;
+            gotBase = gotBase || n > 0;
         } else {
-            if (net > 0) gotNonBase = true;
-            if (net < 0) sentNonBase = true;
+            sentNonBase = sentNonBase || n < 0;
+            gotNonBase = gotNonBase || n > 0;
         }
     }
-    bool lpAdd = false, lpRemove = false;
-    for (auto& tok : tokenOrder) {
-        cpp_int net = netFlow[tok];
-        if (net > 0 && mintedIn.count(tok) && sentBase && sentNonBase) lpAdd = true;
-        if (net < 0 && burnedOut.count(tok) && gotBase && gotNonBase) lpRemove = true;
-    }
-    if (!lpAdd) {
-        for (auto& tok : tokenOrder) {
-            cpp_int net = netFlow[tok];
-            bool poolTokenIn = outCounterparties.count(tok) > 0;
-            if (net > 0 && poolTokenIn && sentBase && sentNonBase) { lpAdd = true; break; }
+
+    bool lpAdd = v3Increase;
+    bool lpRemove = v3Decrease || v3Collect;
+
+    if (!lpAdd && sentBase && sentNonBase) {
+        for (const auto& token : mintedToWallet) {
+            if (netFlow[token] > 0) {
+                lpAdd = true;
+                break;
+            }
         }
     }
-    if (!lpAdd) {
-        for (auto& tok : tokenOrder) {
-            cpp_int net = netFlow[tok];
-            bool poolTokenIn = outCounterparties.count(tok) > 0;
-            if (net > 0 && poolTokenIn && mintedIn.count(tok)) { lpAdd = true; break; }
+
+    if (!lpRemove && gotBase && gotNonBase) {
+        for (const auto& token : burnedFromWallet) {
+            if (netFlow[token] < 0) {
+                lpRemove = true;
+                break;
+            }
         }
     }
-    if (!lpRemove) {
-        for (auto& tok : tokenOrder) {
-            cpp_int net = netFlow[tok];
-            bool poolTokenOut = inCounterparties.count(tok) > 0;
-            if (net < 0 && poolTokenOut) { lpRemove = true; break; }
-        }
-    }
-    if (v3PositionIncrease) lpAdd = true;
-    if (v3PositionDecrease) lpRemove = true;
-    if (v3Collect) lpRemove = true;
-
-    r.lpMintOrBurnSeen = !mintedIn.empty() || !burnedOut.empty();
-    r.lpV3EventSeen = v3PositionIncrease || v3PositionDecrease || v3Collect;
-    for (auto& tok : tokenOrder) {
-        if (outCounterparties.count(tok) > 0 || inCounterparties.count(tok) > 0) { r.lpPoolIdentitySeen = true; break; }
-    }
-
-    std::string bestNonBaseTok; cpp_int bestNonBaseAbs = -1; cpp_int bestNonBaseNet = 0;
-    bool bestNonBaseCoherent = false, bestNonBaseFromPool = false;
-    bool hasBaseIn=false, hasBaseOut=false;
-
-    for (auto& tok : tokenOrder) {
-        if (!isBaseAsset(tok)) continue;
-        cpp_int net = netFlow[tok];
-        if (net > 0) hasBaseIn = true;
-        if (net < 0) hasBaseOut = true;
-    }
-
-    for (auto& tok : tokenOrder) {
-        if (isBaseAsset(tok)) continue;
-        cpp_int net = netFlow[tok];
-        if (net == 0) continue;
-        cpp_int absNet = net >= 0 ? net : -net;
-        bool coherent = (net > 0 && (hasBaseOut || nativeSwapSignal)) || (net < 0 && (hasBaseIn || nativeInflowSignal));
-        bool fromPool = tokenPathTouchesSwapPool(
-            edgesByToken,
-            tok,
-            wa,
-            allSwapPoolAddrs,
-            net > 0
-        );
-
-        // Direct pool counterpart remains a fallback.
-        if (!fromPool) {
-            fromPool = (net > 0)
-                ? (inSources.count(tok) && [&]() { for (auto& s : inSources[tok]) if (allSwapPoolAddrs.count(s)) return true; return false; }())
-                : (outDestinations.count(tok) && [&]() { for (auto& d : outDestinations[tok]) if (allSwapPoolAddrs.count(d)) return true; return false; }());
-        }
-        bool better = bestNonBaseTok.empty() ||
-                      (coherent && !bestNonBaseCoherent) ||
-                      (coherent == bestNonBaseCoherent && fromPool && !bestNonBaseFromPool) ||
-                      (coherent == bestNonBaseCoherent && fromPool == bestNonBaseFromPool && absNet > bestNonBaseAbs);
-        if (better) { bestNonBaseAbs = absNet; bestNonBaseTok = tok; bestNonBaseNet = net; bestNonBaseCoherent = coherent; bestNonBaseFromPool = fromPool; }
-    }
-
-    // Swap event is authoritative when the tracked wallet has a
-    // non-base token flow. Router/selector/counter-flow decoding is optional.
-    const bool swapEventWithWalletTokenFlow =
-        hasSwap &&
-        !bestNonBaseTok.empty() &&
-        bestNonBaseNet != 0;
-
-    r.isSwap = (
-        swapEventWithWalletTokenFlow ||
-        twoSidedFlow ||
-        (!bestNonBaseTok.empty() && (hasBaseIn || hasBaseOut || nativeSwapSignal || nativeInflowSignal)) ||
-        (hasBaseIn && hasBaseOut)
-    );
 
     if (lpAdd || lpRemove) {
         r.isSwap = false;
         r.venue = lpAdd ? "Add Liquidity" : "Remove Liquidity";
+
+        // Show the largest absolute wallet flow as the representative amount.
+        cpp_int best = -1;
+        for (const auto& token : tokenOrder) {
+            const cpp_int a = absInt(netFlow[token]);
+            if (a > best) {
+                best = a;
+                r.tokenAddr = token;
+                r.rawAmount = a;
+                r.isBuy = netFlow[token] > 0;
+            }
+        }
+
+        if (!r.tokenAddr.empty()) {
+            const int dec = getDecimals(r.tokenAddr);
+            r.usdNanos = calcUsdNanos(
+                r.rawAmount, dec, getPriceNanos(r.tokenAddr)
+            );
+        }
+        return r;
     }
 
-    if (!bestNonBaseTok.empty()) {
-        r.tokenAddr = bestNonBaseTok;
-        r.rawAmount = bestNonBaseAbs;
-        r.isBuy = bestNonBaseNet > 0;
+    // ---------------------------------------------------------------------
+    // 4. Flow-first BUY/SELL.
+    //
+    // Main asset = strongest non-base wallet net flow.
+    // Positive non-base flow => BUY.
+    // Negative non-base flow => SELL.
+    //
+    // Swap event/pool linkage confirms that this is a swap. Router decoding
+    // is not required and never determines direction.
+    // ---------------------------------------------------------------------
+    std::string mainToken;
+    cpp_int mainNet = 0;
+    cpp_int mainAbs = -1;
+    bool mainPoolLinked = false;
 
-        if (r.isSwap) {
-            std::string bestCounterTok; cpp_int bestCounterAbs = -1;
-            for (auto& tok : tokenOrder) {
-                if (!isBaseAsset(tok)) continue;
-                cpp_int net = netFlow[tok];
-                bool wantsOutflow = r.isBuy;
-                if (wantsOutflow && net >= 0) continue;
-                if (!wantsOutflow && net <= 0) continue;
-                cpp_int absNet = net >= 0 ? net : -net;
-                if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
-            }
-            if (bestCounterTok.empty() && r.isBuy && nativeOutflow && nativeSwapSignal) {
-                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
-            }
-            if (bestCounterTok.empty() && !r.isBuy && nativeInflowSignal) {
-                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeIn;
-            }
-            if (bestCounterTok.empty()) {
-                for (auto& tok : tokenOrder) {
-                    if (tok == r.tokenAddr) continue;
-                    cpp_int net = netFlow[tok];
-                    bool wantsOutflow = r.isBuy;
-                    if (wantsOutflow && net >= 0) continue;
-                    if (!wantsOutflow && net <= 0) continue;
-                    cpp_int absNet = net >= 0 ? net : -net;
-                    if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
-                }
-            }
-            if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
-        }
-    } else {
-        std::string bestBaseTok; cpp_int bestBaseAbs = -1; cpp_int bestBaseNet = 0;
-        for (auto& tok : tokenOrder) {
-            if (!isBaseAsset(tok)) continue;
-            cpp_int net = netFlow[tok];
-            if (net <= 0) continue;
-            if (net > bestBaseAbs) { bestBaseAbs = net; bestBaseTok = tok; bestBaseNet = net; }
-        }
-        if (bestBaseTok.empty()) {
-            for (auto& tok : tokenOrder) {
-                if (!isBaseAsset(tok)) continue;
-                cpp_int net = netFlow[tok];
-                cpp_int absNet = net >= 0 ? net : -net;
-                if (absNet > bestBaseAbs) { bestBaseAbs = absNet; bestBaseTok = tok; bestBaseNet = net; }
-            }
-        }
-        if (!bestBaseTok.empty()) {
-            r.tokenAddr = bestBaseTok;
-            r.rawAmount = bestBaseAbs;
-            r.isBuy = bestBaseNet > 0;
+    for (const auto& token : tokenOrder) {
+        if (isBaseAsset(token) || netFlow[token] == 0) continue;
 
-            std::string bestCounterTok; cpp_int bestCounterAbs = -1;
-            for (auto& tok : tokenOrder) {
-                if (tok == r.tokenAddr || !isBaseAsset(tok)) continue;
-                cpp_int net = netFlow[tok];
-                bool wantsOutflow = r.isBuy;
-                if (wantsOutflow && net >= 0) continue;
-                if (!wantsOutflow && net <= 0) continue;
-                cpp_int absNet = net >= 0 ? net : -net;
-                if (absNet > bestCounterAbs) { bestCounterAbs = absNet; bestCounterTok = tok; }
-            }
-            if (bestCounterTok.empty() && r.isBuy && nativeOutflow && nativeSwapSignal) {
-                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeOut;
-            }
-            if (bestCounterTok.empty() && !r.isBuy && nativeInflowSignal) {
-                bestCounterTok = NATIVE_BNB_MARKER; bestCounterAbs = nativeIn;
-            }
-            if (!bestCounterTok.empty()) { r.counterAddr = bestCounterTok; r.counterAmount = bestCounterAbs; }
-        } else if (nativeOutflow && !tokenOrder.empty()) {
-            r.tokenAddr = tokenOrder.front();
-            cpp_int net = netFlow[r.tokenAddr];
-            r.rawAmount = net >= 0 ? net : -net;
-            r.isBuy = net > 0;
-            if (r.isBuy && nativeSwapSignal) {
-                r.counterAddr = NATIVE_BNB_MARKER;
-                r.counterAmount = nativeOut;
-            }
-        } else {
-            r.tokenAddr = tokenOrder.front();
-            cpp_int net = netFlow[r.tokenAddr];
-            r.rawAmount = net >= 0 ? net : -net;
-            r.isBuy = net > 0;
+        const cpp_int a = absInt(netFlow[token]);
+        const bool poolLinked = flowLinkedToPool(
+            graph, token, wallet, swapPools, netFlow[token] > 0
+        );
+
+        const bool better =
+            mainToken.empty() ||
+            (poolLinked && !mainPoolLinked) ||
+            (poolLinked == mainPoolLinked && a > mainAbs);
+
+        if (better) {
+            mainToken = token;
+            mainNet = netFlow[token];
+            mainAbs = a;
+            mainPoolLinked = poolLinked;
         }
     }
 
-    if (!r.isSwap && !lpAdd && !lpRemove && !r.tokenAddr.empty() && r.tokenAddr != NATIVE_BNB_MARKER &&
-        !isBaseAsset(r.tokenAddr) && (nativeSwapSignal || nativeInflowSignal)) {
+    bool hasOppositeFlow = false;
+    if (!mainToken.empty()) {
+        for (const auto& token : tokenOrder) {
+            if (token == mainToken || netFlow[token] == 0) continue;
+            if ((mainNet > 0 && netFlow[token] < 0) ||
+                (mainNet < 0 && netFlow[token] > 0)) {
+                hasOppositeFlow = true;
+                break;
+            }
+        }
+
+        if (mainNet > 0 && nativeOut > 0) hasOppositeFlow = true;
+        if (mainNet < 0 && unwrappedForWallet > 0) hasOppositeFlow = true;
+    }
+
+    const bool flowLooksLikeSwap =
+        !mainToken.empty() &&
+        (hasSwap || mainPoolLinked || hasOppositeFlow);
+
+    if (flowLooksLikeSwap) {
         r.isSwap = true;
-        if (r.counterAddr.empty()) {
-            if (r.isBuy && nativeOutflow && nativeSwapSignal) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeOut; }
-            else if (!r.isBuy && nativeInflowSignal) { r.counterAddr = NATIVE_BNB_MARKER; r.counterAmount = nativeIn; }
+        r.tokenAddr = mainToken;
+        r.rawAmount = mainAbs;
+        r.isBuy = mainNet > 0;
+
+        // Counter asset is informational and may legitimately be absent.
+        std::string counter;
+        cpp_int counterAbs = -1;
+
+        for (const auto& token : tokenOrder) {
+            if (token == mainToken || netFlow[token] == 0) continue;
+            const bool opposite =
+                (mainNet > 0 && netFlow[token] < 0) ||
+                (mainNet < 0 && netFlow[token] > 0);
+            if (!opposite) continue;
+
+            const cpp_int a = absInt(netFlow[token]);
+            const bool preferBase = isBaseAsset(token);
+            const bool currentBase = !counter.empty() && isBaseAsset(counter);
+            if (counter.empty() || (preferBase && !currentBase) ||
+                (preferBase == currentBase && a > counterAbs)) {
+                counter = token;
+                counterAbs = a;
+            }
+        }
+
+        if (counter.empty() && r.isBuy && nativeOut > 0) {
+            counter = g_chain.nativeMarker;
+            counterAbs = nativeOut;
+        }
+        if (counter.empty() && !r.isBuy && unwrappedForWallet > 0) {
+            counter = g_chain.nativeMarker;
+            counterAbs = unwrappedForWallet;
+        }
+
+        if (!counter.empty()) {
+            r.counterAddr = counter;
+            r.counterAmount = counterAbs;
+        }
+
+        r.venue = lookupRouterLabel(txTo);
+        if (r.venue.empty() && !swapPools.empty())
+            r.venue = "DEX Pool";
+        if (r.venue.empty() && urCmds.present)
+            r.venue = "Universal Router";
+        if (r.venue.empty())
+            r.venue = "DEX";
+
+        const int dec = getDecimals(r.tokenAddr);
+        r.usdNanos = calcUsdNanos(
+            r.rawAmount, dec, getPriceNanos(r.tokenAddr)
+        );
+        return r;
+    }
+
+    // ---------------------------------------------------------------------
+    // 5. Ordinary transfer. Select the strongest direct wallet net flow.
+    // ---------------------------------------------------------------------
+    cpp_int bestAbs = -1;
+    for (const auto& token : tokenOrder) {
+        if (netFlow[token] == 0) continue;
+        const cpp_int a = absInt(netFlow[token]);
+        if (a > bestAbs) {
+            bestAbs = a;
+            r.tokenAddr = token;
+            r.rawAmount = a;
+            r.isBuy = netFlow[token] > 0;
         }
     }
 
-    int tokenDec = (r.tokenAddr == NATIVE_BNB_MARKER) ? 18 : getDecimals(r.tokenAddr);
-    uint64_t tokenPrice = (r.tokenAddr == NATIVE_BNB_MARKER) ? getPriceNanos(g_chain.wrappedNative) : getPriceNanos(r.tokenAddr);
-    r.usdNanos = calcUsdNanos(r.rawAmount, tokenDec, tokenPrice);
-    r.hasSwapEvent = hasSwap; r.isUniversalRouter = urCmds.present;
-    r.isGenericMulticall = isGenericMulticall; r.hasPermit2Signal = urCmds.hasPermit2;
-    r.dexActivityDetected = hasSwap || routerCall;
-
-    if (r.isSwap && r.venue.empty())
-        r.venue = hasSwap ? "DEX Pool" : "DEX";
-
-    // Missing quote/counter flow does not invalidate an already recognized
-    // BUY/SELL. It only leaves counterAddr/counterAmount empty.
-    if (!r.isSwap && r.venue.empty() && r.dexActivityDetected) {
-        if (!twoSidedFlow) r.unknownReason = "NO_WALLET_TOKEN_FLOW";
-        else if (hasSwap && !routerCall) r.unknownReason = "UNKNOWN_ROUTER";
-        else r.unknownReason = "OTHER";
+    r.isSwap = false;
+    if (dexSignal && mainToken.empty()) {
+        // A DEX event occurred, but no non-base wallet flow exists.
+        // Keep it Unknown rather than lying about BUY/SELL.
+        r.unknownReason = "NO_COUNTER_FLOW";
+        if (r.venue.empty()) r.venue = "DEX activity";
     }
+
+    if (!r.tokenAddr.empty()) {
+        const int dec = getDecimals(r.tokenAddr);
+        r.usdNanos = calcUsdNanos(
+            r.rawAmount, dec, getPriceNanos(r.tokenAddr)
+        );
+    }
+
     return r;
 }
