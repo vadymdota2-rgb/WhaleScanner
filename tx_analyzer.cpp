@@ -130,6 +130,25 @@ struct FlowEdge {
     cpp_int amount;
 };
 
+enum class V3LiquidityKind {
+    Increase,
+    Decrease,
+    Collect
+};
+
+struct V3LiquidityEvent {
+    std::string manager;
+    std::string tokenId;
+    V3LiquidityKind kind;
+};
+
+struct NftTransferEvidence {
+    std::string manager;
+    std::string tokenId;
+    std::string from;
+    std::string to;
+};
+
 cpp_int absInt(const cpp_int& v) {
     return v < 0 ? -v : v;
 }
@@ -185,6 +204,61 @@ bool receiptSucceeded(const json& receipt) {
 std::string topicAddress(const std::string& topic) {
     if (topic.size() < 66) return "";
     return "0x" + toLower(topic.substr(topic.size() - 40));
+}
+
+std::string topicUint256Key(const std::string& topic) {
+    if (topic.size() < 66 || topic[0] != '0' || topic[1] != 'x') return "";
+    return "0x" + toLower(topic.substr(topic.size() - 64));
+}
+
+bool nftEvidenceMatches(
+    const std::vector<NftTransferEvidence>& transfers,
+    const V3LiquidityEvent& event,
+    const std::string& wallet,
+    bool incomingToWallet
+) {
+    for (const auto& nft : transfers) {
+        if (nft.manager != event.manager || nft.tokenId != event.tokenId)
+            continue;
+        if (incomingToWallet && nft.to == wallet)
+            return true;
+        if (!incomingToWallet && nft.from == wallet)
+            return true;
+    }
+    return false;
+}
+
+int maxCommonWalletCounterpartyTokenCount(
+    const std::map<std::string, std::vector<FlowEdge>>& graph,
+    const std::vector<std::string>& tokenOrder,
+    const std::map<std::string, cpp_int>& netFlow,
+    const std::string& wallet,
+    bool incoming
+) {
+    std::map<std::string, std::set<std::string>> tokensByCounterparty;
+
+    for (const auto& token : tokenOrder) {
+        auto netIt = netFlow.find(token);
+        if (netIt == netFlow.end()) continue;
+        if (incoming && netIt->second <= 0) continue;
+        if (!incoming && netIt->second >= 0) continue;
+
+        auto graphIt = graph.find(token);
+        if (graphIt == graph.end()) continue;
+
+        for (const auto& edge : graphIt->second) {
+            if (edge.amount <= 0) continue;
+            if (incoming && edge.to == wallet && edge.from != wallet)
+                tokensByCounterparty[edge.from].insert(token);
+            if (!incoming && edge.from == wallet && edge.to != wallet)
+                tokensByCounterparty[edge.to].insert(token);
+        }
+    }
+
+    int best = 0;
+    for (const auto& item : tokensByCounterparty)
+        best = std::max(best, static_cast<int>(item.second.size()));
+    return best;
 }
 
 bool reachesAny(
@@ -383,6 +457,10 @@ const std::string WBNB_DEPOSIT_TOPIC =
     "0xe1fffcc4923d04b559f4d29a8bfc6cda04eb5b0d3c460751c2402c5c5cc9109c";
 const std::string WBNB_WITHDRAWAL_TOPIC =
     "0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65";
+const std::string V2_MINT_TOPIC =
+    "0x4c209b5fc8ad50758f13e2e1088ba56a560dff690a1c6fef26394f4c03821c4f";
+const std::string V2_BURN_TOPIC =
+    "0xdccd412f0b1252819cb1fd330b93224ca42612892bb3f4f789976e6d81936496";
 const std::string V3_INCREASE_LIQUIDITY_TOPIC =
     "0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f";
 const std::string V3_DECREASE_LIQUIDITY_TOPIC =
@@ -419,7 +497,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     std::set<std::string> swapPools;
     std::set<std::string> mintedToWallet;
     std::set<std::string> burnedFromWallet;
-    std::set<std::string> lpEventContracts;
+    std::set<std::string> v2MintPools;
+    std::set<std::string> v2BurnPools;
+    std::vector<V3LiquidityEvent> v3LiquidityEvents;
+    std::vector<NftTransferEvidence> nftTransfers;
 
     auto touch = [&](const std::string& token) {
         if (!netFlow.count(token)) {
@@ -455,19 +536,36 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             continue;
         }
 
-        if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC) {
-            v3Increase = true;
-            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
+        if (topic0 == V2_MINT_TOPIC) {
+            if (!logAddr.empty()) v2MintPools.insert(logAddr);
             continue;
         }
-        if (topic0 == V3_DECREASE_LIQUIDITY_TOPIC) {
-            v3Decrease = true;
-            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
+        if (topic0 == V2_BURN_TOPIC) {
+            if (!logAddr.empty()) v2BurnPools.insert(logAddr);
             continue;
         }
-        if (topic0 == V3_COLLECT_TOPIC) {
-            v3Collect = true;
-            if (!logAddr.empty()) lpEventContracts.insert(logAddr);
+
+        if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC ||
+            topic0 == V3_DECREASE_LIQUIDITY_TOPIC ||
+            topic0 == V3_COLLECT_TOPIC) {
+            if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC) v3Increase = true;
+            if (topic0 == V3_DECREASE_LIQUIDITY_TOPIC) v3Decrease = true;
+            if (topic0 == V3_COLLECT_TOPIC) v3Collect = true;
+
+            if (!logAddr.empty() &&
+                log["topics"].size() >= 2 &&
+                log["topics"][1].is_string()) {
+                const std::string tokenId =
+                    topicUint256Key(log["topics"][1].get<std::string>());
+                if (!tokenId.empty()) {
+                    V3LiquidityKind kind = V3LiquidityKind::Collect;
+                    if (topic0 == V3_INCREASE_LIQUIDITY_TOPIC)
+                        kind = V3LiquidityKind::Increase;
+                    else if (topic0 == V3_DECREASE_LIQUIDITY_TOPIC)
+                        kind = V3LiquidityKind::Decrease;
+                    v3LiquidityEvents.push_back({logAddr, tokenId, kind});
+                }
+            }
             continue;
         }
 
@@ -482,6 +580,22 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                 if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
                 else unwrappedForWallet += amount;
             }
+            continue;
+        }
+
+        // ERC-721 Transfer has four topics. Preserve manager + tokenId +
+        // direction so V3 liquidity events can be tied to the tracked wallet.
+        if (topic0 == ERC20_TRANSFER_TOPIC && !logAddr.empty() &&
+            log["topics"].size() == 4 &&
+            log["topics"][1].is_string() &&
+            log["topics"][2].is_string() &&
+            log["topics"][3].is_string()) {
+            const std::string nftFrom = topicAddress(log["topics"][1].get<std::string>());
+            const std::string nftTo = topicAddress(log["topics"][2].get<std::string>());
+            const std::string tokenId =
+                topicUint256Key(log["topics"][3].get<std::string>());
+            if (!nftFrom.empty() && !nftTo.empty() && !tokenId.empty())
+                nftTransfers.push_back({logAddr, tokenId, nftFrom, nftTo});
             continue;
         }
 
@@ -549,7 +663,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     r.isUniversalRouter = urCmds.present;
     r.isGenericMulticall = genericMulticall;
     r.hasPermit2Signal = urCmds.hasPermit2;
-    r.dexActivityDetected = dexSignal;
+    // Router/Permit2/multicall are metadata only. Confirm financial DEX
+    // activity later from swap or LP evidence.
+    r.dexActivityDetected = hasSwap;
     r.lpMintOrBurnSeen = !mintedToWallet.empty() || !burnedFromWallet.empty();
     r.lpV3EventSeen = v3Increase || v3Decrease || v3Collect;
     r.lpPoolIdentitySeen = !swapPools.empty();
@@ -612,22 +728,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     // ---------------------------------------------------------------------
     // 3. LP detection. It remains event/flow based, not router-selector based.
     // ---------------------------------------------------------------------
-    bool sentBase = false;
-    bool sentNonBase = false;
-    bool gotBase = false;
-    bool gotNonBase = false;
-
-    for (const auto& token : tokenOrder) {
-        const cpp_int n = netFlow[token];
-        if (isBaseAsset(token)) {
-            sentBase = sentBase || n < 0;
-            gotBase = gotBase || n > 0;
-        } else {
-            sentNonBase = sentNonBase || n < 0;
-            gotNonBase = gotNonBase || n > 0;
-        }
-    }
-
     int outgoingAssets = 0;
     int incomingAssets = 0;
     for (const auto& token : tokenOrder) {
@@ -635,56 +735,71 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (netFlow[token] > 0) ++incomingAssets;
     }
 
-    auto flowTouchesAnyContract = [&](const std::string& token, bool incoming) {
-        return flowLinkedToPool(graph, token, wallet, lpEventContracts, incoming);
-    };
-
-    bool v3AddLinked = false;
-    bool v3RemoveLinked = false;
-    if (v3Increase && outgoingAssets >= 2) {
-        for (const auto& token : tokenOrder) {
-            if (netFlow[token] < 0 && flowTouchesAnyContract(token, false)) {
-                v3AddLinked = true;
-                break;
-            }
-        }
-    }
-    if ((v3Decrease || v3Collect) && incomingAssets >= 2) {
-        for (const auto& token : tokenOrder) {
-            if (netFlow[token] > 0 && flowTouchesAnyContract(token, true)) {
-                v3RemoveLinked = true;
-                break;
-            }
-        }
-    }
-
+    // V2 pair events identify the pool directly. Require the matching LP-token
+    // flow plus two underlying assets connected to that same pair.
     bool v2AddLinked = false;
-    for (const auto& lpToken : mintedToWallet) {
-        if (!swapPools.count(lpToken) || netFlow[lpToken] <= 0) continue;
+    for (const auto& pool : v2MintPools) {
+        if (netFlow[pool] <= 0 && !mintedToWallet.count(pool)) continue;
         int linkedOutgoing = 0;
         for (const auto& token : tokenOrder) {
-            if (token == lpToken || netFlow[token] >= 0) continue;
-            if (flowLinkedToPool(graph, token, wallet, {lpToken}, false))
+            if (token == pool || netFlow[token] >= 0) continue;
+            if (flowLinkedToPool(graph, token, wallet, {pool}, false))
                 ++linkedOutgoing;
         }
-        if (linkedOutgoing >= 2) {
-            v2AddLinked = true;
-            break;
-        }
+        if (linkedOutgoing >= 2) { v2AddLinked = true; break; }
     }
 
     bool v2RemoveLinked = false;
-    for (const auto& lpToken : burnedFromWallet) {
-        if (!swapPools.count(lpToken) || netFlow[lpToken] >= 0) continue;
+    for (const auto& pool : v2BurnPools) {
+        if (netFlow[pool] >= 0 && !burnedFromWallet.count(pool)) continue;
         int linkedIncoming = 0;
         for (const auto& token : tokenOrder) {
-            if (token == lpToken || netFlow[token] <= 0) continue;
-            if (flowLinkedToPool(graph, token, wallet, {lpToken}, true))
+            if (token == pool || netFlow[token] <= 0) continue;
+            if (flowLinkedToPool(graph, token, wallet, {pool}, true))
                 ++linkedIncoming;
         }
-        if (linkedIncoming >= 2) {
-            v2RemoveLinked = true;
-            break;
+        if (linkedIncoming >= 2) { v2RemoveLinked = true; break; }
+    }
+
+    // V3 event ownership/linkage:
+    // 1) strongest evidence: the same manager + tokenId NFT moves to/from wallet;
+    // 2) existing positions usually do not move the NFT, so require at least
+    //    two wallet token flows sharing one direct counterparty.
+    const int commonOutgoingCounterpartyCount =
+        maxCommonWalletCounterpartyTokenCount(
+            graph, tokenOrder, netFlow, wallet, false
+        );
+    const int commonIncomingCounterpartyCount =
+        maxCommonWalletCounterpartyTokenCount(
+            graph, tokenOrder, netFlow, wallet, true
+        );
+
+    bool v3AddLinked = false;
+    bool v3RemoveLinked = false;
+
+    for (const auto& event : v3LiquidityEvents) {
+        if (event.kind == V3LiquidityKind::Increase) {
+            const bool nftToWallet =
+                nftEvidenceMatches(nftTransfers, event, wallet, true);
+            const bool existingPositionFlow =
+                outgoingAssets >= 2 &&
+                commonOutgoingCounterpartyCount >= 2;
+
+            if (!hasSwap && outgoingAssets >= 2 &&
+                (nftToWallet || existingPositionFlow)) {
+                v3AddLinked = true;
+            }
+        } else {
+            const bool nftFromWallet =
+                nftEvidenceMatches(nftTransfers, event, wallet, false);
+            const bool existingPositionFlow =
+                incomingAssets >= 2 &&
+                commonIncomingCounterpartyCount >= 2;
+
+            if (!hasSwap && incomingAssets >= 2 &&
+                (nftFromWallet || existingPositionFlow)) {
+                v3RemoveLinked = true;
+            }
         }
     }
 
@@ -692,6 +807,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     const bool lpRemove = v3RemoveLinked || v2RemoveLinked;
 
     if (lpAdd || lpRemove) {
+        r.dexActivityDetected = true;
         r.isSwap = false;
         r.venue = lpAdd ? "Add Liquidity" : "Remove Liquidity";
 
@@ -784,8 +900,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     const bool flowLooksLikeSwap = confirmedSwap || inferredRouterSwap;
 
     if (flowLooksLikeSwap) {
+        r.dexActivityDetected = true;
         if (inferredRouterSwap)
-            r.unknownReason = "SWAP_INFERRED_FROM_FLOW";
+            r.diagnosticReason = "SWAP_INFERRED_FROM_FLOW";
         r.isSwap = true;
         r.tokenAddr = mainToken;
         r.rawAmount = mainAbs;
@@ -830,7 +947,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         } else if (!r.isBuy) {
             // A token SELL can be confirmed by the receipt while the native
             // proceeds remain invisible without transaction traces.
-            r.unknownReason = "NATIVE_COUNTER_REQUIRES_TRACE";
+            r.diagnosticReason = "NATIVE_COUNTER_REQUIRES_TRACE";
         }
 
         r.venue = lookupRouterLabel(txTo);
@@ -866,13 +983,20 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     }
 
     r.isSwap = false;
-    if (dexSignal && mainToken.empty()) {
+    if (hasSwap && mainToken.empty()) {
         r.unknownReason = "ONLY_BASE_ASSET_FLOW";
-        if (r.venue.empty()) r.venue = "DEX activity";
+        r.venue = "DEX activity";
+        r.tokenAddr.clear();
+        r.rawAmount = 0;
     } else if (!mainToken.empty() && hasOppositeFlow && !flowLooksLikeSwap) {
         r.unknownReason = "UNCONFIRMED_OPPOSITE_FLOW";
-    } else if ((v3Increase || v3Decrease || v3Collect) && !lpAdd && !lpRemove) {
+        r.tokenAddr.clear();
+        r.rawAmount = 0;
+    } else if ((!v2MintPools.empty() || !v2BurnPools.empty() ||
+                v3Increase || v3Decrease || v3Collect) && !lpAdd && !lpRemove) {
         r.unknownReason = "LP_EVENT_NOT_LINKED_TO_WALLET";
+        r.tokenAddr.clear();
+        r.rawAmount = 0;
     }
 
     if (!r.tokenAddr.empty()) {
