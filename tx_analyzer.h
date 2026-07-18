@@ -3,19 +3,39 @@
 #include <string>
 #include <set>
 #include <map>
+#include <vector>
 #include <cstdint>
 #include <boost/multiprecision/cpp_int.hpp>
 #include "json.hpp"
 
 using boost::multiprecision::cpp_int;
 
+struct FlowEdge {
+    std::string from;
+    std::string to;
+    cpp_int amount;
+};
+
 struct TxResult {
-    bool valid, isSwap, isBuy;
-    cpp_int rawAmount, usdNanos;
+    // Core classification
+    bool valid = false;
+    bool isSwap = false;
+    bool isBuy = false;
+    
+    // Main asset
     std::string tokenAddr;
-    std::string venue;
+    cpp_int rawAmount = 0;
+    cpp_int usdNanos = 0;
+    
+    // Counter asset (for swaps)
     std::string counterAddr;
-    cpp_int counterAmount;
+    cpp_int counterAmount = 0;
+    cpp_int counterUsdNanos = 0;
+    
+    // Venue information
+    std::string venue;
+    
+    // Diagnostic signals (for coverage tracking)
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
     bool isGenericMulticall = false;
@@ -24,8 +44,13 @@ struct TxResult {
     bool lpMintOrBurnSeen = false;
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
+    
+    // Error/uncertainty information
     std::string unknownReason;
     std::string diagnosticReason;
+    
+    // Confidence score (0.0 to 1.0)
+    double confidence = 0.0;
 };
 
 struct ChainContext {
@@ -39,6 +64,7 @@ struct ChainContext {
     std::set<std::string> stablecoins;
     std::map<std::string, std::string> routers;
     std::set<std::string> bridges;
+    std::set<std::string> permit2Contracts;
 };
 
 const ChainContext& chainCtx();
@@ -63,4 +89,5 @@ std::string formatUsd(const cpp_int& n);
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec);
 std::string formatPriceUsd(const cpp_int& n);
 
-TxResult analyzeTx(const nlohmann::json& tx, const nlohmann::json& receipt, const std::string& wa);
+bool receiptSucceeded(const nlohmann::json& receipt);
+TxResult analyzeTx(const nlohmann::json& tx, const nlohmann::json& receipt, const std::string& wallet);
