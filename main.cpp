@@ -78,7 +78,7 @@ void recordCoverage(const TxResult& r, bool serviceOnly) {
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
     if (r.hasPermit2Signal) g_stats.sig_permit2.fetch_add(1, std::memory_order_relaxed);
-    if (r.lpMintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
+    if (r.erc20MintOrBurnSeen) g_stats.sig_lp_mint_burn.fetch_add(1, std::memory_order_relaxed);
     if (r.lpPoolIdentitySeen) g_stats.sig_lp_pool_identity.fetch_add(1, std::memory_order_relaxed);
     if (r.lpV3EventSeen) g_stats.sig_lp_v3_event.fetch_add(1, std::memory_order_relaxed);
     if (r.diagnosticReason == "SWAP_EVENT_WITHOUT_WALLET_FLOW" || r.diagnosticReason == "DEX_SIGNAL_WITHOUT_WALLET_FLOW") g_stats.unk_swap_no_wallet_flow.fetch_add(1, std::memory_order_relaxed);
@@ -1748,7 +1748,7 @@ void telegramLoop() {
                                     << "\n📦 Multicall: " << g_stats.sig_multicall.load()
                                     << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
                                     << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
-                                    << "Mint/Burn: " << g_stats.sig_lp_mint_burn.load()
+                                    << "ERC20 mint/burn: " << g_stats.sig_lp_mint_burn.load()
                                     << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
                                     << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
                                     << "\n\n❓ <b>Unknown reasons</b>\n"
