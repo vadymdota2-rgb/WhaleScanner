@@ -21,7 +21,7 @@ struct TxResult {
     bool isGenericMulticall = false;
     bool hasPermit2Signal = false;
     bool dexActivityDetected = false;
-    bool lpMintOrBurnSeen = false;
+    bool erc20MintOrBurnSeen = false;
     bool lpPoolIdentitySeen = false;
     bool lpV3EventSeen = false;
     std::string unknownReason;
