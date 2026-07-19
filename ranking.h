@@ -34,6 +34,17 @@ enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out);
 std::string globalRankKindToString(GlobalRankKind k);
 
+struct TraderStats {
+    int rank = 0;
+    long long pnlNanos = 0;
+    double roiPercent = 0.0;
+    int winRatePercent = 0;
+    int trades = 0;
+    long long lastTs = 0;
+};
+
+bool getTraderStats(const std::string& wallet, TraderStats& out);
+
 RankingMessage buildGlobalTopMenu();
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
