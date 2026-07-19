@@ -712,27 +712,6 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-std::string buildUserListText(const std::string& chatId) {
-    double thr = nanosToUsd(getUserThresholdNanos(chatId));
-    std::stringstream out;
-    out << "💰 Your alert threshold: $" << formatThousands(static_cast<uint64_t>(thr)) << "\n\n";
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    bool any=false;
-    if (prepareOrLog(db,&s,"SELECT wa.address, uw.label FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? ORDER BY uw.created_at")) {
-        sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-        while (sqlite3_step(s)==SQLITE_ROW) {
-            any=true;
-            std::string addr = safeColumnText(s,0);
-            std::string label = safeColumnText(s,1);
-            if (toLower(label) == toLower(addr)) out << "💼 <b>Wallet</b>\n";
-            else out << "💼 <b>" << safeString(label, 32) << "</b>\n";
-            out << "<code>" << safeString(addr, 42) << "</code>\n\n";
-        }
-        sqlite3_finalize(s);
-    }
-    if (!any) out << "No wallets tracked yet. Use /add 0x... Name";
-    return out.str();
-}
 
 void removeUser(const std::string& chatId) {
 
@@ -968,7 +947,7 @@ UIMessage buildHelpMessage() {
     text += "/premium — View Premium plans\n";
     text += "/add &lt;wallet&gt; &lt;name&gt; — Track a wallet\n";
     text += "/remove &lt;wallet&gt; — Remove a wallet\n";
-    text += "/list — My tracked wallets\n";
+    text += "/mywallets — My tracked wallets\n";
     text += "/limit &lt;USD&gt; — Set minimum alert amount\n\n";
     text += "⭐ <b>Premium</b>\n";
     text += "• Full access to Top 100 Traders\n";
@@ -1050,7 +1029,7 @@ void setupBotCommands() {
     cmds.push_back({{"command","start"},{"description","Open the main menu"}});
     cmds.push_back({{"command","add"},{"description","Track a wallet: /add 0x... Name"}});
     cmds.push_back({{"command","remove"},{"description","Stop tracking a wallet"}});
-    cmds.push_back({{"command","list"},{"description","Show your tracked wallets"}});
+    cmds.push_back({{"command","mywallets"},{"description","Show your tracked wallets"}});
     cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
     cmds.push_back({{"command","toptrader"},{"description","Top traders for a token: /toptrader TOKEN"}});
     cmds.push_back({{"command","top"},{"description","Open TOP Traders rankings"}});
@@ -1134,7 +1113,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
 }
 
 namespace {
-constexpr long long AGGREGATION_WINDOW_SECONDS = 180;
+constexpr long long AGGREGATION_WINDOW_SECONDS = 120;
 
 struct PendingAlert {
     std::string wallet;
@@ -1897,7 +1876,7 @@ void telegramLoop() {
                         std::string a=toLower(trim(txt.substr(8)));
                         bool removed=removeUserWhale(cid,a);
                         if (removed) { refreshWatchers(); sendMsg(cid,"✅ Wallet removed"); }
-                        else sendMsg(cid,"⚠️ Address not found in your list. Check /list");
+                        else sendMsg(cid,"⚠️ Address not found in your list. Check /mywallets");
                     }
                     else if (txt.find("/limit ")==0) {
                         try { double v=std::stod(txt.substr(7));
@@ -1910,7 +1889,10 @@ void telegramLoop() {
                         if (rest.empty()) { sendMsg(cid,"❌ Usage: /language en"); }
                         else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
                     }
-                    else if (txt=="/list") { sendMsg(cid,buildUserListText(cid)); }
+                    else if (txt=="/mywallets") {
+                        auto wmsg = TelegramUI::buildWalletsList(cid);
+                        sendMsg(cid, wmsg.text, wmsg.keyboard);
+                    }
                     else if (txt=="/top") {
                         auto msg = buildGlobalTopMenu();
                         sendMsg(cid, msg.text, msg.keyboard);
