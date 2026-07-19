@@ -1092,27 +1092,26 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-std::string buildAlertMessage(const std::string& label, const std::string& walletAddr, const TxResult& res, const std::string& hash) {
+std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
-    std::string head;
-    if (res.venue == "Add Liquidity") head = "\U0001F30A <b>ADD LIQUIDITY";
-    else if (res.venue == "Remove Liquidity") head = "\U0001F30A <b>REMOVE LIQUIDITY";
-    else if (res.venue == "Collect Fees") head = "\U0001F4B8 <b>COLLECT FEES";
-    else if (res.venue == "Wrap") head = "\U0001F504 <b>WRAP " + chainCtx().nativeSymbol;
-    else if (res.venue == "Unwrap") head = "\U0001F504 <b>UNWRAP " + chainCtx().nativeSymbol;
-    else if (res.venue == "Bridge Out") head = "\U0001F309 <b>BRIDGE OUT";
-    else if (res.venue == "Bridge In") head = "\U0001F309 <b>BRIDGE IN";
-    else head = res.isSwap ? (res.isBuy ? "\U0001F7E2 <b>BUY" : "\U0001F6A8 <b>SELL") : "\U0001F4E4 <b>TRANSFER";
-    std::string msg = head + " " + formatUsd(res.usdNanos) + "</b>\n\n";
-    if (tokenIsNative) msg += "\U0001FA99 <b>" + tokenSymbol + "</b>\n";
-    else msg += "\U0001FA99 <a href=\"" + chainCtx().explorerUrl + "/token/" + res.tokenAddr + "\"><b>" + tokenSymbol + "</b></a>\n";
+    std::string msg="\U0001F4BC <b>"+safeString(label)+"</b>\n\n";
+    if (res.venue == "Add Liquidity") msg+="\U0001F30A <b>ADD LIQUIDITY</b>";
+    else if (res.venue == "Remove Liquidity") msg+="\U0001F30A <b>REMOVE LIQUIDITY</b>";
+    else if (res.venue == "Collect Fees") msg+="\U0001F4B8 <b>COLLECT FEES</b>";
+    else if (res.venue == "Wrap") msg+="\U0001F504 <b>WRAP " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Unwrap") msg+="\U0001F504 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Bridge Out") msg+="\U0001F309 <b>BRIDGE OUT</b>";
+    else if (res.venue == "Bridge In") msg+="\U0001F309 <b>BRIDGE IN</b>";
+    else msg+=res.isSwap?(res.isBuy?"\U0001F7E2 <b>BUY</b>":"\U0001F6A8 <b>SELL</b>"):"\U0001F4E4 <b>TRANSFER</b>";
+    msg+="\n\U0001F4B0 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
+    msg+="\U0001FA99 Token: <b>"+tokenSymbol+"</b>\n";
+    msg+="\U0001F4E6 Qty: <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
     if (res.isSwap) {
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
-        msg += "\U0001F4B5 Price: <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
-    } else {
-        msg += "\U0001F4E6 Qty: <b>" + formatAmount(res.rawAmount, tokenDecimals) + "</b>\n";
+        std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
+        msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
     }
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
@@ -1124,14 +1123,13 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
             counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
             counterSymbol = safeString(getSymbol(res.counterAddr), 16);
         }
-        msg += "\U0001F4B0 " + counterLabel + ": <b>" + counterAmountStr + " " + counterSymbol + "</b>\n";
+        msg += (res.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ") + counterLabel + ": <b>" +
+               counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    std::string who = safeString(label);
-    TraderStats ts;
-    if (!walletAddr.empty() && getTraderStats(walletAddr, ts) && ts.rank > 0)
-        who += " (#" + std::to_string(ts.rank) + ")";
-    msg += "\U0001F464 <b>" + who + "</b>\n\n";
-    msg += "\U0001F517 <a href=\"" + chainCtx().explorerUrl + "/tx/" + hash + "\">Transaction</a>";
+    if (!tokenIsNative) msg+="\U0001F4DC Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
+    msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
+    msg+="\U0001F4BC Wallet: <b>"+safeString(label)+"</b>\n\n";
+    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">Transaction</a>";
     return msg;
 }
 
@@ -1169,7 +1167,7 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
 
     bool anySent = false;
     for (auto& [label, chatIds] : byLabel) {
-        std::string msg = buildAlertMessage(label, mA, res, hash);
+        std::string msg = buildAlertMessage(label, res, hash);
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
