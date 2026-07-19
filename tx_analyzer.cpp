@@ -5,6 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <sstream>
+#include <limits>
 #include "utils.h"
 
 using json = nlohmann::json;
@@ -29,9 +30,10 @@ cpp_int hexToCppInt(const std::string& h) {
     return r;
 }
 std::string formatAmount(const cpp_int& raw, int dec) {
+    if (dec < 0 || dec > 36) dec = 18;
     if (raw==0) return "0.00"; cpp_int d=1; for (int i=0;i<dec;i++) d*=10;
     std::string ip=(raw/d).convert_to<std::string>(), fp=(raw%d).convert_to<std::string>();
-    while ((int)fp.length()<dec) fp="0"+fp; if (fp.length()>2) fp=fp.substr(0,2); return ip+"."+fp;
+    while ((int)fp.length()<dec) fp="0"+fp; if (fp.length()>2) fp=fp.substr(0,2); while (fp.length()<2) fp+="0"; return ip+"."+fp;
 }
 cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return 0; cpp_int d=1; for (int i=0;i<dec;i++) d*=10; return (raw*pn)/d; }
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
@@ -82,8 +84,14 @@ int hexNibble(char c) {
 
 uint64_t hexWordToU64(const std::string& hexNo0x, size_t hexPos) {
     if (hexNo0x.size() < hexPos + 64) return 0;
+    for (size_t i = hexPos; i < hexPos + 48; i++)
+        if (hexNo0x[i] != '0') return std::numeric_limits<uint64_t>::max();
     uint64_t v = 0;
-    for (size_t i = hexPos + 32; i < hexPos + 64; i++) v = (v << 4) | (uint64_t)hexNibble(hexNo0x[i]);
+    for (size_t i = hexPos + 48; i < hexPos + 64; i++) {
+        int n = hexNibble(hexNo0x[i]);
+        if (n < 0) return 0;
+        v = (v << 4) | (uint64_t)n;
+    }
     return v;
 }
 
@@ -97,8 +105,9 @@ UniversalRouterCommands parseExecuteCommands(const std::string& input) {
     if (hexNo0x.size() < 8 + 64) return out;
 
     uint64_t offsetCommands = hexWordToU64(hexNo0x, 8);
+    if (offsetCommands > hexNo0x.size()) return out;
     size_t lenHexPos = 8 + offsetCommands * 2;
-    if (offsetCommands > hexNo0x.size() || hexNo0x.size() < lenHexPos + 64) return out;
+    if (hexNo0x.size() < lenHexPos + 64) return out;
 
     uint64_t length = hexWordToU64(hexNo0x, lenHexPos);
     if (length == 0 || length > 64) return out;
@@ -127,6 +136,7 @@ struct FlowEdge {
     std::string from;
     std::string to;
     cpp_int amount;
+    uint64_t logIndex = 0;
 };
 
 enum class V3LiquidityKind {
@@ -170,7 +180,7 @@ FlowRank rankFlow(const std::string& token, const cpp_int& rawAmount) {
     rank.raw = absInt(rawAmount);
 
     int decimals = getDecimals(token);
-    if (decimals < 0) decimals = 18;
+    if (decimals < 0 || decimals > 36) decimals = 18;
     if (decimals <= 18) rank.normalized18 = rank.raw * pow10Int(18 - decimals);
     else rank.normalized18 = rank.raw / pow10Int(decimals - 18);
 
@@ -227,6 +237,25 @@ bool nftEvidenceMatches(
     return false;
 }
 
+int walletFlowsWithCounterparty(
+    const std::map<std::string, std::vector<FlowEdge>>& graph,
+    const std::vector<std::string>& tokenOrder,
+    const std::string& wallet,
+    const std::string& counterparty,
+    bool incoming
+) {
+    int count = 0;
+    for (const auto& token : tokenOrder) {
+        auto it = graph.find(token);
+        if (it == graph.end()) continue;
+        for (const auto& e : it->second) {
+            if (incoming && e.to == wallet && e.from == counterparty) { ++count; break; }
+            if (!incoming && e.from == wallet && e.to == counterparty) { ++count; break; }
+        }
+    }
+    return count;
+}
+
 int maxCommonWalletCounterpartyTokenCount(
     const std::map<std::string, std::vector<FlowEdge>>& graph,
     const std::vector<std::string>& tokenOrder,
@@ -270,22 +299,25 @@ bool reachesAny(
     auto it = graph.find(token);
     if (it == graph.end() || start.empty() || targets.empty()) return false;
 
-    std::set<std::string> seen;
-    std::vector<std::pair<std::string, int>> queue;
-    queue.push_back({start, 0});
-    seen.insert(start);
+    std::map<std::string, uint64_t> bestIdx;
+    std::vector<std::tuple<std::string, int, uint64_t>> queue;
+    queue.push_back({start, 0, 0});
+    bestIdx[start] = 0;
 
     for (size_t qi = 0; qi < queue.size(); ++qi) {
-        const std::string node = queue[qi].first;
-        const int depth = queue[qi].second;
+        const std::string node = std::get<0>(queue[qi]);
+        const int depth = std::get<1>(queue[qi]);
+        const uint64_t lastIdx = std::get<2>(queue[qi]);
         if (targets.count(node)) return true;
         if (depth >= maxDepth) continue;
 
-        for (const auto& edge : it->second) {
-            if (edge.amount <= 0 || edge.from != node) continue;
-            if (targets.count(edge.to)) return true;
-            if (seen.insert(edge.to).second)
-                queue.push_back({edge.to, depth + 1});
+        for (const auto& e : it->second) {
+            if (e.from != node) continue;
+            if (lastIdx > 0 && e.logIndex <= lastIdx) continue;
+            auto b = bestIdx.find(e.to);
+            if (b != bestIdx.end() && b->second <= e.logIndex) continue;
+            bestIdx[e.to] = e.logIndex;
+            queue.push_back({e.to, depth + 1, e.logIndex});
         }
     }
     return false;
@@ -519,7 +551,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     cpp_int wrappedForWallet = 0;
     cpp_int unwrappedForWallet = 0;
 
+    uint64_t logSeq = 0;
     for (const auto& log : receipt["logs"]) {
+        ++logSeq;
         if (!log.is_object() || !log.contains("topics") ||
             !log["topics"].is_array() || log["topics"].empty() ||
             !log["topics"][0].is_string())
@@ -607,7 +641,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         const cpp_int amount = parseUint256(log["data"].get<std::string>());
         if (from.empty() || to.empty() || amount <= 0) continue;
 
-        graph[logAddr].push_back({from, to, amount});
+        graph[logAddr].push_back({from, to, amount, logSeq});
 
         if (from != wallet && to != wallet) continue;
 
@@ -649,8 +683,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     }
 
     const bool knownRouter =
-        (!txTo.empty() && !lookupRouterLabel(txTo).empty()) || urCmds.present;
-    const bool dexSignal = hasSwap || knownRouter || genericMulticall || urCmds.hasPermit2;
+        (!txTo.empty() && !lookupRouterLabel(txTo).empty()) ||
+        (urCmds.present && (urCmds.hasV2Swap || urCmds.hasV3Swap));
+    const bool universalRouterSwap = urCmds.present && (urCmds.hasV2Swap || urCmds.hasV3Swap);
+    const bool dexSignal = hasSwap || knownRouter || universalRouterSwap;
 
     r.hasSwapEvent = hasSwap;
     r.isUniversalRouter = urCmds.present;
@@ -658,7 +694,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     r.hasPermit2Signal = urCmds.hasPermit2;
 
     r.dexActivityDetected = hasSwap;
-    r.lpMintOrBurnSeen = !mintedToWallet.empty() || !burnedFromWallet.empty();
+    r.erc20MintOrBurnSeen = !mintedToWallet.empty() || !burnedFromWallet.empty();
     r.lpV3EventSeen = v3Increase || v3Decrease || v3Collect;
     r.lpPoolIdentitySeen = !v2MintPools.empty() || !v2BurnPools.empty();
 
@@ -745,7 +781,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     bool v2AddLinked = false;
     for (const auto& pool : v2MintPools) {
-        if (netFlow[pool] <= 0 && !mintedToWallet.count(pool)) continue;
+        auto poolNetIt = netFlow.find(pool);
+        const cpp_int poolNet = (poolNetIt == netFlow.end()) ? cpp_int(0) : poolNetIt->second;
+        if (poolNet <= 0 && !mintedToWallet.count(pool)) continue;
         int linkedOutgoing = 0;
         for (const auto& token : tokenOrder) {
             if (token == pool || netFlow[token] >= 0) continue;
@@ -757,7 +795,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     bool v2RemoveLinked = false;
     for (const auto& pool : v2BurnPools) {
-        if (netFlow[pool] >= 0 && !burnedFromWallet.count(pool)) continue;
+        auto poolNetIt = netFlow.find(pool);
+        const cpp_int poolNet = (poolNetIt == netFlow.end()) ? cpp_int(0) : poolNetIt->second;
+        if (poolNet >= 0 && !burnedFromWallet.count(pool)) continue;
         int linkedIncoming = 0;
         for (const auto& token : tokenOrder) {
             if (token == pool || netFlow[token] <= 0) continue;
@@ -767,41 +807,35 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (linkedIncoming >= 2) { v2RemoveLinked = true; break; }
     }
 
-    const int commonOutgoingCounterpartyCount =
-        maxCommonWalletCounterpartyTokenCount(
-            graph, tokenOrder, netFlow, wallet, false
-        );
-    const int commonIncomingCounterpartyCount =
-        maxCommonWalletCounterpartyTokenCount(
-            graph, tokenOrder, netFlow, wallet, true
-        );
-
     bool v3AddLinked = false;
     bool v3RemoveLinked = false;
+
+    bool v3CollectLinked = false;
+    std::set<cpp_int> decreasedTokenIds;
+    for (const auto& event : v3LiquidityEvents)
+        if (event.kind == V3LiquidityKind::Decrease) decreasedTokenIds.insert(event.tokenId);
 
     for (const auto& event : v3LiquidityEvents) {
         if (event.kind == V3LiquidityKind::Increase) {
             const bool nftToWallet =
                 nftEvidenceMatches(nftTransfers, event, wallet, true);
-            const bool existingPositionFlow =
+            const bool managerFlow =
                 outgoingAssets >= 2 &&
-                commonOutgoingCounterpartyCount >= 2;
-
-            if (!hasSwap && outgoingAssets >= 2 &&
-                (nftToWallet || existingPositionFlow)) {
+                walletFlowsWithCounterparty(graph, tokenOrder, wallet, event.manager, false) >= 2;
+            if (!hasSwap && outgoingAssets >= 2 && (nftToWallet || managerFlow))
                 v3AddLinked = true;
-            }
         } else {
             const bool nftFromWallet =
                 nftEvidenceMatches(nftTransfers, event, wallet, false);
-            const bool existingPositionFlow =
+            const bool managerFlow =
                 incomingAssets >= 2 &&
-                commonIncomingCounterpartyCount >= 2;
-
-            if (!hasSwap && incomingAssets >= 2 &&
-                (nftFromWallet || existingPositionFlow)) {
+                walletFlowsWithCounterparty(graph, tokenOrder, wallet, event.manager, true) >= 2;
+            const bool linked = !hasSwap && incomingAssets >= 2 && (nftFromWallet || managerFlow);
+            if (!linked) continue;
+            if (event.kind == V3LiquidityKind::Decrease || decreasedTokenIds.count(event.tokenId))
                 v3RemoveLinked = true;
-            }
+            else
+                v3CollectLinked = true;
         }
     }
 
@@ -832,6 +866,31 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             r.usdNanos = calcUsdNanos(
                 r.rawAmount, dec, getPriceNanos(r.tokenAddr)
             );
+        }
+        return r;
+    }
+
+    if (v3CollectLinked) {
+        r.valid = true;
+        r.isSwap = false;
+        r.dexActivityDetected = true;
+        r.venue = "Collect Fees";
+        FlowRank bestRank;
+        bool haveBest = false;
+        for (const auto& token : tokenOrder) {
+            if (netFlow[token] <= 0) continue;
+            const FlowRank candidate = rankFlow(token, netFlow[token]);
+            if (!haveBest || betterRank(candidate, bestRank)) {
+                haveBest = true;
+                bestRank = candidate;
+                r.tokenAddr = token;
+                r.rawAmount = netFlow[token];
+                r.isBuy = true;
+            }
+        }
+        if (!r.tokenAddr.empty()) {
+            const int dec = getDecimals(r.tokenAddr);
+            r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
         }
         return r;
     }
@@ -970,7 +1029,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     r.isSwap = false;
     if (hasSwap && mainToken.empty()) {
-        if (swapPools.size() >= 2) {
+        int nonZeroBase = 0;
+        for (const auto& token : tokenOrder)
+            if (isBaseAsset(token) && netFlow[token] != 0) ++nonZeroBase;
+        if (swapPools.size() >= 2 && nonZeroBase == 1) {
             r.venue = "Arbitrage";
             r.diagnosticReason = "ARBITRAGE_BASE_CYCLE";
         } else {
@@ -987,8 +1049,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         r.rawAmount = 0;
     }
     if (!r.isSwap && r.venue.empty() && r.unknownReason.empty() && !r.tokenAddr.empty() && !g_chain.bridges.empty()) {
-        if (g_chain.bridges.count(txTo)) r.venue = r.isBuy ? "Bridge In" : "Bridge Out";
-        else {
+        {
             auto git = graph.find(r.tokenAddr);
             if (git != graph.end()) {
                 for (const auto& e : git->second) {
