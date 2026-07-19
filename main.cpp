@@ -821,7 +821,7 @@ std::string buildCancelButton() {
     return keyboard.dump();
 }
 
-UIMessage buildWalletsList(const std::string& chatId) {
+UIMessage buildWalletsList(const std::string& chatId, int page = 1) {
 
     bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
 
@@ -845,27 +845,38 @@ UIMessage buildWalletsList(const std::string& chatId) {
     keyboard["inline_keyboard"] = json::array();
 
     std::stringstream text;
-    text << "💼 <b>My Wallets</b>\n\n";
+    text << "💼 <b>My Wallets</b>";
 
-    bool any = false;
-    size_t idx = 0;
-    for (const auto& [address, label] : walletRows) {
-        any = true;
+    constexpr int PER_PAGE = 5;
+    const int total = static_cast<int>(walletRows.size());
+    const int totalPages = total > 0 ? (total + PER_PAGE - 1) / PER_PAGE : 1;
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
+    if (totalPages > 1) text << " (" << page << "/" << totalPages << ")";
+    text << "\n\n";
+    const int startIdx = (page - 1) * PER_PAGE;
+    const int endIdx = std::min(total, startIdx + PER_PAGE);
 
-        if (idx > 0) text << "━━━━━━━━━━━━━━\n";
+    bool any = total > 0;
+    for (int i = startIdx; i < endIdx; i++) {
+        const std::string& address = walletRows[i].first;
+        const std::string& label = walletRows[i].second;
+        size_t idx = static_cast<size_t>(i);
+
+        if (i > startIdx) text << "━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
         std::string shownLabel = (toLower(label) == address) ? "Wallet" : safeString(label, 32);
         TraderStats ts;
         bool hasStats = getTraderStats(address, ts);
-        if (hasStats && ts.rank > 0) text << "🏆 <b>#" << ts.rank << " " << shownLabel << "</b>" << status << "\n";
-        else text << "🏆 — <b>" << shownLabel << "</b>" << status << "\n";
+        if (hasStats && ts.rank > 0) text << "🏆 <b>#" << ts.rank << "</b>" << status << "\n";
+        else text << "🏆 —" << status << "\n";
+        text << "👤 <b>" << shownLabel << "</b>\n";
         if (hasStats && ts.rank > 0) {
             text << "💰 " << fmtPnlSigned(ts.pnlNanos)
                  << " | 📈 " << fmtPctSigned(ts.roiPercent)
                  << " | 🎯 " << ts.winRatePercent << "%\n";
         }
         text << "<code>" << shortAddress(address) << "</code>\n\n";
-        idx++;
 
         json row;
         row.push_back({{"text", "📊 " + shortAddress(address)}, {"callback_data", "wstats:" + address}});
@@ -874,10 +885,18 @@ UIMessage buildWalletsList(const std::string& chatId) {
         keyboard["inline_keyboard"].push_back(row);
     }
 
+    if (totalPages > 1) {
+        json navRow = json::array();
+        if (page > 1) navRow.push_back({{"text", "⬅️"}, {"callback_data", "mw_page:" + std::to_string(page - 1)}});
+        navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "mw_noop"}});
+        if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "mw_page:" + std::to_string(page + 1)}});
+        keyboard["inline_keyboard"].push_back(navRow);
+    }
+
     if (!any) {
         text << "No wallets tracked yet.\n\n";
         text << "Tap ➕ <b>Add Wallet</b> to start tracking.";
-    } else if (!premium && idx > 1) {
+    } else if (!premium && total > 1) {
         text << "ℹ️ Free plan: alerts are active only for your first wallet (🔔).\n";
         text << "Your other wallets are saved (⏸) and will re-activate with Premium.";
         keyboard["inline_keyboard"].push_back(json::array({
@@ -1092,6 +1111,8 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
     if (res.isSwap) {
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
         msg += "\U0001F4B5 Price: <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+    } else {
+        msg += "\U0001F4E6 Qty: <b>" + formatAmount(res.rawAmount, tokenDecimals) + "</b>\n";
     }
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
@@ -1349,6 +1370,12 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId,
                 "❌ Could not create the invoice. Please try again later.", "");
         }
+    }
+    else if (action == "mw_page") {
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        auto msg = TelegramUI::buildWalletsList(chatId, page);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "wstats") {
         std::string address = toLower(param);
