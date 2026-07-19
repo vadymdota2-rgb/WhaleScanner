@@ -55,6 +55,8 @@ struct Stats {
     std::atomic<uint64_t> unk_other{0};
     std::atomic<uint64_t> diag_swap_inferred{0};
     std::atomic<uint64_t> diag_native_counter{0};
+    std::atomic<uint64_t> diag_native_unwrap{0};
+    std::atomic<uint64_t> diag_native_refund{0};
 } g_stats;
 
 struct CoverageSet {
@@ -88,6 +90,8 @@ void recordCoverage(const TxResult& r, bool serviceOnly) {
     else if (!r.unknownReason.empty()) g_stats.unk_other.fetch_add(1, std::memory_order_relaxed);
     if (r.diagnosticReason == "SWAP_INFERRED_FROM_FLOW") g_stats.diag_swap_inferred.fetch_add(1, std::memory_order_relaxed);
     else if (r.diagnosticReason == "NATIVE_COUNTER_REQUIRES_TRACE") g_stats.diag_native_counter.fetch_add(1, std::memory_order_relaxed);
+    else if (r.diagnosticReason == "NATIVE_COUNTER_FROM_ROUTER_UNWRAP") g_stats.diag_native_unwrap.fetch_add(1, std::memory_order_relaxed);
+    else if (r.diagnosticReason == "NATIVE_REFUND_ADJUSTED") g_stats.diag_native_refund.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -1759,7 +1763,9 @@ void telegramLoop() {
                                     << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
                                     << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
                                     << "\nSwap inferred from flow: " << g_stats.diag_swap_inferred.load()
-                                    << "\nNative counter needs trace: " << g_stats.diag_native_counter.load();
+                                    << "\nNative counter needs trace: " << g_stats.diag_native_counter.load()
+                                    << "\nNative from router unwrap: " << g_stats.diag_native_unwrap.load()
+                                    << "\nNative refund adjusted: " << g_stats.diag_native_refund.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
