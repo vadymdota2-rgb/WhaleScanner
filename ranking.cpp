@@ -81,7 +81,8 @@ void initRankingDB() {
         CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp);
         CREATE TABLE IF NOT EXISTS ignored_wallets(
             wallet TEXT PRIMARY KEY,
-            ignored_until INTEGER NOT NULL
+            ignored_until INTEGER NOT NULL,
+            permanent INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS ranking_cache(
             cache_key TEXT PRIMARY KEY,
@@ -93,6 +94,21 @@ void initRankingDB() {
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[RANKING][FATAL] schema init failed: " << (err ? err : "") << std::endl;
         sqlite3_free(err);
+    }
+
+    {
+        const char* alters[] = {
+            "ALTER TABLE ignored_wallets ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0",
+        };
+        for (const char* migSql : alters) {
+            char* mErr = nullptr;
+            if (sqlite3_exec(db, migSql, nullptr, nullptr, &mErr) != SQLITE_OK) {
+                std::string e = mErr ? mErr : "";
+                if (e.find("duplicate column") == std::string::npos)
+                    std::cerr << "[RANKING][FATAL] migration failed: " << e << std::endl;
+            }
+            if (mErr) sqlite3_free(mErr);
+        }
     }
 
     const char* fn = sqlite3_db_filename(db, "main");
@@ -129,7 +145,7 @@ void cleanupOldTrades() {
     sqlite3_finalize(s);
     if (deleted > 0) std::cout << "[RANKING] Purged " << deleted << " trade(s) older than 30 days" << std::endl;
 
-    if (prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE ignored_until <= ?")) {
+    if (prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE permanent = 0 AND ignored_until <= ?")) {
         sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)));
         sqlite3_step(s);
         int unblocked = sqlite3_changes(db);
@@ -732,14 +748,18 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
         sqlite3_stmt* s;
 
         bool ignored = false;
+        bool permanent = false;
         long long ignoredUntil = 0;
-        if (!prepareOrLog(db, &s, "SELECT ignored_until FROM ignored_wallets WHERE wallet=?")) return;
+        if (!prepareOrLog(db, &s, "SELECT ignored_until, permanent FROM ignored_wallets WHERE wallet=?")) return;
         sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s) == SQLITE_ROW) {
             ignored = true;
             ignoredUntil = sqlite3_column_int64(s, 0);
+            permanent = sqlite3_column_int(s, 1) != 0;
         }
         sqlite3_finalize(s);
+
+        if (permanent) return;
 
         if (ignored) {
             if (ignoredUntil > now) return;
@@ -771,19 +791,13 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
             if (countTrades30DLocked(wallet, since) > MAX_BOT_FILTER_TRADES &&
                 countCompletedTrades30DLocked(wallet, since, MAX_BOT_FILTER_TRADES) > MAX_BOT_FILTER_TRADES) {
                 if (prepareOrLog(db, &s,
-                    "INSERT OR REPLACE INTO ignored_wallets(wallet, ignored_until) VALUES(?, ?)")) {
+                    "INSERT OR REPLACE INTO ignored_wallets(wallet, ignored_until, permanent) VALUES(?, ?, 1)")) {
                     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_int64(s, 2, now + WINDOW_SECONDS);
+                    sqlite3_bind_int64(s, 2, now);
                     sqlite3_step(s);
                     sqlite3_finalize(s);
-                }
-                if (prepareOrLog(db, &s, "DELETE FROM trades WHERE wallet=?")) {
-                    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_step(s);
-                    int purged = sqlite3_changes(db);
-                    sqlite3_finalize(s);
-                    std::cout << "[RANKING] Bot detected: " << wallet << " — purged "
-                              << purged << " trade(s), ignored for 30 days" << std::endl;
+                    std::cout << "[RANKING] Bot detected: " << wallet
+                              << " — permanently excluded from ranking (>500 trades/30d)" << std::endl;
                 }
                 blockedNow = true;
             }
