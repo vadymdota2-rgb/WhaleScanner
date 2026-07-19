@@ -523,6 +523,14 @@ std::string shortAddress(const std::string& a) {
     if (a.length() <= 12) return a;
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
+std::string fmtPnlSigned(long long pnlNanos) {
+    cpp_int a = pnlNanos < 0 ? cpp_int(-pnlNanos) : cpp_int(pnlNanos);
+    return (pnlNanos < 0 ? "-" : "+") + formatUsd(a);
+}
+std::string fmtPctSigned(double p) {
+    long long r = static_cast<long long>(p >= 0 ? p + 0.5 : p - 0.5);
+    return (r < 0 ? "-" : "+") + std::to_string(r < 0 ? -r : r) + "%";
+}
 
 bool isTrackingWallet(const std::string& chatId, const std::string& address) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -842,17 +850,23 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
         if (idx > 0) text << "━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
-        if (toLower(label) == address) {
-            text << "💼 <b>Wallet</b>" << status << "\n";
-        } else {
-            text << "💼 <b>" << safeString(label, 32) << "</b>" << status << "\n";
+        std::string shownLabel = (toLower(label) == address) ? "Wallet" : safeString(label, 32);
+        TraderStats ts;
+        bool hasStats = getTraderStats(address, ts);
+        if (hasStats && ts.rank > 0) text << "🏆 <b>#" << ts.rank << " " << shownLabel << "</b>" << status << "\n";
+        else text << "🏆 — <b>" << shownLabel << "</b>" << status << "\n";
+        if (hasStats && ts.rank > 0) {
+            text << "💰 " << fmtPnlSigned(ts.pnlNanos)
+                 << " | 📈 " << fmtPctSigned(ts.roiPercent)
+                 << " | 🎯 " << ts.winRatePercent << "%\n";
         }
-        text << "<code>" << safeString(address, 42) << "</code>\n\n";
+        text << "<code>" << shortAddress(address) << "</code>\n\n";
         idx++;
 
         json row;
-        row.push_back({{"text", "✏️ Rename"}, {"callback_data", "rename:" + address}});
-        row.push_back({{"text", "🗑️ Remove"}, {"callback_data", "askremove:" + address}});
+        row.push_back({{"text", "📊 " + shortAddress(address)}, {"callback_data", "wstats:" + address}});
+        row.push_back({{"text", "✏️"}, {"callback_data", "rename:" + address}});
+        row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
     }
     sqlite3_finalize(s);
@@ -1056,23 +1070,25 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
+std::string buildAlertMessage(const std::string& label, const std::string& walletAddr, const TxResult& res, const std::string& hash) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
-    std::string msg="💼 <b>"+safeString(label)+"</b>\n\n";
-    if (res.venue == "Add Liquidity") msg+="🌊 <b>ADD LIQUIDITY</b>";
-    else if (res.venue == "Remove Liquidity") msg+="🌊 <b>REMOVE LIQUIDITY</b>";
-    else if (res.venue == "Wrap") msg+="🔄 <b>WRAP " + chainCtx().nativeSymbol + "</b>";
-    else if (res.venue == "Unwrap") msg+="🔄 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>";
-    else msg+=res.isSwap?(res.isBuy?"🟢 <b>BUY</b>":"🚨 <b>SELL</b>"):"📤 <b>TRANSFER</b>";
-    msg+="\n💰 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
-    msg+="🪙 Token: <b>"+tokenSymbol+"</b>\n";
-    msg+="📦 Qty: <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
+    std::string head;
+    if (res.venue == "Add Liquidity") head = "\U0001F30A <b>ADD LIQUIDITY";
+    else if (res.venue == "Remove Liquidity") head = "\U0001F30A <b>REMOVE LIQUIDITY";
+    else if (res.venue == "Collect Fees") head = "\U0001F4B8 <b>COLLECT FEES";
+    else if (res.venue == "Wrap") head = "\U0001F504 <b>WRAP " + chainCtx().nativeSymbol;
+    else if (res.venue == "Unwrap") head = "\U0001F504 <b>UNWRAP " + chainCtx().nativeSymbol;
+    else if (res.venue == "Bridge Out") head = "\U0001F309 <b>BRIDGE OUT";
+    else if (res.venue == "Bridge In") head = "\U0001F309 <b>BRIDGE IN";
+    else head = res.isSwap ? (res.isBuy ? "\U0001F7E2 <b>BUY" : "\U0001F6A8 <b>SELL") : "\U0001F4E4 <b>TRANSFER";
+    std::string msg = head + " " + formatUsd(res.usdNanos) + "</b>\n\n";
+    if (tokenIsNative) msg += "\U0001FA99 <b>" + tokenSymbol + "</b>\n";
+    else msg += "\U0001FA99 <a href=\"" + chainCtx().explorerUrl + "/token/" + res.tokenAddr + "\"><b>" + tokenSymbol + "</b></a>\n";
     if (res.isSwap) {
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
-        std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
-        msg += "💵 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+        msg += "\U0001F4B5 Price: <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
     }
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = res.isBuy ? "Spent" : "Received";
@@ -1084,13 +1100,14 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
             counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
             counterSymbol = safeString(getSymbol(res.counterAddr), 16);
         }
-        msg += (res.isBuy ? "📉 " : "📈 ") + counterLabel + ": <b>" +
-               counterAmountStr + " " + counterSymbol + "</b>\n";
+        msg += "\U0001F4B0 " + counterLabel + ": <b>" + counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    if (!tokenIsNative) msg+="📜 Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
-    msg+="🆔 TX: <code>"+safeString(hash,66)+"</code>\n";
-    msg+="💼 Wallet: <b>"+safeString(label)+"</b>\n\n";
-    msg+="🔗 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">Transaction</a>";
+    std::string who = safeString(label);
+    TraderStats ts;
+    if (!walletAddr.empty() && getTraderStats(walletAddr, ts) && ts.rank > 0)
+        who += " (#" + std::to_string(ts.rank) + ")";
+    msg += "\U0001F464 <b>" + who + "</b>\n\n";
+    msg += "\U0001F517 <a href=\"" + chainCtx().explorerUrl + "/tx/" + hash + "\">Transaction</a>";
     return msg;
 }
 
@@ -1128,7 +1145,7 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
 
     bool anySent = false;
     for (auto& [label, chatIds] : byLabel) {
-        std::string msg = buildAlertMessage(label, res, hash);
+        std::string msg = buildAlertMessage(label, mA, res, hash);
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
@@ -1329,6 +1346,50 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId,
                 "❌ Could not create the invoice. Please try again later.", "");
         }
+    }
+    else if (action == "wstats") {
+        std::string address = toLower(param);
+        std::string wlabel = address;
+        {
+            std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+            if (prepareOrLog(db,&s,"SELECT uw.label FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? AND wa.address=?")) {
+                sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+                sqlite3_bind_text(s,2,address.c_str(),-1,SQLITE_TRANSIENT);
+                if (sqlite3_step(s)==SQLITE_ROW) wlabel = safeColumnText(s,0);
+                sqlite3_finalize(s);
+            }
+        }
+        TraderStats ts;
+        bool hasStats = getTraderStats(address, ts);
+        std::stringstream card;
+        card << "📊 <b>Wallet Statistics</b>\n\n";
+        if (hasStats && ts.rank > 0) card << "🏆 Rank: <b>#" << ts.rank << "</b>\n";
+        else card << "🏆 Rank: <b>—</b> (not in 30D ranking)\n";
+        card << "👤 <b>" << safeString(wlabel, 32) << "</b>\n";
+        if (hasStats && ts.rank > 0) {
+            card << "💰 PnL: <b>" << fmtPnlSigned(ts.pnlNanos) << "</b>\n";
+            card << "📈 ROI: <b>" << fmtPctSigned(ts.roiPercent) << "</b>\n";
+            card << "🎯 Win Rate: <b>" << ts.winRatePercent << "%</b>\n";
+        }
+        card << "🔄 Trades (30D): <b>" << ts.trades << "</b>\n";
+        if (ts.lastTs > 0) {
+            time_t t = static_cast<time_t>(ts.lastTs);
+            char buf[32];
+            strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M UTC", gmtime(&t));
+            card << "📅 Last trade: <b>" << buf << "</b>\n";
+        } else {
+            card << "📅 Last trade: <b>—</b>\n";
+        }
+        card << "\n<code>" << safeString(address, 42) << "</code>";
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", "🔗 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + address}}
+        }));
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", "← Back"}, {"callback_data", "menu:my_wallets"}}
+        }));
+        replyInPlace(chatId, messageId, card.str(), kb.dump());
     }
     else if (action == "rename") {
         std::string address = toLower(param);
