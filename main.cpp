@@ -1134,7 +1134,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
 }
 
 namespace {
-constexpr long long AGGREGATION_WINDOW_SECONDS = 120;
+constexpr long long AGGREGATION_WINDOW_SECONDS = 180;
 
 struct PendingAlert {
     std::string wallet;
