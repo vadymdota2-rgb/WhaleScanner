@@ -811,7 +811,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     bool v3RemoveLinked = false;
 
     bool v3CollectLinked = false;
-    std::set<cpp_int> decreasedTokenIds;
+    std::set<std::string> decreasedTokenIds;
     for (const auto& event : v3LiquidityEvents)
         if (event.kind == V3LiquidityKind::Decrease) decreasedTokenIds.insert(event.tokenId);
 
