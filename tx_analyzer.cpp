@@ -550,6 +550,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     bool v3Collect = false;
     cpp_int wrappedForWallet = 0;
     cpp_int unwrappedForWallet = 0;
+    std::map<std::string, cpp_int> wrappedByDst;
+    std::map<std::string, cpp_int> unwrappedByDst;
 
     uint64_t logSeq = 0;
     for (const auto& log : receipt["logs"]) {
@@ -607,11 +609,15 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (logAddr == g_chain.wrappedNative &&
             (topic0 == WBNB_DEPOSIT_TOPIC || topic0 == WBNB_WITHDRAWAL_TOPIC)) {
             if (log["topics"].size() >= 2 && log["topics"][1].is_string() &&
-                topicAddress(log["topics"][1].get<std::string>()) == wallet &&
                 log.contains("data") && log["data"].is_string()) {
+                const std::string dst = topicAddress(log["topics"][1].get<std::string>());
                 cpp_int amount = parseUint256(log["data"].get<std::string>());
-                if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
-                else unwrappedForWallet += amount;
+                if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedByDst[dst] += amount;
+                else unwrappedByDst[dst] += amount;
+                if (dst == wallet) {
+                    if (topic0 == WBNB_DEPOSIT_TOPIC) wrappedForWallet += amount;
+                    else unwrappedForWallet += amount;
+                }
             }
             continue;
         }
@@ -984,10 +990,25 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (counter.empty() && r.isBuy && nativeOut > 0) {
             counter = g_chain.nativeMarker;
             counterAbs = nativeOut;
+            if (walletIsSender && !txTo.empty()) {
+                auto wIt = wrappedByDst.find(txTo);
+                if (wIt != wrappedByDst.end() && wIt->second > 0 && wIt->second < counterAbs) {
+                    counterAbs = wIt->second;
+                    r.diagnosticReason = "NATIVE_REFUND_ADJUSTED";
+                }
+            }
         }
         if (counter.empty() && !r.isBuy && unwrappedForWallet > 0) {
             counter = g_chain.nativeMarker;
             counterAbs = unwrappedForWallet;
+        }
+        if (counter.empty() && !r.isBuy && walletIsSender && !txTo.empty()) {
+            auto uIt = unwrappedByDst.find(txTo);
+            if (uIt != unwrappedByDst.end() && uIt->second > 0) {
+                counter = g_chain.nativeMarker;
+                counterAbs = uIt->second;
+                r.diagnosticReason = "NATIVE_COUNTER_FROM_ROUTER_UNWRAP";
+            }
         }
 
         if (!counter.empty()) {
