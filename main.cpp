@@ -825,15 +825,21 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
     bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
 
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "SELECT wa.address, uw.label FROM user_whales uw "
-        "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-        "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
-        return {"❌ Error loading wallets.", ""};
+    std::vector<std::pair<std::string, std::string>> walletRows;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s,
+            "SELECT wa.address, uw.label FROM user_whales uw "
+            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+            "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
+            return {"❌ Error loading wallets.", ""};
+        }
+        sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(s) == SQLITE_ROW)
+            walletRows.emplace_back(safeColumnText(s, 0), safeColumnText(s, 1));
+        sqlite3_finalize(s);
     }
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -843,10 +849,8 @@ UIMessage buildWalletsList(const std::string& chatId) {
 
     bool any = false;
     size_t idx = 0;
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    for (const auto& [address, label] : walletRows) {
         any = true;
-        std::string address = safeColumnText(s, 0);
-        std::string label = safeColumnText(s, 1);
 
         if (idx > 0) text << "━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
@@ -869,7 +873,6 @@ UIMessage buildWalletsList(const std::string& chatId) {
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
     }
-    sqlite3_finalize(s);
 
     if (!any) {
         text << "No wallets tracked yet.\n\n";
