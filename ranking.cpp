@@ -30,7 +30,7 @@ constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 500;
 constexpr int PER_PAGE = 5;
-constexpr int GLOBAL_PER_PAGE = 10;
+constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
 const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
