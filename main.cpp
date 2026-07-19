@@ -912,7 +912,7 @@ UIMessage buildRemoveConfirm(const std::string& address, const std::string& labe
 
 UIMessage buildLanguagesMenu(const std::string& chatId) {
     static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
-        {"en", "🇺🇸 English"},
+        {"en", "🇬🇧 English"},
     };
     std::string current = getUserLanguage(chatId);
 
@@ -943,7 +943,6 @@ UIMessage buildHelpMessage() {
     text += "🏆 Discover top on-chain traders, track wallets, and receive real-time trading alerts across supported networks.\n\n";
     text += "<b>Commands:</b>\n";
     text += "/top — Open TOP Traders\n";
-    text += "/toptrader &lt;token&gt; — Top traders for a token\n";
     text += "/premium — View Premium plans\n";
     text += "/add &lt;wallet&gt; &lt;name&gt; — Track a wallet\n";
     text += "/remove &lt;wallet&gt; — Remove a wallet\n";
@@ -1031,7 +1030,6 @@ void setupBotCommands() {
     cmds.push_back({{"command","remove"},{"description","Stop tracking a wallet"}});
     cmds.push_back({{"command","mywallets"},{"description","Show your tracked wallets"}});
     cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
-    cmds.push_back({{"command","toptrader"},{"description","Top traders for a token: /toptrader TOKEN"}});
     cmds.push_back({{"command","top"},{"description","Open TOP Traders rankings"}});
     cmds.push_back({{"command","premium"},{"description","Wallet Tracker Premium"}});
     cmds.push_back({{"command","help"},{"description","How this bot works"}});
@@ -1896,11 +1894,6 @@ void telegramLoop() {
                     else if (txt=="/top") {
                         auto msg = buildGlobalTopMenu();
                         sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt.find("/toptrader ")==0) {
-                        std::string arg = trim(txt.substr(11));
-                        if (arg.empty()) sendMsg(cid, "❌ Usage: /toptrader TOKEN (symbol or contract address)");
-                        else { auto msg = buildTopPnlMessage(cid, arg, 1); sendMsg(cid, msg.text, msg.keyboard); }
                     }
                     else {
                         sendMsg(cid, "🤔 Unknown command. Try /help or use the menu below.");
