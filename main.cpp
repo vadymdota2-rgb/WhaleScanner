@@ -1111,7 +1111,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
 }
 
 namespace {
-constexpr long long AGGREGATION_WINDOW_SECONDS = 120;
+constexpr long long AGGREGATION_WINDOW_SECONDS = 180;
 
 struct PendingAlert {
     std::string wallet;
@@ -1184,8 +1184,16 @@ void flushPendingAlerts(bool force) {
             } else ++it;
         }
     }
+    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
+    { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
     for (const PendingAlert& p : ready) {
-        saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
+        bool serviceWatched = false;
+        if (watchers) {
+            auto wit = watchers->find(p.wallet);
+            if (wit != watchers->end())
+                for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
+        }
+        if (serviceWatched) saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
         dispatchAlert(p.wallet, p.agg, p.hash);
     }
 }
