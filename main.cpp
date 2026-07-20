@@ -13,6 +13,8 @@
 #include <memory>
 #include <csignal>
 #include <cstdlib>
+#include <cmath>
+#include <cstdint>
 #include <curl/curl.h>
 #include <sstream>
 #include <iomanip>
@@ -422,13 +424,63 @@ void walCheckpoint() { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_check
 void cleanupOldTx(long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"DELETE FROM processed_tx WHERE block_number<?")) return;
-    sqlite3_bind_int64(s,1,b-TX_TTL_BLOCKS); sqlite3_step(s); sqlite3_finalize(s);
+    sqlite3_bind_int64(s,1,b-TX_TTL_BLOCKS); stepDoneOrLog(db,s,"cleanupOldTx"); sqlite3_finalize(s);
 }
-void rollbackToBlock(long long t) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"DELETE FROM processed_tx WHERE block_number>?")) return;
-    sqlite3_bind_int64(s,1,t); sqlite3_step(s); sqlite3_finalize(s);
-    std::cerr << "[REORG] Rolled back above block " << t << std::endl;
+bool rollbackToBlock(long long t) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[REORG] rollback BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"DELETE FROM processed_tx WHERE block_number>?")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_bind_int64(s,1,t);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[REORG] processed_tx rollback DELETE failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_finalize(s);
+
+    int tradesDeleted = 0;
+    if (!prepareOrLog(db,&s,"DELETE FROM trades WHERE block_number>?")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_bind_int64(s,1,t);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[REORG] trades rollback DELETE failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    tradesDeleted = sqlite3_changes(db);
+    sqlite3_finalize(s);
+
+    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block',?)")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    { std::string v=std::to_string(t); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); }
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[REORG] rollback last_block write failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_finalize(s);
+
+    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block_hash','')")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[REORG] rollback last_block_hash write failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_finalize(s);
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[REORG] rollback COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    std::cerr << "[REORG] Rolled back above block " << t
+              << " (" << tradesDeleted << " ranking trade(s) purged)" << std::endl;
+    return true;
 }
 void loadTokenCache() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -445,23 +497,25 @@ void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,symbol,decimals) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET symbol=CASE WHEN excluded.symbol!='' THEN excluded.symbol ELSE token_cache.symbol END, decimals=CASE WHEN excluded.decimals>0 THEN excluded.decimals ELSE token_cache.decimals END")) return;
     sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,sym.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int(s,3,dec);
-    sqlite3_step(s); sqlite3_finalize(s);
+    stepDoneOrLog(db,s,"saveTokenMetadata"); sqlite3_finalize(s);
 }
 void saveTokenPrice(const std::string& a, uint64_t pn) {
     if (!pn) return; std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,price_nanos,price_ts) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET price_nanos=excluded.price_nanos, price_ts=excluded.price_ts")) return;
     sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,pn); sqlite3_bind_int64(s,3,time(nullptr));
-    sqlite3_step(s); sqlite3_finalize(s);
+    stepDoneOrLog(db,s,"saveTokenPrice"); sqlite3_finalize(s);
 }
 bool isTxProcessed(const std::string& h) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT 1 FROM processed_tx WHERE tx_hash=?")) return false;
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); bool e=sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s); return e;
 }
-void markTxProcessed(const std::string& h, long long b) {
+bool markTxProcessed(const std::string& h, long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;
-    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
+    if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return false;
+    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b);
+    bool ok = stepDoneOrLog(db,s,"markTxProcessed"); sqlite3_finalize(s);
+    return ok;
 }
 long getTgOffset() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -471,7 +525,7 @@ long getTgOffset() {
 void saveTgOffset(long o) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('tg_offset',?)")) return;
-    std::string v=std::to_string(o); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+    std::string v=std::to_string(o); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); stepDoneOrLog(db,s,"saveTgOffset"); sqlite3_finalize(s);
 }
 long long getChannelDigestAt() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -481,17 +535,48 @@ long long getChannelDigestAt() {
 void saveChannelDigestAt(long long t) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('channel_digest_at',?)")) return;
-    std::string v=std::to_string(t); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+    std::string v=std::to_string(t); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); stepDoneOrLog(db,s,"saveChannelDigestAt"); sqlite3_finalize(s);
 }
 long long getLastBlock() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='last_block'")) return 0;
     long long b=0; if (sqlite3_step(s)==SQLITE_ROW) { std::string v=safeColumnText(s,0); try { if (!v.empty()) b=std::stoll(v); } catch (...) {} } sqlite3_finalize(s); return b;
 }
+bool saveBlockState(long long block, const std::string& hash) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return false;
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block',?)")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    std::string v=std::to_string(block); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[DB] saveBlockState: last_block write failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_finalize(s);
+
+    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block_hash',?)")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_bind_text(s,1,hash.c_str(),-1,SQLITE_TRANSIENT);
+    if (sqlite3_step(s) != SQLITE_DONE) {
+        std::cerr << "[DB] saveBlockState: last_block_hash write failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s); sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    sqlite3_finalize(s);
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[DB] saveBlockState: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false;
+    }
+    return true;
+}
 void saveLastBlock(long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block',?)")) return;
-    std::string v=std::to_string(b); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+    std::string v=std::to_string(b); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); stepDoneOrLog(db,s,"saveLastBlock"); sqlite3_finalize(s);
 }
 std::string getLastBlockHash() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -501,7 +586,7 @@ std::string getLastBlockHash() {
 void saveLastBlockHash(const std::string& h) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('last_block_hash',?)")) return;
-    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
+    sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); stepDoneOrLog(db,s,"saveLastBlockHash"); sqlite3_finalize(s);
 }
 
 void ensureUser(const std::string& chatId) {
@@ -511,7 +596,7 @@ void ensureUser(const std::string& chatId) {
     sqlite3_bind_text(s,2,"en",-1,SQLITE_TRANSIENT);
     sqlite3_bind_int64(s,3,static_cast<sqlite3_int64>(DEFAULT_THRESHOLD_NANOS));
     sqlite3_bind_int64(s,4,time(nullptr));
-    sqlite3_step(s); sqlite3_finalize(s);
+    stepDoneOrLog(db,s,"ensureUser"); sqlite3_finalize(s);
 }
 
 size_t countUsers() {
@@ -524,8 +609,9 @@ std::string shortAddress(const std::string& a) {
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
 std::string fmtPnlSigned(long long pnlNanos) {
-    cpp_int a = pnlNanos < 0 ? cpp_int(-pnlNanos) : cpp_int(pnlNanos);
-    return (pnlNanos < 0 ? "-" : "+") + formatUsd(a);
+    cpp_int value = pnlNanos;
+    if (value < 0) return "-" + formatUsd(-value);
+    return "+" + formatUsd(value);
 }
 std::string fmtPctSigned(double p) {
     long long r = static_cast<long long>(p >= 0 ? p + 0.5 : p - 0.5);
@@ -716,7 +802,7 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"UPDATE users SET language=? WHERE chat_id=?")) return;
     sqlite3_bind_text(s,1,lang.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
+    stepDoneOrLog(db,s,"setUserLanguage"); sqlite3_finalize(s);
 }
 
 
@@ -728,7 +814,7 @@ void removeUser(const std::string& chatId) {
     }
     { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
       if (!prepareOrLog(db,&s,"DELETE FROM users WHERE chat_id=?")) return;
-      sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s); }
+      sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); stepDoneOrLog(db,s,"removeUser"); sqlite3_finalize(s); }
     refreshWatchers();
     std::cout << "[USERS] Removed dead user: " << chatId << std::endl;
 }
@@ -1059,6 +1145,7 @@ int getDecimals(const std::string& addr) {
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 18; }
     int d=18;
     if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
+    if (d < 0 || d > 36) d = 18;
     { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
 }
 std::string getSymbol(const std::string& addr) {
@@ -1072,20 +1159,49 @@ std::string getSymbol(const std::string& addr) {
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
+bool validPrice(double price) {
+    constexpr double SCALE = 1000000000.0;
+    const double maxPrice = static_cast<double>(UINT64_MAX) / SCALE;
+    return std::isfinite(price) && price > 0.0 && price <= maxPrice;
+}
+
 uint64_t getPriceNanos(const std::string& token) {
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
     double p=0; auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
-    try { auto j=json::parse(r); if (j.contains("pairs")&&j["pairs"].is_array()&&!j["pairs"].empty()&&j["pairs"][0].contains("priceUsd")&&j["pairs"][0]["priceUsd"].is_string()) p=std::stod(j["pairs"][0]["priceUsd"].get<std::string>()); } catch (...) {}
-    if (p==0) { auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain?contract_addresses="+token+"&vs_currencies=usd");
-        try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) p=j2[a]["usd"].get<double>(); } catch (...) {} }
-    uint64_t n=static_cast<uint64_t>(p*1000000000.0);
+    try {
+        auto j=json::parse(r);
+        if (j.contains("pairs") && j["pairs"].is_array()) {
+            const std::string wantChain = chainCtx().dexscreenerChainId;
+            double bestLiquidity = -1.0;
+            for (auto& pair : j["pairs"]) {
+                if (!pair.is_object()) continue;
+                if (!wantChain.empty() && pair.value("chainId", "") != wantChain) continue;
+                if (!pair.contains("priceUsd") || !pair["priceUsd"].is_string()) continue;
+                double liq = 0.0;
+                if (pair.contains("liquidity") && pair["liquidity"].is_object() && pair["liquidity"].contains("usd"))
+                    try { liq = pair["liquidity"]["usd"].get<double>(); } catch (...) {}
+                double price = 0.0;
+                try { price = std::stod(pair["priceUsd"].get<std::string>()); } catch (...) { continue; }
+                if (!validPrice(price)) continue;
+                if (liq > bestLiquidity) { bestLiquidity = liq; p = price; }
+            }
+        }
+    } catch (...) {}
+    if (p==0) {
+        std::string platform = chainCtx().coingeckoPlatform.empty() ? "binance-smart-chain" : chainCtx().coingeckoPlatform;
+        auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/"+platform+"?contract_addresses="+token+"&vs_currencies=usd");
+        try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) {
+            double cgPrice = j2[a]["usd"].get<double>();
+            if (validPrice(cgPrice)) p = cgPrice;
+        } } catch (...) {} }
+    uint64_t n = validPrice(p) ? static_cast<uint64_t>(p*1000000000.0) : 0;
     if (n>0) { { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; } saveTokenPrice(a,n); }
     else { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&PRICE_NANOS_CACHE[a].first>0) { g_stats.price_fallbacks.fetch_add(1); std::cerr << "[PRICE] Stale cache: " << a << std::endl; return PRICE_NANOS_CACHE[a].first; } }
     return n;
 }
 
-std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash, Lang lang) {
+std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash, Lang lang, size_t txCount = 1) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
@@ -1120,9 +1236,13 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
     if (!tokenIsNative) msg+="\U0001F4DC " + tr(lang, "alert_contract") + ": <code>"+safeString(res.tokenAddr)+"</code>\n";
-    msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
+    if (txCount > 1) {
+        msg+="\U0001F504 " + tr(lang, "alert_transactions_count") + ": <b>" + std::to_string(txCount) + "</b>\n";
+    } else {
+        msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
+    }
     msg+="\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>"+safeString(label)+"</b>\n\n";
-    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">" + tr(lang, "alert_transaction") + "</a>";
+    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">" + tr(lang, txCount > 1 ? "alert_first_transaction" : "alert_transaction") + "</a>";
     return msg;
 }
 
@@ -1136,13 +1256,21 @@ struct PendingAlert {
     long long block = 0;
     long long blockTs = 0;
     std::chrono::steady_clock::time_point firstSeen{};
+    size_t transactionCount = 1;
 };
 
 std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
 std::mutex g_pendingMutex;
+
+void clearPendingAlertsOnReorg() {
+    std::lock_guard<std::mutex> l(g_pendingMutex);
+    size_t n = g_pendingAlerts.size();
+    g_pendingAlerts.clear();
+    if (n > 0) std::cerr << "[REORG] Discarded " << n << " in-flight pending alert aggregate(s)" << std::endl;
+}
 }
 
-void dispatchAlert(const std::string& mA, const TxResult& res, const std::string& hash) {
+void dispatchAlert(const std::string& mA, const TxResult& res, const std::string& hash, size_t txCount = 1) {
     std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
     {
         std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
@@ -1161,7 +1289,7 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
 
     bool anySent = false;
     for (auto& [labelLang, chatIds] : byLabelLang) {
-        std::string msg = buildAlertMessage(labelLang.first, res, hash, labelLang.second);
+        std::string msg = buildAlertMessage(labelLang.first, res, hash, labelLang.second, txCount);
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
@@ -1186,6 +1314,7 @@ void bufferSwap(const std::string& mA, const TxResult& res, const std::string& h
     a.rawAmount += res.rawAmount;
     if (a.counterAddr == res.counterAddr) a.counterAmount += res.counterAmount;
     else { a.counterAddr.clear(); a.counterAmount = 0; }
+    it->second.transactionCount++;
 }
 
 void flushPendingAlerts(bool force) {
@@ -1201,24 +1330,23 @@ void flushPendingAlerts(bool force) {
             } else ++it;
         }
     }
-    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
-    { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
     for (const PendingAlert& p : ready) {
-        bool serviceWatched = false;
-        if (watchers) {
-            auto wit = watchers->find(p.wallet);
-            if (wit != watchers->end())
-                for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
-        }
-        if (serviceWatched) saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
-        dispatchAlert(p.wallet, p.agg, p.hash);
+        dispatchAlert(p.wallet, p.agg, p.hash, p.transactionCount);
     }
 }
 
-bool processBlock(long long bn) {
+bool processBlock(long long bn, std::string& outHash) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
     auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
     if (block.is_null()||!block.is_object()||!block.contains("transactions")||!block["transactions"].is_array()) return false;
+    if (!block.contains("hash") || !block["hash"].is_string() || block["hash"].get<std::string>().empty()) {
+        std::cerr << "[RPC] Block " << bn << " has no valid hash" << std::endl;
+        return false;
+    }
+    if (!block.contains("parentHash") || !block["parentHash"].is_string() || block["parentHash"].get<std::string>().empty()) {
+        std::cerr << "[RPC] Block " << bn << " has no valid parentHash" << std::endl;
+        return false;
+    }
     std::string ph=block.value("parentHash",""), ep=getLastBlockHash();
     long long blockTs = 0;
     if (block.contains("timestamp") && block["timestamp"].is_string())
@@ -1227,10 +1355,30 @@ bool processBlock(long long bn) {
         g_stats.reorg_verifications.fetch_add(1); std::cerr << "[REORG?] Mismatch at " << bn << ", verifying..." << std::endl;
         size_t ai=(rpcIndex.load(std::memory_order_relaxed)+1)%RPC_ENDPOINTS.size();
         auto vb=rpcOnEndpoint(ai,"eth_getBlockByNumber",{ss.str(),false});
-        std::string vp=vb.is_object()?vb.value("parentHash",""): "";
-        if (vp==ep) std::cerr << "[REORG] False positive" << std::endl;
-        else if (vp==ph) { std::cerr << "[REORG] Confirmed! Rollback " << REORG_ROLLBACK << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
-        else { std::cerr << "[REORG] Both disagree, rollback" << std::endl; rollbackToBlock(bn-REORG_ROLLBACK-1); saveLastBlock(bn-REORG_ROLLBACK-1); saveLastBlockHash(""); return false; }
+        if (!vb.is_object()) {
+            std::cerr << "[REORG] Verification RPC unavailable; will retry" << std::endl;
+            return false;
+        }
+        std::string vp=vb.value("parentHash","");
+        if (vp.empty()) {
+            std::cerr << "[REORG] Verification response has no parentHash; will retry" << std::endl;
+            return false;
+        }
+        if (vp==ep) {
+            std::cerr << "[REORG] Primary RPC returned a stale/fork block; retrying via a different endpoint" << std::endl;
+            rpcIndex.store(ai, std::memory_order_relaxed);
+            return false;
+        }
+        else if (vp==ph) {
+            std::cerr << "[REORG] Confirmed! Rollback " << REORG_ROLLBACK << std::endl;
+            if (rollbackToBlock(bn-REORG_ROLLBACK-1)) {
+                clearPendingAlertsOnReorg();
+            } else {
+                logCritical("Reorg rollback failed for block " + std::to_string(bn));
+            }
+            return false;
+        }
+        else { std::cerr << "[REORG] RPC endpoints disagree; will retry verification" << std::endl; return false; }
     }
 
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
@@ -1243,48 +1391,64 @@ bool processBlock(long long bn) {
         g_stats.tx_processed.fetch_add(1);
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
-        std::string mA;
-        if (watchers->count(from)) mA=from; else if (watchers->count(to)) mA=to;
-        if (mA.empty()) { markTxProcessed(hash,bn); continue; }
+        std::vector<std::string> matchedWallets;
+        if (watchers->count(from)) matchedWallets.push_back(from);
+        if (to != from && watchers->count(to)) matchedWallets.push_back(to);
+        if (matchedWallets.empty()) {
+            if (!markTxProcessed(hash,bn)) { logCritical("Cannot persist processed transaction " + hash); return false; }
+            continue;
+        }
+
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
         }
-        TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        bool svcOnly = false;
-        { auto cw = watchers->find(mA);
-          if (cw != watchers->end() && !cw->second.empty()) {
-              svcOnly = true;
-              for (const auto& w : cw->second) if (w.chatId != SERVICE_CHAT_ID) { svcOnly = false; break; }
-          } }
-        recordCoverage(res, svcOnly);
-        checkInvariants(hash, res);
-        if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
-        if (res.venue == "DEX interaction") logBeneficiaries(hash, tx, res);
-        if (res.isSwap && (res.venue.empty() || res.venue == "DEX Pool" || res.venue == "DEX" || res.venue == "Universal Router")) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
-        if (res.tokenAddr.empty()) { markTxProcessed(hash,bn); continue; }
-        if (isBaseAsset(res.tokenAddr) && !res.isSwap) { markTxProcessed(hash,bn); continue; }
+        for (const auto& mA : matchedWallets) {
+            TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) continue;
+            bool svcOnly = false;
+            { auto cw = watchers->find(mA);
+              if (cw != watchers->end() && !cw->second.empty()) {
+                  svcOnly = true;
+                  for (const auto& w : cw->second) if (w.chatId != SERVICE_CHAT_ID) { svcOnly = false; break; }
+              } }
+            recordCoverage(res, svcOnly);
+            checkInvariants(hash, res);
+            if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
+            if (res.venue == "DEX interaction") logBeneficiaries(hash, tx, res);
+            if (res.isSwap && (res.venue.empty() || res.venue == "DEX Pool" || res.venue == "DEX" || res.venue == "Universal Router")) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
-        auto wit = watchers->find(mA);
-        if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
+            if (res.tokenAddr.empty()) continue;
+            if (isBaseAsset(res.tokenAddr) && !res.isSwap) continue;
 
-        if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
-        else dispatchAlert(mA, res, hash);
-        markTxProcessed(hash,bn);
+            auto wit = watchers->find(mA);
+            if (wit == watchers->end()) continue;
+
+            if (res.isSwap) {
+                bool serviceWatched = false;
+                for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
+                if (serviceWatched) saveTrade(mA, res, hash, bn, blockTs);
+            }
+
+            if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
+            else dispatchAlert(mA, res, hash);
+        }
+        if (!markTxProcessed(hash,bn)) { logCritical("Cannot persist processed transaction " + hash); return false; }
     }
-    saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
+    outHash = block["hash"].get<std::string>(); return true;
 }
 
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
-        if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
+        sqlite3_bind_int64(s,1,time(nullptr)-3*86400);
+        if (stepDoneOrLog(db,s,"cleanupOldAlerts(alerts)")) { int da=sqlite3_changes(db); if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
+        sqlite3_finalize(s); }
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
-        if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
+        sqlite3_bind_int64(s,1,time(nullptr)-2*86400);
+        if (stepDoneOrLog(db,s,"cleanupOldAlerts(deliveries)")) { int dd=sqlite3_changes(db); if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
+        sqlite3_finalize(s); }
 }
 
 std::mutex g_lastViewMutex;
@@ -1519,27 +1683,32 @@ void handleCallbackQuery(const json& callbackQuery) {
             return;
         }
 
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (!prepareOrLog(db, &s,
-            "SELECT uw.label FROM user_whales uw "
-            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "WHERE uw.user_id = ? AND wa.address = ?")) {
-            replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), "");
-            return;
+        bool prepFailed = false;
+        bool found = false;
+        std::string currentLabel;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (!prepareOrLog(db, &s,
+                "SELECT uw.label FROM user_whales uw "
+                "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+                "WHERE uw.user_id = ? AND wa.address = ?")) {
+                prepFailed = true;
+            } else {
+                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) { currentLabel = safeColumnText(s, 0); found = true; }
+                sqlite3_finalize(s);
+            }
         }
-        sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
 
-        if (sqlite3_step(s) == SQLITE_ROW) {
-            std::string currentLabel = safeColumnText(s, 0);
-            sqlite3_finalize(s);
-
+        if (prepFailed) {
+            replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), "");
+        } else if (found) {
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address);
             replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
                     "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
         } else {
-            sqlite3_finalize(s);
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), "");
         }
     }
@@ -1797,6 +1966,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
             return true;
         }
 
+        bool renamed = false;
         {
             std::lock_guard<std::mutex> l(dbMutex);
             sqlite3_stmt* s;
@@ -1806,9 +1976,16 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
                 sqlite3_bind_text(s, 1, newLabel.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 3, session.pendingAddress.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(s);
+                int rc = sqlite3_step(s);
+                if (rc == SQLITE_DONE) renamed = sqlite3_changes(db) == 1;
+                else std::cerr << "[DB] rename wallet failed: " << sqlite3_errmsg(db) << std::endl;
                 sqlite3_finalize(s);
             }
+        }
+
+        if (!renamed) {
+            sendMsg(chatId, tr(lang, "rename_save_failed"), TelegramUI::buildCancelButton(lang));
+            return true;
         }
 
         refreshWatchers();
@@ -2006,7 +2183,10 @@ int main() {
     }
     initDB(); initRankingDB();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
-        std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
+        logCritical("Premium schema initialization failed - this can also break core alerting (refreshWatchers depends on the same users table columns), stopping startup");
+        if (db) sqlite3_close(db);
+        curl_global_cleanup();
+        return 1;
     }
     loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
@@ -2016,7 +2196,7 @@ int main() {
     { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
     long long lb=getLastBlock(); if (lb==0) { auto b=rpc("eth_blockNumber",{}); long long tmp; if (b.is_string()&&hexToLL(b.get<std::string>(),tmp)) lb=tmp; }
     auto lj=rpc("eth_blockNumber",{}); long long tmpLat;
-    if (lj.is_string()&&hexToLL(lj.get<std::string>(),tmpLat)) { long long lat=tmpLat; if (lat-lb>FAST_SYNC_LAG) { std::cout << "[FAST SYNC] Lag " << (lat-lb) << ", skip to latest-5" << std::endl; lb=lat-5; saveLastBlock(lb); saveLastBlockHash(""); } }
+    if (lj.is_string()&&hexToLL(lj.get<std::string>(),tmpLat)) { long long lat=tmpLat; if (lat-lb>FAST_SYNC_LAG) { std::cout << "[FAST SYNC] Lag " << (lat-lb) << ", skip to latest-5" << std::endl; long long fastSyncBlock=lat-5; if (!saveBlockState(fastSyncBlock, "")) { logCritical("Failed to persist fast-sync block state"); return 1; } lb=fastSyncBlock; } }
     std::cout << "🐋 Started. Block: " << lb << ", Users: " << countUsers() << ", Watched addresses: " << initialWatcherAddrs << std::endl;
     g_msgQueue.setDeadUserHandler([](const std::string& cid) {
         if (cid != SERVICE_CHAT_ID) removeUser(cid);
@@ -2030,11 +2210,17 @@ int main() {
             if (!lj.is_string()||!hexToLL(lj.get<std::string>(),lat)) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
             while (lb<lat&&running.load(std::memory_order_relaxed)) {
                 long long next = lb+1;
-                if (!processBlock(next)) {
+                std::string nextHash;
+                if (!processBlock(next, nextHash)) {
                     lb = getLastBlock();
                     break;
                 }
-                lb = next; saveLastBlock(lb);
+                if (!saveBlockState(next, nextHash)) {
+                    logCritical("Failed to persist block state for block " + std::to_string(next) + " - stopping to avoid memory/DB divergence");
+                    running.store(false, std::memory_order_relaxed);
+                    break;
+                }
+                lb = next;
                 bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
                 if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
             }
