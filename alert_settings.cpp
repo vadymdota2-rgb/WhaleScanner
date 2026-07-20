@@ -6,6 +6,8 @@
 #include "json.hpp"
 #include "utils.h"
 
+std::string getUserLanguage(const std::string& chatId);
+
 using json = nlohmann::json;
 
 namespace {
@@ -19,21 +21,15 @@ constexpr uint64_t MAX_THRESHOLD_USD = 1000000000ULL;
 constexpr uint64_t MAX_THRESHOLD_CENTS = MAX_THRESHOLD_USD * 100;
 constexpr size_t MAX_INT_DIGITS = 10;
 
-constexpr char ERR_INVALID[]   = "❌ Invalid number.";
-constexpr char ERR_POSITIVE[]  = "❌ Threshold must be positive.";
-constexpr char ERR_TOO_LARGE[] = "❌ Threshold is too large.";
-constexpr char ERR_DECIMALS[]  = "❌ Use at most 2 decimal places (e.g., 7500.50).";
-constexpr char RETRY_HINT[] = "\n\nPlease enter a valid amount (e.g., 7500 or 7500.50) or press Cancel.";
-
 enum class ParseResult { OK, INVALID, NOT_POSITIVE, TOO_LARGE, TOO_MANY_DECIMALS };
 enum class ApplyResult { Changed, Unchanged };
 
-const char* parseError(ParseResult r) {
+std::string parseError(ParseResult r, Lang lang) {
     switch (r) {
-        case ParseResult::NOT_POSITIVE:      return ERR_POSITIVE;
-        case ParseResult::TOO_LARGE:         return ERR_TOO_LARGE;
-        case ParseResult::TOO_MANY_DECIMALS: return ERR_DECIMALS;
-        default:                             return ERR_INVALID;
+        case ParseResult::NOT_POSITIVE:      return tr(lang, "err_threshold_positive");
+        case ParseResult::TOO_LARGE:         return tr(lang, "err_threshold_too_large");
+        case ParseResult::TOO_MANY_DECIMALS: return tr(lang, "err_threshold_decimals");
+        default:                             return tr(lang, "err_invalid_number");
     }
 }
 
@@ -98,21 +94,20 @@ ApplyResult applyThreshold(const std::string& chatId, uint64_t nanos) {
     return ApplyResult::Changed;
 }
 
-std::string buildStatusText(ApplyResult result, uint64_t nanos) {
+std::string buildStatusText(ApplyResult result, uint64_t nanos, Lang lang) {
     if (result == ApplyResult::Unchanged)
-        return "ℹ️ Current threshold is already <b>" + formatUsdNanos(nanos) + "</b>.";
-    return "✅ <b>Alert threshold updated</b>\n\n"
-           "Current threshold:\n<b>" + formatUsdNanos(nanos) + "</b>";
+        return tr(lang, "threshold_unchanged") + " <b>" + formatUsdNanos(nanos) + "</b>.";
+    return tr(lang, "threshold_updated") + "\n<b>" + formatUsdNanos(nanos) + "</b>";
 }
 
 }
 
-TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresholdNanos) {
+TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresholdNanos, Lang lang) {
     std::stringstream text;
-    text << "💰 <b>Alert Threshold</b>\n\n";
-    text << "You'll only be alerted for transactions at or above this amount.\n\n";
-    text << "Current threshold: <b>" << formatUsdNanos(currentThresholdNanos) << "</b>\n\n";
-    text << "Choose a preset or enter a custom amount:";
+    text << tr(lang, "threshold_title") << "\n\n";
+    text << tr(lang, "threshold_desc") << "\n\n";
+    text << tr(lang, "threshold_current") << " <b>" << formatUsdNanos(currentThresholdNanos) << "</b>\n\n";
+    text << tr(lang, "threshold_choose");
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -135,49 +130,50 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
     if (inRow > 0) keyboard["inline_keyboard"].push_back(row);
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "✏️ Custom amount"}, {"callback_data", "threshold:custom"}}
+        {{"text", tr(lang, "threshold_custom_btn")}, {"callback_data", "threshold:custom"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     return {text.str(), keyboard.dump()};
 }
 
 bool handleThresholdCallback(const std::string& chatId, const std::string& param, long long messageId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     if (param == "custom") {
         g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD);
         replyInPlace(chatId, messageId,
-            "💰 <b>Custom Threshold</b>\n\n"
-            "Please enter the minimum alert amount in USD (e.g., 7500 or 7500.50):",
-            TelegramUI::buildCancelButton());
+            tr(lang, "threshold_custom_title"),
+            TelegramUI::buildCancelButton(lang));
         return true;
     }
 
     uint64_t nanos = 0;
     ParseResult pr = parseThresholdNanos(param, nanos);
     if (pr != ParseResult::OK) {
-        replyInPlace(chatId, messageId, parseError(pr));
+        replyInPlace(chatId, messageId, parseError(pr, lang));
         return true;
     }
 
     ApplyResult ar = applyThreshold(chatId, nanos);
     auto menu = TelegramUI::buildMainMenu(chatId);
-    replyInPlace(chatId, messageId, buildStatusText(ar, nanos) + "\n\n" + menu.text, menu.keyboard);
+    replyInPlace(chatId, messageId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
 
 bool handleThresholdText(const std::string& chatId, const std::string& text) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     uint64_t nanos = 0;
     ParseResult pr = parseThresholdNanos(text, nanos);
     if (pr != ParseResult::OK) {
-        sendMsg(chatId, std::string(parseError(pr)) + RETRY_HINT, TelegramUI::buildCancelButton());
+        sendMsg(chatId, parseError(pr, lang) + tr(lang, "threshold_retry_hint"), TelegramUI::buildCancelButton(lang));
         return true;
     }
 
     g_sessionManager.clearSession(chatId);
     ApplyResult ar = applyThreshold(chatId, nanos);
     auto menu = TelegramUI::buildMainMenu(chatId);
-    sendMsg(chatId, buildStatusText(ar, nanos) + "\n\n" + menu.text, menu.keyboard);
+    sendMsg(chatId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
