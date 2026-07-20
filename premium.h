@@ -4,7 +4,7 @@
 #include "json.hpp"
 #include "ru.h"
 
-void initPremium(const std::string& botToken, const std::string& serviceChatId = "");
+bool initPremium(const std::string& botToken, const std::string& serviceChatId = "");
 
 bool isPremium(const std::string& chatId);
 
@@ -12,7 +12,10 @@ void cleanupExpiredPremium();
 
 long long premiumExpireTs(const std::string& chatId);
 
-void activateOrExtendPremium(const std::string& chatId);
+bool activateOrExtendPremium(const std::string& chatId);
+
+enum class PaymentApplyResult { Activated, Extended, Duplicate, Rejected, Error };
+PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp);
 
 size_t premiumMaxWallets(const std::string& chatId);
 
