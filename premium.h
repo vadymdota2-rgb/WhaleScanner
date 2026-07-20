@@ -2,6 +2,7 @@
 
 #include <string>
 #include "json.hpp"
+#include "ru.h"
 
 void initPremium(const std::string& botToken, const std::string& serviceChatId = "");
 
@@ -24,7 +25,7 @@ struct PremiumMessage {
 
 PremiumMessage buildPremiumPage(const std::string& chatId);
 
-PremiumMessage buildWalletLimitMessage();
+PremiumMessage buildWalletLimitMessage(Lang lang);
 
 bool sendPremiumInvoice(const std::string& chatId);
 
