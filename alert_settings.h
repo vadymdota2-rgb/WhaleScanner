@@ -26,7 +26,7 @@ SendResult sendMsg(const std::string& chatId, const std::string& text,
 void replyInPlace(const std::string& chatId, long long messageId,
                   const std::string& text, const std::string& keyboard = "");
 
-void setUserThresholdNanos(const std::string& chatId, uint64_t nanos);
+bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos);
 uint64_t getUserThresholdNanos(const std::string& chatId);
 void refreshWatchers();
 
