@@ -82,49 +82,8 @@ std::string globalRankKindToString(GlobalRankKind k) {
     return "pnl";
 }
 
-void migrateTradesUniqueConstraint() {
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, "SELECT sql FROM sqlite_master WHERE type='table' AND name='trades'")) return;
-    bool tableExists = false;
-    std::string existingSql;
-    if (sqlite3_step(s) == SQLITE_ROW) { tableExists = true; existingSql = safeColumnText(s, 0); }
-    sqlite3_finalize(s);
-
-    if (!tableExists) return; // fresh DB — the CREATE TABLE below will already use the correct constraint
-    if (existingSql.find("UNIQUE(wallet, tx_hash)") != std::string::npos) return; // already migrated
-
-    std::cout << "[RANKING] Migrating trades table: tx_hash-only UNIQUE -> UNIQUE(wallet, tx_hash) "
-                 "(needed for tracked-to-tracked transactions to record both sides)" << std::endl;
-    const char* migrationSql = R"(
-        ALTER TABLE trades RENAME TO trades_pre_migration;
-        CREATE TABLE trades(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            wallet TEXT NOT NULL,
-            token TEXT NOT NULL,
-            is_buy INTEGER NOT NULL,
-            usd_nanos INTEGER NOT NULL,
-            token_amount TEXT NOT NULL,
-            tx_hash TEXT,
-            block_number INTEGER,
-            timestamp INTEGER,
-            UNIQUE(wallet, tx_hash)
-        );
-        INSERT INTO trades(wallet,token,is_buy,usd_nanos,token_amount,tx_hash,block_number,timestamp)
-            SELECT wallet,token,is_buy,usd_nanos,token_amount,tx_hash,block_number,timestamp FROM trades_pre_migration;
-        DROP TABLE trades_pre_migration;
-    )";
-    char* err = nullptr;
-    if (sqlite3_exec(db, migrationSql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::cerr << "[RANKING][FATAL] trades unique-constraint migration failed: " << (err ? err : "") << std::endl;
-        sqlite3_free(err);
-    } else {
-        std::cout << "[RANKING] trades table migrated successfully" << std::endl;
-    }
-}
-
 void initRankingDB() {
     std::lock_guard<std::mutex> l(dbMutex);
-    migrateTradesUniqueConstraint();
     const char* sql = R"(
         CREATE TABLE IF NOT EXISTS trades(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,10 +92,9 @@ void initRankingDB() {
             is_buy INTEGER NOT NULL,
             usd_nanos INTEGER NOT NULL,
             token_amount TEXT NOT NULL,
-            tx_hash TEXT,
+            tx_hash TEXT UNIQUE,
             block_number INTEGER,
-            timestamp INTEGER,
-            UNIQUE(wallet, tx_hash)
+            timestamp INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token);
         DROP INDEX IF EXISTS idx_trades_wallet;
