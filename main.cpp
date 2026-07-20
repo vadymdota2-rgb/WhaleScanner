@@ -568,11 +568,11 @@ void refreshWatchers() {
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "JOIN users u ON u.chat_id = uw.user_id "
             "ORDER BY uw.user_id ASC, uw.created_at ASC, uw.rowid ASC")) {
-            queryOk = true;
             sqlite3_bind_int64(s,1,now);
             std::string prevUser;
             size_t loadedForUser = 0;
-            while (sqlite3_step(s)==SQLITE_ROW) {
+            int stepRc;
+            while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
                 std::string addr = toLower(safeColumnText(s,0));
                 std::string uid = safeColumnText(s,1);
                 std::string label = safeColumnText(s,2);
@@ -583,6 +583,8 @@ void refreshWatchers() {
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
             }
+            queryOk = (stepRc == SQLITE_DONE);
+            if (!queryOk) std::cerr << "[WATCHERS] refresh query step failed mid-read (rc=" << stepRc << "): " << sqlite3_errmsg(db) << std::endl;
             sqlite3_finalize(s);
         }
     }
