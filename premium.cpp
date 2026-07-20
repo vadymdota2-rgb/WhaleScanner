@@ -233,22 +233,32 @@ bool activateOrExtendPremium(const std::string& chatId) {
 PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp) {
     if (!sp.is_object()) return PaymentApplyResult::Rejected;
 
-    std::string payload = sp.value("invoice_payload", "");
+    std::string payload, currency, chargeId, providerChargeId;
+    long long amount = 0;
+    try {
+        payload = sp.value("invoice_payload", "");
+        currency = sp.value("currency", "");
+        amount = sp.value("total_amount", 0);
+        chargeId = sp.value("telegram_payment_charge_id", "");
+        providerChargeId = sp.value("provider_payment_charge_id", "");
+    } catch (const nlohmann::json::exception& e) {
+        std::cerr << "[PREMIUM] successful_payment malformed JSON (chat " << chatId
+                  << "): " << e.what() << std::endl;
+        return PaymentApplyResult::Rejected;
+    }
+
     if (payload != PREMIUM_PAYLOAD) {
         std::cerr << "[PREMIUM] successful_payment with unknown payload: "
                   << payload << " (chat " << chatId << ")" << std::endl;
         return PaymentApplyResult::Rejected;
     }
 
-    std::string currency = sp.value("currency", "");
-    long long amount = sp.value("total_amount", 0);
     if (currency != "XTR" || amount != PREMIUM_PRICE_STARS) {
         std::cerr << "[PREMIUM] successful_payment amount/currency mismatch: "
                   << amount << " " << currency << " (chat " << chatId << ")" << std::endl;
         return PaymentApplyResult::Rejected;
     }
 
-    std::string chargeId = sp.value("telegram_payment_charge_id", "");
     if (chargeId.empty()) {
         std::cerr << "[PREMIUM] successful_payment missing telegram_payment_charge_id "
                      "(chat " << chatId << ") — rejected, no history record possible" << std::endl;
@@ -260,7 +270,6 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
         return PaymentApplyResult::Error;
     }
 
-    std::string providerChargeId = sp.value("provider_payment_charge_id", "");
     long long paidAt = static_cast<long long>(time(nullptr));
 
     ensureUser(chatId);
@@ -288,9 +297,10 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     sqlite3_bind_text(s, 6, currency.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 7, paidAt);
     int rc = sqlite3_step(s);
+    int extendedRc = sqlite3_extended_errcode(db);
     sqlite3_finalize(s);
 
-    if (rc == SQLITE_CONSTRAINT && sqlite3_extended_errcode(db) == SQLITE_CONSTRAINT_UNIQUE) {
+    if (rc == SQLITE_CONSTRAINT && extendedRc == SQLITE_CONSTRAINT_UNIQUE) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         std::cout << "[PREMIUM] Duplicate payment ignored (charge "
                   << chargeId << ", chat " << chatId << ")" << std::endl;
@@ -457,9 +467,18 @@ bool sendPremiumInvoice(const std::string& chatId) {
 void handlePreCheckoutQuery(const json& q) {
     if (!q.is_object() || !q.contains("id") || !q["id"].is_string()) return;
 
-    std::string payload = q.value("invoice_payload", "");
-    std::string currency = q.value("currency", "");
-    long long amount = q.value("total_amount", 0);
+    std::string payload, currency;
+    long long amount = 0;
+    bool parseOk = true;
+    try {
+        payload = q.value("invoice_payload", "");
+        currency = q.value("currency", "");
+        amount = q.value("total_amount", 0);
+    } catch (const nlohmann::json::exception& e) {
+        std::cerr << "[PREMIUM] pre_checkout malformed JSON: " << e.what() << std::endl;
+        parseOk = false;
+    }
+
     Lang lang = Lang::EN;
     if (q.contains("from") && q["from"].is_object() &&
         q["from"].contains("id") && q["from"]["id"].is_number_integer()) {
@@ -470,7 +489,7 @@ void handlePreCheckoutQuery(const json& q) {
     json a;
     a["pre_checkout_query_id"] = q["id"].get<std::string>();
     bool schemaReady = g_premiumSchemaOk.load();
-    bool valid = schemaReady && payload == PREMIUM_PAYLOAD && currency == "XTR" && amount == PREMIUM_PRICE_STARS;
+    bool valid = parseOk && schemaReady && payload == PREMIUM_PAYLOAD && currency == "XTR" && amount == PREMIUM_PRICE_STARS;
     if (valid) {
         a["ok"] = true;
     } else {
