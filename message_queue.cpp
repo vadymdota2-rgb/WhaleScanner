@@ -4,6 +4,7 @@
 #include <mutex>
 #include <tuple>
 #include <chrono>
+#include <algorithm>
 #include <iostream>
 
 #include "alert_settings.h"
@@ -21,6 +22,10 @@ constexpr size_t MAX_QUEUE_SIZE = 100000;
 SafeMessageQueue g_msgQueue;
 
 void SafeMessageQueue::setDeadUserHandler(std::function<void(const std::string&)> handler) {
+    if (senderThread.joinable()) {
+        std::cerr << "[QUEUE] setDeadUserHandler called after start() — ignored" << std::endl;
+        return;
+    }
     deadUserHandler = std::move(handler);
 }
 
@@ -30,28 +35,45 @@ void SafeMessageQueue::initCounters() {
         if (sqlite3_step(s)==SQLITE_ROW) queueSize.store(sqlite3_column_int64(s,0)); sqlite3_finalize(s); }
 }
 
-void SafeMessageQueue::updateStatus(int64_t id, int st, int rc, time_t nr) {
+bool SafeMessageQueue::markTerminal(int64_t id, int st, int rc, time_t nr) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=?")) return;
+    if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=? AND status IN (0,3)")) return false;
     sqlite3_bind_int(s,1,st); sqlite3_bind_int(s,2,rc); sqlite3_bind_int64(s,3,nr); sqlite3_bind_int64(s,4,id);
-    if (sqlite3_step(s)!=SQLITE_DONE) std::cerr << "[QUEUE] status UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
+    int stepRc = sqlite3_step(s);
     sqlite3_finalize(s);
+    if (stepRc!=SQLITE_DONE) { std::cerr << "[QUEUE] terminal UPDATE failed: " << sqlite3_errmsg(db) << std::endl; return false; }
+    if (sqlite3_changes(db)!=1) { std::cerr << "[QUEUE] terminal UPDATE changed no row for delivery #" << id << std::endl; return false; }
+    queueSize.fetch_sub(1, std::memory_order_relaxed);
+    return true;
 }
 
-void SafeMessageQueue::scheduleRetry(int64_t id) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE deliveries SET status=CASE WHEN retry_count>=4 THEN 4 ELSE 3 END, retry_count=retry_count+1, next_retry_at=?+MIN(30*(1<<retry_count),600) WHERE id=? AND status!=4")) return;
-    sqlite3_bind_int64(s,1,time(nullptr)); sqlite3_bind_int64(s,2,id);
-    if (sqlite3_step(s)!=SQLITE_DONE) {
-        std::cerr << "[QUEUE] retry UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
-        sqlite3_finalize(s); return;
-    }
-    if (sqlite3_changes(db)>0) { sqlite3_stmt* c;
-        if (prepareOrLog(db,&c,"SELECT status FROM deliveries WHERE id=?")) {
-            sqlite3_bind_int64(c,1,id); if (sqlite3_step(c)==SQLITE_ROW&&sqlite3_column_int(c,0)==4) {
-                std::cerr << "[QUEUE] Delivery #" << id << " FAILED after 5 retries" << std::endl;
-                queueSize.fetch_sub(1,std::memory_order_relaxed); } sqlite3_finalize(c); } }
+RetryResult SafeMessageQueue::scheduleRetry(int64_t id) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT retry_count FROM deliveries WHERE id=? AND status IN (0,3)")) return RetryResult::Error;
+    sqlite3_bind_int64(s,1,id);
+    if (sqlite3_step(s)!=SQLITE_ROW) { sqlite3_finalize(s); return RetryResult::Error; }
+    int curRetry = sqlite3_column_int(s,0);
     sqlite3_finalize(s);
+
+    int safeRetry = std::clamp(curRetry, 0, 4);
+    int newStatus = (safeRetry>=4) ? 4 : 3;
+    time_t nextRetry = time(nullptr) + std::min(30*(1<<safeRetry), 600);
+
+    sqlite3_stmt* u;
+    if (!prepareOrLog(db,&u,"UPDATE deliveries SET status=?,retry_count=?,next_retry_at=? WHERE id=? AND status IN (0,3)")) return RetryResult::Error;
+    sqlite3_bind_int(u,1,newStatus); sqlite3_bind_int(u,2,safeRetry+1); sqlite3_bind_int64(u,3,nextRetry); sqlite3_bind_int64(u,4,id);
+    int rc = sqlite3_step(u);
+    sqlite3_finalize(u);
+    if (rc!=SQLITE_DONE) { std::cerr << "[QUEUE] retry UPDATE failed: " << sqlite3_errmsg(db) << std::endl; return RetryResult::Error; }
+    if (sqlite3_changes(db)==0) return RetryResult::Error;
+
+    if (newStatus==4) {
+        std::cerr << "[QUEUE] Delivery #" << id << " FAILED after 5 retries" << std::endl;
+        queueSize.fetch_sub(1, std::memory_order_relaxed);
+        return RetryResult::PermanentlyFailed;
+    }
+    return RetryResult::Scheduled;
 }
 
 void SafeMessageQueue::senderLoop() {
@@ -62,25 +84,60 @@ void SafeMessageQueue::senderLoop() {
         if (ra>0&&time(nullptr)<ra) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
         if (queueSize.load(std::memory_order_relaxed)==0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
         std::vector<std::tuple<int64_t,std::string,std::string>> batch;
+        bool prepFailed=false;
         { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.id ASC LIMIT 100")) continue;
-          sqlite3_bind_int64(s,1,time(nullptr));
-          while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
-          sqlite3_finalize(s); }
+          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.id ASC LIMIT 100")) { prepFailed=true; }
+          else {
+              sqlite3_bind_int64(s,1,time(nullptr));
+              while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
+              sqlite3_finalize(s);
+          }
+        }
+        if (prepFailed) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
         if (batch.empty()) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
         for (auto& [did,cid,msg]:batch) {
-            auto res=sendMsg(cid,msg);
-            if (res.ok) { updateStatus(did,1,0,0); queueSize.fetch_sub(1,std::memory_order_relaxed); }
-            else if (res.retryAfterSec>0) { globalRetryAfter.store(time(nullptr)+res.retryAfterSec); scheduleRetry(did);
-                std::cerr << "[TG] 429: pausing " << res.retryAfterSec << "s" << std::endl; break; }
-            else if (res.deadUser) { updateStatus(did,2,0,0); if (deadUserHandler) deadUserHandler(cid); queueSize.fetch_sub(1,std::memory_order_relaxed); }
-            else scheduleRetry(did);
+            try {
+                auto res=sendMsg(cid,msg);
+                if (res.ok) {
+                    markTerminal(did,1,0,0);
+                }
+                else if (res.retryAfterSec>0) {
+                    globalRetryAfter.store(time(nullptr)+res.retryAfterSec, std::memory_order_relaxed);
+                    std::cerr << "[TG] 429: pausing " << res.retryAfterSec << "s (message left pending, not counted as a retry)" << std::endl;
+                    break;
+                }
+                else if (res.deadUser) {
+                    markTerminal(did,2,0,0);
+                    try {
+                        if (deadUserHandler) deadUserHandler(cid);
+                    } catch (const std::exception& e) {
+                        std::cerr << "[QUEUE] deadUserHandler threw for " << cid << ": " << e.what() << std::endl;
+                    } catch (...) {
+                        std::cerr << "[QUEUE] deadUserHandler threw unknown exception for " << cid << std::endl;
+                    }
+                }
+                else {
+                    scheduleRetry(did);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[QUEUE] Delivery #" << did << " threw: " << e.what() << std::endl;
+                scheduleRetry(did);
+            } catch (...) {
+                std::cerr << "[QUEUE] Delivery #" << did << " threw unknown exception" << std::endl;
+                scheduleRetry(did);
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(SEND_MS));
         }
     }
 }
 
-void SafeMessageQueue::start() { qRunning.store(true); senderThread=std::thread(&SafeMessageQueue::senderLoop,this); }
+void SafeMessageQueue::start() {
+    if (senderThread.joinable()) return;
+    qRunning.store(true, std::memory_order_release);
+    senderThread=std::thread(&SafeMessageQueue::senderLoop,this);
+}
+
+SafeMessageQueue::~SafeMessageQueue() { stop(); }
 
 void SafeMessageQueue::stop() { qRunning.store(false); if (senderThread.joinable()) senderThread.join(); }
 
@@ -95,17 +152,19 @@ void SafeMessageQueue::syncSize() {
 
 bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
     if (recipients.empty()) return true;
-    size_t current = queueSize.load(std::memory_order_relaxed);
     size_t batchSize = recipients.size();
-    if (current + batchSize > MAX_QUEUE_SIZE) {
+
+    auto txStart=std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> l(dbMutex);
+
+    size_t current = queueSize.load(std::memory_order_relaxed);
+    if (current >= MAX_QUEUE_SIZE || batchSize > MAX_QUEUE_SIZE - current) {
         logCritical("Queue OVERLOAD (" + std::to_string(current) + "+" +
                     std::to_string(batchSize) + ">" + std::to_string(MAX_QUEUE_SIZE) +
                     ") — alert rejected!");
         return false;
     }
 
-    auto txStart=std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> l(dbMutex);
     if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[QUEUE] BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
         return false;
