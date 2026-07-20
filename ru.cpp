@@ -90,6 +90,12 @@ const std::unordered_map<std::string, Entry>& table() {
         {"unknown_command", {"🤔 Please use the menu below.",
                              "🤔 Пожалуйста, используйте меню ниже."}},
 
+        {"lang_title", {"🌐 <b>Languages</b>", "🌐 <b>Язык</b>"}},
+        {"lang_choose", {"Choose your language:", "Выберите язык:"}},
+
+        {"rk_generating", {"⏳ Rating is being generated.\n\nPlease try again in a minute.",
+                           "⏳ Рейтинг формируется.\n\nПопробуйте снова через минуту."}},
+
         {"mw_no_wallets", {"No wallets tracked yet.", "Пока нет отслеживаемых кошельков."}},
         {"mw_tap_add", {"Tap ➕ <b>Add Wallet</b> to start tracking.", "Нажмите ➕ <b>Добавить кошелёк</b>, чтобы начать отслеживание."}},
         {"mw_free_notice1", {"ℹ️ Free plan: alerts are active only for your first wallet (🔔).",
@@ -212,8 +218,11 @@ std::string tr(Lang lang, const std::string& key) {
 }
 
 std::string pluralRu(long long n, const std::string& one, const std::string& few, const std::string& many) {
-    long long n100 = n % 100;
-    long long n10 = n % 10;
+    unsigned long long mag = (n < 0)
+        ? (~static_cast<unsigned long long>(n) + 1ULL)
+        : static_cast<unsigned long long>(n);
+    unsigned long long n100 = mag % 100;
+    unsigned long long n10 = mag % 10;
     if (n100 >= 11 && n100 <= 14) return many;
     if (n10 == 1) return one;
     if (n10 >= 2 && n10 <= 4) return few;
