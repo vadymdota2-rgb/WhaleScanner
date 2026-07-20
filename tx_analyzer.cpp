@@ -256,6 +256,39 @@ int walletFlowsWithCounterparty(
     return count;
 }
 
+int maxCommonWalletCounterpartyTokenCount(
+    const std::map<std::string, std::vector<FlowEdge>>& graph,
+    const std::vector<std::string>& tokenOrder,
+    const std::map<std::string, cpp_int>& netFlow,
+    const std::string& wallet,
+    bool incoming
+) {
+    std::map<std::string, std::set<std::string>> tokensByCounterparty;
+
+    for (const auto& token : tokenOrder) {
+        auto netIt = netFlow.find(token);
+        if (netIt == netFlow.end()) continue;
+        if (incoming && netIt->second <= 0) continue;
+        if (!incoming && netIt->second >= 0) continue;
+
+        auto graphIt = graph.find(token);
+        if (graphIt == graph.end()) continue;
+
+        for (const auto& edge : graphIt->second) {
+            if (edge.amount <= 0) continue;
+            if (incoming && edge.to == wallet && edge.from != wallet)
+                tokensByCounterparty[edge.from].insert(token);
+            if (!incoming && edge.from == wallet && edge.to != wallet)
+                tokensByCounterparty[edge.to].insert(token);
+        }
+    }
+
+    int best = 0;
+    for (const auto& item : tokensByCounterparty)
+        best = std::max(best, static_cast<int>(item.second.size()));
+    return best;
+}
+
 bool reachesAny(
     const std::map<std::string, std::vector<FlowEdge>>& graph,
     const std::string& token,
@@ -356,8 +389,6 @@ ChainContext makeBscContext() {
         "0x78bc5ee9f11d133a08b331c2e18fe81be0ed02dc",
         "0xdd90e5e87a2081dcf0391920868ebc2ffb81a1af",
     };
-    c.coingeckoPlatform = "binance-smart-chain";
-    c.dexscreenerChainId = "bsc";
     return c;
 }
 
@@ -384,8 +415,6 @@ ChainContext makeEthereumContext() {
         {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
         {"0x66a9893cc07d91d95644aedd05d03f95e1dba8af", "Uniswap V4 (Universal Router)"},
     };
-    c.coingeckoPlatform = "ethereum";
-    c.dexscreenerChainId = "ethereum";
     return c;
 }
 
@@ -410,8 +439,6 @@ ChainContext makeBaseContext() {
         {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
         {"0x6ff5693b99212da76ad316178a184ab56d299b43", "Uniswap V4 (Universal Router)"},
     };
-    c.coingeckoPlatform = "base";
-    c.dexscreenerChainId = "base";
     return c;
 }
 
@@ -437,8 +464,6 @@ ChainContext makeArbitrumContext() {
         {"0xe592427a0aece92de3edee1f18e0157c05861564", "Uniswap V3"},
         {"0x68b3465833fb72a70ecdf485e0e4c7bd8665fc45", "Uniswap V3 (Router 2)"},
     };
-    c.coingeckoPlatform = "arbitrum-one";
-    c.dexscreenerChainId = "arbitrum";
     return c;
 }
 
@@ -450,6 +475,7 @@ const ChainContext& chainCtx() { return g_chain; }
 void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
 
 bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
+bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
 std::string lookupRouterLabel(const std::string& addr) {
     auto it = g_chain.routers.find(toLower(addr));
     return it != g_chain.routers.end() ? it->second : std::string();
