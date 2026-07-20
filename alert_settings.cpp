@@ -120,8 +120,10 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
     json row = json::array();
     size_t inRow = 0;
     for (uint64_t usd : PRESETS_USD) {
+        std::string label = presetLabel(usd);
+        if (usd * NANOS_PER_USD == currentThresholdNanos) label = "✅ " + label;
         row.push_back({
-            {"text", presetLabel(usd)},
+            {"text", label},
             {"callback_data", "threshold:" + std::to_string(usd)}
         });
         if (++inRow == PRESETS_PER_ROW) {
