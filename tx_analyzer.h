@@ -40,6 +40,8 @@ struct ChainContext {
     std::set<std::string> stablecoins;
     std::map<std::string, std::string> routers;
     std::set<std::string> bridges;
+    std::string coingeckoPlatform;
+    std::string dexscreenerChainId;
 };
 
 const ChainContext& chainCtx();
@@ -51,7 +53,6 @@ ChainContext makeArbitrumContext();
 
 
 bool isBaseAsset(const std::string& a);
-bool isStablecoin(const std::string& a);
 std::string lookupRouterLabel(const std::string& addr);
 
 cpp_int parseUint256(const std::string& h);
