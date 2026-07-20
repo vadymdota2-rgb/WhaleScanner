@@ -180,6 +180,12 @@ const std::unordered_map<std::string, Entry>& table() {
         {"invoice_description", {"30-Day Premium Subscription", "Подписка Премиум на 30 дней"}},
         {"invoice_price_label", {"Premium (30 Days)", "Премиум (30 дней)"}},
         {"invoice_unknown_product", {"Unknown product. Please try again.", "Неизвестный товар. Попробуйте ещё раз."}},
+        {"payments_unavailable", {"Payments are temporarily unavailable. Please try again later.",
+                                  "Платежи временно недоступны. Пожалуйста, попробуйте позже."}},
+
+        {"payment_success_title", {"✅ Payment successful!", "✅ Оплата прошла успешно!"}},
+        {"payment_success_activated", {"Wallet Tracker Premium has been activated.", "Wallet Tracker Премиум активирован."}},
+        {"payment_success_duration", {"Valid for 30 days.", "Действует 30 дней."}},
 
         {"limit_50_reached", {"⚠️ You've reached the limit of 50 tracked wallets.", "⚠️ Достигнут лимит 50 отслеживаемых кошельков."}},
         {"already_tracking", {"⚠️ You're already tracking this wallet.", "⚠️ Вы уже отслеживаете этот кошелёк."}},
