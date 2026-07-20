@@ -844,7 +844,7 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
         std::lock_guard<std::mutex> l(g_cacheMutex);
         auto it = g_lastTokenByChat.find(chatId);
         if (it == g_lastTokenByChat.end()) {
-            return {"⏳ This ranking has expired. Please request it again (e.g. /toptrader TOKEN).", ""};
+            return {"⏳ This ranking has expired. Please search for the token again via the menu.", ""};
         }
         token = it->second;
     }
