@@ -12,13 +12,16 @@ std::string toLower(std::string s) {
 
 std::string safeColumnText(sqlite3_stmt* stmt, int col) {
     const unsigned char* p = sqlite3_column_text(stmt, col);
-    return p ? reinterpret_cast<const char*>(p) : "";
+    if (!p) return "";
+    int size = sqlite3_column_bytes(stmt, col);
+    return std::string(reinterpret_cast<const char*>(p), static_cast<size_t>(size));
 }
 
 bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql) {
     int rc = sqlite3_prepare_v2(db, sql, -1, stmt, nullptr);
     if (rc != SQLITE_OK) {
         std::cerr << "[DB] prepare failed: " << sqlite3_errmsg(db) << " | SQL: " << sql << std::endl;
+        if (stmt) *stmt = nullptr;
         return false;
     }
     return true;
@@ -52,6 +55,13 @@ std::string safeString(const std::string& s, size_t maxLen) {
 
 bool hexToLL(const std::string& hex, long long& out) {
     if (hex.empty()) return false;
+    size_t start = 0;
+    if (hex.size() >= 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) start = 2;
+    if (start >= hex.size()) return false;
+    for (size_t i = start; i < hex.size(); i++) {
+        char c = hex[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+    }
     try {
         size_t pos = 0;
         out = std::stoll(hex, &pos, 16);
