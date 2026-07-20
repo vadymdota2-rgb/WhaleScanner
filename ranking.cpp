@@ -14,6 +14,9 @@
 #include <chrono>
 #include "json.hpp"
 #include "utils.h"
+#include "ru.h"
+
+std::string getUserLanguage(const std::string& chatId);
 
 using json = nlohmann::json;
 
@@ -348,7 +351,7 @@ RankingMessage buildGeneratingMessage() {
     return {"⏳ Rating is being generated.\n\nPlease try again in a minute.", keyboard.dump()};
 }
 
-RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page) {
+RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page, Lang lang) {
     int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
     page = std::max(1, std::min(page, totalPages));
     int startIdx = (page - 1) * PER_PAGE;
@@ -356,16 +359,16 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
 
     std::stringstream text;
 
-text << "🏆 <b>Top PnL (30D)</b>\n\n";
-text << "📄 <b>Smart Contract</b>\n";
+text << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
+text << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
 text << "<code>" << safeString(token, 42) << "</code>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
     if (rows.empty()) {
-        text << "📊 No wallets with at least " << MIN_COMPLETED_TRADES
-             << " completed trades in the last 30 days.";
+        text << "📊 " << tr(lang, "rk_no_wallets_min_trades1") << " " << MIN_COMPLETED_TRADES
+             << " " << tr(lang, "rk_no_wallets_min_trades2");
     } else {
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
@@ -374,24 +377,24 @@ text << "<code>" << safeString(token, 42) << "</code>\n\n";
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
             text << "📈 <b>ROI:</b> " << formatPercentSigned(r.roiPercent) << "\n";
-            text << "🎯 <b>Win Rate:</b> " << r.winRatePercent << "%\n";
-            text << "🔄 <b>Trades:</b> " << r.completedTrades << "\n";
+            text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
-            row.push_back({{"text", "➕ Track #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
+            row.push_back({{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
             row.push_back({{"text", "🔍 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + r.wallet}});
             keyboard["inline_keyboard"].push_back(row);
         }
     }
 
     json navRow = json::array();
-    if (page > 1) navRow.push_back({{"text", "⬅️ Prev"}, {"callback_data", "tt_page:" + std::to_string(page - 1)}});
+    if (page > 1) navRow.push_back({{"text", tr(lang, "rk_prev")}, {"callback_data", "tt_page:" + std::to_string(page - 1)}});
     navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
-    if (page < totalPages) navRow.push_back({{"text", "Next ➡️"}, {"callback_data", "tt_page:" + std::to_string(page + 1)}});
+    if (page < totalPages) navRow.push_back({{"text", tr(lang, "rk_next")}, {"callback_data", "tt_page:" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
     }));
 
     return {text.str(), keyboard.dump()};
@@ -514,18 +517,18 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
     return out;
 }
 
-std::string globalTitle(GlobalRankKind kind) {
+std::string globalTitle(GlobalRankKind kind, Lang lang) {
     switch (kind) {
-        case GlobalRankKind::PNL: return "💵 Top PnL (30D)";
-        case GlobalRankKind::ROI: return "📈 Top ROI (30D)";
-        case GlobalRankKind::WIN_RATE: return "🎯 Top Win Rate (30D)";
-        case GlobalRankKind::ACTIVE: return "🔄 Most Active (30D)";
+        case GlobalRankKind::PNL: return "💵 " + tr(lang, "rk_top_pnl_30d");
+        case GlobalRankKind::ROI: return "📈 " + tr(lang, "rk_top_roi_30d");
+        case GlobalRankKind::WIN_RATE: return "🎯 " + tr(lang, "rk_top_winrate_30d");
+        case GlobalRankKind::ACTIVE: return "🔄 " + tr(lang, "rk_most_active_30d");
     }
-    return "🏆 Top Traders (30D)";
+    return "🏆 " + tr(lang, "rk_top_traders_30d");
 }
 
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
-                                int maxRank, bool showUpgrade) {
+                                int maxRank, bool showUpgrade, Lang lang) {
     if (maxRank < 1) maxRank = 1;
     int visible = std::min(static_cast<int>(rows.size()), maxRank);
     int totalPages = std::max(1, (visible + GLOBAL_PER_PAGE - 1) / GLOBAL_PER_PAGE);
@@ -534,13 +537,13 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     int endIdx = std::min(visible, startIdx + GLOBAL_PER_PAGE);
 
     std::stringstream text;
-    text << "🏆 <b>" << globalTitle(kind) << "</b>\n\n";
+    text << "🏆 <b>" << globalTitle(kind, lang) << "</b>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
     if (rows.empty()) {
-        text << "📊 No completed trades in the last 30 days yet.";
+        text << "📊 " << tr(lang, "rk_no_completed_trades");
     } else {
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
@@ -549,21 +552,21 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
             text << "📈 <b>ROI:</b> " << formatPercentPlain(r.roiPercent) << "\n";
-            text << "🎯 <b>Win Rate:</b> " << r.winRatePercent << "%\n";
-            text << "🔄 <b>Trades:</b> " << r.completedTrades << "\n";
+            text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
-            row.push_back({{"text", "➕ Track #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
+            row.push_back({{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
             keyboard["inline_keyboard"].push_back(row);
         }
     }
 
     if (showUpgrade && !rows.empty()) {
         text << "\n" << CARD_SEPARATOR << "\n";
-        text << "🔒 Unlock Top 100 with Premium.";
+        text << tr(lang, "rk_unlock_top100");
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
+            {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
         }));
     }
 
@@ -574,31 +577,31 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
     }));
 
     return {text.str(), keyboard.dump()};
 }
 
-RankingMessage buildTokenRankingFromCache(const std::string& token, int page) {
+RankingMessage buildTokenRankingFromCache(const std::string& token, int page, Lang lang) {
     std::string payload;
     if (!loadCachedPayload("token_" + token, payload)) {
         if (!cacheReady()) return buildGeneratingMessage();
-        return renderPage(token, std::vector<PnlRow>{}, page);
+        return renderPage(token, std::vector<PnlRow>{}, page, lang);
     }
     std::vector<PnlRow> rows;
     if (!rowsFromJson(payload, rows)) return buildGeneratingMessage();
-    return renderPage(token, rows, page);
+    return renderPage(token, rows, page, lang);
 }
 
-RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade) {
+RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade, Lang lang) {
     std::string payload;
     if (!loadCachedPayload("global_" + globalRankKindToString(kind), payload)) {
         return buildGeneratingMessage();
     }
     std::vector<PnlRow> rows;
     if (!rowsFromJson(payload, rows)) return buildGeneratingMessage();
-    return renderGlobalPage(kind, rows, page, maxRank, showUpgrade);
+    return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang);
 }
 
 std::vector<std::string> listActiveTokens() {
@@ -823,11 +826,11 @@ std::string resolveTokenArg(const std::string& argIn) {
 }
 
 RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     std::string token = resolveTokenArg(tokenArg);
     if (token.empty()) {
-        return {"❌ Unknown token: " + safeString(tokenArg, 32) +
-                "\n\nEither give the contract address directly, or a symbol the bot "
-                "has already seen in a trade.", ""};
+        return {tr(lang, "rk_unknown_token1") + " " + safeString(tokenArg, 32) +
+                "\n\n" + tr(lang, "rk_unknown_token2"), ""};
     }
 
     {
@@ -835,20 +838,21 @@ RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& 
         g_lastTokenByChat[chatId] = token;
     }
 
-    return buildTokenRankingFromCache(token, page);
+    return buildTokenRankingFromCache(token, page, lang);
 }
 
 RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     std::string token;
     {
         std::lock_guard<std::mutex> l(g_cacheMutex);
         auto it = g_lastTokenByChat.find(chatId);
         if (it == g_lastTokenByChat.end()) {
-            return {"⏳ This ranking has expired. Please search for the token again via the menu.", ""};
+            return {tr(lang, "rk_expired"), ""};
         }
         token = it->second;
     }
-    return buildTokenRankingFromCache(token, page);
+    return buildTokenRankingFromCache(token, page, lang);
 }
 
 bool getTraderStats(const std::string& walletArg, TraderStats& out) {
@@ -886,44 +890,45 @@ bool getTraderStats(const std::string& walletArg, TraderStats& out) {
     return out.rank > 0 || out.lastTs > 0;
 }
 
-RankingMessage buildGlobalTopMenu() {
+RankingMessage buildGlobalTopMenu(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "💵 Top PnL"}, {"callback_data", "gt_open:pnl"}}
+        {{"text", tr(lang, "rk_btn_top_pnl")}, {"callback_data", "gt_open:pnl"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "📈 Top ROI"}, {"callback_data", "gt_open:roi"}}
+        {{"text", tr(lang, "rk_btn_top_roi")}, {"callback_data", "gt_open:roi"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🎯 Top Win Rate"}, {"callback_data", "gt_open:winrate"}}
+        {{"text", tr(lang, "rk_btn_top_winrate")}, {"callback_data", "gt_open:winrate"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🔄 Most Active"}, {"callback_data", "gt_open:active"}}
+        {{"text", tr(lang, "rk_btn_most_active")}, {"callback_data", "gt_open:active"}}
     }));
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🪙 Top PnL by Token"}, {"callback_data", "gt_token"}}
+        {{"text", tr(lang, "rk_btn_top_pnl_by_token")}, {"callback_data", "gt_token"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
-    return {std::string("🏆 <b>Top Traders (30D)</b>\n")
+    return {std::string("🏆 <b>" + tr(lang, "rk_top_traders_30d") + "</b>\n")
             + "<code>" + MENU_STRETCH + "</code>"
-            + "\nChoose a ranking:", keyboard.dump()};
+            + "\n" + tr(lang, "rk_choose_ranking"), keyboard.dump()};
 }
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
                                      int maxRank, bool showUpgrade) {
-    (void)chatId;
-    return buildGlobalFromCache(kind, 1, maxRank, showUpgrade);
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    return buildGlobalFromCache(kind, 1, maxRank, showUpgrade, lang);
 }
 
 RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind, int page,
                                   int maxRank, bool showUpgrade) {
-    (void)chatId;
-    return buildGlobalFromCache(kind, page, maxRank, showUpgrade);
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    return buildGlobalFromCache(kind, page, maxRank, showUpgrade, lang);
 }
 
 RankingMessage buildDailyChannelDigest() {
