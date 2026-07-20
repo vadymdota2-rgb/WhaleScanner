@@ -78,6 +78,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"threshold_unchanged", {"ℹ️ Current threshold is already", "ℹ️ Текущий порог уже равен"}},
         {"threshold_updated", {"✅ <b>Alert threshold updated</b>\n\nCurrent threshold:",
                                "✅ <b>Порог алертов обновлён</b>\n\nТекущий порог:"}},
+        {"threshold_save_failed", {"❌ Failed to save the threshold. Please try again.",
+                                   "❌ Не удалось сохранить порог. Попробуйте ещё раз."}},
         {"threshold_title", {"💰 <b>Alert Threshold</b>", "💰 <b>Порог алертов</b>"}},
         {"threshold_desc", {"You'll only be alerted for transactions at or above this amount.",
                             "Вы будете получать алерты только по сделкам от этой суммы и выше."}},
