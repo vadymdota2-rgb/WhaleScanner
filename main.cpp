@@ -278,7 +278,6 @@ constexpr size_t MAX_USERS = 1000000;
 
 constexpr int DIGEST_HOUR_UTC = 12;
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
-uint64_t usdToNanos(double usd) { return static_cast<uint64_t>(usd * 1000000000.0 + 0.5); }
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 std::atomic<bool> running{true};
@@ -558,6 +557,7 @@ uint64_t getUserThresholdNanos(const std::string& chatId) {
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
     long long now = static_cast<long long>(time(nullptr));
+    bool queryOk = false;
     {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
 
@@ -568,6 +568,7 @@ void refreshWatchers() {
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "JOIN users u ON u.chat_id = uw.user_id "
             "ORDER BY uw.user_id ASC, uw.created_at ASC, uw.rowid ASC")) {
+            queryOk = true;
             sqlite3_bind_int64(s,1,now);
             std::string prevUser;
             size_t loadedForUser = 0;
@@ -584,6 +585,10 @@ void refreshWatchers() {
             }
             sqlite3_finalize(s);
         }
+    }
+    if (!queryOk) {
+        std::cerr << "[WATCHERS] refresh query failed - keeping previous watcher list (not wiping to empty)" << std::endl;
+        return;
     }
     std::unique_lock l(watchersMutex);
     WATCHERS_PTR = m;
@@ -682,17 +687,16 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     return removed;
 }
 
-void setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
+bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
     ensureUser(chatId);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return;
+    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return false;
     sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    if (sqlite3_step(s)!=SQLITE_DONE) std::cerr << "[DB] threshold UPDATE failed: " << sqlite3_errmsg(db) << std::endl;
+    int rc = sqlite3_step(s);
+    bool ok = rc==SQLITE_DONE && sqlite3_changes(db)==1;
+    if (!ok) std::cerr << "[DB] threshold UPDATE failed or matched no row (rc=" << rc << "): " << sqlite3_errmsg(db) << std::endl;
     sqlite3_finalize(s);
-}
-
-void setUserThreshold(const std::string& chatId, double usd) {
-    setUserThresholdNanos(chatId, usdToNanos(usd));
+    return ok;
 }
 
 std::string getUserLanguage(const std::string& chatId) {
