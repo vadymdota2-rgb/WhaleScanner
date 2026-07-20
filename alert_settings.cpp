@@ -19,10 +19,9 @@ constexpr uint64_t NANOS_PER_USD = 1000000000ULL;
 constexpr uint64_t NANOS_PER_CENT = NANOS_PER_USD / 100;
 constexpr uint64_t MAX_THRESHOLD_USD = 1000000000ULL;
 constexpr uint64_t MAX_THRESHOLD_CENTS = MAX_THRESHOLD_USD * 100;
-constexpr size_t MAX_INT_DIGITS = 10;
 
 enum class ParseResult { OK, INVALID, NOT_POSITIVE, TOO_LARGE, TOO_MANY_DECIMALS };
-enum class ApplyResult { Changed, Unchanged };
+enum class ApplyResult { Changed, Unchanged, Error };
 
 std::string parseError(ParseResult r, Lang lang) {
     switch (r) {
@@ -44,8 +43,13 @@ ParseResult parseThresholdNanos(const std::string& raw, uint64_t& outNanos) {
 
     size_t intDigits = 0;
     for (; i < t.size() && t[i] >= '0' && t[i] <= '9'; i++) {
-        if (++intDigits > MAX_INT_DIGITS) return ParseResult::TOO_LARGE;
-        dollars = dollars * 10 + static_cast<uint64_t>(t[i] - '0');
+        intDigits++;
+        uint64_t digit = static_cast<uint64_t>(t[i] - '0');
+        if (dollars > MAX_THRESHOLD_USD / 10 ||
+            (dollars == MAX_THRESHOLD_USD / 10 && digit > MAX_THRESHOLD_USD % 10)) {
+            return ParseResult::TOO_LARGE;
+        }
+        dollars = dollars * 10 + digit;
     }
     if (intDigits == 0) return ParseResult::INVALID;
 
@@ -89,7 +93,7 @@ std::string presetLabel(uint64_t usd) {
 
 ApplyResult applyThreshold(const std::string& chatId, uint64_t nanos) {
     if (getUserThresholdNanos(chatId) == nanos) return ApplyResult::Unchanged;
-    setUserThresholdNanos(chatId, nanos);
+    if (!setUserThresholdNanos(chatId, nanos)) return ApplyResult::Error;
     refreshWatchers();
     return ApplyResult::Changed;
 }
@@ -116,7 +120,7 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
     size_t inRow = 0;
     for (uint64_t usd : PRESETS_USD) {
         std::string label = presetLabel(usd);
-        if (usd * NANOS_PER_USD == currentThresholdNanos) label = "✅ " + label;
+        if (usd * NANOS_PER_USD == currentThresholdNanos) label = label + " ✅";
         row.push_back({
             {"text", label},
             {"callback_data", "threshold:" + std::to_string(usd)}
@@ -152,11 +156,17 @@ bool handleThresholdCallback(const std::string& chatId, const std::string& param
     uint64_t nanos = 0;
     ParseResult pr = parseThresholdNanos(param, nanos);
     if (pr != ParseResult::OK) {
-        replyInPlace(chatId, messageId, parseError(pr, lang));
+        auto menu = TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), lang);
+        replyInPlace(chatId, messageId, parseError(pr, lang) + "\n\n" + menu.text, menu.keyboard);
         return true;
     }
 
     ApplyResult ar = applyThreshold(chatId, nanos);
+    if (ar == ApplyResult::Error) {
+        auto menu = TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), lang);
+        replyInPlace(chatId, messageId, tr(lang, "threshold_save_failed") + "\n\n" + menu.text, menu.keyboard);
+        return true;
+    }
     auto menu = TelegramUI::buildMainMenu(chatId);
     replyInPlace(chatId, messageId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
@@ -171,8 +181,12 @@ bool handleThresholdText(const std::string& chatId, const std::string& text) {
         return true;
     }
 
-    g_sessionManager.clearSession(chatId);
     ApplyResult ar = applyThreshold(chatId, nanos);
+    if (ar == ApplyResult::Error) {
+        sendMsg(chatId, tr(lang, "threshold_save_failed"), TelegramUI::buildCancelButton(lang));
+        return true;
+    }
+    g_sessionManager.clearSession(chatId);
     auto menu = TelegramUI::buildMainMenu(chatId);
     sendMsg(chatId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
