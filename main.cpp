@@ -1500,7 +1500,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         else {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
             g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address);
-            sendMsg(chatId, "🏷 Enter a name for this trader:", TelegramUI::buildCancelButton());
+            replyInPlace(chatId, messageId, "🏷 Enter a name for this trader:", TelegramUI::buildCancelButton());
         }
     }
     else if (action == "tt_noop") {
