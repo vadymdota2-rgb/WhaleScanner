@@ -930,20 +930,21 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         {"ru", "🇷🇺 Русский"},
     };
     std::string current = getUserLanguage(chatId);
+    Lang lang = langFromCode(current);
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
-    for (const auto& lang : LANGUAGES) {
-        std::string labelText = lang.second + (lang.first == current ? " ✅" : "");
+    for (const auto& l : LANGUAGES) {
+        std::string labelText = l.second + (l.first == current ? " ✅" : "");
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", labelText}, {"callback_data", "lang:" + lang.first}}
+            {{"text", labelText}, {"callback_data", "lang:" + l.first}}
         }));
     }
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
-    std::string text = "🌐 <b>Languages</b>\n\nChoose your language:";
+    std::string text = tr(lang, "lang_title") + "\n\n" + tr(lang, "lang_choose");
     return {text, keyboard.dump()};
 }
 
@@ -1997,7 +1998,11 @@ int main() {
         else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
     }
-    initDB(); initRankingDB(); initPremium(TG_TOKEN, SERVICE_CHAT_ID); loadTokenCache();
+    initDB(); initRankingDB();
+    if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
+        std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
+    }
+    loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     setupBotCommands();
