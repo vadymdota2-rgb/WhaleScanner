@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include "ru.h"
 
 namespace TelegramUI {
 
@@ -13,8 +14,8 @@ struct UIMessage {
 };
 
 UIMessage buildMainMenu(const std::string& chatId);
-std::string buildCancelButton();
-UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos);
+std::string buildCancelButton(Lang lang = Lang::EN);
+UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos, Lang lang = Lang::EN);
 
 }
 
