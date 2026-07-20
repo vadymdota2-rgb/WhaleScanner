@@ -958,12 +958,12 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     std::string text = tr(lang, "help_title") + "\n\n";
     text += tr(lang, "help_intro") + "\n\n";
     text += tr(lang, "help_commands") + "\n";
-    text += tr(lang, "help_cmd_top") + "\n";
-    text += tr(lang, "help_cmd_premium") + "\n";
-    text += tr(lang, "help_cmd_add") + "\n";
-    text += tr(lang, "help_cmd_remove") + "\n";
-    text += tr(lang, "help_cmd_mywallets") + "\n";
-    text += tr(lang, "help_cmd_limit") + "\n\n";
+    text += tr(lang, "help_menu_add") + "\n";
+    text += tr(lang, "help_menu_mywallets") + "\n";
+    text += tr(lang, "help_menu_threshold") + "\n";
+    text += tr(lang, "help_menu_top") + "\n";
+    text += tr(lang, "help_menu_premium") + "\n";
+    text += tr(lang, "help_menu_languages") + "\n\n";
     text += tr(lang, "help_premium_title") + "\n";
     text += tr(lang, "help_premium_1") + "\n";
     text += tr(lang, "help_premium_2") + "\n";
@@ -1042,13 +1042,6 @@ void answerCallbackQuery(const std::string& callbackQueryId, const std::string& 
 void setupBotCommands() {
     json cmds = json::array();
     cmds.push_back({{"command","start"},{"description","Open the main menu"}});
-    cmds.push_back({{"command","add"},{"description","Track a wallet: /add 0x... Name"}});
-    cmds.push_back({{"command","remove"},{"description","Stop tracking a wallet"}});
-    cmds.push_back({{"command","mywallets"},{"description","Show your tracked wallets"}});
-    cmds.push_back({{"command","limit"},{"description","Set alert threshold in USD"}});
-    cmds.push_back({{"command","top"},{"description","Open TOP Traders rankings"}});
-    cmds.push_back({{"command","premium"},{"description","Wallet Tracker Premium"}});
-    cmds.push_back({{"command","help"},{"description","How this bot works"}});
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
@@ -1971,73 +1964,6 @@ void telegramLoop() {
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
                         }
-                    }
-                    else if (txt=="/help") {
-                        auto msg = TelegramUI::buildHelpMessage(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt=="/premium") {
-                        ensureUser(cid);
-                        auto msg = buildPremiumPage(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt.find("/add ")==0) {
-                        Lang lang = langFromCode(getUserLanguage(cid));
-                        size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
-                        if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,tr(lang, "cmd_add_usage")); }
-                        else {
-                            std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
-                            std::string label=trim(txt.substr(p2+1));
-                            if (label.empty() || label == "-" || label == "." || toLower(label) == addr) label = shortAddress(addr);
-                            if (label.length() > 32) { sendMsg(cid,tr(lang, "cmd_add_name_too_long")); }
-                            else {
-                            auto res=addUserWhale(cid,addr,label);
-                            switch (res) {
-                                case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,tr(lang, "cmd_add_wallet_added")+" "+safeString(label)); break;
-                                case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,tr(lang, "already_tracking")); break;
-                                case AddWhaleResult::LIMIT_REACHED: {
-                                    if (isPremium(cid)) sendMsg(cid,tr(lang, "limit_50_reached"));
-                                    else { auto lim = buildWalletLimitMessage(lang); sendMsg(cid, lim.text, lim.keyboard); }
-                                    break;
-                                }
-                                case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,tr(lang, "cmd_add_bad_address")); break;
-                                case AddWhaleResult::ERROR: sendMsg(cid,tr(lang, "generic_error_retry")); break;
-                            }
-                            }
-                        }
-                    }
-                    else if (txt.find("/remove ")==0) {
-                        Lang lang = langFromCode(getUserLanguage(cid));
-                        std::string a=toLower(trim(txt.substr(8)));
-                        bool removed=removeUserWhale(cid,a);
-                        if (removed) { refreshWatchers(); sendMsg(cid,tr(lang, "cmd_remove_removed")); }
-                        else sendMsg(cid,tr(lang, "cmd_remove_not_found"));
-                    }
-                    else if (txt.find("/limit ")==0) {
-                        Lang lang = langFromCode(getUserLanguage(cid));
-                        try { double v=std::stod(txt.substr(7));
-                            if (v<0) { sendMsg(cid,tr(lang, "cmd_limit_positive")); }
-                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,tr(lang, "cmd_limit_set")+formatThousands(static_cast<uint64_t>(v))); }
-                        } catch (...) { sendMsg(cid,tr(lang, "cmd_limit_usage")); }
-                    }
-                    else if (txt.find("/language")==0) {
-                        std::string rest = toLower(trim(txt.substr(9)));
-                        static const std::set<std::string> SUPPORTED_LANGS_CMD = {"en", "ru"};
-                        if (rest.empty() || !SUPPORTED_LANGS_CMD.count(rest)) {
-                            sendMsg(cid,tr(langFromCode(getUserLanguage(cid)), "cmd_language_usage"));
-                        } else {
-                            setUserLanguage(cid,rest);
-                            auto msg = TelegramUI::buildMainMenu(cid);
-                            sendMsg(cid, "✅ " + tr(langFromCode(rest), "menu_languages") + "\n\n" + msg.text, msg.keyboard);
-                        }
-                    }
-                    else if (txt=="/mywallets") {
-                        auto wmsg = TelegramUI::buildWalletsList(cid);
-                        sendMsg(cid, wmsg.text, wmsg.keyboard);
-                    }
-                    else if (txt=="/top") {
-                        auto msg = buildGlobalTopMenu(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
                     }
                     else {
                         sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "unknown_command"));
