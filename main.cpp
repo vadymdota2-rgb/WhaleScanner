@@ -1270,6 +1270,82 @@ void cleanupOldAlerts() {
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
 }
 
+std::mutex g_lastViewMutex;
+std::unordered_map<std::string, std::string> g_lastView;
+
+void rememberView(const std::string& chatId, const std::string& data) {
+    std::lock_guard<std::mutex> l(g_lastViewMutex);
+    g_lastView[chatId] = data;
+}
+
+std::string getLastView(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(g_lastViewMutex);
+    auto it = g_lastView.find(chatId);
+    return it != g_lastView.end() ? it->second : "";
+}
+
+void handleCallbackQuery(const json& callbackQuery);
+
+TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::string& data) {
+    size_t colonPos = data.find(':');
+    std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
+    std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
+
+    if (action == "menu") {
+        if (param == "my_wallets") return TelegramUI::buildWalletsList(chatId);
+        if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId));
+        if (param == "toptrader") { auto r = buildGlobalTopMenu(); return {r.text, r.keyboard}; }
+        if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
+        if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
+        if (param == "help") return TelegramUI::buildHelpMessage();
+        return TelegramUI::buildMainMenu(chatId);
+    }
+    if (action == "mw_page") {
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        return TelegramUI::buildWalletsList(chatId, page);
+    }
+    if (action == "tt_page") {
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        auto r = buildTopPnlPage(chatId, page);
+        return {r.text, r.keyboard};
+    }
+    if (action == "gt_open") {
+        GlobalRankKind kind;
+        if (parseGlobalRankKind(param, kind)) {
+            auto r = buildGlobalTopMessage(chatId, kind, premiumTopTradersLimit(chatId), !isPremium(chatId));
+            return {r.text, r.keyboard};
+        }
+    }
+    if (action == "gt_page") {
+        size_t sep = param.find(':');
+        if (sep != std::string::npos) {
+            GlobalRankKind kind;
+            if (parseGlobalRankKind(param.substr(0, sep), kind)) {
+                int page = 1;
+                try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
+                auto r = buildGlobalTopPage(chatId, kind, page, premiumTopTradersLimit(chatId), !isPremium(chatId));
+                return {r.text, r.keyboard};
+            }
+        }
+    }
+    return TelegramUI::buildMainMenu(chatId);
+}
+
+bool navigateBack(const std::string& chatId, long long messageId) {
+    std::string back = getLastView(chatId);
+    if (back.empty()) return false;
+    json synthetic;
+    synthetic["data"] = back;
+    synthetic["from"] = json::object();
+    synthetic["from"]["id"] = std::stoll(chatId);
+    synthetic["message"] = json::object();
+    synthetic["message"]["message_id"] = messageId;
+    handleCallbackQuery(synthetic);
+    return true;
+}
+
 void handleCallbackQuery(const json& callbackQuery) {
     if (!callbackQuery.contains("data") || !callbackQuery["data"].is_string()) return;
     if (!callbackQuery.contains("from") || !callbackQuery["from"].contains("id")) return;
@@ -1287,7 +1363,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
     std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
 
-    if (action != "tt_track" && !callbackQueryId.empty()) {
+    if (action != "tt_track" && action != "remove" && !callbackQueryId.empty()) {
         answerCallbackQuery(callbackQueryId);
     }
 
@@ -1295,6 +1371,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         g_sessionManager.clearSession(chatId);
 
         if (param == "main") {
+            rememberView(chatId, data);
             auto msg = TelegramUI::buildMainMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
@@ -1304,45 +1381,54 @@ void handleCallbackQuery(const json& callbackQuery) {
                     TelegramUI::buildCancelButton());
         }
         else if (param == "my_wallets") {
+            rememberView(chatId, data);
             auto msg = TelegramUI::buildWalletsList(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "alert_threshold") {
+            rememberView(chatId, data);
             uint64_t threshold = getUserThresholdNanos(chatId);
             auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "toptrader") {
+            rememberView(chatId, data);
             auto msg = buildGlobalTopMenu();
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "premium") {
-
+            rememberView(chatId, data);
             auto msg = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "settings") {
+            rememberView(chatId, data);
             auto msg = TelegramUI::buildMainMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "languages") {
+            rememberView(chatId, data);
             auto msg = TelegramUI::buildLanguagesMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "help") {
+            rememberView(chatId, data);
             auto msg = TelegramUI::buildHelpMessage();
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
     else if (action == "cancel") {
         g_sessionManager.clearSession(chatId);
-        auto msg = TelegramUI::buildMainMenu(chatId);
-        replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
+        if (!navigateBack(chatId, messageId)) {
+            auto msg = TelegramUI::buildMainMenu(chatId);
+            replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
+        }
     }
     else if (action == "lang") {
         static const std::set<std::string> SUPPORTED_LANGS = {"en"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
+            rememberView(chatId, "menu:languages");
             auto msg = TelegramUI::buildLanguagesMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
@@ -1355,12 +1441,14 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "mw_page") {
+        rememberView(chatId, data);
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
         auto msg = TelegramUI::buildWalletsList(chatId, page);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "wstats") {
+        rememberView(chatId, data);
         std::string address = toLower(param);
         std::string wlabel = address;
         {
@@ -1461,6 +1549,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "remove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Invalid wallet address.", true);
             replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
             return;
         }
@@ -1468,16 +1557,22 @@ void handleCallbackQuery(const json& callbackQuery) {
         bool removed = removeUserWhale(chatId, address);
         if (removed) {
             refreshWatchers();
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, "✅ Wallet removed.\n\n" + msg.text, msg.keyboard);
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "✅ Wallet removed", false);
+            if (!navigateBack(chatId, messageId)) {
+                auto msg = TelegramUI::buildWalletsList(chatId);
+                replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+            }
         } else {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Wallet not found in your list.", true);
             replyInPlace(chatId, messageId, "❌ Wallet not found in your list.", "");
         }
     }
     else if (action == "threshold") {
+        rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
     else if (action == "tt_page") {
+        rememberView(chatId, data);
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
         auto msg = buildTopPnlPage(chatId, page);
@@ -1508,7 +1603,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "gt_open") {
         GlobalRankKind kind;
         if (parseGlobalRankKind(param, kind)) {
-
+            rememberView(chatId, data);
             auto msg = buildGlobalTopMessage(chatId, kind,
                                              premiumTopTradersLimit(chatId),
                                              !isPremium(chatId));
@@ -1523,6 +1618,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
             GlobalRankKind kind;
             if (parseGlobalRankKind(kindStr, kind)) {
+                rememberView(chatId, data);
                 auto msg = buildGlobalTopPage(chatId, kind, page,
                                               premiumTopTradersLimit(chatId),
                                               !isPremium(chatId));
@@ -1632,13 +1728,15 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
         if (result == AddWhaleResult::OK) {
             refreshWatchers();
+            std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu(chatId);
+            auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
             sendMsg(chatId, "✅ Wallet \"" + safeString(label, 32) + "\" is now being tracked.\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
+            std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
-            auto msg = TelegramUI::buildMainMenu(chatId);
+            auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
             sendMsg(chatId, "⚠️ You're already tracking this wallet.\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
@@ -1687,8 +1785,9 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         }
 
         refreshWatchers();
+        std::string back = getLastView(chatId);
         g_sessionManager.clearSession(chatId);
-        auto msg = TelegramUI::buildMainMenu(chatId);
+        auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
         sendMsg(chatId, "✅ <b>Wallet renamed</b>\n\nNew name: <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
                 msg.keyboard);
         return true;
