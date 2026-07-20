@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <iostream>
 #include <sstream>
+#include <unordered_map>
+#include <atomic>
 #include "utils.h"
 #include "ru.h"
 
@@ -34,6 +36,9 @@ constexpr int    PREMIUM_TOP_TRADERS = 100;
 std::string g_botToken;
 
 std::string g_serviceChatId;
+
+std::mutex g_lastInvoiceMutex;
+std::unordered_map<std::string, long long> g_lastInvoiceMsgId;
 
 std::string apiUrl(const char* method) {
     return "https://api.telegram.org/bot" + g_botToken + "/" + method;
@@ -66,14 +71,17 @@ bool readPremiumRowLocked(const std::string& chatId,
     return found;
 }
 
+std::atomic<bool> g_premiumSchemaOk{false};
+
 }
 
-void initPremium(const std::string& botToken, const std::string& serviceChatId) {
+bool initPremium(const std::string& botToken, const std::string& serviceChatId) {
     g_botToken = botToken;
     g_serviceChatId = serviceChatId;
 
     std::lock_guard<std::mutex> l(dbMutex);
 
+    bool ok = true;
     const char* alters[] = {
         "ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN premium_start INTEGER DEFAULT 0",
@@ -83,8 +91,10 @@ void initPremium(const std::string& botToken, const std::string& serviceChatId) 
         char* err = nullptr;
         if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
             std::string e = err ? err : "";
-            if (e.find("duplicate column") == std::string::npos)
+            if (e.find("duplicate column") == std::string::npos) {
                 std::cerr << "[PREMIUM][FATAL] migration failed: " << e << std::endl;
+                ok = false;
+            }
         }
         if (err) sqlite3_free(err);
     }
@@ -107,12 +117,20 @@ void initPremium(const std::string& botToken, const std::string& serviceChatId) 
     if (sqlite3_exec(db, paymentsSql, nullptr, nullptr, &perr) != SQLITE_OK) {
         std::cerr << "[PREMIUM][FATAL] premium_payments schema failed: "
                   << (perr ? perr : "") << std::endl;
+        ok = false;
     }
     if (perr) sqlite3_free(perr);
 
-    std::cout << "[PREMIUM] Module initialized (price: " << PREMIUM_PRICE_STARS
-              << " Stars / 30 days)" << std::endl;
+    g_premiumSchemaOk = ok;
+    if (ok) {
+        std::cout << "[PREMIUM] Module initialized (price: " << PREMIUM_PRICE_STARS
+                  << " Stars / 30 days)" << std::endl;
+    } else {
+        std::cerr << "[PREMIUM][FATAL] Module init failed — payments are DISABLED until fixed" << std::endl;
+    }
+    return ok;
 }
+
 
 bool isPremium(const std::string& chatId) {
 
@@ -136,7 +154,12 @@ void cleanupExpiredPremium() {
             "UPDATE users SET is_premium=0 WHERE is_premium=1 AND premium_expire<=?"))
             return;
         sqlite3_bind_int64(s, 1, now);
-        sqlite3_step(s);
+        int rc = sqlite3_step(s);
+        if (rc != SQLITE_DONE) {
+            std::cerr << "[PREMIUM] cleanup failed: " << sqlite3_errmsg(db) << std::endl;
+            sqlite3_finalize(s);
+            return;
+        }
         changed = sqlite3_changes(db);
         sqlite3_finalize(s);
     }
@@ -154,7 +177,31 @@ long long premiumExpireTs(const std::string& chatId) {
     return expire;
 }
 
-void activateOrExtendPremium(const std::string& chatId) {
+namespace {
+
+bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlreadyActive) {
+    int flag = 0; long long start = 0, expire = 0;
+    if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
+
+    wasAlreadyActive = (flag != 0 && expire > now);
+    long long newExpire = (wasAlreadyActive ? expire : now) + PREMIUM_DURATION_SECONDS;
+    long long newStart = wasAlreadyActive ? (start > 0 ? start : now) : now;
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?"))
+        return false;
+    sqlite3_bind_int64(s, 1, newStart);
+    sqlite3_bind_int64(s, 2, newExpire);
+    sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(s);
+    sqlite3_finalize(s);
+    return rc == SQLITE_DONE;
+}
+
+}
+
+bool activateOrExtendPremium(const std::string& chatId) {
     ensureUser(chatId);
     long long now = static_cast<long long>(time(nullptr));
 
@@ -162,49 +209,124 @@ void activateOrExtendPremium(const std::string& chatId) {
 
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
         std::cerr << "[PREMIUM] activate: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
-        return;
+        return false;
     }
 
-    int flag = 0; long long start = 0, expire = 0;
-    if (!readPremiumRowLocked(chatId, flag, start, expire)) {
-
+    bool wasAlreadyActive = false;
+    if (!extendPremiumLocked(chatId, now, wasAlreadyActive)) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        std::cerr << "[PREMIUM] activate: user row missing for " << chatId << std::endl;
-        return;
+        std::cerr << "[PREMIUM] activate: failed for " << chatId << std::endl;
+        return false;
     }
 
-    bool stillActive = (flag != 0 && expire > now);
-
-    long long newExpire = (stillActive ? expire : now) + PREMIUM_DURATION_SECONDS;
-    long long newStart = stillActive ? (start > 0 ? start : now) : now;
-
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?")) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return;
-    }
-    sqlite3_bind_int64(s, 1, newStart);
-    sqlite3_bind_int64(s, 2, newExpire);
-    sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-
-    if (rc != SQLITE_DONE) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        std::cerr << "[PREMIUM] activate: UPDATE failed (" << rc << ") for "
-                  << chatId << ", rolled back" << std::endl;
-        return;
-    }
     if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         std::cerr << "[PREMIUM] activate: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
-        return;
+        return false;
     }
 
-    std::cout << "[PREMIUM] " << (stillActive ? "Extended" : "Activated")
-              << " for " << chatId << " until " << newExpire << std::endl;
+    std::cout << "[PREMIUM] " << (wasAlreadyActive ? "Extended" : "Activated")
+              << " for " << chatId << std::endl;
+    return true;
 }
+
+PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp) {
+    if (!sp.is_object()) return PaymentApplyResult::Rejected;
+
+    std::string payload = sp.value("invoice_payload", "");
+    if (payload != PREMIUM_PAYLOAD) {
+        std::cerr << "[PREMIUM] successful_payment with unknown payload: "
+                  << payload << " (chat " << chatId << ")" << std::endl;
+        return PaymentApplyResult::Rejected;
+    }
+
+    std::string currency = sp.value("currency", "");
+    long long amount = sp.value("total_amount", 0);
+    if (currency != "XTR" || amount != PREMIUM_PRICE_STARS) {
+        std::cerr << "[PREMIUM] successful_payment amount/currency mismatch: "
+                  << amount << " " << currency << " (chat " << chatId << ")" << std::endl;
+        return PaymentApplyResult::Rejected;
+    }
+
+    std::string chargeId = sp.value("telegram_payment_charge_id", "");
+    if (chargeId.empty()) {
+        std::cerr << "[PREMIUM] successful_payment missing telegram_payment_charge_id "
+                     "(chat " << chatId << ") — rejected, no history record possible" << std::endl;
+        return PaymentApplyResult::Rejected;
+    }
+
+    if (!g_premiumSchemaOk) {
+        std::cerr << "[PREMIUM] apply: schema not ready, cannot process payment for " << chatId << std::endl;
+        return PaymentApplyResult::Error;
+    }
+
+    std::string providerChargeId = sp.value("provider_payment_charge_id", "");
+    long long paidAt = static_cast<long long>(time(nullptr));
+
+    ensureUser(chatId);
+
+    std::lock_guard<std::mutex> l(dbMutex);
+
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM] apply: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return PaymentApplyResult::Error;
+    }
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "INSERT INTO premium_payments"
+        "(chat_id,telegram_payment_charge_id,provider_payment_charge_id,"
+        "payload,amount,currency,paid_at) VALUES(?,?,?,?,?,?,?)")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return PaymentApplyResult::Error;
+    }
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, chargeId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, providerChargeId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, payload.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 5, amount);
+    sqlite3_bind_text(s, 6, currency.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 7, paidAt);
+    int rc = sqlite3_step(s);
+    sqlite3_finalize(s);
+
+    if (rc == SQLITE_CONSTRAINT && sqlite3_extended_errcode(db) == SQLITE_CONSTRAINT_UNIQUE) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        std::cout << "[PREMIUM] Duplicate payment ignored (charge "
+                  << chargeId << ", chat " << chatId << ")" << std::endl;
+        return PaymentApplyResult::Duplicate;
+    }
+    if (rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        std::cerr << "[PREMIUM] apply: payment INSERT failed (" << rc << "): "
+                  << sqlite3_errmsg(db) << std::endl;
+        return PaymentApplyResult::Error;
+    }
+
+    bool wasAlreadyActive = false;
+    if (!extendPremiumLocked(chatId, paidAt, wasAlreadyActive)) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        std::cerr << "[PREMIUM] apply: extend failed for " << chatId
+                  << " (charge " << chargeId << "), payment record rolled back too" << std::endl;
+        return PaymentApplyResult::Error;
+    }
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        std::cerr << "[PREMIUM] apply: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        return PaymentApplyResult::Error;
+    }
+
+    std::cout << "[PREMIUM] " << (wasAlreadyActive ? "Extended" : "Activated")
+              << " for " << chatId << " (charge " << chargeId << ")" << std::endl;
+    {
+        std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
+        g_lastInvoiceMsgId.erase(chatId);
+    }
+
+    return wasAlreadyActive ? PaymentApplyResult::Extended : PaymentApplyResult::Activated;
+}
+
 
 size_t premiumMaxWallets(const std::string& chatId) {
     return isPremium(chatId) ? PREMIUM_MAX_WALLETS : FREE_MAX_WALLETS;
@@ -282,7 +404,25 @@ PremiumMessage buildWalletLimitMessage(Lang lang) {
 }
 
 bool sendPremiumInvoice(const std::string& chatId) {
+    if (!g_premiumSchemaOk) {
+        std::cerr << "[PREMIUM] sendInvoice blocked: schema not initialized" << std::endl;
+        return false;
+    }
+
     Lang lang = langFromCode(getUserLanguage(chatId));
+
+    {
+        long long staleId = 0;
+        {
+            std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
+            auto it = g_lastInvoiceMsgId.find(chatId);
+            if (it != g_lastInvoiceMsgId.end()) { staleId = it->second; g_lastInvoiceMsgId.erase(it); }
+        }
+        if (staleId != 0) {
+            json d; d["chat_id"] = chatId; d["message_id"] = staleId;
+            http(apiUrl("deleteMessage"), d.dump(), 10);
+        }
+    }
 
     json j;
     j["chat_id"] = chatId;
@@ -298,7 +438,14 @@ bool sendPremiumInvoice(const std::string& chatId) {
     auto r = http(apiUrl("sendInvoice"), j.dump(), 10);
     try {
         auto p = json::parse(r);
-        if (p.value("ok", false)) return true;
+        if (p.value("ok", false)) {
+            if (p.contains("result") && p["result"].is_object() && p["result"].contains("message_id")) {
+                long long msgId = p["result"]["message_id"].get<long long>();
+                std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
+                g_lastInvoiceMsgId[chatId] = msgId;
+            }
+            return true;
+        }
         std::cerr << "[PREMIUM] sendInvoice failed: "
                   << p.value("description", "(no description)") << std::endl;
     } catch (...) {
@@ -311,90 +458,65 @@ void handlePreCheckoutQuery(const json& q) {
     if (!q.is_object() || !q.contains("id") || !q["id"].is_string()) return;
 
     std::string payload = q.value("invoice_payload", "");
+    std::string currency = q.value("currency", "");
+    long long amount = q.value("total_amount", 0);
     Lang lang = Lang::EN;
-    if (q.contains("from") && q["from"].is_object() && q["from"].contains("id")) {
+    if (q.contains("from") && q["from"].is_object() &&
+        q["from"].contains("id") && q["from"]["id"].is_number_integer()) {
         std::string buyerChatId = std::to_string(q["from"]["id"].get<long long>());
         lang = langFromCode(getUserLanguage(buyerChatId));
     }
 
     json a;
     a["pre_checkout_query_id"] = q["id"].get<std::string>();
-    if (payload == PREMIUM_PAYLOAD) {
+    bool schemaReady = g_premiumSchemaOk.load();
+    bool valid = schemaReady && payload == PREMIUM_PAYLOAD && currency == "XTR" && amount == PREMIUM_PRICE_STARS;
+    if (valid) {
         a["ok"] = true;
     } else {
         a["ok"] = false;
-        a["error_message"] = tr(lang, "invoice_unknown_product");
-        std::cerr << "[PREMIUM] pre_checkout with unknown payload: "
-                  << payload << std::endl;
+        a["error_message"] = schemaReady ? tr(lang, "invoice_unknown_product") : tr(lang, "payments_unavailable");
+        std::cerr << "[PREMIUM] pre_checkout rejected: schemaReady=" << schemaReady
+                  << " payload=" << payload << " currency=" << currency << " amount=" << amount << std::endl;
     }
 
-    http(apiUrl("answerPreCheckoutQuery"), a.dump(), 10);
-}
-
-namespace {
-
-bool recordPaymentOnce(const std::string& chatId, const std::string& chargeId,
-                       const nlohmann::json& sp) {
-    std::string providerChargeId = sp.value("provider_payment_charge_id", "");
-    std::string payload = sp.value("invoice_payload", "");
-    long long amount = sp.value("total_amount", 0);
-    std::string currency = sp.value("currency", "");
-    long long paidAt = static_cast<long long>(time(nullptr));
-
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "INSERT OR IGNORE INTO premium_payments"
-        "(chat_id,telegram_payment_charge_id,provider_payment_charge_id,"
-        "payload,amount,currency,paid_at) VALUES(?,?,?,?,?,?,?)")) {
-
-        return true;
+    auto r = http(apiUrl("answerPreCheckoutQuery"), a.dump(), 8);
+    try {
+        auto p = json::parse(r);
+        if (!p.value("ok", false)) {
+            std::cerr << "[PREMIUM] answerPreCheckoutQuery failed: "
+                      << p.value("description", "(no description)") << std::endl;
+        }
+    } catch (...) {
+        std::cerr << "[PREMIUM] answerPreCheckoutQuery: bad API response" << std::endl;
     }
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, chargeId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, providerChargeId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, payload.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 5, amount);
-    sqlite3_bind_text(s, 6, currency.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 7, paidAt);
-    sqlite3_step(s);
-    bool inserted = sqlite3_changes(db) > 0;
-    sqlite3_finalize(s);
-    return inserted;
-}
-
 }
 
 bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
-    if (!sp.is_object()) return false;
-    std::string payload = sp.value("invoice_payload", "");
-    if (payload != PREMIUM_PAYLOAD) {
-        std::cerr << "[PREMIUM] successful_payment with unknown payload: "
-                  << payload << " (chat " << chatId << ")" << std::endl;
-        return false;
-    }
+    PaymentApplyResult result = applySuccessfulPayment(chatId, sp);
 
-    std::string chargeId = sp.value("telegram_payment_charge_id", "");
-    if (chargeId.empty()) {
-
-        std::cerr << "[PREMIUM] ⚠️ successful_payment without "
-                     "telegram_payment_charge_id (chat " << chatId
-                  << ") — activating without a history record" << std::endl;
-    } else if (!recordPaymentOnce(chatId, chargeId, sp)) {
-        std::cout << "[PREMIUM] Duplicate payment ignored (charge "
-                  << chargeId << ", chat " << chatId << ")" << std::endl;
-        return true;
-    }
-
-    activateOrExtendPremium(chatId);
+    if (result == PaymentApplyResult::Rejected) return false;
+    if (result == PaymentApplyResult::Error) return false;
+    if (result == PaymentApplyResult::Duplicate) return true;
 
     refreshWatchers();
 
+    Lang lang = langFromCode(getUserLanguage(chatId));
     json j;
     j["chat_id"] = chatId;
-    j["text"] = "✅ Payment successful!\n\n"
-                "Wallet Tracker Premium has been activated.\n\n"
-                "Valid for 30 days.";
-    http(apiUrl("sendMessage"), j.dump(), 10);
+    j["text"] = tr(lang, "payment_success_title") + "\n\n" +
+                tr(lang, "payment_success_activated") + "\n\n" +
+                tr(lang, "payment_success_duration");
+    auto r = http(apiUrl("sendMessage"), j.dump(), 10);
+    try {
+        auto p = json::parse(r);
+        if (!p.value("ok", false)) {
+            std::cerr << "[PREMIUM] success notification failed for " << chatId
+                      << ": " << p.value("description", "(no description)") << std::endl;
+        }
+    } catch (...) {
+        std::cerr << "[PREMIUM] success notification: bad API response for " << chatId << std::endl;
+    }
     return true;
 }
+
