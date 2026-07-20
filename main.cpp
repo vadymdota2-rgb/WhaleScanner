@@ -26,6 +26,7 @@
 #include "utils.h"
 #include "ranking.h"
 #include "alert_settings.h"
+#include "ru.h"
 #include "premium.h"
 #include "message_queue.h"
 #include "tx_analyzer.h"
@@ -747,55 +748,67 @@ namespace TelegramUI {
 UIMessage buildMainMenu(const std::string& chatId) {
     size_t walletCount = countUserWhales(chatId);
     double thresholdUsd = nanosToUsd(getUserThresholdNanos(chatId));
+    Lang lang = langFromCode(getUserLanguage(chatId));
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "➕ Add Wallet"}, {"callback_data", "menu:add_wallet"}}
+        {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "💼 My Wallets (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:my_wallets"}}
+        {{"text", tr(lang, "menu_my_wallets") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:my_wallets"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "💰 Alert Threshold ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
+        {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🏆 Top Traders"}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "⭐ Premium"}, {"callback_data", "menu:premium"}}
+        {{"text", tr(lang, "menu_premium")}, {"callback_data", "menu:premium"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🌐 Languages"}, {"callback_data", "menu:languages"}}
+        {{"text", tr(lang, "menu_languages")}, {"callback_data", "menu:languages"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "❓ Help"}, {"callback_data", "menu:help"}}
+        {{"text", tr(lang, "menu_help")}, {"callback_data", "menu:help"}}
     }));
 
     std::stringstream text;
-    text << "🚨 <b>Wallet Tracker</b>\n\n";
+    text << tr(lang, "menu_title") << "\n\n";
     if (walletCount == 0) {
-        text << "You're not tracking any wallets yet.\nTap <b>Add Wallet</b> to start getting alerts.";
+        text << tr(lang, "menu_no_wallets");
+    } else if (lang == Lang::RU) {
+        std::string walletWord = pluralRu(static_cast<long long>(walletCount), "кошелёк", "кошелька", "кошельков");
+        text << tr(lang, "menu_tracking_prefix") << " <b>" << walletCount << "</b> " << walletWord
+             << ", " << tr(lang, "menu_alerts_above") << " <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
     } else {
-        text << "Tracking <b>" << walletCount << "</b> wallet" << (walletCount == 1 ? "" : "s")
-             << ", alerts above <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
+        text << tr(lang, "menu_tracking_prefix") << " <b>" << walletCount << "</b> wallet" << (walletCount == 1 ? "" : "s")
+             << ", " << tr(lang, "menu_alerts_above") << " <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
     }
     return {text.str(), keyboard.dump()};
 }
 
 UIMessage buildWelcomeMessage(const std::string& chatId) {
-    auto m = buildMainMenu(chatId);
-    m.text = "🚨 <b>Welcome to Wallet Tracker!</b>\n\n"
-             "Monitor whale wallets on " + chainCtx().displayName + " and get instant notifications for buys, sells and transfers.\n\n"
-             "Tap a button below to get started:";
-    return m;
+    auto msg = buildMainMenu(chatId);
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    if (lang == Lang::RU) {
+        msg.text = "🚨 <b>Добро пожаловать в Wallet Tracker!</b>\n\n"
+                 "Отслеживайте кошельки китов в сети " + chainCtx().displayName + " и получайте мгновенные уведомления о покупках, продажах и переводах.\n\n"
+                 "Нажмите кнопку ниже, чтобы начать:";
+    } else {
+        msg.text = "🚨 <b>Welcome to Wallet Tracker!</b>\n\n"
+                 "Monitor whale wallets on " + chainCtx().displayName + " and get instant notifications for buys, sells and transfers.\n\n"
+                 "Tap a button below to get started:";
+    }
+    return msg;
 }
 
-std::string buildCancelButton() {
+std::string buildCancelButton(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "❌ Cancel"}, {"callback_data", "cancel"}}
+        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
     }));
     return keyboard.dump();
 }
@@ -803,6 +816,7 @@ std::string buildCancelButton() {
 UIMessage buildWalletsList(const std::string& chatId, int page = 1) {
 
     bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
+    Lang lang = langFromCode(getUserLanguage(chatId));
 
     std::vector<std::pair<std::string, std::string>> walletRows;
     {
@@ -824,7 +838,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page = 1) {
     keyboard["inline_keyboard"] = json::array();
 
     std::stringstream text;
-    text << "💼 <b>My Wallets</b>";
+    text << tr(lang, "menu_my_wallets");
 
     constexpr int PER_PAGE = 5;
     const int total = static_cast<int>(walletRows.size());
@@ -844,7 +858,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page = 1) {
 
         if (i > startIdx) text << "━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
-        std::string shownLabel = (toLower(label) == address) ? "Wallet" : safeString(label, 32);
+        std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         TraderStats ts;
         bool hasStats = getTraderStats(address, ts);
         if (hasStats && ts.rank > 0) text << "🏆 <b>#" << ts.rank << "</b>" << status << "\n";
@@ -873,39 +887,39 @@ UIMessage buildWalletsList(const std::string& chatId, int page = 1) {
     }
 
     if (!any) {
-        text << "No wallets tracked yet.\n\n";
-        text << "Tap ➕ <b>Add Wallet</b> to start tracking.";
+        text << tr(lang, "mw_no_wallets") << "\n\n";
+        text << tr(lang, "mw_tap_add");
     } else if (!premium && total > 1) {
-        text << "ℹ️ Free plan: alerts are active only for your first wallet (🔔).\n";
-        text << "Your other wallets are saved (⏸) and will re-activate with Premium.";
+        text << tr(lang, "mw_free_notice1") << "\n";
+        text << tr(lang, "mw_free_notice2");
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
+            {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
         }));
     }
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     return {text.str(), keyboard.dump()};
 }
 
-UIMessage buildRemoveConfirm(const std::string& address, const std::string& label) {
+UIMessage buildRemoveConfirm(const std::string& address, const std::string& label, Lang lang) {
     std::stringstream text;
-    text << "🗑️ <b>Remove wallet?</b>\n\n";
+    text << tr(lang, "remove_confirm_title") << "\n\n";
     if (toLower(label) == toLower(address)) {
-        text << "💼 <b>Wallet</b>\n";
+        text << "💼 <b>" << tr(lang, "alert_wallet") << "</b>\n";
     } else {
         text << "💼 <b>" << safeString(label, 32) << "</b>\n";
     }
     text << "<code>" << safeString(address, 42) << "</code>\n\n";
-    text << "You'll stop receiving alerts for this wallet.";
+    text << tr(lang, "remove_confirm_notice");
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "🗑️ Yes, remove"}, {"callback_data", "remove:" + address}},
-        {{"text", "❌ Cancel"}, {"callback_data", "menu:my_wallets"}}
+        {{"text", tr(lang, "remove_yes")}, {"callback_data", "remove:" + address}},
+        {{"text", tr(lang, "cancel_button")}, {"callback_data", "menu:my_wallets"}}
     }));
     return {text.str(), keyboard.dump()};
 }
@@ -913,6 +927,7 @@ UIMessage buildRemoveConfirm(const std::string& address, const std::string& labe
 UIMessage buildLanguagesMenu(const std::string& chatId) {
     static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
         {"en", "🇬🇧 English"},
+        {"ru", "🇷🇺 Русский"},
     };
     std::string current = getUserLanguage(chatId);
 
@@ -932,30 +947,31 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
     return {text, keyboard.dump()};
 }
 
-UIMessage buildHelpMessage() {
+UIMessage buildHelpMessage(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
-    std::string text = "❓ <b>Help</b>\n\n";
-    text += "🏆 Discover top on-chain traders, track wallets, and receive real-time trading alerts across supported networks.\n\n";
-    text += "<b>Commands:</b>\n";
-    text += "/top — Open TOP Traders\n";
-    text += "/premium — View Premium plans\n";
-    text += "/add &lt;wallet&gt; &lt;name&gt; — Track a wallet\n";
-    text += "/remove &lt;wallet&gt; — Remove a wallet\n";
-    text += "/mywallets — My tracked wallets\n";
-    text += "/limit &lt;USD&gt; — Set minimum alert amount\n\n";
-    text += "⭐ <b>Premium</b>\n";
-    text += "• Full access to Top 100 Traders\n";
-    text += "• Track up to 50 wallets\n";
-    text += "• Advanced features\n";
-    text += "• Priority access to new updates\n\n";
-    text += "📞 Support: @WalletTrackerHelp\n";
-    text += "📢 Channel: t.me/WalletTrackerOfficial\n\n";
-    text += "Use the main menu for quick access to all features.";
+    std::string text = tr(lang, "help_title") + "\n\n";
+    text += tr(lang, "help_intro") + "\n\n";
+    text += tr(lang, "help_commands") + "\n";
+    text += tr(lang, "help_cmd_top") + "\n";
+    text += tr(lang, "help_cmd_premium") + "\n";
+    text += tr(lang, "help_cmd_add") + "\n";
+    text += tr(lang, "help_cmd_remove") + "\n";
+    text += tr(lang, "help_cmd_mywallets") + "\n";
+    text += tr(lang, "help_cmd_limit") + "\n\n";
+    text += tr(lang, "help_premium_title") + "\n";
+    text += tr(lang, "help_premium_1") + "\n";
+    text += tr(lang, "help_premium_2") + "\n";
+    text += tr(lang, "help_premium_3") + "\n";
+    text += tr(lang, "help_premium_4") + "\n\n";
+    text += tr(lang, "help_support") + "\n";
+    text += tr(lang, "help_channel") + "\n\n";
+    text += tr(lang, "help_footer");
 
     return {text, keyboard.dump()};
 }
@@ -1069,29 +1085,29 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash) {
+std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash, Lang lang) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
     std::string msg="\U0001F4BC <b>"+safeString(label)+"</b>\n\n";
-    if (res.venue == "Add Liquidity") msg+="\U0001F30A <b>ADD LIQUIDITY</b>";
-    else if (res.venue == "Remove Liquidity") msg+="\U0001F30A <b>REMOVE LIQUIDITY</b>";
-    else if (res.venue == "Collect Fees") msg+="\U0001F4B8 <b>COLLECT FEES</b>";
-    else if (res.venue == "Wrap") msg+="\U0001F504 <b>WRAP " + chainCtx().nativeSymbol + "</b>";
-    else if (res.venue == "Unwrap") msg+="\U0001F504 <b>UNWRAP " + chainCtx().nativeSymbol + "</b>";
-    else if (res.venue == "Bridge Out") msg+="\U0001F309 <b>BRIDGE OUT</b>";
-    else if (res.venue == "Bridge In") msg+="\U0001F309 <b>BRIDGE IN</b>";
-    else msg+=res.isSwap?(res.isBuy?"\U0001F7E2 <b>BUY</b>":"\U0001F6A8 <b>SELL</b>"):"\U0001F4E4 <b>TRANSFER</b>";
-    msg+="\n\U0001F4B0 Amount: <b>"+formatUsd(res.usdNanos)+"</b>\n";
-    msg+="\U0001FA99 Token: <b>"+tokenSymbol+"</b>\n";
-    msg+="\U0001F4E6 Qty: <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
+    if (res.venue == "Add Liquidity") msg+="\U0001F30A <b>" + tr(lang, "alert_add_liquidity") + "</b>";
+    else if (res.venue == "Remove Liquidity") msg+="\U0001F30A <b>" + tr(lang, "alert_remove_liquidity") + "</b>";
+    else if (res.venue == "Collect Fees") msg+="\U0001F4B8 <b>" + tr(lang, "alert_collect_fees") + "</b>";
+    else if (res.venue == "Wrap") msg+="\U0001F504 <b>" + tr(lang, "alert_wrap") + " " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Unwrap") msg+="\U0001F504 <b>" + tr(lang, "alert_unwrap") + " " + chainCtx().nativeSymbol + "</b>";
+    else if (res.venue == "Bridge Out") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_out") + "</b>";
+    else if (res.venue == "Bridge In") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_in") + "</b>";
+    else msg+=res.isSwap?(res.isBuy?"\U0001F7E2 <b>"+tr(lang,"alert_buy")+"</b>":"\U0001F6A8 <b>"+tr(lang,"alert_sell")+"</b>"):"\U0001F4E4 <b>"+tr(lang,"alert_transfer")+"</b>";
+    msg+="\n\U0001F4B0 " + tr(lang, "alert_amount") + ": <b>"+formatUsd(res.usdNanos)+"</b>\n";
+    msg+="\U0001FA99 " + tr(lang, "alert_token") + ": <b>"+tokenSymbol+"</b>\n";
+    msg+="\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
     if (res.isSwap) {
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
-        std::string priceLabel = res.isBuy ? "Buy Price" : "Sell Price";
+        std::string priceLabel = tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price");
         msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
     }
     if (res.isSwap && !res.counterAddr.empty()) {
-        std::string counterLabel = res.isBuy ? "Spent" : "Received";
+        std::string counterLabel = tr(lang, res.isBuy ? "alert_spent" : "alert_received");
         std::string counterAmountStr, counterSymbol;
         if (res.counterAddr == chainCtx().nativeMarker) {
             counterAmountStr = formatAmount(res.counterAmount, 18);
@@ -1103,10 +1119,10 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         msg += (res.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ") + counterLabel + ": <b>" +
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    if (!tokenIsNative) msg+="\U0001F4DC Contract: <code>"+safeString(res.tokenAddr)+"</code>\n";
+    if (!tokenIsNative) msg+="\U0001F4DC " + tr(lang, "alert_contract") + ": <code>"+safeString(res.tokenAddr)+"</code>\n";
     msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
-    msg+="\U0001F4BC Wallet: <b>"+safeString(label)+"</b>\n\n";
-    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">Transaction</a>";
+    msg+="\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>"+safeString(label)+"</b>\n\n";
+    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">" + tr(lang, "alert_transaction") + "</a>";
     return msg;
 }
 
@@ -1127,7 +1143,7 @@ std::mutex g_pendingMutex;
 }
 
 void dispatchAlert(const std::string& mA, const TxResult& res, const std::string& hash) {
-    std::map<std::string, std::vector<std::string>> byLabel;
+    std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
     {
         std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
         { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
@@ -1137,21 +1153,22 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
         for (auto& w : wit->second) {
             if (res.usdNanos < static_cast<cpp_int>(w.thresholdNanos)) continue;
             if (w.chatId == SERVICE_CHAT_ID) continue;
-            byLabel[w.label].push_back(w.chatId);
+            Lang lang = langFromCode(getUserLanguage(w.chatId));
+            byLabelLang[{w.label, lang}].push_back(w.chatId);
         }
     }
-    if (byLabel.empty()) return;
+    if (byLabelLang.empty()) return;
 
     bool anySent = false;
-    for (auto& [label, chatIds] : byLabel) {
-        std::string msg = buildAlertMessage(label, res, hash);
+    for (auto& [labelLang, chatIds] : byLabelLang) {
+        std::string msg = buildAlertMessage(labelLang.first, res, hash, labelLang.second);
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
-        g_stats.alerts_sent.fetch_add(byLabel.size());
+        g_stats.alerts_sent.fetch_add(byLabelLang.size());
         std::cout << "[OK] " << mA << " " << (res.isSwap?(res.isBuy?"BUY":"SELL"):"TRANSFER") << " "
                   << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
-                  << " -> " << byLabel.size() << " label group(s)" << std::endl;
+                  << " -> " << byLabelLang.size() << " label group(s)" << std::endl;
     } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
 }
 
@@ -1293,11 +1310,11 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
 
     if (action == "menu") {
         if (param == "my_wallets") return TelegramUI::buildWalletsList(chatId);
-        if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId));
-        if (param == "toptrader") { auto r = buildGlobalTopMenu(); return {r.text, r.keyboard}; }
+        if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), langFromCode(getUserLanguage(chatId)));
+        if (param == "toptrader") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
         if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
-        if (param == "help") return TelegramUI::buildHelpMessage();
+        if (param == "help") return TelegramUI::buildHelpMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
     }
     if (action == "mw_page") {
@@ -1376,9 +1393,10 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "add_wallet") {
+            Lang lang = langFromCode(getUserLanguage(chatId));
             g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
-            replyInPlace(chatId, messageId, "➕ <b>Add Wallet</b>\n\nPlease enter the wallet address (0x...):",
-                    TelegramUI::buildCancelButton());
+            replyInPlace(chatId, messageId, tr(lang, "add_wallet_title"),
+                    TelegramUI::buildCancelButton(lang));
         }
         else if (param == "my_wallets") {
             rememberView(chatId, data);
@@ -1388,12 +1406,12 @@ void handleCallbackQuery(const json& callbackQuery) {
         else if (param == "alert_threshold") {
             rememberView(chatId, data);
             uint64_t threshold = getUserThresholdNanos(chatId);
-            auto msg = TelegramUI::buildAlertThresholdMenu(threshold);
+            auto msg = TelegramUI::buildAlertThresholdMenu(threshold, langFromCode(getUserLanguage(chatId)));
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "toptrader") {
             rememberView(chatId, data);
-            auto msg = buildGlobalTopMenu();
+            auto msg = buildGlobalTopMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "premium") {
@@ -1413,7 +1431,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
         else if (param == "help") {
             rememberView(chatId, data);
-            auto msg = TelegramUI::buildHelpMessage();
+            auto msg = TelegramUI::buildHelpMessage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
@@ -1425,7 +1443,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "lang") {
-        static const std::set<std::string> SUPPORTED_LANGS = {"en"};
+        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
             rememberView(chatId, "menu:languages");
@@ -1449,6 +1467,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     }
     else if (action == "wstats") {
         rememberView(chatId, data);
+        Lang lang = langFromCode(getUserLanguage(chatId));
         std::string address = toLower(param);
         std::string wlabel = address;
         {
@@ -1463,23 +1482,23 @@ void handleCallbackQuery(const json& callbackQuery) {
         TraderStats ts;
         bool hasStats = getTraderStats(address, ts);
         std::stringstream card;
-        card << "📊 <b>Wallet Statistics</b>\n\n";
-        if (hasStats && ts.rank > 0) card << "🏆 Rank: <b>#" << ts.rank << "</b>\n";
-        else card << "🏆 Rank: <b>—</b> (not in 30D ranking)\n";
+        card << tr(lang, "ws_title") << "\n\n";
+        if (hasStats && ts.rank > 0) card << "🏆 " << tr(lang, "ws_rank") << ": <b>#" << ts.rank << "</b>\n";
+        else card << "🏆 " << tr(lang, "ws_rank") << ": <b>—</b> " << tr(lang, "ws_not_in_ranking") << "\n";
         card << "👤 <b>" << safeString(wlabel, 32) << "</b>\n";
         if (hasStats && ts.rank > 0) {
             card << "💰 PnL: <b>" << fmtPnlSigned(ts.pnlNanos) << "</b>\n";
             card << "📈 ROI: <b>" << fmtPctSigned(ts.roiPercent) << "</b>\n";
-            card << "🎯 Win Rate: <b>" << ts.winRatePercent << "%</b>\n";
+            card << "🎯 " << tr(lang, "ws_winrate") << ": <b>" << ts.winRatePercent << "%</b>\n";
         }
-        card << "🔄 Trades (30D): <b>" << ts.trades << "</b>\n";
+        card << "🔄 " << tr(lang, "ws_trades_30d") << ": <b>" << ts.trades << "</b>\n";
         if (ts.lastTs > 0) {
             time_t t = static_cast<time_t>(ts.lastTs);
             char buf[32];
             strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M UTC", gmtime(&t));
-            card << "📅 Last trade: <b>" << buf << "</b>\n";
+            card << "📅 " << tr(lang, "ws_last_trade") << ": <b>" << buf << "</b>\n";
         } else {
-            card << "📅 Last trade: <b>—</b>\n";
+            card << "📅 " << tr(lang, "ws_last_trade") << ": <b>—</b>\n";
         }
         card << "\n<code>" << safeString(address, 42) << "</code>";
         json kb;
@@ -1488,14 +1507,15 @@ void handleCallbackQuery(const json& callbackQuery) {
             {{"text", "🔗 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + address}}
         }));
         kb["inline_keyboard"].push_back(json::array({
-            {{"text", "← Back"}, {"callback_data", "menu:my_wallets"}}
+            {{"text", tr(lang, "back_button")}, {"callback_data", "menu:my_wallets"}}
         }));
         replyInPlace(chatId, messageId, card.str(), kb.dump());
     }
     else if (action == "rename") {
         std::string address = toLower(param);
+        Lang lang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
+            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), "");
             return;
         }
 
@@ -1505,7 +1525,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             "SELECT uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? AND wa.address = ?")) {
-            replyInPlace(chatId, messageId, "❌ Error loading wallet.", "");
+            replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), "");
             return;
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
@@ -1516,17 +1536,17 @@ void handleCallbackQuery(const json& callbackQuery) {
             sqlite3_finalize(s);
 
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address);
-            replyInPlace(chatId, messageId, "✏️ <b>Rename Wallet</b>\n\nCurrent name: <b>" + safeString(currentLabel, 32) +
-                    "</b>\n\nPlease enter a new name:", TelegramUI::buildCancelButton());
+            replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
+                    "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
         } else {
             sqlite3_finalize(s);
-            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.", "");
+            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), "");
         }
     }
     else if (action == "askremove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
+            replyInPlace(chatId, messageId, tr(langFromCode(getUserLanguage(chatId)), "err_invalid_address"), "");
             return;
         }
         std::string label = address;
@@ -1543,28 +1563,29 @@ void handleCallbackQuery(const json& callbackQuery) {
                 sqlite3_finalize(s);
             }
         }
-        auto msg = TelegramUI::buildRemoveConfirm(address, label);
+        auto msg = TelegramUI::buildRemoveConfirm(address, label, langFromCode(getUserLanguage(chatId)));
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "remove") {
         std::string address = toLower(param);
+        Lang lang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Invalid wallet address.", true);
-            replyInPlace(chatId, messageId, "❌ Invalid wallet address.", "");
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_invalid_address"), true);
+            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), "");
             return;
         }
 
         bool removed = removeUserWhale(chatId, address);
         if (removed) {
             refreshWatchers();
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "✅ Wallet removed", false);
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "toast_wallet_removed"), false);
             if (!navigateBack(chatId, messageId)) {
                 auto msg = TelegramUI::buildWalletsList(chatId);
                 replyInPlace(chatId, messageId, msg.text, msg.keyboard);
             }
         } else {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Wallet not found in your list.", true);
-            replyInPlace(chatId, messageId, "❌ Wallet not found in your list.", "");
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
+            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), "");
         }
     }
     else if (action == "threshold") {
@@ -1580,22 +1601,23 @@ void handleCallbackQuery(const json& callbackQuery) {
     }
     else if (action == "tt_track") {
         std::string address = toLower(param);
+        Lang trackLang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "❌ Invalid address.", true);
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_invalid_address"), true);
         }
         else if (isTrackingWallet(chatId, address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, "✅ Already tracking", true);
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_already_tracking"), true);
         }
         else if (chatId != SERVICE_CHAT_ID && countUserWhales(chatId) >= premiumMaxWallets(chatId)) {
             std::string feedback = isPremium(chatId)
-                ? "⚠️ Wallet limit reached (50)"
-                : "⚠️ Free plan allows tracking only 1 wallet. Upgrade to Premium — tap ⭐ Premium in the menu.";
+                ? tr(trackLang, "wallet_limit_50_short")
+                : tr(trackLang, "free_plan_1_wallet");
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
         }
         else {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
             g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address);
-            replyInPlace(chatId, messageId, "🏷 Enter a name for this trader:", TelegramUI::buildCancelButton());
+            replyInPlace(chatId, messageId, tr(trackLang, "track_name_prompt"), TelegramUI::buildCancelButton(trackLang));
         }
     }
     else if (action == "tt_noop") {
@@ -1627,15 +1649,14 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "gt_token") {
+        Lang lang = langFromCode(getUserLanguage(chatId));
         g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
 
         replyInPlace(
             chatId,
             messageId,
-            "🪙 <b>Top PnL by Token</b>\n\n"
-            "Enter a token symbol (e.g. <code>CAKE</code>) "
-            "or a contract address (<code>0x...</code>):",
-            TelegramUI::buildCancelButton()
+            tr(lang, "token_search_prompt"),
+            TelegramUI::buildCancelButton(lang)
         );
     }
 }
@@ -1649,31 +1670,33 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
     if (session.state == UserState::AWAITING_WALLET_ADDRESS) {
         std::string address = toLower(trim(text));
+        Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (!isValidAddress(address)) {
-            sendMsg(chatId, "❌ Invalid BSC address.\n\nPlease enter a valid address or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "add_wallet_invalid"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
         g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_NAME, address);
-        sendMsg(chatId, "✅ Address accepted.\n\nNow enter a name for this wallet (e.g., \"Binance\"):",
-                TelegramUI::buildCancelButton());
+        sendMsg(chatId, tr(lang, "add_wallet_addr_ok"),
+                TelegramUI::buildCancelButton(lang));
         return true;
     }
 
     if (session.state == UserState::AWAITING_WALLET_NAME) {
         std::string label = trim(text);
+        Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (label.empty()) {
-            sendMsg(chatId, "❌ Name cannot be empty.\n\nPlease enter a name or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "err_name_empty"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
         if (label.length() > 32) {
-            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
@@ -1683,28 +1706,27 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
             refreshWatchers();
             g_sessionManager.clearSession(chatId);
             auto msg = TelegramUI::buildMainMenu(chatId);
-            sendMsg(chatId, "✅ <b>Wallet added</b>\n\nName: <b>" + safeString(label, 32) +
-                    "</b>\nAddress: <code>" + session.pendingAddress + "</code>\n\nTracking enabled.\n\n" + msg.text,
+            sendMsg(chatId, tr(lang, "add_wallet_success") + "\n\n" + tr(lang, "add_wallet_name_label") + " <b>" + safeString(label, 32) +
+                    "</b>\n" + tr(lang, "add_wallet_address_label") + " <code>" + session.pendingAddress + "</code>\n\n" + tr(lang, "add_wallet_tracking_enabled") + "\n\n" + msg.text,
                     msg.keyboard);
         }
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
             g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
-            sendMsg(chatId, "⚠️ You're already tracking this wallet.\n\nPlease enter a different address or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "already_tracking_retry"),
+                    TelegramUI::buildCancelButton(lang));
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
             if (isPremium(chatId)) {
                 auto msg = TelegramUI::buildMainMenu(chatId);
-                sendMsg(chatId, "⚠️ You've reached the limit of 50 tracked wallets.\n\n" + msg.text, msg.keyboard);
+                sendMsg(chatId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
             } else {
-
-                auto lim = buildWalletLimitMessage();
+                auto lim = buildWalletLimitMessage(lang);
                 sendMsg(chatId, lim.text, lim.keyboard);
             }
         }
         else {
-            sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "generic_error_retry"), TelegramUI::buildCancelButton(lang));
         }
 
         return true;
@@ -1719,8 +1741,9 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         }
 
         if (label.length() > 32) {
-            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
@@ -1728,45 +1751,49 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
         if (result == AddWhaleResult::OK) {
             refreshWatchers();
+            Lang lang = langFromCode(getUserLanguage(chatId));
             std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-            sendMsg(chatId, "✅ Wallet \"" + safeString(label, 32) + "\" is now being tracked.\n\n" + msg.text, msg.keyboard);
+            sendMsg(chatId, tr(lang, "track_now_tracked") + " \"" + safeString(label, 32) + "\" " + tr(lang, "track_now_tracked_suffix") + "\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
+            Lang lang = langFromCode(getUserLanguage(chatId));
             std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-            sendMsg(chatId, "⚠️ You're already tracking this wallet.\n\n" + msg.text, msg.keyboard);
+            sendMsg(chatId, tr(lang, "already_tracking") + "\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
+            Lang lang = langFromCode(getUserLanguage(chatId));
             if (isPremium(chatId)) {
                 auto msg = TelegramUI::buildMainMenu(chatId);
-                sendMsg(chatId, "⚠️ You've reached the limit of 50 tracked wallets.\n\n" + msg.text, msg.keyboard);
+                sendMsg(chatId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
             } else {
-                auto lim = buildWalletLimitMessage();
+                auto lim = buildWalletLimitMessage(lang);
                 sendMsg(chatId, lim.text, lim.keyboard);
             }
         }
         else {
-            sendMsg(chatId, "❌ Something went wrong, please try again.", TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(langFromCode(getUserLanguage(chatId)), "generic_error_retry"), TelegramUI::buildCancelButton(langFromCode(getUserLanguage(chatId))));
         }
         return true;
     }
 
     if (session.state == UserState::AWAITING_RENAME) {
         std::string newLabel = trim(text);
+        Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (newLabel.empty()) {
-            sendMsg(chatId, "❌ Name cannot be empty.\n\nPlease enter a name or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "err_name_empty"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
         if (newLabel.length() > 32) {
-            sendMsg(chatId, "❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
@@ -1788,7 +1815,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         std::string back = getLastView(chatId);
         g_sessionManager.clearSession(chatId);
         auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-        sendMsg(chatId, "✅ <b>Wallet renamed</b>\n\nNew name: <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
+        sendMsg(chatId, tr(lang, "rename_success") + "\n\n" + tr(lang, "rename_new_name") + " <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
                 msg.keyboard);
         return true;
     }
@@ -1798,10 +1825,11 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
     if (session.state == UserState::AWAITING_TOPTRADER_TOKEN) {
         std::string tokenArg = trim(text);
+        Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (tokenArg.empty()) {
-            sendMsg(chatId, "❌ Please enter a token symbol or contract address, or press Cancel.",
-                    TelegramUI::buildCancelButton());
+            sendMsg(chatId, tr(lang, "token_search_empty"),
+                    TelegramUI::buildCancelButton(lang));
             return true;
         }
 
@@ -1945,7 +1973,7 @@ void telegramLoop() {
                         }
                     }
                     else if (txt=="/help") {
-                        auto msg = TelegramUI::buildHelpMessage();
+                        auto msg = TelegramUI::buildHelpMessage(cid);
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
                     else if (txt=="/premium") {
@@ -1954,56 +1982,65 @@ void telegramLoop() {
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
                     else if (txt.find("/add ")==0) {
+                        Lang lang = langFromCode(getUserLanguage(cid));
                         size_t p1=txt.find(' '),p2=txt.find(' ',p1+1);
-                        if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,"❌ Usage: /add 0x... Name"); }
+                        if (p1==std::string::npos||p2==std::string::npos) { sendMsg(cid,tr(lang, "cmd_add_usage")); }
                         else {
                             std::string addr=toLower(trim(txt.substr(p1+1,p2-p1-1)));
                             std::string label=trim(txt.substr(p2+1));
                             if (label.empty() || label == "-" || label == "." || toLower(label) == addr) label = shortAddress(addr);
-                            if (label.length() > 32) { sendMsg(cid,"❌ Name is too long (max 32 characters)"); }
+                            if (label.length() > 32) { sendMsg(cid,tr(lang, "cmd_add_name_too_long")); }
                             else {
                             auto res=addUserWhale(cid,addr,label);
                             switch (res) {
-                                case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,"✅ Wallet added: "+safeString(label)); break;
-                                case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,"⚠️ You're already tracking this wallet"); break;
+                                case AddWhaleResult::OK: refreshWatchers(); sendMsg(cid,tr(lang, "cmd_add_wallet_added")+" "+safeString(label)); break;
+                                case AddWhaleResult::ALREADY_EXISTS: sendMsg(cid,tr(lang, "already_tracking")); break;
                                 case AddWhaleResult::LIMIT_REACHED: {
-                                    if (isPremium(cid)) sendMsg(cid,"⚠️ You've reached the limit of 50 tracked wallets");
-                                    else { auto lim = buildWalletLimitMessage(); sendMsg(cid, lim.text, lim.keyboard); }
+                                    if (isPremium(cid)) sendMsg(cid,tr(lang, "limit_50_reached"));
+                                    else { auto lim = buildWalletLimitMessage(lang); sendMsg(cid, lim.text, lim.keyboard); }
                                     break;
                                 }
-                                case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,"❌ That doesn't look like a valid address (expected 0x + 40 hex characters)"); break;
-                                case AddWhaleResult::ERROR: sendMsg(cid,"❌ Something went wrong, please try again"); break;
+                                case AddWhaleResult::BAD_ADDRESS: sendMsg(cid,tr(lang, "cmd_add_bad_address")); break;
+                                case AddWhaleResult::ERROR: sendMsg(cid,tr(lang, "generic_error_retry")); break;
                             }
                             }
                         }
                     }
                     else if (txt.find("/remove ")==0) {
+                        Lang lang = langFromCode(getUserLanguage(cid));
                         std::string a=toLower(trim(txt.substr(8)));
                         bool removed=removeUserWhale(cid,a);
-                        if (removed) { refreshWatchers(); sendMsg(cid,"✅ Wallet removed"); }
-                        else sendMsg(cid,"⚠️ Address not found in your list. Check /mywallets");
+                        if (removed) { refreshWatchers(); sendMsg(cid,tr(lang, "cmd_remove_removed")); }
+                        else sendMsg(cid,tr(lang, "cmd_remove_not_found"));
                     }
                     else if (txt.find("/limit ")==0) {
+                        Lang lang = langFromCode(getUserLanguage(cid));
                         try { double v=std::stod(txt.substr(7));
-                            if (v<0) { sendMsg(cid,"❌ Threshold must be positive"); }
-                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,"✅ Threshold set to $"+formatThousands(static_cast<uint64_t>(v))); }
-                        } catch (...) { sendMsg(cid,"❌ Usage: /limit 5000"); }
+                            if (v<0) { sendMsg(cid,tr(lang, "cmd_limit_positive")); }
+                            else { setUserThreshold(cid,v); refreshWatchers(); sendMsg(cid,tr(lang, "cmd_limit_set")+formatThousands(static_cast<uint64_t>(v))); }
+                        } catch (...) { sendMsg(cid,tr(lang, "cmd_limit_usage")); }
                     }
                     else if (txt.find("/language")==0) {
-                        std::string rest = trim(txt.substr(9));
-                        if (rest.empty()) { sendMsg(cid,"❌ Usage: /language en"); }
-                        else { setUserLanguage(cid,toLower(rest)); sendMsg(cid,"✅ Language preference saved (message translation coming in a future version — alerts are currently in English)."); }
+                        std::string rest = toLower(trim(txt.substr(9)));
+                        static const std::set<std::string> SUPPORTED_LANGS_CMD = {"en", "ru"};
+                        if (rest.empty() || !SUPPORTED_LANGS_CMD.count(rest)) {
+                            sendMsg(cid,tr(langFromCode(getUserLanguage(cid)), "cmd_language_usage"));
+                        } else {
+                            setUserLanguage(cid,rest);
+                            auto msg = TelegramUI::buildMainMenu(cid);
+                            sendMsg(cid, "✅ " + tr(langFromCode(rest), "menu_languages") + "\n\n" + msg.text, msg.keyboard);
+                        }
                     }
                     else if (txt=="/mywallets") {
                         auto wmsg = TelegramUI::buildWalletsList(cid);
                         sendMsg(cid, wmsg.text, wmsg.keyboard);
                     }
                     else if (txt=="/top") {
-                        auto msg = buildGlobalTopMenu();
+                        auto msg = buildGlobalTopMenu(cid);
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
                     else {
-                        sendMsg(cid, "🤔 Unknown command. Try /help or use the menu below.");
+                        sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "unknown_command"));
                         auto msg = TelegramUI::buildMainMenu(cid);
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
