@@ -45,7 +45,7 @@ struct TraderStats {
 
 bool getTraderStats(const std::string& wallet, TraderStats& out);
 
-RankingMessage buildGlobalTopMenu();
+RankingMessage buildGlobalTopMenu(const std::string& chatId);
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
                                      int maxRank, bool showUpgrade);
