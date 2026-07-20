@@ -30,8 +30,6 @@ const std::unordered_map<std::string, Entry>& table() {
         {"alert_contract", {"Contract", "Контракт"}},
         {"alert_wallet", {"Wallet", "Кошелёк"}},
         {"alert_transaction", {"Transaction", "Транзакция"}},
-        {"alert_transactions_count", {"Transactions", "Транзакций"}},
-        {"alert_first_transaction", {"First transaction", "Первая транзакция"}},
 
         {"menu_title", {"🚨 <b>Wallet Tracker</b>", "🚨 <b>Wallet Tracker</b>"}},
         {"menu_add_wallet", {"➕ Add Wallet", "➕ Добавить кошелёк"}},
@@ -212,8 +210,6 @@ const std::unordered_map<std::string, Entry>& table() {
         {"rename_enter_new", {"Please enter a new name:", "Введите новое имя:"}},
         {"rename_success", {"✅ <b>Wallet renamed</b>", "✅ <b>Кошелёк переименован</b>"}},
         {"rename_new_name", {"New name:", "Новое имя:"}},
-        {"rename_save_failed", {"❌ Failed to save the new name. Please try again.",
-                                "❌ Не удалось сохранить новое имя. Попробуйте ещё раз."}},
         {"err_name_empty", {"❌ Name cannot be empty.\n\nPlease enter a name or press Cancel.",
                             "❌ Имя не может быть пустым.\n\nВведите имя или нажмите Отмена."}},
         {"err_name_too_long", {"❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
