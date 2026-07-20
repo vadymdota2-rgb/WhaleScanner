@@ -27,6 +27,13 @@ bool prepareOrLog(sqlite3* db, sqlite3_stmt** stmt, const char* sql) {
     return true;
 }
 
+bool stepDoneOrLog(sqlite3* db, sqlite3_stmt* stmt, const char* operation) {
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) return true;
+    std::cerr << "[DB] " << operation << " failed (rc=" << rc << "): " << sqlite3_errmsg(db) << std::endl;
+    return false;
+}
+
 std::string escapeHtml(const std::string& s) {
     std::string r; r.reserve(s.size() + 16);
     for (char c : s) {
