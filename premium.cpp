@@ -7,6 +7,9 @@
 #include <iostream>
 #include <sstream>
 #include "utils.h"
+#include "ru.h"
+
+std::string getUserLanguage(const std::string& chatId);
 
 using json = nlohmann::json;
 
@@ -212,15 +215,15 @@ int premiumTopTradersLimit(const std::string& chatId) {
 }
 
 PremiumMessage buildPremiumPage(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
 
     if (!g_serviceChatId.empty() && chatId == g_serviceChatId) {
         json kb;
         kb["inline_keyboard"] = json::array();
         kb["inline_keyboard"].push_back(json::array({
-            {{"text", "← Back"}, {"callback_data", "menu:main"}}
+            {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
         }));
-        return {"⭐ <b>Premium Active</b>\n\n"
-                "Service account — Premium access is permanent.", kb.dump()};
+        return {tr(lang, "pr_active_title") + "\n\n" + tr(lang, "pr_service_account"), kb.dump()};
     }
 
     json keyboard;
@@ -231,64 +234,65 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
     std::stringstream text;
     if (active) {
         long long expire = premiumExpireTs(chatId);
-        text << "⭐ <b>Premium Active</b>\n\n"
-             << "Your subscription is active.\n\n"
-             << "<b>Valid until:</b>\n"
+        text << tr(lang, "pr_active_title") << "\n\n"
+             << tr(lang, "pr_subscription_active") << "\n\n"
+             << tr(lang, "pr_valid_until") << "\n"
              << formatDateDDMMYYYY(expire);
 
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", "🔄 Renew Premium"}, {"callback_data", "premium_buy"}}
+            {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
         }));
     } else {
-        text << "⭐ <b>Wallet Tracker Premium</b>\n\n"
-             << "Unlock the full potential of Wallet Tracker.\n\n"
-             << "<b>Premium includes:</b>\n"
-             << "✅ Track up to 50 wallets\n"
-             << "✅ Access Top 100 Traders\n"
-             << "(Top 10 available for free)\n\n"
-             << "<b>Subscription:</b>\n30 Days\n\n"
-             << "<b>Price:</b>\n⭐ " << PREMIUM_PRICE_STARS << " Stars";
+        text << tr(lang, "pr_title") << "\n\n"
+             << tr(lang, "pr_unlock") << "\n\n"
+             << tr(lang, "pr_includes") << "\n"
+             << tr(lang, "pr_50_wallets") << "\n"
+             << tr(lang, "pr_top100") << "\n"
+             << tr(lang, "pr_top10_free") << "\n\n"
+             << tr(lang, "pr_subscription_label") << "\n\n"
+             << tr(lang, "pr_price_label") << "\n⭐ " << PREMIUM_PRICE_STARS << " Stars";
 
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", "⭐ Buy Premium"}, {"callback_data", "premium_buy"}}
+            {{"text", tr(lang, "pr_buy")}, {"callback_data", "premium_buy"}}
         }));
     }
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     return {text.str(), keyboard.dump()};
 }
 
-PremiumMessage buildWalletLimitMessage() {
+PremiumMessage buildWalletLimitMessage(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "⭐ Upgrade to Premium"}, {"callback_data", "menu:premium"}}
+        {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", "← Back"}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     std::string text =
-        "⚠️ <b>Wallet limit reached</b>\n\n"
-        "Free plan allows tracking only 1 wallet.\n\n"
-        "Upgrade to Premium to track up to 50 wallets.";
+        tr(lang, "pr_limit_title") + "\n\n" +
+        tr(lang, "pr_limit_free") + "\n\n" +
+        tr(lang, "pr_limit_upgrade");
     return {text, keyboard.dump()};
 }
 
 bool sendPremiumInvoice(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
 
     json j;
     j["chat_id"] = chatId;
-    j["title"] = "Wallet Tracker Premium";
-    j["description"] = "30-Day Premium Subscription";
+    j["title"] = tr(lang, "invoice_title");
+    j["description"] = tr(lang, "invoice_description");
     j["payload"] = PREMIUM_PAYLOAD;
     j["provider_token"] = "";
     j["currency"] = "XTR";
     j["prices"] = json::array();
-    j["prices"].push_back({{"label", "Premium (30 Days)"},
+    j["prices"].push_back({{"label", tr(lang, "invoice_price_label")},
                            {"amount", PREMIUM_PRICE_STARS}});
 
     auto r = http(apiUrl("sendInvoice"), j.dump(), 10);
@@ -307,6 +311,11 @@ void handlePreCheckoutQuery(const json& q) {
     if (!q.is_object() || !q.contains("id") || !q["id"].is_string()) return;
 
     std::string payload = q.value("invoice_payload", "");
+    Lang lang = Lang::EN;
+    if (q.contains("from") && q["from"].is_object() && q["from"].contains("id")) {
+        std::string buyerChatId = std::to_string(q["from"]["id"].get<long long>());
+        lang = langFromCode(getUserLanguage(buyerChatId));
+    }
 
     json a;
     a["pre_checkout_query_id"] = q["id"].get<std::string>();
@@ -314,7 +323,7 @@ void handlePreCheckoutQuery(const json& q) {
         a["ok"] = true;
     } else {
         a["ok"] = false;
-        a["error_message"] = "Unknown product. Please try again.";
+        a["error_message"] = tr(lang, "invoice_unknown_product");
         std::cerr << "[PREMIUM] pre_checkout with unknown payload: "
                   << payload << std::endl;
     }
