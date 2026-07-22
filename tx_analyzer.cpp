@@ -754,23 +754,87 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                     if (!e.to.empty()) perAddr[e.to][token] += e.amount;
                     if (!e.from.empty()) perAddr[e.from][token] -= e.amount;
                 }
-            std::string out;
-            int listed = 0;
-            for (const auto& [token, edges] : graph) {
-                std::string bestAddr; cpp_int bestNet = 0;
-                for (const auto& [addr, flows] : perAddr) {
-                    if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
-                        swapPools.count(addr) || addr == txTo) continue;
-                    auto it = flows.find(token);
-                    if (it != flows.end() && it->second > bestNet) { bestNet = it->second; bestAddr = addr; }
+
+            // --- Vault-flow attribution ---
+            // Паттерн: кошелёк вызывает контракт-исполнитель (напр. MEV/арбитражный бот,
+            // платящий "Puissant: Payment" за приоритет включения в блок), а реальный
+            // своп проходит через ОДИН выделенный вспомогательный адрес ("vault"),
+            // который сам кошельком не является. Если такой адрес единственный и имеет
+            // явную покупку одного токена за счёт другого - считаем это свопом кошелька,
+            // но помечаем отдельным venue, чтобы не путать с прямыми свопами.
+            std::string vaultAddr;
+            int vaultCandidates = 0;
+            for (const auto& [addr, flows] : perAddr) {
+                if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
+                    swapPools.count(addr) || addr == txTo) continue;
+                bool hasPos = false, hasNeg = false;
+                for (const auto& [token, amt] : flows) {
+                    if (amt > 0) hasPos = true;
+                    if (amt < 0) hasNeg = true;
                 }
-                if (!bestAddr.empty() && listed < 5) {
-                    if (!out.empty()) out += ";";
-                    out += token + ":" + bestAddr + ":" + bestNet.convert_to<std::string>();
-                    ++listed;
+                if (hasPos && hasNeg) { vaultAddr = addr; ++vaultCandidates; }
+            }
+
+            bool vaultAttributed = false;
+            if (vaultCandidates == 1 && !vaultAddr.empty()) {
+                const auto& vFlow = perAddr.at(vaultAddr);
+                std::string vMainToken; cpp_int vMainNet = 0; cpp_int vMainAbs = 0;
+                FlowRank vMainRank; bool vMainSet = false;
+                for (const auto& [token, amt] : vFlow) {
+                    if (isBaseAsset(token) || amt == 0) continue;
+                    const FlowRank candidateRank = rankFlow(token, amt);
+                    if (!vMainSet || betterRank(candidateRank, vMainRank)) {
+                        vMainSet = true; vMainToken = token; vMainNet = amt;
+                        vMainAbs = absInt(amt); vMainRank = candidateRank;
+                    }
+                }
+                if (vMainSet) {
+                    std::string vCounter; cpp_int vCounterAbs = 0; FlowRank vCounterRank; bool vCounterSet = false;
+                    for (const auto& [token, amt] : vFlow) {
+                        if (token == vMainToken || amt == 0) continue;
+                        const bool opposite = (vMainNet > 0 && amt < 0) || (vMainNet < 0 && amt > 0);
+                        if (!opposite) continue;
+                        const FlowRank candidateRank = rankFlow(token, amt);
+                        if (!vCounterSet || betterRank(candidateRank, vCounterRank)) {
+                            vCounterSet = true; vCounter = token; vCounterAbs = absInt(amt); vCounterRank = candidateRank;
+                        }
+                    }
+                    if (vCounterSet) {
+                        r.isSwap = true;
+                        r.dexActivityDetected = true;
+                        r.tokenAddr = vMainToken;
+                        r.rawAmount = vMainAbs;
+                        r.isBuy = vMainNet > 0;
+                        r.counterAddr = vCounter;
+                        r.counterAmount = vCounterAbs;
+                        r.venue = "Bot Trade";
+                        r.diagnosticReason = "VAULT_FLOW_ATTRIBUTED";
+                        const int dec = getDecimals(r.tokenAddr);
+                        r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
+                        vaultAttributed = true;
+                    }
                 }
             }
-            r.flowBeneficiaries = out;
+
+            if (!vaultAttributed) {
+                std::string out;
+                int listed = 0;
+                for (const auto& [token, edges] : graph) {
+                    std::string bestAddr; cpp_int bestNet = 0;
+                    for (const auto& [addr, flows] : perAddr) {
+                        if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
+                            swapPools.count(addr) || addr == txTo) continue;
+                        auto it = flows.find(token);
+                        if (it != flows.end() && it->second > bestNet) { bestNet = it->second; bestAddr = addr; }
+                    }
+                    if (!bestAddr.empty() && listed < 5) {
+                        if (!out.empty()) out += ";";
+                        out += token + ":" + bestAddr + ":" + bestNet.convert_to<std::string>();
+                        ++listed;
+                    }
+                }
+                r.flowBeneficiaries = out;
+            }
         } else {
             r.unknownReason = "NO_WALLET_FLOW";
         }
