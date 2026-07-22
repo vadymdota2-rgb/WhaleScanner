@@ -872,6 +872,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
     else if (res.venue == "Unwrap") msg+="\U0001F504 <b>" + tr(lang, "alert_unwrap") + " " + chainCtx().nativeSymbol + "</b>";
     else if (res.venue == "Bridge Out") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_out") + "</b>";
     else if (res.venue == "Bridge In") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_in") + "</b>";
+    else if (res.venue == "Arbitrage") msg+="\u267B\uFE0F <b>" + tr(lang, "alert_arbitrage") + "</b>";
     else msg+=res.isSwap?(res.isBuy?"\U0001F7E2 <b>"+tr(lang,"alert_buy")+"</b>":"\U0001F6A8 <b>"+tr(lang,"alert_sell")+"</b>"):"\U0001F4E4 <b>"+tr(lang,"alert_transfer")+"</b>";
     msg+="\n\U0001F4B0 " + tr(lang, "alert_amount") + ": <b>"+formatUsd(res.usdNanos)+"</b>\n";
     msg+="\U0001FA99 " + tr(lang, "alert_token") + ": <b>"+tokenSymbol+"</b>\n";
