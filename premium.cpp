@@ -366,10 +366,12 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
     std::stringstream text;
     if (active) {
         long long expire = premiumExpireTs(chatId);
+        long long secsLeft = expire - static_cast<long long>(time(nullptr));
+        long long daysLeft = secsLeft > 0 ? (secsLeft + 86399LL) / 86400LL : 0;
         text << tr(lang, "pr_active_title") << "\n\n"
-             << tr(lang, "pr_subscription_active") << "\n\n"
-             << tr(lang, "pr_valid_until") << "\n"
-             << formatDateDDMMYYYY(expire);
+             << tr(lang, "pr_valid_until_inline") << " <b>" << formatDateDDMMYYYY(expire)
+             << "</b> (" << tr(lang, "pr_days_left") << " " << daysLeft << ")\n\n"
+             << tr(lang, "pr_active_benefits");
 
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
