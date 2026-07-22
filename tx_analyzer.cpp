@@ -799,7 +799,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                             vCounterSet = true; vCounter = token; vCounterAbs = absInt(amt); vCounterRank = candidateRank;
                         }
                     }
-                    if (vCounterSet) {
+                    const bool vMainPoolLinked = vCounterSet &&
+                        flowLinkedToPool(graph, vMainToken, vaultAddr, swapPools, true);
+                    const bool vCounterPoolLinked = vCounterSet &&
+                        flowLinkedToPool(graph, vCounter, vaultAddr, swapPools, false);
+                    if (vCounterSet && vMainPoolLinked && vCounterPoolLinked) {
                         r.isSwap = true;
                         r.dexActivityDetected = true;
                         r.tokenAddr = vMainToken;
