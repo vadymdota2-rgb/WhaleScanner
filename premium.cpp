@@ -381,10 +381,9 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
              << tr(lang, "pr_unlock") << "\n\n"
              << tr(lang, "pr_includes") << "\n"
              << tr(lang, "pr_50_wallets") << "\n"
-             << tr(lang, "pr_top100") << "\n"
-             << tr(lang, "pr_top10_free") << "\n\n"
-             << tr(lang, "pr_subscription_label") << "\n\n"
-             << tr(lang, "pr_price_label") << "\n⭐ " << PREMIUM_PRICE_STARS << " Stars";
+             << tr(lang, "pr_top100") << "\n\n"
+             << tr(lang, "pr_subscription_label") << " · "
+             << tr(lang, "pr_price_label") << " ⭐ " << PREMIUM_PRICE_STARS << " Stars";
 
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "pr_buy")}, {"callback_data", "premium_buy"}}
