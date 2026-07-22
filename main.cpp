@@ -31,6 +31,7 @@
 #include "premium.h"
 #include "message_queue.h"
 #include "tx_analyzer.h"
+#include "beneficiary_stats.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -1033,7 +1034,7 @@ bool processBlock(long long bn) {
         recordCoverage(res, svcOnly);
         checkInvariants(hash, res);
         if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
-        if (res.venue == "DEX interaction") logBeneficiaries(hash, tx, res);
+        if (res.venue == "DEX interaction") { logBeneficiaries(hash, tx, res); recordBeneficiarySignal(tx, res); }
         if (res.isSwap && (res.venue.empty() || res.venue == "DEX Pool" || res.venue == "DEX" || res.venue == "Universal Router")) logLowConfidenceTx(hash, bn, tx, receipt, res);
 
         if (res.tokenAddr.empty()) { markTxProcessed(hash,bn); continue; }
@@ -1207,8 +1208,9 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "cancel") {
         g_sessionManager.clearSession(chatId);
         if (!navigateBack(chatId, messageId)) {
+            Lang lang = langFromCode(getUserLanguage(chatId));
             auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, "❌ Operation cancelled.\n\n" + msg.text, msg.keyboard);
+            replyInPlace(chatId, messageId, tr(lang, "op_cancelled") + "\n\n" + msg.text, msg.keyboard);
         }
     }
     else if (action == "lang") {
@@ -1224,7 +1226,7 @@ void handleCallbackQuery(const json& callbackQuery) {
 
         if (!sendPremiumInvoice(chatId)) {
             replyInPlace(chatId, messageId,
-                "❌ Could not create the invoice. Please try again later.", "");
+                tr(langFromCode(getUserLanguage(chatId)), "err_invoice_failed"), "");
         }
     }
     else if (action == "mw_page" || action == "wstats" || action == "rename" ||
@@ -1382,7 +1384,7 @@ void telegramLoop() {
                         }
 
                         if (countUsers() >= MAX_USERS && isNewUser) {
-                            sendMsg(cid, "⚠️ User limit reached. Please try again later.");
+                            sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
                             ensureUser(cid);
                             if (isNewUser) {
@@ -1464,6 +1466,8 @@ void telegramLoop() {
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
                         }
+                    }
+                    else if (handleBeneficiaryCommand(cid, txt)) {
                     }
                     else {
                         sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "unknown_command"));
