@@ -60,6 +60,7 @@ struct Stats {
     std::atomic<uint64_t> diag_native_counter{0};
     std::atomic<uint64_t> diag_native_unwrap{0};
     std::atomic<uint64_t> diag_native_refund{0};
+    std::atomic<uint64_t> diag_vault_flow_attributed{0};
 } g_stats;
 
 struct CoverageSet {
@@ -95,6 +96,7 @@ void recordCoverage(const TxResult& r, bool serviceOnly) {
     else if (r.diagnosticReason == "NATIVE_COUNTER_REQUIRES_TRACE") g_stats.diag_native_counter.fetch_add(1, std::memory_order_relaxed);
     else if (r.diagnosticReason == "NATIVE_COUNTER_FROM_ROUTER_UNWRAP") g_stats.diag_native_unwrap.fetch_add(1, std::memory_order_relaxed);
     else if (r.diagnosticReason == "NATIVE_REFUND_ADJUSTED") g_stats.diag_native_refund.fetch_add(1, std::memory_order_relaxed);
+    else if (r.diagnosticReason == "VAULT_FLOW_ATTRIBUTED") g_stats.diag_vault_flow_attributed.fetch_add(1, std::memory_order_relaxed);
 }
 
 const bool LOG_INVARIANT_VIOLATIONS = []() {
@@ -1461,7 +1463,8 @@ void telegramLoop() {
                                     << "\nSwap inferred from flow: " << g_stats.diag_swap_inferred.load()
                                     << "\nNative counter needs trace: " << g_stats.diag_native_counter.load()
                                     << "\nNative from router unwrap: " << g_stats.diag_native_unwrap.load()
-                                    << "\nNative refund adjusted: " << g_stats.diag_native_refund.load();
+                                    << "\nNative refund adjusted: " << g_stats.diag_native_refund.load()
+                                    << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
