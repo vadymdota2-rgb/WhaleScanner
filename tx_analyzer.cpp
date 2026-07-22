@@ -389,6 +389,15 @@ ChainContext makeBscContext() {
         "0x78bc5ee9f11d133a08b331c2e18fe81be0ed02dc",
         "0xdd90e5e87a2081dcf0391920868ebc2ffb81a1af",
     };
+    // PancakeSwap Infinity - единая инфраструктура-синглтон на ВСЕ пары (в отличие
+    // от V2/V3, где у каждой пары свой pool-контракт, распознаваемый по Swap-топику).
+    // Vault - это "accounting layer", которая физически двигает токены между сторонами
+    // свопа, поэтому именно он чаще всего встречается как контрагент в Transfer-логах.
+    c.knownPoolInfra = {
+        "0x238a358808379702088667322f80ac48bad5e6c4", // PancakeSwap Infinity: Vault
+        "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b",  // PancakeSwap Infinity: CLPoolManager
+        "0xc697d2898e0d09264376196696c51d7abbbaa4a9",  // PancakeSwap Infinity: BinPoolManager
+    };
     return c;
 }
 
@@ -487,6 +496,7 @@ const std::set<std::string> SWAP_EVENT_TOPICS = {
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83",
+    "0x04206ad2b7c0f463bff3dd4f33c5735b0f2957a351e4f79763a4fa9e775dd237", // PancakeSwap Infinity CLPoolManager Swap
 };
 const std::string ERC20_TRANSFER_TOPIC =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -766,7 +776,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             int vaultCandidates = 0;
             for (const auto& [addr, flows] : perAddr) {
                 if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
-                    swapPools.count(addr) || addr == txTo) continue;
+                    swapPools.count(addr) || addr == txTo || g_chain.knownPoolInfra.count(addr)) continue;
                 bool hasPos = false, hasNeg = false;
                 for (const auto& [token, amt] : flows) {
                     if (amt > 0) hasPos = true;
@@ -799,11 +809,28 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                             vCounterSet = true; vCounter = token; vCounterAbs = absInt(amt); vCounterRank = candidateRank;
                         }
                     }
-                    const bool vMainPoolLinked = vCounterSet &&
-                        flowLinkedToPool(graph, vMainToken, vaultAddr, swapPools, true);
-                    const bool vCounterPoolLinked = vCounterSet &&
-                        flowLinkedToPool(graph, vCounter, vaultAddr, swapPools, false);
-                    if (vCounterSet && vMainPoolLinked && vCounterPoolLinked) {
+                    // Протокол-агностичная проверка: вместо привязки к известному
+                    // Swap-топику (который есть не у всех DEX - например, у PancakeSwap
+                    // Infinity/singleton-архитектур с хуками свой нестандартный набор
+                    // событий) требуем прямого совпадения контрагента: адрес, которому
+                    // vault отдал один токен, должен быть тем же адресом, от которого
+                    // пришёл другой - это и есть "своп с одним контрагентом" независимо
+                    // от того, какой конкретно DEX за этим стоит.
+                    std::set<std::string> outCounterparties, inCounterparties;
+                    if (vCounterSet) {
+                        auto vCounterIt = graph.find(vCounter);
+                        if (vCounterIt != graph.end())
+                            for (const auto& e : vCounterIt->second)
+                                if (e.from == vaultAddr) outCounterparties.insert(e.to);
+                        auto vMainIt = graph.find(vMainToken);
+                        if (vMainIt != graph.end())
+                            for (const auto& e : vMainIt->second)
+                                if (e.to == vaultAddr) inCounterparties.insert(e.from);
+                    }
+                    bool sameCounterparty = false;
+                    for (const auto& c : outCounterparties)
+                        if (inCounterparties.count(c)) { sameCounterparty = true; break; }
+                    if (vCounterSet && sameCounterparty) {
                         r.isSwap = true;
                         r.dexActivityDetected = true;
                         r.tokenAddr = vMainToken;
