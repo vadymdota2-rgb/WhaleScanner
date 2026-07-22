@@ -92,8 +92,9 @@ const std::unordered_map<std::string, Entry>& table() {
         {"unknown_command", {"🤔 Please use the menu below.",
                              "🤔 Пожалуйста, используйте меню ниже."}},
 
-        {"lang_title", {"🌐 <b>Languages</b>", "🌐 <b>Язык</b>"}},
-        {"lang_choose", {"Choose your language:", "Выберите язык:"}},
+        {"lang_title", {"🌐 <b>Language / Язык</b>", "🌐 <b>Язык / Language</b>"}},
+        {"lang_current", {"Current language:", "Текущий язык:"}},
+        {"lang_choose", {"Choose the interface language for alerts and menus:", "Выберите язык интерфейса для алертов и меню:"}},
 
         {"rk_generating", {"⏳ Rating is being generated.\n\nPlease try again in a minute.",
                            "⏳ Рейтинг формируется.\n\nПопробуйте снова через минуту."}},
