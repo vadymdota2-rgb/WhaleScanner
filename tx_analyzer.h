@@ -40,6 +40,7 @@ struct ChainContext {
     std::set<std::string> stablecoins;
     std::map<std::string, std::string> routers;
     std::set<std::string> bridges;
+    std::set<std::string> knownPoolInfra;
 };
 
 const ChainContext& chainCtx();
