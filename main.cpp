@@ -950,7 +950,9 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
-    std::string text = tr(lang, "lang_title") + "\n\n" + tr(lang, "lang_choose");
+    std::string currentLabel = current;
+    for (const auto& l : LANGUAGES) if (l.first == current) { currentLabel = l.second; break; }
+    std::string text = tr(lang, "lang_title") + "\n" + tr(lang, "lang_current") + " <b>" + currentLabel + "</b>\n\n" + tr(lang, "lang_choose");
     return {text, keyboard.dump()};
 }
 
