@@ -775,8 +775,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             std::string vaultAddr;
             int vaultCandidates = 0;
             for (const auto& [addr, flows] : perAddr) {
+                // Примечание: txTo НЕ исключается здесь - некоторые боты сами являются
+                // своим settlement-адресом (держат и двигают токены напрямую с адреса,
+                // на который звонит кошелёк), а не делегируют отдельному внутреннему
+                // vault-адресу. Подтверждено реальной транзакцией.
                 if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
-                    swapPools.count(addr) || addr == txTo || g_chain.knownPoolInfra.count(addr)) continue;
+                    swapPools.count(addr) || g_chain.knownPoolInfra.count(addr)) continue;
                 bool hasPos = false, hasNeg = false;
                 for (const auto& [token, amt] : flows) {
                     if (amt > 0) hasPos = true;
@@ -818,13 +822,19 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                     // от того, какой конкретно DEX за этим стоит.
                     std::set<std::string> outCounterparties, inCounterparties;
                     if (vCounterSet) {
-                        auto vCounterIt = graph.find(vCounter);
-                        if (vCounterIt != graph.end())
-                            for (const auto& e : vCounterIt->second)
+                        // Направление зависит от BUY/SELL: при покупке vault платит vCounter
+                        // и получает vMainToken; при продаже - наоборот, отдаёт vMainToken
+                        // и получает vCounter. Без этого различия проверка молча не находит
+                        // совпадение для SELL-направления (подтверждено реальной транзакцией).
+                        const std::string& outToken = (vMainNet > 0) ? vCounter : vMainToken;
+                        const std::string& inToken  = (vMainNet > 0) ? vMainToken : vCounter;
+                        auto outIt = graph.find(outToken);
+                        if (outIt != graph.end())
+                            for (const auto& e : outIt->second)
                                 if (e.from == vaultAddr) outCounterparties.insert(e.to);
-                        auto vMainIt = graph.find(vMainToken);
-                        if (vMainIt != graph.end())
-                            for (const auto& e : vMainIt->second)
+                        auto inIt = graph.find(inToken);
+                        if (inIt != graph.end())
+                            for (const auto& e : inIt->second)
                                 if (e.to == vaultAddr) inCounterparties.insert(e.from);
                     }
                     bool sameCounterparty = false;
@@ -854,7 +864,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                     std::string bestAddr; cpp_int bestNet = 0;
                     for (const auto& [addr, flows] : perAddr) {
                         if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
-                            swapPools.count(addr) || addr == txTo) continue;
+                            swapPools.count(addr) || addr == txTo || g_chain.knownPoolInfra.count(addr)) continue;
                         auto it = flows.find(token);
                         if (it != flows.end() && it->second > bestNet) { bestNet = it->second; bestAddr = addr; }
                     }
