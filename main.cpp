@@ -251,16 +251,18 @@ const std::string BOT_USERNAME = []{
 const std::string DB_FILE = "whale_bot.db";
 
 const std::vector<std::string> BSC_RPC_ENDPOINTS = {
-    "https://bsc-dataseed.bnbchain.org",      // Официальный
-    "https://bsc-dataseed1.defibit.io",        // Официальный
-    "https://bsc-dataseed2.ninicoin.io",       // Официальный
-    "https://bsc-dataseed3.ninicoin.io",       // Официальный
-    "https://bsc.publicnode.com",              // PublicNode
-    "https://binance.llamarpc.com",            // LlamaRPC
-    "https://rpc.ankr.com/bsc",                // Ankr
-    "https://1rpc.io/bnb",                     // 1RPC (приватность)
-    "https://bsc.drpc.org",                    // DRPC (децентрализованный)
-    "https://bsc.blockpi.network/v1/rpc/public" // BlockPI
+    "https://bsc-dataseed.bnbchain.org",
+    "https://bsc-dataseed1.defibit.io",
+    "https://bsc-dataseed2.ninicoin.io",
+    "https://bsc-dataseed3.ninicoin.io",
+    "https://bsc-dataseed1.bnbchain.org",
+    "https://bsc-dataseed2.bnbchain.org",
+    "https://bsc.publicnode.com",
+    "https://binance.llamarpc.com",
+    "https://rpc.ankr.com/bsc",
+    "https://1rpc.io/bnb",
+    "https://bsc.drpc.org",
+    "https://bsc.blockpi.network/v1/rpc/public"
 };
 const std::vector<std::string> ETHEREUM_RPC_ENDPOINTS = {
     "https://eth.llamarpc.com",
