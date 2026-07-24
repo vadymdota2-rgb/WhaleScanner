@@ -19,40 +19,6 @@ using json = nlohmann::json;
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
-// ==================== Память навигации по списку =========================
-// Кнопка "Назад" с карточки кошелька или из подтверждения удаления должна
-// возвращать на ТУ ЖЕ страницу списка, где был пользователь, а не на первую.
-namespace {
-std::mutex g_walletPageMutex;
-std::map<std::string, int> g_lastWalletPage;
-}
-
-void rememberWalletPage(const std::string& chatId, int page) {
-    std::lock_guard<std::mutex> l(g_walletPageMutex);
-    g_lastWalletPage[chatId] = page < 1 ? 1 : page;
-}
-
-int lastWalletPage(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(g_walletPageMutex);
-    auto it = g_lastWalletPage.find(chatId);
-    return it != g_lastWalletPage.end() ? it->second : 1;
-}
-
-std::string backToWalletsData(const std::string& chatId) {
-    return "mw_page:" + std::to_string(lastWalletPage(chatId));
-}
-
-// Клавиатура для экранов ошибок: без неё пользователь оставался в тупике -
-// сообщение об ошибке вообще без кнопок, выйти можно было только через /start.
-std::string errorBackKeyboard(const std::string& chatId, Lang lang) {
-    json kb;
-    kb["inline_keyboard"] = json::array();
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", backToWalletsData(chatId)}}
-    }));
-    return kb.dump();
-}
-
 // ============================ Форматирование ============================
 
 std::string shortAddress(const std::string& a) {
@@ -224,7 +190,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
     if (page < 1) page = 1;
     if (page > totalPages) page = totalPages;
     if (totalPages > 1) text << " (" << page << "/" << totalPages << ")";
-    rememberWalletPage(chatId, page);
     text << "\n\n";
     const int startIdx = (page - 1) * PER_PAGE;
     const int endIdx = std::min(total, startIdx + PER_PAGE);
@@ -235,7 +200,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         const std::string& label = walletRows[i].second;
         size_t idx = static_cast<size_t>(i);
 
-        if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━\n";
+        if (i > startIdx) text << "━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         TraderStats ts;
@@ -277,16 +242,13 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
     }
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     return {text.str(), keyboard.dump()};
 }
 
-UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& address, const std::string& label, Lang lang) {
+UIMessage buildRemoveConfirm(const std::string& address, const std::string& label, Lang lang) {
     std::stringstream text;
     text << tr(lang, "remove_confirm_title") << "\n\n";
     if (toLower(label) == toLower(address)) {
@@ -301,7 +263,7 @@ UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& addre
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "remove_yes")}, {"callback_data", "remove:" + address}},
-        {{"text", tr(lang, "cancel_button")}, {"callback_data", backToWalletsData(chatId)}}
+        {{"text", tr(lang, "cancel_button")}, {"callback_data", "menu:my_wallets"}}
     }));
     return {text.str(), keyboard.dump()};
 }
@@ -312,7 +274,7 @@ UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& addre
 
 void startAddWalletFlow(const std::string& chatId, long long messageId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
-    g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS, "", messageId);
+    g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
     replyInPlace(chatId, messageId, tr(lang, "add_wallet_title"),
             TelegramUI::buildCancelButton(lang));
 }
@@ -369,7 +331,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             {{"text", "🔗 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + address}}
         }));
         kb["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "back_button")}, {"callback_data", backToWalletsData(chatId)}}
+            {{"text", tr(lang, "back_button")}, {"callback_data", "menu:my_wallets"}}
         }));
         replyInPlace(chatId, messageId, card.str(), kb.dump());
     }
@@ -377,7 +339,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         std::string address = toLower(param);
         Lang lang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), errorBackKeyboard(chatId, lang));
+            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), "");
             return true;
         }
 
@@ -387,7 +349,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             "SELECT uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? AND wa.address = ?")) {
-            replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), errorBackKeyboard(chatId, lang));
+            replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), "");
             return true;
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
@@ -397,18 +359,18 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             std::string currentLabel = safeColumnText(s, 0);
             sqlite3_finalize(s);
 
-            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
+            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address);
             replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
                     "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
         } else {
             sqlite3_finalize(s);
-            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
+            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), "");
         }
     }
     else if (action == "askremove") {
         std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, messageId, tr(langFromCode(getUserLanguage(chatId)), "err_invalid_address"), errorBackKeyboard(chatId, langFromCode(getUserLanguage(chatId))));
+            replyInPlace(chatId, messageId, tr(langFromCode(getUserLanguage(chatId)), "err_invalid_address"), "");
             return true;
         }
         std::string label = address;
@@ -425,7 +387,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
                 sqlite3_finalize(s);
             }
         }
-        auto msg = TelegramUI::buildRemoveConfirm(chatId, address, label, langFromCode(getUserLanguage(chatId)));
+        auto msg = TelegramUI::buildRemoveConfirm(address, label, langFromCode(getUserLanguage(chatId)));
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "remove") {
@@ -433,7 +395,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         Lang lang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_invalid_address"), true);
-            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), errorBackKeyboard(chatId, lang));
+            replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), "");
             return true;
         }
 
@@ -447,7 +409,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             }
         } else {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
-            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
+            replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), "");
         }
     }
     else return false;
@@ -462,13 +424,13 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (!isValidAddress(address)) {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "add_wallet_invalid"),
+            sendMsg(chatId, tr(lang, "add_wallet_invalid"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
 
-        g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_NAME, address, session.promptMessageId);
-        replyInPlace(chatId, session.promptMessageId, tr(lang, "add_wallet_addr_ok"),
+        g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_NAME, address);
+        sendMsg(chatId, tr(lang, "add_wallet_addr_ok"),
                 TelegramUI::buildCancelButton(lang));
         return true;
     }
@@ -478,13 +440,13 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (label.empty()) {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_name_empty"),
+            sendMsg(chatId, tr(lang, "err_name_empty"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
 
         if (label.length() > 32) {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_name_too_long"),
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
@@ -494,35 +456,33 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         if (result == AddWhaleResult::OK) {
             refreshWatchers();
             g_sessionManager.clearSession(chatId);
-            // Возвращаем в список кошельков, а не в главное меню: пользователь
-            // сразу видит только что добавленный кошелёк на своём месте.
-            auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "add_wallet_success") + "\n\n" + tr(lang, "add_wallet_name_label") + " <b>" + safeString(label, 32) +
+            auto msg = TelegramUI::buildMainMenu(chatId);
+            sendMsg(chatId, tr(lang, "add_wallet_success") + "\n\n" + tr(lang, "add_wallet_name_label") + " <b>" + safeString(label, 32) +
                     "</b>\n" + tr(lang, "add_wallet_address_label") + " <code>" + session.pendingAddress + "</code>\n\n" + tr(lang, "add_wallet_tracking_enabled") + "\n\n" + msg.text,
                     msg.keyboard);
         }
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
-            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS, "", session.promptMessageId);
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "already_tracking_retry"),
+            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
+            sendMsg(chatId, tr(lang, "already_tracking_retry"),
                     TelegramUI::buildCancelButton(lang));
         }
         else if (result == AddWhaleResult::PERMANENTLY_BANNED) {
-            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS, "", session.promptMessageId);
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "wallet_bot_banned"),
+            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
+            sendMsg(chatId, tr(lang, "wallet_bot_banned"),
                     TelegramUI::buildCancelButton(lang));
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
             if (isPremium(chatId)) {
                 auto msg = TelegramUI::buildMainMenu(chatId);
-                replyInPlace(chatId, session.promptMessageId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
+                sendMsg(chatId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
             } else {
                 auto lim = buildWalletLimitMessage(lang);
-                replyInPlace(chatId, session.promptMessageId, lim.text, lim.keyboard);
+                sendMsg(chatId, lim.text, lim.keyboard);
             }
         }
         else {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "generic_error_retry"), TelegramUI::buildCancelButton(lang));
+            sendMsg(chatId, tr(lang, "generic_error_retry"), TelegramUI::buildCancelButton(lang));
         }
 
         return true;
@@ -538,7 +498,7 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
 
         if (label.length() > 32) {
             Lang lang = langFromCode(getUserLanguage(chatId));
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_name_too_long"),
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
@@ -551,28 +511,28 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
             std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "track_now_tracked") + " \"" + safeString(label, 32) + "\" " + tr(lang, "track_now_tracked_suffix") + "\n\n" + msg.text, msg.keyboard);
+            sendMsg(chatId, tr(lang, "track_now_tracked") + " \"" + safeString(label, 32) + "\" " + tr(lang, "track_now_tracked_suffix") + "\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
             Lang lang = langFromCode(getUserLanguage(chatId));
             std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "already_tracking") + "\n\n" + msg.text, msg.keyboard);
+            sendMsg(chatId, tr(lang, "already_tracking") + "\n\n" + msg.text, msg.keyboard);
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
             Lang lang = langFromCode(getUserLanguage(chatId));
             if (isPremium(chatId)) {
                 auto msg = TelegramUI::buildMainMenu(chatId);
-                replyInPlace(chatId, session.promptMessageId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
+                sendMsg(chatId, tr(lang, "limit_50_reached") + "\n\n" + msg.text, msg.keyboard);
             } else {
                 auto lim = buildWalletLimitMessage(lang);
-                replyInPlace(chatId, session.promptMessageId, lim.text, lim.keyboard);
+                sendMsg(chatId, lim.text, lim.keyboard);
             }
         }
         else {
-            replyInPlace(chatId, session.promptMessageId, tr(langFromCode(getUserLanguage(chatId)), "generic_error_retry"), TelegramUI::buildCancelButton(langFromCode(getUserLanguage(chatId))));
+            sendMsg(chatId, tr(langFromCode(getUserLanguage(chatId)), "generic_error_retry"), TelegramUI::buildCancelButton(langFromCode(getUserLanguage(chatId))));
         }
         return true;
     }
@@ -582,13 +542,13 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         Lang lang = langFromCode(getUserLanguage(chatId));
 
         if (newLabel.empty()) {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_name_empty"),
+            sendMsg(chatId, tr(lang, "err_name_empty"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
 
         if (newLabel.length() > 32) {
-            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_name_too_long"),
+            sendMsg(chatId, tr(lang, "err_name_too_long"),
                     TelegramUI::buildCancelButton(lang));
             return true;
         }
@@ -611,7 +571,7 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         std::string back = getLastView(chatId);
         g_sessionManager.clearSession(chatId);
         auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-        replyInPlace(chatId, session.promptMessageId, tr(lang, "rename_success") + "\n\n" + tr(lang, "rename_new_name") + " <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
+        sendMsg(chatId, tr(lang, "rename_success") + "\n\n" + tr(lang, "rename_new_name") + " <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
                 msg.keyboard);
         return true;
     }
