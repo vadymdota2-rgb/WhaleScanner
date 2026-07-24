@@ -316,9 +316,23 @@ size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
     d->append((char*)c, s * n); return s * n;
 }
 
+// Постоянное соединение на каждый поток. Раньше здесь были curl_easy_init/cleanup
+// на КАЖДЫЙ запрос - это заново открывало TCP-соединение и проводило полное
+// TLS-рукопожатие (~100-300мс) при каждом вызове RPC. curl_easy_reset сбрасывает
+// параметры запроса, но сохраняет живое соединение, DNS-кэш и TLS-сессии, поэтому
+// повторные обращения к тому же узлу переиспользуют уже открытый канал.
+// thread_local обязателен: easy-хэндл нельзя разделять между потоками.
+struct CurlHandleHolder {
+    CURL* h = nullptr;
+    CurlHandleHolder() : h(curl_easy_init()) {}
+    ~CurlHandleHolder() { if (h) curl_easy_cleanup(h); }
+};
+
 std::string http(const std::string& url, const std::string& post = "", int timeout = 10) {
-    CURL* curl = curl_easy_init();
+    thread_local CurlHandleHolder holder;
+    CURL* curl = holder.h;
     if (!curl) return "";
+    curl_easy_reset(curl);
     std::string res; struct curl_slist* h = nullptr;
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB);
@@ -341,7 +355,6 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
         std::cerr << "[HTTP] " << curl_easy_strerror(rc) << " | " << su << std::endl;
     }
     if (h) curl_slist_free_all(h);
-    curl_easy_cleanup(curl);
     return res;
 }
 
