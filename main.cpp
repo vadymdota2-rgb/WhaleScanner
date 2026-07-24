@@ -1595,7 +1595,7 @@ int main() {
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
                     << " queue=" << g_msgQueue.size() << " uptime=" << getUptime() << std::endl; lst=std::chrono::steady_clock::now(); }
         } catch (const std::exception& e) { std::cerr << "[ERROR] " << e.what() << std::endl; }
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
 
     std::cout << "[SHUTDOWN] Stopping..." << std::endl;
