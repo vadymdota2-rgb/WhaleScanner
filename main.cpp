@@ -1064,17 +1064,21 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
-    std::vector<std::pair<std::string, long long>> noMatchBatch;
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
-        std::string hash=tx["hash"].get<std::string>(); if (isTxProcessed(hash)) continue;
+        std::string hash=tx["hash"].get<std::string>();
         g_stats.tx_processed.fetch_add(1);
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         std::string mA;
         if (watchers->count(from)) mA=from; else if (watchers->count(to)) mA=to;
-        if (mA.empty()) { noMatchBatch.emplace_back(hash, bn); continue; }
+        // Дедупликация нужна только там, где возможен алерт. Транзакции без
+        // совпадения с отслеживаемым кошельком алертов не создают, поэтому не
+        // пишем и не проверяем их в processed_tx - иначе это ~87 SELECT+INSERT
+        // в секунду и таблица на миллионы строк вместо десятков тысяч.
+        if (mA.empty()) continue;
+        if (isTxProcessed(hash)) continue;
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
@@ -1103,7 +1107,6 @@ bool processBlock(long long bn) {
         else dispatchAlert(mA, res, hash);
         markTxProcessed(hash,bn);
     }
-    markTxProcessedBatch(noMatchBatch);
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
 }
 
