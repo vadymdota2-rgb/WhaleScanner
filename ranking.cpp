@@ -31,7 +31,7 @@ constexpr int MAX_RANKED_WALLETS = 20;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
-constexpr int MAX_BOT_FILTER_TRADES = 500;
+constexpr int MAX_BOT_FILTER_TRADES = 1000;
 constexpr int PER_PAGE = 5;
 constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
@@ -335,6 +335,7 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
 std::mutex g_cacheMutex;
 std::map<std::string, std::string> g_lastTokenByChat;
 std::atomic<bool> g_forceRebuild{false};
+
 
 std::string rowsToJson(const std::vector<PnlRow>& rows) {
     json a = json::array();
@@ -774,6 +775,34 @@ void rebuildAllRankings() {
 
 }
 
+bool isPermanentlyBanned(const std::string& wallet) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "SELECT 1 FROM ignored_wallets WHERE wallet=? AND permanent=1")) return false;
+    sqlite3_bind_text(s, 1, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
+    bool found = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_finalize(s);
+    return found;
+}
+
+bool liftPermanentBan(const std::string& wallet) {
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE wallet=? AND permanent=1")) return false;
+        sqlite3_bind_text(s, 1, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db) > 0;
+        else std::cerr << "[RANKING] lift permanent ban failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s);
+    }
+    if (removed) {
+        std::cout << "[RANKING] Permanent ban lifted for " << toLower(wallet) << std::endl;
+        g_forceRebuild.store(true, std::memory_order_relaxed);
+    }
+    return removed;
+}
+
 namespace {
 
 int countTrades30DLocked(const std::string& wallet, long long since) {
@@ -923,7 +952,12 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
         }
     }
 
-    if (blockedNow) g_forceRebuild.store(true, std::memory_order_relaxed);
+    if (blockedNow) {
+        g_forceRebuild.store(true, std::memory_order_relaxed);
+        // Вне области действия dbMutex: снятие с отслеживания берёт тот же
+        // мьютекс, и вызов внутри блокировки привёл бы к взаимоблокировке.
+        untrackWalletFromService(wallet);
+    }
 }
 
 std::string resolveTokenArg(const std::string& argIn) {
