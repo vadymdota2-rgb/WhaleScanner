@@ -43,6 +43,8 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
+    std::atomic<int64_t> current_lag{0};   // lat - lb, живой снимок на момент последнего опроса
+    std::atomic<int64_t> max_lag_seen{0};  // максимум за время работы процесса
 
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
@@ -918,7 +920,8 @@ struct PendingAlert {
     std::string hash;
     long long block = 0;
     long long blockTs = 0;
-    std::chrono::steady_clock::time_point firstSeen{};
+    long long firstSeen = 0; // Unix-время БЛОКА (blockTs), не время обработки -
+                              // иначе при догоне после лага все сделки слипаются в "только что"
 };
 
 std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
@@ -961,7 +964,7 @@ void bufferSwap(const std::string& mA, const TxResult& res, const std::string& h
     std::lock_guard<std::mutex> l(g_pendingMutex);
     auto it = g_pendingAlerts.find(key);
     if (it == g_pendingAlerts.end()) {
-        g_pendingAlerts.emplace(key, PendingAlert{mA, res, hash, block, blockTs, std::chrono::steady_clock::now()});
+        g_pendingAlerts.emplace(key, PendingAlert{mA, res, hash, block, blockTs, blockTs});
         return;
     }
     TxResult& a = it->second.agg;
@@ -975,9 +978,9 @@ void flushPendingAlerts(bool force) {
     std::vector<PendingAlert> ready;
     {
         std::lock_guard<std::mutex> l(g_pendingMutex);
-        auto now = std::chrono::steady_clock::now();
+        long long nowTs = static_cast<long long>(time(nullptr));
         for (auto it = g_pendingAlerts.begin(); it != g_pendingAlerts.end(); ) {
-            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.firstSeen).count();
+            long long age = nowTs - it->second.firstSeen;
             if (force || age >= AGGREGATION_WINDOW_SECONDS) {
                 ready.push_back(std::move(it->second));
                 it = g_pendingAlerts.erase(it);
@@ -1347,6 +1350,18 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
     return false;
 }
 
+// Отдельный поток сброса алертов - не зависит от того, чем занят главный цикл
+// обработки блоков. Раньше flushPendingAlerts вызывался только ПОСЛЕ полного
+// прохода цикла "while (lb<lat)", поэтому при отставании (лаг RPC, пачка блоков)
+// бот "деньги мял" по несколько минут молча, а потом высыпал всё одной лавиной.
+void alertFlushLoop() {
+    while (running.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        try { flushPendingAlerts(false); }
+        catch (const std::exception& e) { std::cerr << "[ALERT-FLUSH][ERROR] " << e.what() << std::endl; }
+    }
+}
+
 void telegramLoop() {
     long offset=getTgOffset(); std::cout << "[TG] Restored offset: " << offset << std::endl;
     while (running.load(std::memory_order_relaxed)) {
@@ -1437,7 +1452,8 @@ void telegramLoop() {
                             size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
                             { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
-                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load();
+                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
+                                << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
                                     uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
@@ -1530,12 +1546,18 @@ int main() {
         if (cid != SERVICE_CHAT_ID) removeUser(cid);
         else std::cout << "[USERS] Skip removing service account" << std::endl;
     });
-    g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop);
+    g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop);
     long long bsc=0; auto lcp=std::chrono::steady_clock::now(), lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
         try {
             auto lj=rpc("eth_blockNumber",{}); long long lat;
             if (!lj.is_string()||!hexToLL(lj.get<std::string>(),lat)) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+            {
+                int64_t lagNow = lat - lb;
+                g_stats.current_lag.store(lagNow, std::memory_order_relaxed);
+                int64_t prevMax = g_stats.max_lag_seen.load(std::memory_order_relaxed);
+                if (lagNow > prevMax) g_stats.max_lag_seen.store(lagNow, std::memory_order_relaxed);
+            }
             while (lb<lat&&running.load(std::memory_order_relaxed)) {
                 long long next = lb+1;
                 if (!processBlock(next)) {
@@ -1581,6 +1603,7 @@ int main() {
     g_msgQueue.stop();
     tg.join();
     rk.join();
+    af.join();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
