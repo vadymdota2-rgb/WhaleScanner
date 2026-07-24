@@ -285,7 +285,7 @@ std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
-const long long TX_TTL_BLOCKS = 1000;
+const long long TX_TTL_BLOCKS = 6700; // ~50 минут при 0.45с/блок (BSC после хардфорка Fermi, было 1000 при старых ~3с/блок)
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
@@ -294,6 +294,7 @@ constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 std::atomic<bool> running{true};
+std::atomic<int64_t> g_lastProcessedBlock{0};
 void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
 
 std::mutex dbMutex, cacheMutex;
@@ -431,7 +432,7 @@ void initDB() {
     }
 }
 
-void walCheckpoint() { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_checkpoint_v2(db,nullptr,SQLITE_CHECKPOINT_TRUNCATE,nullptr,nullptr); }
+void walCheckpoint(int mode = SQLITE_CHECKPOINT_TRUNCATE) { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_checkpoint_v2(db,nullptr,mode,nullptr,nullptr); }
 void cleanupOldTx(long long b) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"DELETE FROM processed_tx WHERE block_number<?")) return;
@@ -1379,6 +1380,27 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 // обработки блоков. Раньше flushPendingAlerts вызывался только ПОСЛЕ полного
 // прохода цикла "while (lb<lat)", поэтому при отставании (лаг RPC, пачка блоков)
 // бот "деньги мял" по несколько минут молча, а потом высыпал всё одной лавиной.
+// Обслуживание БД (WAL-чекпойнт + чистка старых processed_tx) в отдельном потоке -
+// раньше это делалось внутри цикла обработки блоков раз в N блоков, и любое
+// изменение скорости сети (как хардфорк Fermi, ускоривший блок в ~7 раз) сразу
+// меняло частоту стоп-мир пауз. Теперь обслуживание полностью на таймере,
+// не зависит от того, сколько блоков успели обработать.
+void dbMaintenanceLoop() {
+    auto lastTruncate = std::chrono::steady_clock::now();
+    while (running.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::minutes(1));
+        try {
+            bool doTruncate = std::chrono::duration_cast<std::chrono::minutes>(
+                std::chrono::steady_clock::now() - lastTruncate).count() >= 30;
+            walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);
+            if (doTruncate) {
+                cleanupOldTx(g_lastProcessedBlock.load(std::memory_order_relaxed));
+                lastTruncate = std::chrono::steady_clock::now();
+            }
+        } catch (const std::exception& e) { std::cerr << "[DB-MAINT][ERROR] " << e.what() << std::endl; }
+    }
+}
+
 void alertFlushLoop() {
     while (running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -1571,8 +1593,8 @@ int main() {
         if (cid != SERVICE_CHAT_ID) removeUser(cid);
         else std::cout << "[USERS] Skip removing service account" << std::endl;
     });
-    g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop);
-    long long bsc=0; auto lcp=std::chrono::steady_clock::now(), lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
+    g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
+    auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
         try {
             auto lj=rpc("eth_blockNumber",{}); long long lat;
@@ -1590,8 +1612,7 @@ int main() {
                     break;
                 }
                 lb = next; saveLastBlock(lb);
-                bool nc=(++bsc>=200); if (!nc) { auto e=std::chrono::steady_clock::now()-lcp; nc=std::chrono::duration_cast<std::chrono::minutes>(e).count()>=5; }
-                if (nc) { walCheckpoint(); cleanupOldTx(lb); bsc=0; lcp=std::chrono::steady_clock::now(); }
+                g_lastProcessedBlock.store(lb, std::memory_order_relaxed);
             }
             flushPendingAlerts(false);
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) {
@@ -1629,6 +1650,7 @@ int main() {
     tg.join();
     rk.join();
     af.join();
+    dm.join();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
