@@ -21,7 +21,7 @@ std::string fmtPnlSigned(long long pnlNanos);
 std::string fmtPctSigned(double p);
 
 // --- Операции хранилища кошельков ---
-enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, ERROR };
+enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, PERMANENTLY_BANNED, ERROR };
 
 bool isTrackingWallet(const std::string& chatId, const std::string& address);
 size_t countUserWhales(const std::string& chatId);
