@@ -476,6 +476,29 @@ void markTxProcessed(const std::string& h, long long b) {
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
 }
+
+// Пакетная версия для самого частого случая ("транзакция не касается ни одного
+// отслеживаемого кошелька" - обычно 95%+ всех tx блока). Один prepared statement
+// и один коммит на весь блок вместо отдельной компиляции SQL и автокоммита на
+// КАЖДУЮ транзакцию - при текущей скорости BSC (~100+ tx/сек после Fermi) это
+// компиляции+коммита на каждую была основной причиной отставания.
+void markTxProcessedBatch(const std::vector<std::pair<std::string, long long>>& items) {
+    if (items.empty()) return;
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return;
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return;
+    }
+    for (const auto& [h, b] : items) {
+        sqlite3_bind_text(s, 1, h.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, b);
+        sqlite3_step(s);
+        sqlite3_reset(s);
+    }
+    sqlite3_finalize(s);
+    sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+}
 long getTgOffset() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='tg_offset'")) return 0;
@@ -1022,6 +1045,7 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
+    std::vector<std::pair<std::string, long long>> noMatchBatch;
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -1031,7 +1055,7 @@ bool processBlock(long long bn) {
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         std::string mA;
         if (watchers->count(from)) mA=from; else if (watchers->count(to)) mA=to;
-        if (mA.empty()) { markTxProcessed(hash,bn); continue; }
+        if (mA.empty()) { noMatchBatch.emplace_back(hash, bn); continue; }
         auto receipt=rpc("eth_getTransactionReceipt",{hash});
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
@@ -1060,6 +1084,7 @@ bool processBlock(long long bn) {
         else dispatchAlert(mA, res, hash);
         markTxProcessed(hash,bn);
     }
+    markTxProcessedBatch(noMatchBatch);
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
 }
 
