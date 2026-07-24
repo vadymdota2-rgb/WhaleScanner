@@ -370,9 +370,11 @@ json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
 // точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
 // именно КАКОЙ узел тормозит, а не гадать.
 const long long RPC_SLOW_THRESHOLD_MS = 1000;
+const int RPC_SLOW_STREAK_LIMIT = 3;
 std::mutex g_rpcLatencyMutex;
 std::map<std::string, uint64_t> g_rpcSlowCount;
 std::map<std::string, int64_t> g_rpcSlowMaxMs;
+std::atomic<int> g_rpcSlowStreak{0};
 
 json rpc(const std::string& method, json params, int maxRetries = 3) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
@@ -383,11 +385,24 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
         auto res = http(RPC_ENDPOINTS[idx], body);
         int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
         if (elapsedMs >= RPC_SLOW_THRESHOLD_MS) {
-            std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
-            g_rpcSlowCount[RPC_ENDPOINTS[idx]]++;
-            int64_t& mx = g_rpcSlowMaxMs[RPC_ENDPOINTS[idx]];
-            if (elapsedMs > mx) mx = elapsedMs;
+            {
+                std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
+                g_rpcSlowCount[RPC_ENDPOINTS[idx]]++;
+                int64_t& mx = g_rpcSlowMaxMs[RPC_ENDPOINTS[idx]];
+                if (elapsedMs > mx) mx = elapsedMs;
+            }
             std::cerr << "[RPC-SLOW] " << method << " on " << RPC_ENDPOINTS[idx] << " took " << elapsedMs << "ms" << std::endl;
+            // Уходим с узла, который стабильно тормозит, а не только с упавшего.
+            // Порог в несколько подряд - чтобы не скакать из-за одиночной заминки:
+            // при постоянных соединениях смена узла стоит нового TLS-рукопожатия.
+            if (g_rpcSlowStreak.fetch_add(1, std::memory_order_relaxed) + 1 >= RPC_SLOW_STREAK_LIMIT) {
+                g_rpcSlowStreak.store(0, std::memory_order_relaxed);
+                size_t cur = rpcIndex.load(std::memory_order_relaxed);
+                rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur] << std::endl;
+            }
+        } else {
+            g_rpcSlowStreak.store(0, std::memory_order_relaxed);
         }
         bool valid = false;
         try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) { valid=true; return p["result"]; } } catch (...) {}
