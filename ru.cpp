@@ -202,6 +202,8 @@ const std::unordered_map<std::string, Entry>& table() {
                                 "⚠️ Бесплатный план позволяет отслеживать только 1 кошелёк. Улучшите до Премиум — нажмите ⭐ Премиум в меню."}},
         {"already_tracking_retry", {"⚠️ You're already tracking this wallet.\n\nPlease enter a different address or press Cancel.",
                                     "⚠️ Вы уже отслеживаете этот кошелёк.\n\nВведите другой адрес или нажмите Отмена."}},
+        {"wallet_bot_banned", {"🤖 This wallet was flagged as a bot and permanently excluded from the ranking. The service account cannot track it.\n\nEnter a different address or press Cancel.",
+                               "🤖 Этот кошелёк помечен как бот и навсегда исключён из рейтинга. Сервисный аккаунт не может его отслеживать.\n\nВведите другой адрес или нажмите Отмена."}},
         {"toast_invalid_address", {"❌ Invalid address.", "❌ Неверный адрес."}},
         {"track_now_tracked", {"✅ Wallet", "✅ Кошелёк"}},
         {"track_now_tracked_suffix", {"is now being tracked.", "теперь отслеживается."}},
