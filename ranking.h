@@ -14,6 +14,15 @@ void closeRankingDB();
 
 void cleanupOldTrades();
 
+// Проверка/снятие пожизненного бана в рейтинге (детектор ботов).
+bool isPermanentlyBanned(const std::string& wallet);
+bool liftPermanentBan(const std::string& wallet);
+
+// Реализуется в main.cpp: вызывается, когда детектор навсегда забанил кошелёк,
+// чтобы снять его с СЕРВИСНОГО отслеживания (экономия RPC). Пользователей
+// не затрагивает - они могут отслеживать такой кошелёк как обычно.
+void untrackWalletFromService(const std::string& wallet);
+
 void rankingCacheLoop();
 
 std::string resolveTokenArg(const std::string& arg);
