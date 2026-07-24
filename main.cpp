@@ -352,12 +352,30 @@ json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
     return nullptr;
 }
 
+// Диагностика: если конкретный публичный RPC периодически "подвисает" на секунды
+// без явного сбоя (timeout/ошибка), rpc_failures это не заметит - а лаг растёт
+// точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
+// именно КАКОЙ узел тормозит, а не гадать.
+const long long RPC_SLOW_THRESHOLD_MS = 1000;
+std::mutex g_rpcLatencyMutex;
+std::map<std::string, uint64_t> g_rpcSlowCount;
+std::map<std::string, int64_t> g_rpcSlowMaxMs;
+
 json rpc(const std::string& method, json params, int maxRetries = 3) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     std::string body = r.dump();
     for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
         size_t idx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
+        auto t0 = std::chrono::steady_clock::now();
         auto res = http(RPC_ENDPOINTS[idx], body);
+        int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (elapsedMs >= RPC_SLOW_THRESHOLD_MS) {
+            std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
+            g_rpcSlowCount[RPC_ENDPOINTS[idx]]++;
+            int64_t& mx = g_rpcSlowMaxMs[RPC_ENDPOINTS[idx]];
+            if (elapsedMs > mx) mx = elapsedMs;
+            std::cerr << "[RPC-SLOW] " << method << " on " << RPC_ENDPOINTS[idx] << " took " << elapsedMs << "ms" << std::endl;
+        }
         bool valid = false;
         try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) { valid=true; return p["result"]; } } catch (...) {}
         if (!valid) {
@@ -1501,6 +1519,16 @@ void telegramLoop() {
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
+                            {
+                                std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
+                                if (!g_rpcSlowCount.empty()) {
+                                    std::string worst; uint64_t worstCount = 0;
+                                    for (const auto& [ep, cnt] : g_rpcSlowCount) if (cnt > worstCount) { worstCount = cnt; worst = ep; }
+                                    ss2 << "\n🐢 Slow RPC (>=" << RPC_SLOW_THRESHOLD_MS << "ms): " << worst
+                                        << " x" << worstCount << " (max " << g_rpcSlowMaxMs[worst] << "ms)";
+                                    if (g_rpcSlowCount.size() > 1) ss2 << " [+" << (g_rpcSlowCount.size()-1) << " др.]";
+                                }
+                            }
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
                                     uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
