@@ -651,6 +651,30 @@ void refreshWatchers() {
     WATCHERS_PTR = m;
 }
 
+// Вызывается из ranking.cpp, когда детектор навсегда забанил кошелёк в рейтинге.
+// Снимаем его ТОЛЬКО с сервисного аккаунта - чтобы не тратить RPC на бота с
+// сотнями сделок. Обычные пользователи, если следят за этим кошельком,
+// продолжают получать алерты как ни в чём не бывало.
+void untrackWalletFromService(const std::string& wallet) {
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s,
+            "DELETE FROM user_whales WHERE user_id=? AND whale_id=("
+            "SELECT id FROM whale_addresses WHERE address=?)")) return;
+        sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db) > 0;
+        else std::cerr << "[WATCHERS] service untrack failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s);
+    }
+    if (removed) {
+        std::cout << "[WATCHERS] Bot wallet untracked from service account: " << toLower(wallet) << std::endl;
+        refreshWatchers();
+    }
+}
+
 bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
     ensureUser(chatId);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -1598,6 +1622,20 @@ void telegramLoop() {
                             }
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
+                        }
+                    }
+                    else if (txt.rfind("/unban", 0) == 0) {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            std::string arg = trim(txt.substr(6));
+                            if (!isValidAddress(arg)) {
+                                sendMsg(cid, "Использование: /unban 0x&lt;адрес&gt;");
+                            } else if (liftPermanentBan(arg)) {
+                                sendMsg(cid, "✅ Бан снят: <code>" + toLower(arg) + "</code>\nКошелёк снова может попадать в рейтинг.");
+                            } else {
+                                sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
+                            }
                         }
                     }
                     else if (handleBeneficiaryCommand(cid, txt)) {
