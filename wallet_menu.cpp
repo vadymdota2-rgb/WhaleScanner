@@ -57,6 +57,14 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
+    // Сервисному аккаунту нельзя повторно взять на отслеживание кошелёк,
+    // который детектор пометил как бота - чтобы не вернуть его случайно.
+    // На обычных пользователей это не распространяется: им можно следить
+    // за любым адресом, бан касается только рейтинга и сервисного аккаунта.
+    if (chatId == SERVICE_CHAT_ID && isPermanentlyBanned(address)) {
+        return AddWhaleResult::PERMANENTLY_BANNED;
+    }
+
     if (chatId != SERVICE_CHAT_ID &&
         countUserWhales(chatId) >= premiumMaxWallets(chatId))
     {
@@ -162,7 +170,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
             "SELECT wa.address, uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
-            return {"❌ Error loading wallets.", ""};
+            return {tr(lang, "err_loading_wallets"), ""};
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(s) == SQLITE_ROW)
@@ -456,6 +464,11 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         else if (result == AddWhaleResult::ALREADY_EXISTS) {
             g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
             sendMsg(chatId, tr(lang, "already_tracking_retry"),
+                    TelegramUI::buildCancelButton(lang));
+        }
+        else if (result == AddWhaleResult::PERMANENTLY_BANNED) {
+            g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS);
+            sendMsg(chatId, tr(lang, "wallet_bot_banned"),
                     TelegramUI::buildCancelButton(lang));
         }
         else if (result == AddWhaleResult::LIMIT_REACHED) {
