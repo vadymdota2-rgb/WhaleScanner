@@ -27,6 +27,9 @@ bool isTrackingWallet(const std::string& chatId, const std::string& address);
 size_t countUserWhales(const std::string& chatId);
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label);
 bool removeUserWhale(const std::string& chatId, const std::string& address);
+// Снимает кошелёк с СЕРВИСНОГО отслеживания (вызывается детектором ботов из
+// ranking). Пользователей не затрагивает - они могут следить за ним как обычно.
+void untrackWalletFromService(const std::string& wallet);
 
 // --- Меню ---
 namespace TelegramUI {
