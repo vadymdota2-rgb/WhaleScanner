@@ -1006,21 +1006,26 @@ std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
     return out;
 }
 
-// Нативный баланс (BNB/ETH) в wei.
-cpp_int getNativeBalance(const std::string& wallet) {
+// Нативный баланс (BNB/ETH) в wei. false - узнать не удалось.
+bool getNativeBalance(const std::string& wallet, cpp_int& out) {
     auto r = rpc("eth_getBalance", {wallet, "latest"});
-    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 0; }
-    return hexToCppInt(r.get<std::string>());
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
+    out = hexToCppInt(r.get<std::string>());
+    return true;
 }
 
 // balanceOf(address) - селектор 0x70a08231 + адрес, дополненный до 32 байт.
-cpp_int getTokenBalance(const std::string& token, const std::string& wallet) {
+// Возвращает false, если УЗНАТЬ баланс не удалось. Отличать это от честного
+// нуля критично: по нулю мы удаляем монету из списка, и без такой проверки
+// одна сетевая заминка стирала бы её навсегда.
+bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_int& out) {
     std::string w = toLower(wallet);
     if (w.size() == 42 && w.rfind("0x",0) == 0) w = w.substr(2);
     std::string data = "0x70a08231" + std::string(24, '0') + w;
     auto r = rpc("eth_call", {{{"to", token}, {"data", data}}, "latest"});
-    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 0; }
-    return hexToCppInt(r.get<std::string>());
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
+    out = hexToCppInt(r.get<std::string>());
+    return true;
 }
 
 int getDecimals(const std::string& addr) {
