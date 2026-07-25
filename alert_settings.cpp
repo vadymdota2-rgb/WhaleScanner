@@ -3,10 +3,19 @@
 #include <array>
 #include <sstream>
 #include <cstdio>
+#include <iostream>
+#include <mutex>
+#include <sqlite3.h>
 #include "json.hpp"
 #include "utils.h"
 
 std::string getUserLanguage(const std::string& chatId);
+void ensureUser(const std::string& chatId);
+
+// База данных и её мьютекс живут в main.cpp - модуль пользуется ими,
+// как и остальные (ranking, premium, wallet_menu).
+extern sqlite3* db;
+extern std::mutex dbMutex;
 
 using json = nlohmann::json;
 
@@ -147,6 +156,27 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
     }));
 
     return {text.str(), keyboard.dump()};
+}
+
+// Хранение порога - домен этого модуля, поэтому реализация живёт здесь,
+// а не в main.cpp (он лишь пользуется ими через заголовок).
+uint64_t getUserThresholdNanos(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT threshold_nanos FROM users WHERE chat_id=?")) return DEFAULT_THRESHOLD_NANOS;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    uint64_t v=DEFAULT_THRESHOLD_NANOS; if (sqlite3_step(s)==SQLITE_ROW) v=static_cast<uint64_t>(sqlite3_column_int64(s,0)); sqlite3_finalize(s); return v;
+}
+
+bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
+    ensureUser(chatId);
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return false;
+    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    int rc = sqlite3_step(s);
+    bool ok = rc==SQLITE_DONE && sqlite3_changes(db)==1;
+    if (!ok) std::cerr << "[DB] threshold UPDATE failed or matched no row (rc=" << rc << "): " << sqlite3_errmsg(db) << std::endl;
+    sqlite3_finalize(s);
+    return ok;
 }
 
 bool handleThresholdCallback(const std::string& chatId, const std::string& param, long long messageId) {
