@@ -50,6 +50,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hold_coins", {"Coins held", "Монеты в кошельке"}},
         {"hold_empty", {"No coins worth $10 or more found in this wallet.",
                         "В этом кошельке не найдено монет на $10 и дороже."}},
+        {"hold_partial", {"⚠️ Some balances could not be read right now — the total may be incomplete.",
+                          "⚠️ Часть балансов сейчас прочитать не удалось — сумма может быть неполной."}},
         {"hold_dust_note", {"Positions under $10 are hidden.", "Позиции дешевле $10 скрыты."}},
         {"hold_no_history", {"We have not seen this wallet trade yet, so there is nothing to check besides the native balance.",
                              "Мы ещё не видели сделок этого кошелька, поэтому кроме основного баланса проверять нечего."}},
