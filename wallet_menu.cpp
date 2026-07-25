@@ -202,7 +202,9 @@ namespace TelegramUI {
 
 UIMessage buildWalletsList(const std::string& chatId, int page) {
 
-    bool premium = isPremium(chatId) || chatId == SERVICE_CHAT_ID;
+    // isPremium() уже возвращает true для сервисного аккаунта - отдельная
+    // проверка здесь была бы дублированием.
+    bool premium = isPremium(chatId);
     Lang lang = langFromCode(getUserLanguage(chatId));
 
     std::vector<std::pair<std::string, std::string>> walletRows;
