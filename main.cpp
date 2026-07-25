@@ -878,7 +878,16 @@ bool editMsg(const std::string& c, long long messageId, const std::string& t, co
         try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
     }
     auto r = http("https://api.telegram.org/bot" + TG_TOKEN + "/editMessageText", j.dump());
-    try { auto p = json::parse(r); return p.value("ok", false); } catch (...) { return false; }
+    try {
+        auto p = json::parse(r);
+        if (p.value("ok", false)) return true;
+        // "message is not modified" - это НЕ сбой: содержимое уже такое, какое
+        // нужно. Раньше мы считали это ошибкой и отправляли копию сообщения,
+        // из-за чего в чате появлялись дубли меню.
+        std::string desc = p.value("description", std::string());
+        if (desc.find("message is not modified") != std::string::npos) return true;
+        return false;
+    } catch (...) { return false; }
 }
 
 void replyInPlace(const std::string& chatId, long long messageId, const std::string& text, const std::string& keyboard) {
@@ -913,6 +922,24 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
+// Разовый перенос истории токенов из таблицы сделок. Вызывается ПОСЛЕ
+// initRankingDB(), потому что таблицу trades создаёт именно она. Без этого
+// у экрана "Портфель" не было бы кандидатов и показывался бы только BNB.
+void seedWalletTokensFromTrades() {
+    std::lock_guard<std::mutex> l(dbMutex);
+    const char* sql =
+        "INSERT OR IGNORE INTO wallet_tokens(wallet, token, last_seen) "
+        "SELECT wallet, token, MAX(timestamp) FROM trades GROUP BY wallet, token";
+    char* err = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[STARTUP] wallet_tokens seed failed: " << (err ? err : "") << std::endl;
+        sqlite3_free(err);
+        return;
+    }
+    int n = sqlite3_changes(db);
+    if (n > 0) std::cout << "[STARTUP] Seeded " << n << " wallet/token pairs from trade history" << std::endl;
+}
+
 void rememberWalletToken(const std::string& wallet, const std::string& token, long long ts) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO wallet_tokens(wallet,token,last_seen) VALUES(?,?,?) "
@@ -921,6 +948,39 @@ void rememberWalletToken(const std::string& wallet, const std::string& token, lo
     sqlite3_bind_text(s,2,toLower(token).c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_bind_int64(s,3,ts);
     sqlite3_step(s); sqlite3_finalize(s);
+}
+
+// Из чека транзакции вытаскиваем ВСЕ токены, где кошелёк был отправителем или
+// получателем - не только результат свопа. Так в портфель попадают и обычные
+// переводы, и раздачи, и вторая нога сложных сделок. Всё считаем сами,
+// без внешних сервисов: данные уже есть в чеке, который мы и так загрузили.
+void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& receipt, long long ts) {
+    if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array()) return;
+    static const std::string TRANSFER_TOPIC =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    const std::string w = toLower(wallet);
+    std::set<std::string> seen;
+
+    for (const auto& lg : receipt["logs"]) {
+        if (!lg.is_object() || !lg.contains("topics") || !lg["topics"].is_array()) continue;
+        const auto& tp = lg["topics"];
+        if (tp.size() < 3 || !tp[0].is_string()) continue;
+        if (toLower(tp[0].get<std::string>()) != TRANSFER_TOPIC) continue;
+
+        // topics[1] = отправитель, topics[2] = получатель (адрес в 32 байтах)
+        bool involvesWallet = false;
+        for (int i = 1; i <= 2 && !involvesWallet; ++i) {
+            if (!tp[i].is_string()) continue;
+            std::string t = toLower(tp[i].get<std::string>());
+            if (t.size() >= 40 && ("0x" + t.substr(t.size() - 40)) == w) involvesWallet = true;
+        }
+        if (!involvesWallet) continue;
+
+        if (!lg.contains("address") || !lg["address"].is_string()) continue;
+        std::string token = toLower(lg["address"].get<std::string>());
+        if (token.empty() || !seen.insert(token).second) continue;
+        rememberWalletToken(wallet, token, ts);
+    }
 }
 
 std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
@@ -1175,11 +1235,10 @@ bool processBlock(long long bn) {
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        // Запоминаем, какими токенами кошелёк оперировал: это единственный
-        // источник кандидатов для экрана "Холд" (в блокчейне нет запроса
-        // "покажи все токены адреса"). Пишем для ВСЕХ отслеживаемых, а не
-        // только для сервисных, иначе у добавленных вручную список пуст.
-        if (res.isSwap && !res.tokenAddr.empty()) rememberWalletToken(mA, res.tokenAddr, blockTs);
+        // Единственный источник кандидатов для "Портфеля": в блокчейне нет
+        // запроса "покажи все токены адреса". Собираем сами из чека, который
+        // и так загружен, - без внешних сервисов и лишних запросов.
+        rememberTokensFromReceipt(mA, receipt, blockTs);
         if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
         else dispatchAlert(mA, res, hash);
         markTxProcessed(hash,bn);
@@ -1662,7 +1721,7 @@ int main() {
         else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
     }
-    initDB(); initRankingDB();
+    initDB(); initRankingDB(); seedWalletTokensFromTrades();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
