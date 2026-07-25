@@ -290,7 +290,6 @@ constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
 constexpr int DIGEST_HOUR_UTC = 12;
-constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 std::atomic<bool> running{true};
@@ -594,13 +593,6 @@ size_t countUsers() {
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM users")) return 0;
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
-uint64_t getUserThresholdNanos(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"SELECT threshold_nanos FROM users WHERE chat_id=?")) return DEFAULT_THRESHOLD_NANOS;
-    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    uint64_t v=DEFAULT_THRESHOLD_NANOS; if (sqlite3_step(s)==SQLITE_ROW) v=static_cast<uint64_t>(sqlite3_column_int64(s,0)); sqlite3_finalize(s); return v;
-}
-
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
     long long now = static_cast<long long>(time(nullptr));
@@ -647,38 +639,6 @@ void refreshWatchers() {
 // Снимаем его ТОЛЬКО с сервисного аккаунта - чтобы не тратить RPC на бота с
 // сотнями сделок. Обычные пользователи, если следят за этим кошельком,
 // продолжают получать алерты как ни в чём не бывало.
-void untrackWalletFromService(const std::string& wallet) {
-    bool removed = false;
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (!prepareOrLog(db, &s,
-            "DELETE FROM user_whales WHERE user_id=? AND whale_id=("
-            "SELECT id FROM whale_addresses WHERE address=?)")) return;
-        sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db) > 0;
-        else std::cerr << "[WATCHERS] service untrack failed: " << sqlite3_errmsg(db) << std::endl;
-        sqlite3_finalize(s);
-    }
-    if (removed) {
-        std::cout << "[WATCHERS] Bot wallet untracked from service account: " << toLower(wallet) << std::endl;
-        refreshWatchers();
-    }
-}
-
-bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos) {
-    ensureUser(chatId);
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE users SET threshold_nanos=? WHERE chat_id=?")) return false;
-    sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(nanos)); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    int rc = sqlite3_step(s);
-    bool ok = rc==SQLITE_DONE && sqlite3_changes(db)==1;
-    if (!ok) std::cerr << "[DB] threshold UPDATE failed or matched no row (rc=" << rc << "): " << sqlite3_errmsg(db) << std::endl;
-    sqlite3_finalize(s);
-    return ok;
-}
-
 std::string getUserLanguage(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT language FROM users WHERE chat_id=?")) return "en";
