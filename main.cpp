@@ -476,6 +476,21 @@ void initDB() {
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
     }
+
+    // Разовая нормализация: минимальный порог алертов - $50. Пользователи,
+    // успевшие поставить меньше до введения ограничения, подтягиваются к нему,
+    // иначе интерфейс запрещает такие значения, а в базе они остаются навсегда.
+    {
+        const char* clampSql = "UPDATE users SET threshold_nanos = 50000000000 WHERE threshold_nanos < 50000000000";
+        char* cerr2 = nullptr;
+        if (sqlite3_exec(db, clampSql, nullptr, nullptr, &cerr2) != SQLITE_OK) {
+            std::cerr << "[STARTUP] threshold normalisation failed: " << (cerr2 ? cerr2 : "") << std::endl;
+            sqlite3_free(cerr2);
+        } else {
+            int n = sqlite3_changes(db);
+            if (n > 0) std::cout << "[STARTUP] Raised " << n << " user threshold(s) to the $50 minimum" << std::endl;
+        }
+    }
 }
 
 void walCheckpoint(int mode = SQLITE_CHECKPOINT_TRUNCATE) { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_checkpoint_v2(db,nullptr,mode,nullptr,nullptr); }
