@@ -40,6 +40,13 @@ UIMessage buildWalletsList(const std::string& chatId, int page = 1);
 UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& address, const std::string& label, Lang lang);
 }
 
+// Одна позиция портфеля: монета, её количество и стоимость в долларах.
+struct PortfolioItem {
+    std::string symbol;
+    std::string amount;    // уже отформатированное количество
+    cpp_int usdNanos = 0;
+};
+
 // --- Сервисы main.cpp для экрана "Холд" ---
 std::vector<std::string> getWalletTokens(const std::string& wallet, int limit);
 cpp_int getNativeBalance(const std::string& wallet);
