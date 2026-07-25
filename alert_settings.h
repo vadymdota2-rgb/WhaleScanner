@@ -19,6 +19,9 @@ UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos, Lang lang = La
 
 }
 
+// Порог алертов по умолчанию - домен этого модуля.
+constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
+
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
 
 SendResult sendMsg(const std::string& chatId, const std::string& text,
