@@ -19,13 +19,18 @@ constexpr uint64_t NANOS_PER_USD = 1000000000ULL;
 constexpr uint64_t NANOS_PER_CENT = NANOS_PER_USD / 100;
 constexpr uint64_t MAX_THRESHOLD_USD = 1000000000ULL;
 constexpr uint64_t MAX_THRESHOLD_CENTS = MAX_THRESHOLD_USD * 100;
+// Нижняя граница порога. Ниже неё алерты превращаются в поток мусора
+// (мелкие сделки идут постоянно), поэтому запрещено ставить меньше.
+constexpr uint64_t MIN_THRESHOLD_USD = 50ULL;
+constexpr uint64_t MIN_THRESHOLD_CENTS = MIN_THRESHOLD_USD * 100;
 
-enum class ParseResult { OK, INVALID, NOT_POSITIVE, TOO_LARGE, TOO_MANY_DECIMALS };
+enum class ParseResult { OK, INVALID, NOT_POSITIVE, TOO_SMALL, TOO_LARGE, TOO_MANY_DECIMALS };
 enum class ApplyResult { Changed, Unchanged, Error };
 
 std::string parseError(ParseResult r, Lang lang) {
     switch (r) {
         case ParseResult::NOT_POSITIVE:      return tr(lang, "err_threshold_positive");
+        case ParseResult::TOO_SMALL:         return tr(lang, "err_threshold_too_small");
         case ParseResult::TOO_LARGE:         return tr(lang, "err_threshold_too_large");
         case ParseResult::TOO_MANY_DECIMALS: return tr(lang, "err_threshold_decimals");
         default:                             return tr(lang, "err_invalid_number");
@@ -68,6 +73,7 @@ ParseResult parseThresholdNanos(const std::string& raw, uint64_t& outNanos) {
 
     uint64_t totalCents = dollars * 100 + cents;
     if (totalCents == 0) return ParseResult::NOT_POSITIVE;
+    if (totalCents < MIN_THRESHOLD_CENTS) return ParseResult::TOO_SMALL;
     if (totalCents > MAX_THRESHOLD_CENTS) return ParseResult::TOO_LARGE;
 
     outNanos = totalCents * NANOS_PER_CENT;
@@ -146,7 +152,7 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
 bool handleThresholdCallback(const std::string& chatId, const std::string& param, long long messageId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     if (param == "custom") {
-        g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD);
+        g_sessionManager.setState(chatId, UserState::AWAITING_CUSTOM_THRESHOLD, "", messageId);
         replyInPlace(chatId, messageId,
             tr(lang, "threshold_custom_title"),
             TelegramUI::buildCancelButton(lang));
@@ -167,27 +173,35 @@ bool handleThresholdCallback(const std::string& chatId, const std::string& param
         replyInPlace(chatId, messageId, tr(lang, "threshold_save_failed") + "\n\n" + menu.text, menu.keyboard);
         return true;
     }
-    auto menu = TelegramUI::buildMainMenu(chatId);
+    // Сбрасываем возможный незакрытый диалог "своя сумма": иначе, если
+    // пользователь открыл ввод суммы, а затем нажал пресет в другом сообщении,
+    // состояние осталось бы висеть и следующий обычный текст в чате был бы
+    // молча принят за сумму порога.
+    g_sessionManager.clearSession(chatId);
+    auto menu = TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), lang);
     replyInPlace(chatId, messageId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
 
 bool handleThresholdText(const std::string& chatId, const std::string& text) {
     Lang lang = langFromCode(getUserLanguage(chatId));
+    // Правим то же сообщение, в котором шёл диалог, иначе в чате остаётся
+    // висеть старое приглашение и получается два меню порога сразу.
+    const long long promptId = g_sessionManager.getSession(chatId).promptMessageId;
     uint64_t nanos = 0;
     ParseResult pr = parseThresholdNanos(text, nanos);
     if (pr != ParseResult::OK) {
-        sendMsg(chatId, parseError(pr, lang) + tr(lang, "threshold_retry_hint"), TelegramUI::buildCancelButton(lang));
+        replyInPlace(chatId, promptId, parseError(pr, lang) + tr(lang, "threshold_retry_hint"), TelegramUI::buildCancelButton(lang));
         return true;
     }
 
     ApplyResult ar = applyThreshold(chatId, nanos);
     if (ar == ApplyResult::Error) {
-        sendMsg(chatId, tr(lang, "threshold_save_failed"), TelegramUI::buildCancelButton(lang));
+        replyInPlace(chatId, promptId, tr(lang, "threshold_save_failed"), TelegramUI::buildCancelButton(lang));
         return true;
     }
     g_sessionManager.clearSession(chatId);
-    auto menu = TelegramUI::buildMainMenu(chatId);
-    sendMsg(chatId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
+    auto menu = TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), lang);
+    replyInPlace(chatId, promptId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
     return true;
 }
