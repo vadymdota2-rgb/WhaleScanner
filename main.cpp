@@ -264,6 +264,11 @@ const std::vector<std::string> BSC_RPC_ENDPOINTS = {
     "https://rpc.ankr.com/bsc",
     "https://1rpc.io/bnb",
     "https://bsc.drpc.org",
+    "https://bsc-dataseed.nariox.org",
+    "https://bsc.nodereal.io",
+    "https://bsc-dataseed-public.bnbchain.org",
+    "https://rpc.coinsdo.net/bsc",
+    "https://bsc-mainnet.gateway.tatum.io",
     "https://bsc.blockpi.network/v1/rpc/public"
 };
 const std::vector<std::string> ETHEREUM_RPC_ENDPOINTS = {
