@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdio>
 #include <iostream>
 
 std::string toLower(std::string s) {
@@ -124,4 +126,38 @@ std::string formatThousands(uint64_t v) {
     }
     std::reverse(out.begin(), out.end());
     return out;
+}
+
+std::string formatUsdNanosSigned(long long nanos, bool withPlus) {
+    const bool neg = nanos < 0;
+    // Модуль берём через unsigned, чтобы корректно обработать LLONG_MIN,
+    // у которого нет положительного двойника в знаковом типе.
+    unsigned long long mag = neg
+        ? (~static_cast<unsigned long long>(nanos) + 1ULL)
+        : static_cast<unsigned long long>(nanos);
+
+    unsigned long long dollars = mag / 1000000000ULL;
+    int cents = static_cast<int>((mag % 1000000000ULL) / 10000000ULL);
+
+    std::string s = formatThousands(dollars);
+    if (cents != 0) {
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), ".%02d", cents);
+        s += buf;
+    }
+    const char* sign = neg ? "-" : (withPlus ? "+" : "");
+    return std::string(sign) + "$" + s;
+}
+
+std::string formatPercent(double pct, bool withPlus) {
+    if (!std::isfinite(pct)) return "n/a";
+    const bool neg = pct < 0;
+    double a = neg ? -pct : pct;
+    // Точность по величине: меньше 1% - один знак (0.9%), 1..1000% - два
+    // знака (1.35%), выше - целое (12346%), где дробь была бы шумом.
+    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
+    const char* sign = neg ? "-" : (withPlus ? "+" : "");
+    return std::string(sign) + buf + "%";
 }
