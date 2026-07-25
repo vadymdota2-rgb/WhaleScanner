@@ -2,6 +2,9 @@
 
 #include <string>
 #include <cstddef>
+#include <vector>
+#include <boost/multiprecision/cpp_int.hpp>
+using boost::multiprecision::cpp_int;
 #include "alert_settings.h"
 #include "ru.h"
 
@@ -35,6 +38,20 @@ void untrackWalletFromService(const std::string& wallet);
 namespace TelegramUI {
 UIMessage buildWalletsList(const std::string& chatId, int page = 1);
 UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& address, const std::string& label, Lang lang);
+}
+
+// --- Сервисы main.cpp для экрана "Холд" ---
+std::vector<std::string> getWalletTokens(const std::string& wallet, int limit);
+cpp_int getNativeBalance(const std::string& wallet);
+cpp_int getTokenBalance(const std::string& token, const std::string& wallet);
+int getDecimals(const std::string& addr);
+std::string getSymbol(const std::string& addr);
+uint64_t getPriceNanos(const std::string& token);
+
+namespace TelegramUI {
+UIMessage buildAccountMenu(const std::string& chatId);
+UIMessage buildHoldWalletList(const std::string& chatId, int page = 1);
+UIMessage buildHoldCard(const std::string& chatId, const std::string& address);
 }
 
 // --- Точки входа диспетчеризации ---
