@@ -469,6 +469,12 @@ void initDB() {
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
+        CREATE TABLE IF NOT EXISTS wallet_tokens (
+            wallet TEXT NOT NULL,
+            token TEXT NOT NULL,
+            last_seen INTEGER NOT NULL,
+            PRIMARY KEY (wallet, token)
+        );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
     char* err = nullptr;
@@ -700,7 +706,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_my_wallets") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:my_wallets"}}
+        {{"text", tr(lang, "menu_account") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:account"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
@@ -905,6 +911,44 @@ void setupBotCommands() {
     cmds.push_back({{"command","start"},{"description","Open the main menu"}});
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
+}
+
+void rememberWalletToken(const std::string& wallet, const std::string& token, long long ts) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT INTO wallet_tokens(wallet,token,last_seen) VALUES(?,?,?) "
+                            "ON CONFLICT(wallet,token) DO UPDATE SET last_seen=excluded.last_seen")) return;
+    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,toLower(token).c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s,3,ts);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+
+std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
+    std::vector<std::string> out;
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT token FROM wallet_tokens WHERE wallet=? ORDER BY last_seen DESC LIMIT ?")) return out;
+    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int(s,2,limit);
+    while (sqlite3_step(s)==SQLITE_ROW) out.push_back(safeColumnText(s,0));
+    sqlite3_finalize(s);
+    return out;
+}
+
+// Нативный баланс (BNB/ETH) в wei.
+cpp_int getNativeBalance(const std::string& wallet) {
+    auto r = rpc("eth_getBalance", {wallet, "latest"});
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 0; }
+    return hexToCppInt(r.get<std::string>());
+}
+
+// balanceOf(address) - селектор 0x70a08231 + адрес, дополненный до 32 байт.
+cpp_int getTokenBalance(const std::string& token, const std::string& wallet) {
+    std::string w = toLower(wallet);
+    if (w.size() == 42 && w.rfind("0x",0) == 0) w = w.substr(2);
+    std::string data = "0x70a08231" + std::string(24, '0') + w;
+    auto r = rpc("eth_call", {{{"to", token}, {"data", data}}, "latest"});
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 0; }
+    return hexToCppInt(r.get<std::string>());
 }
 
 int getDecimals(const std::string& addr) {
@@ -1131,6 +1175,11 @@ bool processBlock(long long bn) {
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
+        // Запоминаем, какими токенами кошелёк оперировал: это единственный
+        // источник кандидатов для экрана "Холд" (в блокчейне нет запроса
+        // "покажи все токены адреса"). Пишем для ВСЕХ отслеживаемых, а не
+        // только для сервисных, иначе у добавленных вручную список пуст.
+        if (res.isSwap && !res.tokenAddr.empty()) rememberWalletToken(mA, res.tokenAddr, blockTs);
         if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
         else dispatchAlert(mA, res, hash);
         markTxProcessed(hash,bn);
@@ -1256,6 +1305,16 @@ void handleCallbackQuery(const json& callbackQuery) {
         else if (param == "add_wallet") {
             startAddWalletFlow(chatId, messageId);
         }
+        else if (param == "account") {
+            rememberView(chatId, data);
+            auto msg = TelegramUI::buildAccountMenu(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+        else if (param == "hold") {
+            rememberView(chatId, data);
+            auto msg = TelegramUI::buildHoldWalletList(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
         else if (param == "my_wallets") {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildWalletsList(chatId);
@@ -1320,6 +1379,20 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId,
                 tr(lang, "err_invoice_failed") + "\n\n" + page.text, page.keyboard);
         }
+    }
+    else if (action == "hold_page") {
+        int p = 1; try { p = std::stoi(param); } catch (...) {}
+        rememberView(chatId, data);
+        auto msg = TelegramUI::buildHoldWalletList(chatId, p);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+    }
+    else if (action == "hold_noop") {
+    }
+    else if (action == "hold_info") {
+        Lang lang = langFromCode(getUserLanguage(chatId));
+        replyInPlace(chatId, messageId, tr(lang, "hold_loading"), "");
+        auto msg = TelegramUI::buildHoldCard(chatId, param);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "mw_page" || action == "wstats" || action == "rename" ||
              action == "askremove" || action == "remove") {
