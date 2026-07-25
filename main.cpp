@@ -757,6 +757,20 @@ std::string buildCancelButton(Lang lang) {
     return keyboard.dump();
 }
 
+// То же, но с быстрым переходом в Топ трейдеров: на экране ввода адреса это
+// избавляет от лишнего пути "выйти - найти в меню - вернуться".
+std::string buildCancelWithTopTraders(Lang lang) {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
+    }));
+    return keyboard.dump();
+}
+
 
 UIMessage buildLanguagesMenu(const std::string& chatId) {
     static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
