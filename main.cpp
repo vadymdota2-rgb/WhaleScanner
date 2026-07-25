@@ -1339,8 +1339,12 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "premium_buy") {
 
         if (!sendPremiumInvoice(chatId)) {
+            // Возвращаем страницу премиума под сообщением об ошибке: иначе
+            // пользователь остаётся с голым текстом без единой кнопки.
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            auto page = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId,
-                tr(langFromCode(getUserLanguage(chatId)), "err_invoice_failed"), "");
+                tr(lang, "err_invoice_failed") + "\n\n" + page.text, page.keyboard);
         }
     }
     else if (action == "mw_page" || action == "wstats" || action == "rename" ||
