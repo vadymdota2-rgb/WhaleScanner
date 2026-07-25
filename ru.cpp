@@ -72,6 +72,8 @@ const std::unordered_map<std::string, Entry>& table() {
 
         {"err_invalid_number", {"❌ Invalid number.", "❌ Неверное число."}},
         {"err_threshold_positive", {"❌ Threshold must be positive.", "❌ Порог должен быть положительным."}},
+        {"err_threshold_too_small", {"❌ The minimum alert threshold is $50. Please enter $50 or more.",
+                                     "❌ Минимальный порог алертов — $50. Введите $50 или больше."}},
         {"err_threshold_too_large", {"❌ Threshold is too large.", "❌ Слишком большой порог."}},
         {"err_threshold_decimals", {"❌ Use at most 2 decimal places (e.g., 7500.50).", "❌ Используйте не более 2 знаков после запятой (например, 7500.50)."}},
         {"threshold_retry_hint", {"\n\nPlease enter a valid amount (e.g., 7500 or 7500.50) or press Cancel.",
@@ -87,8 +89,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"threshold_current", {"Current threshold:", "Текущий порог:"}},
         {"threshold_choose", {"Choose a preset or enter a custom amount:", "Выберите готовый вариант или введите свою сумму:"}},
         {"threshold_custom_btn", {"✏️ Custom amount", "✏️ Своя сумма"}},
-        {"threshold_custom_title", {"💰 <b>Custom Threshold</b>\n\nPlease enter the minimum alert amount in USD (e.g., 7500 or 7500.50):",
-                                    "💰 <b>Своя сумма порога</b>\n\nВведите минимальную сумму алерта в USD (например, 7500 или 7500.50):"}},
+        {"threshold_custom_title", {"💰 <b>Custom Threshold</b>\n\nEnter the minimum alert amount in USD — from $50 and up (e.g., 7500 or 7500.50):",
+                                    "💰 <b>Своя сумма порога</b>\n\nВведите минимальную сумму алерта в USD — от $50 и выше (например, 7500 или 7500.50):"}},
 
         {"unknown_command", {"🤔 Please use the menu below.",
                              "🤔 Пожалуйста, используйте меню ниже."}},
