@@ -950,6 +950,18 @@ void rememberWalletToken(const std::string& wallet, const std::string& token, lo
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
+// Забыть токен: вызывается, когда при открытии портфеля баланс оказался
+// нулевым - значит кошелёк эту монету продал или перевёл. Чистим по ФАКТУ,
+// а не по возрасту записи: иначе потеряли бы монеты, которые держат годами
+// не трогая, и продолжали бы тратить запросы на давно проданные.
+void forgetWalletToken(const std::string& wallet, const std::string& token) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"DELETE FROM wallet_tokens WHERE wallet=? AND token=?")) return;
+    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,toLower(token).c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+
 // Из чека транзакции вытаскиваем ВСЕ токены, где кошелёк был отправителем или
 // получателем - не только результат свопа. Так в портфель попадают и обычные
 // переводы, и раздачи, и вторая нога сложных сделок. Всё считаем сами,
