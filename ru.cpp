@@ -48,8 +48,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"back_button", {"← Back", "← Назад"}},
         {"cancel_button", {"❌ Cancel", "❌ Отмена"}},
 
-        {"add_wallet_title", {"➕ <b>Add Wallet</b>\n\nSend the address of the wallet you want to track — format 0x..., 42 characters.\n\n💡 <b>Where to find wallets:</b> open 🏆 <b>Top Traders</b> in the menu — it ranks the most profitable wallets of the last 30 days, and you can start tracking any of them in one tap. You can also take an address from any block explorer or analytics site.",
-                              "➕ <b>Добавить кошелёк</b>\n\nОтправьте адрес кошелька, который хотите отслеживать — формат 0x..., 42 символа.\n\n💡 <b>Где взять кошелёк:</b> откройте в меню 🏆 <b>Топ трейдеров</b> — там рейтинг самых прибыльных кошельков за 30 дней, любого можно взять на отслеживание в один тап. Также адрес можно взять из блокчейн-эксплорера или со сторонних аналитических сервисов."}},
+        {"add_wallet_title", {"➕ <b>Add Wallet</b>\n\nSend the address of the wallet you want to track — format 0x..., 42 characters.\n\n💡 <b>Not sure whose wallet to add?</b>\nThe 🏆 <b>Top Traders</b> tab below ranks the most profitable wallets of the last 30 days — pick anyone and start tracking in one tap.\nOr paste an address from a block explorer or an analytics service.",
+                              "➕ <b>Добавить кошелёк</b>\n\nОтправьте адрес кошелька, который хотите отслеживать — формат 0x..., 42 символа.\n\n💡 <b>Не знаете, чей кошелёк добавить?</b>\nВкладка 🏆 <b>Топ трейдеров</b> ниже — рейтинг самых прибыльных кошельков за 30 дней. Выбирайте любого и берите на отслеживание одним тапом.\nИли вставьте адрес из блокчейн-эксплорера либо аналитического сервиса."}},
         {"add_wallet_addr_ok", {"✅ Address accepted.\n\nNow enter a name for this wallet — up to 32 characters (e.g., \"Binance\"):",
                                 "✅ Адрес принят.\n\nТеперь введите имя для этого кошелька — до 32 символов (например, «Binance»):"}},
         {"add_wallet_invalid", {"❌ Invalid wallet address.\n\nThe address must start with 0x and be 42 characters long. Enter a valid address or press Cancel.",
