@@ -523,29 +523,6 @@ void markTxProcessed(const std::string& h, long long b) {
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) return;
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,b); sqlite3_step(s); sqlite3_finalize(s);
 }
-
-// Пакетная версия для самого частого случая ("транзакция не касается ни одного
-// отслеживаемого кошелька" - обычно 95%+ всех tx блока). Один prepared statement
-// и один коммит на весь блок вместо отдельной компиляции SQL и автокоммита на
-// КАЖДУЮ транзакцию - при текущей скорости BSC (~100+ tx/сек после Fermi) это
-// компиляции+коммита на каждую была основной причиной отставания.
-void markTxProcessedBatch(const std::vector<std::pair<std::string, long long>>& items) {
-    if (items.empty()) return;
-    std::lock_guard<std::mutex> l(dbMutex);
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return;
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, "INSERT OR IGNORE INTO processed_tx(tx_hash,block_number) VALUES(?,?)")) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return;
-    }
-    for (const auto& [h, b] : items) {
-        sqlite3_bind_text(s, 1, h.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(s, 2, b);
-        sqlite3_step(s);
-        sqlite3_reset(s);
-    }
-    sqlite3_finalize(s);
-    sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
-}
 long getTgOffset() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='tg_offset'")) return 0;
@@ -914,6 +891,16 @@ void replyInPlace(const std::string& chatId, long long messageId, const std::str
     if (messageId <= 0 || !editMsg(chatId, messageId, text, kb)) {
         sendMsg(chatId, text, keyboard);
     }
+}
+
+// Удаление собственного сообщения бота. Нужно, чтобы после завершения диалога
+// (ввод адреса/имени) не оставалось второе "мёртвое" меню в чате.
+void deleteMsg(const std::string& chatId, long long messageId) {
+    if (messageId <= 0) return;
+    json j;
+    j["chat_id"] = chatId;
+    j["message_id"] = messageId;
+    http("https://api.telegram.org/bot" + TG_TOKEN + "/deleteMessage", j.dump());
 }
 
 void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text, bool showAlert) {
@@ -1373,7 +1360,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
         else {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-            g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address);
+            g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address, messageId);
             replyInPlace(chatId, messageId, tr(trackLang, "track_name_prompt"), TelegramUI::buildCancelButton(trackLang));
         }
     }
