@@ -12,7 +12,6 @@ void cleanupExpiredPremium();
 
 long long premiumExpireTs(const std::string& chatId);
 
-bool activateOrExtendPremium(const std::string& chatId);
 
 enum class PaymentApplyResult { Activated, Extended, Duplicate, Rejected, Error };
 PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp);
