@@ -2,6 +2,7 @@
 
 #include <string>
 #include "tx_analyzer.h"
+#include "ru.h"   // Lang - для formatHoldTime
 
 void initRankingDB();
 
@@ -47,7 +48,12 @@ struct TraderStats {
     int winRatePercent = 0;
     int trades = 0;
     long long lastTs = 0;
+    long long avgHoldSeconds = 0;
 };
+
+// Читаемая длительность ("2ч 15м" / "2h 15m") - используется и в рейтинге,
+// и в карточке кошелька, чтобы формат совпадал.
+std::string formatHoldTime(long long seconds, Lang lang);
 
 bool getTraderStats(const std::string& wallet, TraderStats& out);
 
