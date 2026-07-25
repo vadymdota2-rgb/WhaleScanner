@@ -77,6 +77,17 @@ std::string shortAddress(const std::string& a) {
     if (a.length() <= 12) return a;
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
+// Деньги из наносов в едином виде проекта ($1,234.56). Через строку, а не
+// прямым приведением: строковое представление есть всегда, а для сумм за
+// пределами long long честно откатываемся на форматтер больших чисел.
+std::string fmtUsdNanos(const cpp_int& nanos) {
+    std::string s = nanos.convert_to<std::string>();
+    if (s.size() > 18) return formatUsd(nanos);
+    long long v = 0;
+    try { v = std::stoll(s); } catch (...) { return formatUsd(nanos); }
+    return formatUsdNanosSigned(v, false);
+}
+
 // Форматирование вынесено в utils - одна реализация на весь проект.
 std::string fmtPnlSigned(long long pnlNanos) { return formatUsdNanosSigned(pnlNanos); }
 std::string fmtPctSigned(double p)            { return formatPercent(p, true); }
@@ -321,15 +332,21 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
     std::vector<PortfolioItem> held;
     cpp_int totalUsdNanos = 0;
+    int failedReads = 0;   // сколько балансов не удалось прочитать
+
     // 1) Нативный актив
     {
-        cpp_int wei = getNativeBalance(address);
-        if (wei > 0) {
+        cpp_int wei = 0;
+        if (!getNativeBalance(address, wei)) {
+            ++failedReads;
+        } else if (wei > 0) {
             uint64_t price = getPriceNanos(chainCtx().wrappedNative);
-            cpp_int usd = (wei * cpp_int(price)) / cpp_int("1000000000000000000");
-            if (usd >= cpp_int(DUST_USD_NANOS)) {
-                held.push_back({chainCtx().nativeSymbol, formatAmount(wei, 18), usd});
-                totalUsdNanos += usd;
+            if (price > 0) {
+                cpp_int usd = (wei * cpp_int(price)) / cpp_int("1000000000000000000");
+                if (usd >= cpp_int(DUST_USD_NANOS)) {
+                    held.push_back({chainCtx().nativeSymbol, formatAmount(wei, 18), usd});
+                    totalUsdNanos += usd;
+                }
             }
         }
     }
@@ -337,16 +354,21 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     // 2) Токены, которые кошелёк трогал
     std::vector<std::string> tokens = getWalletTokens(address, MAX_TOKENS_TO_CHECK);
     for (const auto& t : tokens) {
-        cpp_int raw = getTokenBalance(t, address);
+        cpp_int raw = 0;
+        if (!getTokenBalance(t, address, raw)) {
+            // Узнать не удалось - НЕ удаляем запись, иначе сетевая заминка
+            // стёрла бы монету навсегда. Просто пропускаем в этот раз.
+            ++failedReads;
+            continue;
+        }
         if (raw <= 0) {
-            // Баланс нулевой - монеты у кошелька больше нет. Убираем из списка,
-            // чтобы не тратить на неё запрос при каждом открытии портфеля.
+            // Баланс честно нулевой - монеты у кошелька больше нет.
             forgetWalletToken(address, t);
             continue;
         }
         int dec = getDecimals(t);
         uint64_t price = getPriceNanos(t);
-        if (price == 0) continue;
+        if (price == 0) continue;          // цены нет - монету не оценить
         cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
         cpp_int usd = (raw * cpp_int(price)) / denom;
         if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
@@ -361,7 +383,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     text << tr(lang, "hold_title") << "\n";
     text << "<code>" << safeString(address, 42) << "</code>\n\n";
     text << "\U0001F4B0 <b>" << tr(lang, "hold_total") << ":</b> "
-         << formatUsd(totalUsdNanos) << "\n\n";
+         << fmtUsdNanos(totalUsdNanos) << "\n\n";
 
     if (held.empty()) {
         text << tr(lang, "hold_empty");
@@ -370,10 +392,13 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         text << "\U0001FA99 <b>" << tr(lang, "hold_coins") << ":</b>\n";
         for (const auto& h : held) {
             text << "• <b>" << h.symbol << "</b> — "
-                 << formatUsd(h.usdNanos) << "  <i>(" << h.amount << ")</i>\n";
+                 << fmtUsdNanos(h.usdNanos)
+                 << "  <i>(" << h.amount << ")</i>\n";
         }
         text << "\n<i>" << tr(lang, "hold_dust_note") << "</i>";
     }
+    if (failedReads > 0)
+        text << "\n<i>" << tr(lang, "hold_partial") << "</i>";
 
     json kb;
     kb["inline_keyboard"] = json::array();
