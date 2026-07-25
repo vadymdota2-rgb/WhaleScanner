@@ -49,8 +49,8 @@ struct PortfolioItem {
 
 // --- Сервисы main.cpp для экрана "Холд" ---
 std::vector<std::string> getWalletTokens(const std::string& wallet, int limit);
-cpp_int getNativeBalance(const std::string& wallet);
-cpp_int getTokenBalance(const std::string& token, const std::string& wallet);
+bool getNativeBalance(const std::string& wallet, cpp_int& out);
+bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_int& out);
 void forgetWalletToken(const std::string& wallet, const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
