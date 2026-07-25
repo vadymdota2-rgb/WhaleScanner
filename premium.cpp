@@ -201,35 +201,6 @@ bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlre
 
 }
 
-bool activateOrExtendPremium(const std::string& chatId) {
-    ensureUser(chatId);
-    long long now = static_cast<long long>(time(nullptr));
-
-    std::lock_guard<std::mutex> l(dbMutex);
-
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        std::cerr << "[PREMIUM] activate: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
-        return false;
-    }
-
-    bool wasAlreadyActive = false;
-    if (!extendPremiumLocked(chatId, now, wasAlreadyActive)) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        std::cerr << "[PREMIUM] activate: failed for " << chatId << std::endl;
-        return false;
-    }
-
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        std::cerr << "[PREMIUM] activate: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
-        return false;
-    }
-
-    std::cout << "[PREMIUM] " << (wasAlreadyActive ? "Extended" : "Activated")
-              << " for " << chatId << std::endl;
-    return true;
-}
-
 PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp) {
     if (!sp.is_object()) return PaymentApplyResult::Rejected;
 
