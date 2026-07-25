@@ -319,10 +319,8 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;  // $10
     constexpr int MAX_TOKENS_TO_CHECK = 40;                      // потолок RPC-запросов
 
-    struct Holding { std::string symbol; cpp_int usdNanos; std::string amountStr; };
-    std::vector<Holding> held;
+    std::vector<PortfolioItem> held;
     cpp_int totalUsdNanos = 0;
-
     // 1) Нативный актив
     {
         cpp_int wei = getNativeBalance(address);
@@ -330,7 +328,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
             uint64_t price = getPriceNanos(chainCtx().wrappedNative);
             cpp_int usd = (wei * cpp_int(price)) / cpp_int("1000000000000000000");
             if (usd >= cpp_int(DUST_USD_NANOS)) {
-                held.push_back({chainCtx().nativeSymbol, usd, formatAmount(wei, 18)});
+                held.push_back({chainCtx().nativeSymbol, formatAmount(wei, 18), usd});
                 totalUsdNanos += usd;
             }
         }
@@ -347,12 +345,12 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
         cpp_int usd = (raw * cpp_int(price)) / denom;
         if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
-        held.push_back({safeString(getSymbol(t), 12), usd, formatAmount(raw, dec)});
+        held.push_back({safeString(getSymbol(t), 12), formatAmount(raw, dec), usd});
         totalUsdNanos += usd;
     }
 
     std::sort(held.begin(), held.end(),
-              [](const Holding& a, const Holding& b) { return a.usdNanos > b.usdNanos; });
+              [](const PortfolioItem& a, const PortfolioItem& b) { return a.usdNanos > b.usdNanos; });
 
     std::stringstream text;
     text << tr(lang, "hold_title") << "\n";
@@ -367,7 +365,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         text << "\U0001FA99 <b>" << tr(lang, "hold_coins") << ":</b>\n";
         for (const auto& h : held) {
             text << "• <b>" << h.symbol << "</b> — "
-                 << formatUsd(h.usdNanos) << "  <i>(" << h.amountStr << ")</i>\n";
+                 << formatUsd(h.usdNanos) << "  <i>(" << h.amount << ")</i>\n";
         }
         text << "\n<i>" << tr(lang, "hold_dust_note") << "</i>";
     }
