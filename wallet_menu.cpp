@@ -61,22 +61,9 @@ std::string shortAddress(const std::string& a) {
     if (a.length() <= 12) return a;
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
-std::string fmtPnlSigned(long long pnlNanos) {
-    cpp_int a = pnlNanos < 0 ? cpp_int(-pnlNanos) : cpp_int(pnlNanos);
-    return (pnlNanos < 0 ? "-" : "+") + formatUsd(a);
-}
-std::string fmtPctSigned(double p) {
-    if (!std::isfinite(p)) return "n/a";
-    const bool neg = p < 0;
-    double a = neg ? -p : p;
-    // Та же схема точности, что и в рейтинге, чтобы ROI выглядел одинаково:
-    // <1% - один знак (0.9%), 1..1000% - два знака (1.35%), выше - целое.
-    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
-    return std::string(neg ? "-" : "+") + buf + "%";
-}
-
+// Форматирование вынесено в utils - одна реализация на весь проект.
+std::string fmtPnlSigned(long long pnlNanos) { return formatUsdNanosSigned(pnlNanos); }
+std::string fmtPctSigned(double p)            { return formatPercent(p, true); }
 
 // ========================= Операции хранилища ==========================
 
