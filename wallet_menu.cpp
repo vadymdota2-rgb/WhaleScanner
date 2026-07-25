@@ -83,6 +83,26 @@ size_t countUserWhales(const std::string& chatId) {
 }
 
 
+void untrackWalletFromService(const std::string& wallet) {
+    bool removed = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s,
+            "DELETE FROM user_whales WHERE user_id=? AND whale_id=("
+            "SELECT id FROM whale_addresses WHERE address=?)")) return;
+        sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db) > 0;
+        else std::cerr << "[WATCHERS] service untrack failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(s);
+    }
+    if (removed) {
+        std::cout << "[WATCHERS] Bot wallet untracked from service account: " << toLower(wallet) << std::endl;
+        refreshWatchers();
+    }
+}
+
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
