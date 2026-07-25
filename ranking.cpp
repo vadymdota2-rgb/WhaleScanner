@@ -8,6 +8,8 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdint>
+#include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <atomic>
 #include <thread>
@@ -36,7 +38,7 @@ constexpr int PER_PAGE = 5;
 constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
-const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━";
+const char* const CARD_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━";
 
 const char* const MENU_STRETCH =
     "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀";
@@ -205,9 +207,18 @@ std::string formatUsdSigned(int64_t usdNanos) {
 }
 
 std::string formatPercentSigned(double pct) {
-    long long rounded = static_cast<long long>(pct >= 0 ? pct + 0.5 : pct - 0.5);
-    std::string sign = rounded >= 0 ? "+" : "-";
-    return sign + std::to_string(rounded < 0 ? -rounded : rounded) + "%";
+    if (!std::isfinite(pct)) return "n/a";
+    const bool neg = pct < 0;
+    double a = neg ? -pct : pct;
+    // Точность по величине: раньше всё округлялось до целого, из-за чего
+    // 0.9% превращалось в "1%", а 0.4% - вообще в "0%".
+    //   меньше 1%   -> один знак  (0.9%)
+    //   от 1 до 1000 -> два знака  (1.35%)
+    //   больше 1000  -> целое     (12345%), два знака там были бы шумом
+    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
+    return std::string(neg ? "-" : "+") + buf + "%";
 }
 
 std::string rankLabel(int rank) {
@@ -220,8 +231,14 @@ std::string rankLabel(int rank) {
 }
 
 std::string formatPercentPlain(double pct) {
-    long long rounded = static_cast<long long>(pct >= 0 ? pct + 0.5 : pct - 0.5);
-    return (rounded < 0 ? "-" : "") + std::to_string(rounded < 0 ? -rounded : rounded) + "%";
+    if (!std::isfinite(pct)) return "n/a";
+    const bool neg = pct < 0;
+    double a = neg ? -pct : pct;
+    // Та же точность, что и в formatPercentSigned, но без ведущего "+".
+    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
+    return std::string(neg ? "-" : "") + buf + "%";
 }
 
 struct PnlRow {
@@ -404,9 +421,9 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
 
     std::stringstream text;
 
-text << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
-text << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
-text << "<code>" << safeString(token, 42) << "</code>\n\n";
+    text << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
+    text << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
+    text << "<code>" << safeString(token, 42) << "</code>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
