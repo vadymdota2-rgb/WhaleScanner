@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <mutex>
 #include <ctime>
+#include <cmath>
+#include <cstdio>
 #include <sqlite3.h>
 
 #include "json.hpp"
@@ -64,8 +66,15 @@ std::string fmtPnlSigned(long long pnlNanos) {
     return (pnlNanos < 0 ? "-" : "+") + formatUsd(a);
 }
 std::string fmtPctSigned(double p) {
-    long long r = static_cast<long long>(p >= 0 ? p + 0.5 : p - 0.5);
-    return (r < 0 ? "-" : "+") + std::to_string(r < 0 ? -r : r) + "%";
+    if (!std::isfinite(p)) return "n/a";
+    const bool neg = p < 0;
+    double a = neg ? -p : p;
+    // Та же схема точности, что и в рейтинге, чтобы ROI выглядел одинаково:
+    // <1% - один знак (0.9%), 1..1000% - два знака (1.35%), выше - целое.
+    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
+    return std::string(neg ? "-" : "+") + buf + "%";
 }
 
 
