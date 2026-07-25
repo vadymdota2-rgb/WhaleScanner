@@ -364,6 +364,22 @@ json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
     return nullptr;
 }
 
+// Запрос с РАСПРЕДЕЛЕНИЕМ по узлам. Нужен для параллельной загрузки чеков:
+// если все потоки бьют в один эндпоинт, мы упираемся в его лимит (~33 запроса
+// в секунду) задолго до нехватки времени. Раскладывая запросы по 12 узлам,
+// поднимаем суммарную ёмкость примерно до 400/сек. При неудаче пробуем
+// следующие узлы, поэтому отказ одного не роняет загрузку блока.
+json rpcSpread(size_t seed, const std::string& method, json params) {
+    const size_t n = RPC_ENDPOINTS.size();
+    for (size_t attempt = 0; attempt < 3 && running.load(std::memory_order_relaxed); ++attempt) {
+        size_t idx = (seed + attempt) % n;
+        auto r = rpcOnEndpoint(idx, method, params);
+        if (!r.is_null()) return r;
+        g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
+    }
+    return nullptr;
+}
+
 // Диагностика: если конкретный публичный RPC периодически "подвисает" на секунды
 // без явного сбоя (timeout/ошибка), rpc_failures это не заметит - а лаг растёт
 // точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
@@ -1213,6 +1229,9 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
+    // ---- Проход 1: находим совпадения. Запросов к сети нет, только сравнения. ----
+    struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; };
+    std::vector<Matched> matched;
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -1228,7 +1247,45 @@ bool processBlock(long long bn) {
         // в секунду и таблица на миллионы строк вместо десятков тысяч.
         if (mA.empty()) continue;
         if (isTxProcessed(hash)) continue;
-        auto receipt=rpc("eth_getTransactionReceipt",{hash});
+        matched.push_back({&tx, hash, mA});
+    }
+
+    // ---- Проход 2: чеки тянем ПАРАЛЛЕЛЬНО. ----
+    // Раньше они запрашивались строго по одному, и именно это упирало потолок
+    // числа отслеживаемых кошельков: время блока = сумма всех ожиданий сети.
+    // Параллелить безопасно: curl-хэндлы у нас thread_local, выбор эндпоинта
+    // атомарный, а каждый поток пишет в свою ячейку результата. Вся работа с
+    // базой и кэшами остаётся ниже, в один поток.
+    std::vector<nlohmann::json> receipts(matched.size());
+    if (!matched.empty()) {
+        const size_t CONCURRENCY = 8;
+        // Сдвиг от текущего узла, чтобы разные блоки начинали с разных мест
+        // и нагрузка не скапливалась на первых эндпоинтах.
+        const size_t spreadBase = rpcIndex.load(std::memory_order_relaxed);
+        std::atomic<size_t> next{0};
+        std::vector<std::thread> pool;
+        size_t threads = std::min(CONCURRENCY, matched.size());
+        for (size_t t = 0; t < threads; ++t) {
+            pool.emplace_back([&]() {
+                for (;;) {
+                    size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= matched.size() || !running.load(std::memory_order_relaxed)) return;
+                    // Каждая задача идёт на свой узел: seed = базовый сдвиг + номер
+                    // задачи. Так нагрузка размазывается по всем эндпоинтам.
+                    receipts[i] = rpcSpread(spreadBase + i, "eth_getTransactionReceipt", {matched[i].hash});
+                }
+            });
+        }
+        for (auto& th : pool) th.join();
+    }
+
+    // ---- Проход 3: анализ и запись - последовательно, как и раньше. ----
+    for (size_t i = 0; i < matched.size(); ++i) {
+        if (!running.load(std::memory_order_relaxed)) return false;
+        const auto& tx = *matched[i].tx;
+        const std::string& hash = matched[i].hash;
+        const std::string& mA = matched[i].wallet;
+        const auto& receipt = receipts[i];
         if (receipt.is_null()) {
             std::cerr << "[RPC] receipt unavailable, will retry whole block: " << hash << std::endl;
             return false;
