@@ -1355,72 +1355,9 @@ void handleCallbackQuery(const json& callbackQuery) {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
-    else if (action == "tt_page") {
-        rememberView(chatId, data);
-        int page = 1;
-        try { page = std::stoi(param); } catch (...) {}
-        auto msg = buildTopPnlPage(chatId, page);
-        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "tt_track") {
-        std::string address = toLower(param);
-        Lang trackLang = langFromCode(getUserLanguage(chatId));
-        if (!isValidAddress(address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_invalid_address"), true);
-        }
-        else if (isTrackingWallet(chatId, address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_already_tracking"), true);
-        }
-        else if (chatId != SERVICE_CHAT_ID && countUserWhales(chatId) >= premiumMaxWallets(chatId)) {
-            std::string feedback = isPremium(chatId)
-                ? tr(trackLang, "wallet_limit_50_short")
-                : tr(trackLang, "free_plan_1_wallet");
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
-        }
-        else {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-            g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address, messageId);
-            replyInPlace(chatId, messageId, tr(trackLang, "track_name_prompt"), TelegramUI::buildCancelButton(trackLang));
-        }
-    }
-    else if (action == "tt_noop") {
-    }
-    else if (action == "gt_open") {
-        GlobalRankKind kind;
-        if (parseGlobalRankKind(param, kind)) {
-            rememberView(chatId, data);
-            auto msg = buildGlobalTopMessage(chatId, kind,
-                                             premiumTopTradersLimit(chatId),
-                                             !isPremium(chatId));
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-    }
-    else if (action == "gt_page") {
-        size_t sep = param.find(':');
-        if (sep != std::string::npos) {
-            std::string kindStr = param.substr(0, sep);
-            int page = 1;
-            try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
-            GlobalRankKind kind;
-            if (parseGlobalRankKind(kindStr, kind)) {
-                rememberView(chatId, data);
-                auto msg = buildGlobalTopPage(chatId, kind, page,
-                                              premiumTopTradersLimit(chatId),
-                                              !isPremium(chatId));
-                replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-            }
-        }
-    }
-    else if (action == "gt_token") {
-        Lang lang = langFromCode(getUserLanguage(chatId));
-        g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
-
-        replyInPlace(
-            chatId,
-            messageId,
-            tr(lang, "token_search_prompt"),
-            TelegramUI::buildCancelButton(lang)
-        );
+    else if (action == "tt_page" || action == "tt_track" || action == "tt_noop" ||
+             action == "gt_open" || action == "gt_page" || action == "gt_token") {
+        handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
 }
 
