@@ -1690,6 +1690,52 @@ void telegramLoop() {
                             sendMsg(cid,ss2.str());
                         }
                     }
+                    else if (txt.rfind("/import", 0) == 0) {
+                        if (cid != OWNER_CHAT_ID) {
+                            sendMsg(cid, "Access denied.");
+                        } else {
+                            // Массовая заливка кошельков на СЕРВИСНЫЙ аккаунт.
+                            // Адреса выбираем из текста регуляркой, поэтому годится
+                            // список через запятую, пробел или с новой строки.
+                            std::vector<std::string> found;
+                            {
+                                std::string s = toLower(txt);
+                                size_t p = 0;
+                                while ((p = s.find("0x", p)) != std::string::npos) {
+                                    if (p + 42 <= s.size()) {
+                                        std::string cand = s.substr(p, 42);
+                                        if (isValidAddress(cand)) { found.push_back(cand); p += 42; continue; }
+                                    }
+                                    p += 2;
+                                }
+                            }
+                            if (found.empty()) {
+                                sendMsg(cid, "Использование: /import 0x... 0x... (адреса через пробел, запятую или с новой строки)");
+                            } else {
+                                int added = 0, dup = 0, banned = 0, failed = 0;
+                                for (const auto& a : found) {
+                                    switch (addUserWhale(SERVICE_CHAT_ID, a, a)) {
+                                        case AddWhaleResult::OK:                  ++added;  break;
+                                        case AddWhaleResult::ALREADY_EXISTS:      ++dup;    break;
+                                        case AddWhaleResult::PERMANENTLY_BANNED:  ++banned; break;
+                                        default:                                  ++failed; break;
+                                    }
+                                }
+                                // Один раз в конце, а не после каждого кошелька.
+                                refreshWatchers();
+                                std::stringstream rep;
+                                rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
+                                    << "Найдено адресов: <b>" << found.size() << "</b>\n"
+                                    << "✅ Добавлено: <b>" << added << "</b>\n"
+                                    << "↩️ Уже отслеживались: <b>" << dup << "</b>\n";
+                                if (banned > 0) rep << "🤖 Помечены как боты (пропущены): <b>" << banned << "</b>\n";
+                                if (failed > 0) rep << "⚠️ Не удалось добавить: <b>" << failed << "</b>\n";
+                                rep << "\nВсего на сервисном аккаунте: <b>"
+                                    << countUserWhales(SERVICE_CHAT_ID) << "</b>";
+                                sendMsg(cid, rep.str());
+                            }
+                        }
+                    }
                     else if (txt.rfind("/unban", 0) == 0) {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
