@@ -372,6 +372,8 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             card << "🎯 " << tr(lang, "ws_winrate") << ": <b>" << ts.winRatePercent << "%</b>\n";
         }
         card << "🔄 " << tr(lang, "ws_trades_30d") << ": <b>" << ts.trades << "</b>\n";
+        if (ts.avgHoldSeconds > 0)
+            card << "⏳ " << tr(lang, "rk_avg_hold") << ": <b>" << formatHoldTime(ts.avgHoldSeconds, lang) << "</b>\n";
         if (ts.lastTs > 0) {
             time_t t = static_cast<time_t>(ts.lastTs);
             char buf[32];
