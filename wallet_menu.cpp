@@ -338,7 +338,12 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     std::vector<std::string> tokens = getWalletTokens(address, MAX_TOKENS_TO_CHECK);
     for (const auto& t : tokens) {
         cpp_int raw = getTokenBalance(t, address);
-        if (raw <= 0) continue;
+        if (raw <= 0) {
+            // Баланс нулевой - монеты у кошелька больше нет. Убираем из списка,
+            // чтобы не тратить на неё запрос при каждом открытии портфеля.
+            forgetWalletToken(address, t);
+            continue;
+        }
         int dec = getDecimals(t);
         uint64_t price = getPriceNanos(t);
         if (price == 0) continue;
