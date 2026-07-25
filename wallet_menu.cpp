@@ -29,6 +29,22 @@ std::mutex g_walletPageMutex;
 std::map<std::string, int> g_lastWalletPage;
 }
 
+namespace {
+std::mutex g_holdPageMutex;
+std::map<std::string, int> g_lastHoldPage;
+}
+
+void rememberHoldPage(const std::string& chatId, int page) {
+    std::lock_guard<std::mutex> l(g_holdPageMutex);
+    g_lastHoldPage[chatId] = page < 1 ? 1 : page;
+}
+
+int lastHoldPage(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(g_holdPageMutex);
+    auto it = g_lastHoldPage.find(chatId);
+    return it != g_lastHoldPage.end() ? it->second : 1;
+}
+
 void rememberWalletPage(const std::string& chatId, int page) {
     std::lock_guard<std::mutex> l(g_walletPageMutex);
     g_lastWalletPage[chatId] = page < 1 ? 1 : page;
@@ -206,6 +222,168 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
 // ================================ Меню =================================
 
 namespace TelegramUI {
+
+// Экран "Мой аккаунт" - развилка между списком кошельков и холдом.
+UIMessage buildAccountMenu(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    size_t count = countUserWhales(chatId);
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_my_wallets") + " (" + std::to_string(count) + ")"},
+         {"callback_data", "menu:my_wallets"}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_hold")}, {"callback_data", "menu:hold"}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+    }));
+
+    std::stringstream text;
+    text << tr(lang, "account_title") << "\n\n" << tr(lang, "account_desc");
+    return {text.str(), kb.dump()};
+}
+
+// Список кошельков для выбора: у каждого своя кнопка "информация".
+UIMessage buildHoldWalletList(const std::string& chatId, int page) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    json kb;
+    kb["inline_keyboard"] = json::array();
+
+    std::vector<std::pair<std::string, std::string>> wallets; // адрес, имя
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+            "SELECT wa.address, uw.label FROM user_whales uw "
+            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+            "WHERE uw.user_id = ? ORDER BY uw.id ASC")) {
+            sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(s) == SQLITE_ROW)
+                wallets.emplace_back(safeColumnText(s, 0), safeColumnText(s, 1));
+            sqlite3_finalize(s);
+        }
+    }
+
+    constexpr int PER_PAGE = 5;
+    const int total = static_cast<int>(wallets.size());
+    const int totalPages = total > 0 ? (total + PER_PAGE - 1) / PER_PAGE : 1;
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
+    const int startIdx = (page - 1) * PER_PAGE;
+    const int endIdx = std::min(startIdx + PER_PAGE, total);
+
+    std::stringstream text;
+    rememberHoldPage(chatId, page);
+    text << tr(lang, "hold_title");
+    if (totalPages > 1) text << " (" << page << "/" << totalPages << ")";
+    text << "\n\n";
+
+    if (wallets.empty()) {
+        text << tr(lang, "mw_no_wallets") << "\n\n" << tr(lang, "mw_tap_add");
+    } else {
+        text << tr(lang, "hold_choose");
+        for (int i = startIdx; i < endIdx; ++i) {
+            const auto& [addr, label] = wallets[i];
+            std::string name = (toLower(label) == toLower(addr)) ? shortAddress(addr) : label;
+            kb["inline_keyboard"].push_back(json::array({
+                {{"text", "\U0001F4BC " + safeString(name, 28)}, {"callback_data", "hold_info:" + addr}}
+            }));
+        }
+    }
+
+    if (totalPages > 1) {
+        json nav = json::array();
+        if (page > 1)
+            nav.push_back({{"text", "\u2039"}, {"callback_data", "hold_page:" + std::to_string(page - 1)}});
+        nav.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)},
+                       {"callback_data", "hold_noop"}});
+        if (page < totalPages)
+            nav.push_back({{"text", "\u203A"}, {"callback_data", "hold_page:" + std::to_string(page + 1)}});
+        kb["inline_keyboard"].push_back(nav);
+    }
+
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:account"}}
+    }));
+    return {text.str(), kb.dump()};
+}
+
+// Карточка холда: нативный баланс + монеты дороже порога пыли.
+// Список токенов берём из wallet_tokens (что кошелёк торговал при нас) -
+// в блокчейне нет запроса "все токены адреса", поэтому иначе никак.
+UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;  // $10
+    constexpr int MAX_TOKENS_TO_CHECK = 40;                      // потолок RPC-запросов
+
+    struct Holding { std::string symbol; cpp_int usdNanos; std::string amountStr; };
+    std::vector<Holding> held;
+    cpp_int totalUsdNanos = 0;
+
+    // 1) Нативный актив
+    {
+        cpp_int wei = getNativeBalance(address);
+        if (wei > 0) {
+            uint64_t price = getPriceNanos(chainCtx().wrappedNative);
+            cpp_int usd = (wei * cpp_int(price)) / cpp_int("1000000000000000000");
+            if (usd >= cpp_int(DUST_USD_NANOS)) {
+                held.push_back({chainCtx().nativeSymbol, usd, formatAmount(wei, 18)});
+                totalUsdNanos += usd;
+            }
+        }
+    }
+
+    // 2) Токены, которые кошелёк трогал
+    std::vector<std::string> tokens = getWalletTokens(address, MAX_TOKENS_TO_CHECK);
+    for (const auto& t : tokens) {
+        cpp_int raw = getTokenBalance(t, address);
+        if (raw <= 0) continue;
+        int dec = getDecimals(t);
+        uint64_t price = getPriceNanos(t);
+        if (price == 0) continue;
+        cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
+        cpp_int usd = (raw * cpp_int(price)) / denom;
+        if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
+        held.push_back({safeString(getSymbol(t), 12), usd, formatAmount(raw, dec)});
+        totalUsdNanos += usd;
+    }
+
+    std::sort(held.begin(), held.end(),
+              [](const Holding& a, const Holding& b) { return a.usdNanos > b.usdNanos; });
+
+    std::stringstream text;
+    text << tr(lang, "hold_title") << "\n";
+    text << "<code>" << safeString(address, 42) << "</code>\n\n";
+    text << "\U0001F4B0 <b>" << tr(lang, "hold_total") << ":</b> "
+         << formatUsd(totalUsdNanos) << "\n\n";
+
+    if (held.empty()) {
+        text << tr(lang, "hold_empty");
+        if (tokens.empty()) text << "\n\n" << tr(lang, "hold_no_history");
+    } else {
+        text << "\U0001FA99 <b>" << tr(lang, "hold_coins") << ":</b>\n";
+        for (const auto& h : held) {
+            text << "• <b>" << h.symbol << "</b> — "
+                 << formatUsd(h.usdNanos) << "  <i>(" << h.amountStr << ")</i>\n";
+        }
+        text << "\n<i>" << tr(lang, "hold_dust_note") << "</i>";
+    }
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", "\U0001F50D " + chainCtx().explorerName},
+         {"url", chainCtx().explorerUrl + "/address/" + address}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")},
+         {"callback_data", "hold_page:" + std::to_string(lastHoldPage(chatId))}}
+    }));
+    return {text.str(), kb.dump()};
+}
 
 UIMessage buildWalletsList(const std::string& chatId, int page) {
 
