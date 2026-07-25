@@ -71,15 +71,41 @@ bool hexToLL(const std::string& hex, long long& out) {
     }
 }
 
+namespace {
+// Длина пробельного символа, начинающегося в позиции i (0 - непробельный).
+// Важно обрабатывать неразрывный пробел U+00A0 как ЦЕЛЫЙ двухбайтовый символ:
+// побайтовое сравнение обрезало бы байт A0 и у обычных букв (например, у
+// кириллической "Р" = D0 A0), ломая UTF-8.
+size_t whitespaceLenAt(const std::string& s, size_t i) {
+    unsigned char c = static_cast<unsigned char>(s[i]);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') return 1;
+    if (c == 0xC2 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0xA0) return 2;
+    return 0;
+}
+}
+
 std::string trim(const std::string& s) {
-    size_t a = s.find_first_not_of(" \t\r\n\xc2\xa0");
-    if (a == std::string::npos) return "";
-    size_t b = s.find_last_not_of(" \t\r\n\xc2\xa0");
-    return s.substr(a, b - a + 1);
+    size_t a = 0;
+    while (a < s.size()) {
+        size_t w = whitespaceLenAt(s, a);
+        if (w == 0) break;
+        a += w;
+    }
+    if (a >= s.size()) return "";
+
+    size_t end = a, i = a;
+    while (i < s.size()) {
+        size_t w = whitespaceLenAt(s, i);
+        if (w) { i += w; }
+        else    { ++i; end = i; }
+    }
+    return s.substr(a, end - a);
 }
 
 bool isValidAddress(const std::string& a) {
-    if (a.length() != 42 || a[0] != '0' || a[1] != 'x') return false;
+    // Префикс принимаем в обоих регистрах: часть вызовов проверяет адрес до
+    // приведения к нижнему регистру, и вставленный "0X..." отвергался бы зря.
+    if (a.length() != 42 || a[0] != '0' || (a[1] != 'x' && a[1] != 'X')) return false;
     for (size_t i = 2; i < a.length(); i++) {
         char c = a[i];
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
