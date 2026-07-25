@@ -17,6 +17,9 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ru.h"
+#include "premium.h"       // isPremium, premiumMaxWallets, premiumTopTradersLimit
+#include "wallet_menu.h"   // isTrackingWallet, TelegramUI::buildCancelButton
+#include "alert_settings.h" // g_sessionManager, replyInPlace, answerCallbackQuery
 
 std::string getUserLanguage(const std::string& chatId);
 
@@ -190,36 +193,10 @@ int64_t cppIntToClampedI64(const cpp_int& v) {
     return v.convert_to<int64_t>();
 }
 
-std::string formatUsdSigned(int64_t usdNanos) {
-    bool neg = usdNanos < 0;
-    int64_t dollars = usdNanos / 1000000000LL;
-    if (neg) dollars = -dollars;
-    std::string s = std::to_string(dollars);
-    std::string out;
-    int cnt = 0;
-    for (auto it = s.rbegin(); it != s.rend(); ++it) {
-        if (cnt != 0 && cnt % 3 == 0) out.push_back(',');
-        out.push_back(*it);
-        cnt++;
-    }
-    std::reverse(out.begin(), out.end());
-    return (neg ? "-$" : "+$") + out;
-}
-
-std::string formatPercentSigned(double pct) {
-    if (!std::isfinite(pct)) return "n/a";
-    const bool neg = pct < 0;
-    double a = neg ? -pct : pct;
-    // Точность по величине: раньше всё округлялось до целого, из-за чего
-    // 0.9% превращалось в "1%", а 0.4% - вообще в "0%".
-    //   меньше 1%   -> один знак  (0.9%)
-    //   от 1 до 1000 -> два знака  (1.35%)
-    //   больше 1000  -> целое     (12345%), два знака там были бы шумом
-    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
-    return std::string(neg ? "-" : "+") + buf + "%";
-}
+// Форматирование вынесено в utils, чтобы одно и то же число выглядело
+// одинаково во всех модулях и правки не приходилось дублировать.
+std::string formatUsdSigned(int64_t usdNanos) { return formatUsdNanosSigned(usdNanos); }
+std::string formatPercentSigned(double pct)   { return formatPercent(pct, true); }
 
 std::string rankLabel(int rank) {
     switch (rank) {
@@ -230,16 +207,7 @@ std::string rankLabel(int rank) {
     }
 }
 
-std::string formatPercentPlain(double pct) {
-    if (!std::isfinite(pct)) return "n/a";
-    const bool neg = pct < 0;
-    double a = neg ? -pct : pct;
-    // Та же точность, что и в formatPercentSigned, но без ведущего "+".
-    int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
-    char buf[48];
-    std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
-    return std::string(neg ? "-" : "") + buf + "%";
-}
+std::string formatPercentPlain(double pct) { return formatPercent(pct, false); }
 
 struct PnlRow {
     std::string wallet;
@@ -1136,4 +1104,78 @@ void rankingCacheLoop() {
             if (g_forceRebuild.exchange(false)) break;
         }
     }
+}
+
+bool handleRankingCallback(const std::string& chatId, const std::string& action,
+                           const std::string& param, const std::string& data,
+                           long long messageId, const std::string& callbackQueryId) {
+    if (action == "tt_page") {
+        rememberView(chatId, data);
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        auto msg = buildTopPnlPage(chatId, page);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+    }
+    else if (action == "tt_track") {
+        std::string address = toLower(param);
+        Lang trackLang = langFromCode(getUserLanguage(chatId));
+        if (!isValidAddress(address)) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_invalid_address"), true);
+        }
+        else if (isTrackingWallet(chatId, address)) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(trackLang, "toast_already_tracking"), true);
+        }
+        else if (chatId != SERVICE_CHAT_ID && countUserWhales(chatId) >= premiumMaxWallets(chatId)) {
+            std::string feedback = isPremium(chatId)
+                ? tr(trackLang, "wallet_limit_50_short")
+                : tr(trackLang, "free_plan_1_wallet");
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, feedback, true);
+        }
+        else {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
+            g_sessionManager.setState(chatId, UserState::AWAITING_TRACK_NAME, address, messageId);
+            replyInPlace(chatId, messageId, tr(trackLang, "track_name_prompt"), TelegramUI::buildCancelButton(trackLang));
+        }
+    }
+    else if (action == "tt_noop") {
+    }
+    else if (action == "gt_open") {
+        GlobalRankKind kind;
+        if (parseGlobalRankKind(param, kind)) {
+            rememberView(chatId, data);
+            auto msg = buildGlobalTopMessage(chatId, kind,
+                                             premiumTopTradersLimit(chatId),
+                                             !isPremium(chatId));
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+    }
+    else if (action == "gt_page") {
+        size_t sep = param.find(':');
+        if (sep != std::string::npos) {
+            std::string kindStr = param.substr(0, sep);
+            int page = 1;
+            try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
+            GlobalRankKind kind;
+            if (parseGlobalRankKind(kindStr, kind)) {
+                rememberView(chatId, data);
+                auto msg = buildGlobalTopPage(chatId, kind, page,
+                                              premiumTopTradersLimit(chatId),
+                                              !isPremium(chatId));
+                replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+            }
+        }
+    }
+    else if (action == "gt_token") {
+        Lang lang = langFromCode(getUserLanguage(chatId));
+        g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
+
+        replyInPlace(
+            chatId,
+            messageId,
+            tr(lang, "token_search_prompt"),
+            TelegramUI::buildCancelButton(lang)
+        );
+    }
+    else return false;
+    return true;
 }
