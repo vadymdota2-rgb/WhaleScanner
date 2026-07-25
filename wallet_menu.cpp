@@ -259,7 +259,7 @@ UIMessage buildHoldWalletList(const std::string& chatId, int page) {
         if (prepareOrLog(db, &s,
             "SELECT wa.address, uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "WHERE uw.user_id = ? ORDER BY uw.id ASC")) {
+            "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
             sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
             while (sqlite3_step(s) == SQLITE_ROW)
                 wallets.emplace_back(safeColumnText(s, 0), safeColumnText(s, 1));
