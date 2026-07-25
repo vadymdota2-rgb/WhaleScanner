@@ -54,6 +54,18 @@ struct TraderStats {
 
 bool getTraderStats(const std::string& wallet, TraderStats& out);
 
+// --- Сервисы main.cpp, нужные обработчику рейтинга ---
+std::string getUserLanguage(const std::string& chatId);
+void rememberView(const std::string& chatId, const std::string& data);
+size_t countUserWhales(const std::string& chatId);
+extern const std::string SERVICE_CHAT_ID;
+
+// Обработка callback'ов рейтинга: tt_page, tt_track, tt_noop, gt_open,
+// gt_page, gt_token. Возвращает true, если действие распознано.
+bool handleRankingCallback(const std::string& chatId, const std::string& action,
+                           const std::string& param, const std::string& data,
+                           long long messageId, const std::string& callbackQueryId);
+
 RankingMessage buildGlobalTopMenu(const std::string& chatId);
 
 RankingMessage buildGlobalTopMessage(const std::string& chatId, GlobalRankKind kind,
