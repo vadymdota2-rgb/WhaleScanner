@@ -215,7 +215,14 @@ struct PnlRow {
     double roiPercent = 0.0;
     int winRatePercent = 0;
     int completedTrades = 0;
+    // Среднее время удержания позиции (покупка -> продажа), в секундах.
+    // Показывает стиль трейдера и, главное, реально ли за ним успеть:
+    // скальпера с удержанием в минуты скопировать по алерту невозможно.
+    long long avgHoldSeconds = 0;
 };
+
+// "5m", "2h 15m", "3d 4h" - компактно и читаемо в строке рейтинга.
+
 
 std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
     ok = false;
@@ -229,6 +236,10 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
     cpp_int totalCostDeployed = 0;
     int completedTrades = 0;
     int winningTrades = 0;
+    // Взвешенная по количеству сумма времён покупок - позволяет получить
+    // среднюю дату входа так же, как heldCost даёт среднюю себестоимость.
+    cpp_int heldTimeWeighted = 0;
+    long long totalHoldSeconds = 0;
 
     auto flush = [&]() {
         if (!curWallet.empty() && completedTrades >= MIN_COMPLETED_TRADES &&
@@ -242,6 +253,7 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
             row.winRatePercent = completedTrades > 0
                 ? static_cast<int>(100.0 * winningTrades / completedTrades + 0.5)
                 : 0;
+            row.avgHoldSeconds = completedTrades > 0 ? totalHoldSeconds / completedTrades : 0;
             row.completedTrades = completedTrades;
             results.push_back(row);
         }
@@ -254,7 +266,7 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
 
     sqlite3_stmt* s;
     if (!prepareOrLog(rdb, &s,
-        "SELECT t.wallet, t.is_buy, t.usd_nanos, t.token_amount FROM trades t "
+        "SELECT t.wallet, t.is_buy, t.usd_nanos, t.token_amount, t.timestamp FROM trades t "
         "WHERE t.token=? AND t.timestamp>=? "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw WHERE iw.wallet=t.wallet AND iw.permanent=1) "
         "ORDER BY t.wallet ASC, t.timestamp ASC, t.id ASC")) return results;
@@ -267,6 +279,7 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
         bool isBuy = sqlite3_column_int(s, 1) != 0;
         int64_t usdNanos = sqlite3_column_int64(s, 2);
         std::string amountStr = safeColumnText(s, 3);
+        long long tradeTs = sqlite3_column_int64(s, 4);
         cpp_int amount;
         if (!safeParseAmount(amountStr, "wallet=" + wallet + " token=" + token, amount)) {
             sqlite3_finalize(s);
@@ -279,23 +292,32 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
             curWallet = wallet;
             heldQty = 0; heldCost = 0; realizedPnl = 0; totalCostDeployed = 0;
             completedTrades = 0; winningTrades = 0;
+            heldTimeWeighted = 0; totalHoldSeconds = 0;
         }
 
         if (isBuy) {
             heldQty += amount;
             heldCost += cpp_int(usdNanos);
+            heldTimeWeighted += amount * cpp_int(tradeTs);
         } else if (heldQty > 0 && amount > 0) {
             cpp_int matchedQty = amount < heldQty ? amount : heldQty;
             cpp_int costOfMatched = (heldCost * matchedQty) / heldQty;
             cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
+            cpp_int timeOfMatched = (heldTimeWeighted * matchedQty) / heldQty;
 
             realizedPnl += (proceedsMatched - costOfMatched);
             totalCostDeployed += costOfMatched;
             completedTrades++;
             if (proceedsMatched > costOfMatched) winningTrades++;
 
+            // Средняя дата входа проданной части = взвешенное время / количество.
+            cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
+            long long held = tradeTs - avgBuyTs.convert_to<long long>();
+            if (held > 0) totalHoldSeconds += held;
+
             heldQty -= matchedQty;
             heldCost -= costOfMatched;
+            heldTimeWeighted -= timeOfMatched;
         }
 
     }
@@ -326,7 +348,8 @@ std::string rowsToJson(const std::vector<PnlRow>& rows) {
     json a = json::array();
     for (const PnlRow& r : rows) {
         a.push_back({{"w", r.wallet}, {"p", r.pnlNanos}, {"r", r.roiPercent},
-                     {"wr", r.winRatePercent}, {"t", r.completedTrades}});
+                     {"wr", r.winRatePercent}, {"t", r.completedTrades},
+                     {"h", r.avgHoldSeconds}});
     }
     return a.dump();
 }
@@ -344,6 +367,7 @@ bool rowsFromJson(const std::string& payload, std::vector<PnlRow>& out) {
             r.roiPercent = e.value("r", 0.0);
             r.winRatePercent = e.value("wr", 0);
             r.completedTrades = e.value("t", 0);
+            r.avgHoldSeconds = e.value("h", static_cast<long long>(0));
             tmp.push_back(r);
         }
         out = std::move(tmp);
@@ -409,6 +433,7 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
             text << "📈 <b>ROI:</b> " << formatPercentSigned(r.roiPercent) << "\n";
             text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
+            text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
@@ -446,6 +471,8 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
     cpp_int heldQty = 0, heldCost = 0;
     cpp_int outerPnl = 0, outerBuyVol = 0;
     int outerCompleted = 0, outerWinning = 0;
+    cpp_int heldTimeWeighted = 0;
+    long long outerHoldSeconds = 0;
 
     auto flush = [&]() {
         if (!curWallet.empty() && outerCompleted >= MIN_GLOBAL_COMPLETED_TRADES &&
@@ -460,6 +487,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             row.winRatePercent = outerCompleted > 0
                 ? static_cast<int>(100.0 * outerWinning / outerCompleted + 0.5)
                 : 0;
+            row.avgHoldSeconds = outerCompleted > 0 ? outerHoldSeconds / outerCompleted : 0;
             row.completedTrades = outerCompleted;
             results.push_back(row);
         }
@@ -472,7 +500,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
 
     sqlite3_stmt* s;
     if (!prepareOrLog(rdb, &s,
-        "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.token_amount FROM trades t "
+        "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.token_amount, t.timestamp FROM trades t "
         "WHERE t.timestamp>=? "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw WHERE iw.wallet=t.wallet AND iw.permanent=1) "
         "ORDER BY t.wallet ASC, t.token ASC, t.timestamp ASC, t.id ASC")) return results;
@@ -485,6 +513,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
         bool isBuy = sqlite3_column_int(s, 2) != 0;
         int64_t usdNanos = sqlite3_column_int64(s, 3);
         std::string amountStr = safeColumnText(s, 4);
+        long long tradeTs = sqlite3_column_int64(s, 5);
         cpp_int amount;
         if (!safeParseAmount(amountStr, "wallet=" + wallet + " token=" + token, amount)) {
             sqlite3_finalize(s);
@@ -497,27 +526,35 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             curWallet = wallet;
             curToken.clear();
             outerPnl = 0; outerBuyVol = 0; outerCompleted = 0; outerWinning = 0;
+            outerHoldSeconds = 0;
         }
         if (token != curToken) {
             curToken = token;
-            heldQty = 0; heldCost = 0;
+            heldQty = 0; heldCost = 0; heldTimeWeighted = 0;
         }
 
         if (isBuy) {
             heldQty += amount;
             heldCost += cpp_int(usdNanos);
+            heldTimeWeighted += amount * cpp_int(tradeTs);
             outerBuyVol += cpp_int(usdNanos);
         } else if (heldQty > 0 && amount > 0) {
             cpp_int matchedQty = amount < heldQty ? amount : heldQty;
             cpp_int costOfMatched = (heldCost * matchedQty) / heldQty;
+            cpp_int timeOfMatched = (heldTimeWeighted * matchedQty) / heldQty;
             cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
 
             outerPnl += (proceedsMatched - costOfMatched);
             outerCompleted++;
             if (proceedsMatched > costOfMatched) outerWinning++;
 
+            cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
+            long long held = tradeTs - avgBuyTs.convert_to<long long>();
+            if (held > 0) outerHoldSeconds += held;
+
             heldQty -= matchedQty;
             heldCost -= costOfMatched;
+            heldTimeWeighted -= timeOfMatched;
         }
 
     }
@@ -599,6 +636,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             text << "📈 <b>ROI:</b> " << formatPercentPlain(r.roiPercent) << "\n";
             text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
+            text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
             if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
 
             json row;
@@ -758,6 +796,21 @@ void rebuildAllRankings() {
     std::cout << "[RANKING] Cache rebuilt: " << entries.size() << " entrie(s), " << ms << "ms" << std::endl;
 }
 
+}
+
+std::string formatHoldTime(long long seconds, Lang lang) {
+    if (seconds <= 0) return "—";
+    const std::string D = tr(lang, "unit_day"), H = tr(lang, "unit_hour"),
+                      M = tr(lang, "unit_min"), S = tr(lang, "unit_sec");
+    long long d = seconds / 86400;
+    long long h = (seconds % 86400) / 3600;
+    long long m = (seconds % 3600) / 60;
+    if (d > 0) return h > 0 ? (std::to_string(d) + D + " " + std::to_string(h) + H)
+                            : (std::to_string(d) + D);
+    if (h > 0) return m > 0 ? (std::to_string(h) + H + " " + std::to_string(m) + M)
+                            : (std::to_string(h) + H);
+    if (m > 0) return std::to_string(m) + M;
+    return std::to_string(seconds) + S;
 }
 
 bool isPermanentlyBanned(const std::string& wallet) {
@@ -1004,6 +1057,7 @@ bool getTraderStats(const std::string& walletArg, TraderStats& out) {
                     out.roiPercent = rows[i].roiPercent;
                     out.winRatePercent = rows[i].winRatePercent;
                     out.trades = rows[i].completedTrades;
+                    out.avgHoldSeconds = rows[i].avgHoldSeconds;
                     break;
                 }
             }
