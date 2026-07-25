@@ -31,7 +31,7 @@ bool removeUserWhale(const std::string& chatId, const std::string& address);
 // --- Меню ---
 namespace TelegramUI {
 UIMessage buildWalletsList(const std::string& chatId, int page = 1);
-UIMessage buildRemoveConfirm(const std::string& address, const std::string& label, Lang lang);
+UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& address, const std::string& label, Lang lang);
 }
 
 // --- Точки входа диспетчеризации ---
