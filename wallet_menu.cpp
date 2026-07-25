@@ -332,7 +332,7 @@ void startAddWalletFlow(const std::string& chatId, long long messageId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS, "", messageId);
     replyInPlace(chatId, messageId, tr(lang, "add_wallet_title"),
-            TelegramUI::buildCancelButton(lang));
+            TelegramUI::buildCancelWithTopTraders(lang));
 }
 
 bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
