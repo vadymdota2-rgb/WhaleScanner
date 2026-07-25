@@ -25,6 +25,7 @@ SendResult sendMsg(const std::string& chatId, const std::string& text,
                    const std::string& reply_markup = "");
 void replyInPlace(const std::string& chatId, long long messageId,
                   const std::string& text, const std::string& keyboard = "");
+void deleteMsg(const std::string& chatId, long long messageId);
 
 bool setUserThresholdNanos(const std::string& chatId, uint64_t nanos);
 uint64_t getUserThresholdNanos(const std::string& chatId);
@@ -43,6 +44,9 @@ enum class UserState {
 struct UserSession {
     UserState state = UserState::IDLE;
     std::string pendingAddress;
+    // id сообщения-приглашения ("введите адрес..."), чтобы удалить его после
+    // завершения диалога и не оставлять в чате второе висящее меню.
+    long long promptMessageId = 0;
 };
 
 class UserSessionManager {
@@ -56,9 +60,10 @@ public:
     }
 
     void setState(const std::string& chatId, UserState state,
-                  const std::string& pendingAddress = "") {
+                  const std::string& pendingAddress = "",
+                  long long promptMessageId = 0) {
         std::lock_guard<std::mutex> l(mtx);
-        sessions[chatId] = UserSession{state, pendingAddress};
+        sessions[chatId] = UserSession{state, pendingAddress, promptMessageId};
     }
 
     void clearSession(const std::string& chatId) {
