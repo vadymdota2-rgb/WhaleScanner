@@ -16,13 +16,14 @@ ChainContext makeBscContext() {
     c.nativeMarker = NATIVE_BNB_MARKER;
     c.wrappedNative = WBNB_ADDR;
     c.stablecoins = {
-        "0x55d398326f99059ff775485246999027b3197955",
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
-        "0xe9e7cea3dedca5984780bafc599bd69add087d56"
+        "0x55d398326f99059ff775485246999027b3197955",  // USDT
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  // USDC
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  // BUSD
+        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",  // FDUSD
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d"   // USD1
     };
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WBNB_ADDR);
-    c.baseAssets.insert("0xc5f0f7b66764f6ec8c8dff7ba683102295e16409");
     c.routers = {
         {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
         {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
