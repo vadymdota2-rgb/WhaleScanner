@@ -17,6 +17,9 @@ std::string formatThousands(uint64_t v);
 // правки во всех копиях.
 std::string formatUsdNanosSigned(long long nanos, bool withPlus = true);
 std::string formatPercent(double pct, bool withPlus = true);
+// Мелкие суммы (комиссия сети): дороже цента - два знака ($5.25), дешевле -
+// четыре ($0.0045), иначе всё превращалось бы в бессмысленный $0.00.
+std::string formatUsdSmall(long long nanos);
 bool hexToLL(const std::string& hex, long long& out);
 bool isValidAddress(const std::string& a);
 std::string safeColumnText(sqlite3_stmt* stmt, int col);
