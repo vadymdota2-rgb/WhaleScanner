@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include <set>
 #include <map>
 #include <cstdint>
@@ -41,14 +42,14 @@ struct ChainContext {
     std::map<std::string, std::string> routers;
     std::set<std::string> bridges;
     std::set<std::string> knownPoolInfra;
+    // Узлы этой сети хранятся здесь же: чтобы добавить сеть, достаточно
+    // описать её в ОДНОМ месте, а не искать по трём файлам.
+    std::vector<std::string> rpcEndpoints;
 };
 
 const ChainContext& chainCtx();
 void setChainContext(const ChainContext& ctx);
-ChainContext makeBscContext();
-ChainContext makeEthereumContext();
-ChainContext makeBaseContext();
-ChainContext makeArbitrumContext();
+// Конфигурации сетей вынесены в chains.h
 
 
 bool isBaseAsset(const std::string& a);
