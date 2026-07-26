@@ -91,6 +91,8 @@ ChainContext makeBscContext() {
     "https://bsc.nodereal.io",
     };
 
+    c.dexscreenerChainId = "bsc";
+    c.coingeckoPlatform = "binance-smart-chain";
     return c;
 }
 
@@ -130,6 +132,8 @@ ChainContext makeEthereumContext() {
     "https://cloudflare-eth.com"
     };
 
+    c.dexscreenerChainId = "ethereum";
+    c.coingeckoPlatform = "ethereum";
     return c;
 }
 
@@ -162,6 +166,8 @@ ChainContext makeBaseContext() {
     "https://base.publicnode.com"
     };
 
+    c.dexscreenerChainId = "base";
+    c.coingeckoPlatform = "base";
     return c;
 }
 
@@ -195,6 +201,8 @@ ChainContext makeArbitrumContext() {
     "https://arbitrum-one.publicnode.com"
     };
 
+    c.dexscreenerChainId = "arbitrum";
+    c.coingeckoPlatform = "arbitrum-one";
     return c;
 }
 
@@ -210,3 +218,4 @@ bool chainConfigByName(const std::string& name, ChainContext& out) {
     if (n == "arbitrum" || n == "arb")     { out = makeArbitrumContext(); return true; }
     return false;
 }
+
