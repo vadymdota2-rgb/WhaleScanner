@@ -26,6 +26,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"alert_qty", {"Qty", "Кол-во"}},
         {"alert_buy_price", {"Buy Price", "Цена покупки"}},
         {"alert_sell_price", {"Sell Price", "Цена продажи"}},
+        {"alert_gas", {"Gas fee", "Комиссия сети"}},
         {"alert_spent", {"Spent", "Потрачено"}},
         {"alert_received", {"Received", "Получено"}},
         {"alert_contract", {"Contract", "Контракт"}},
