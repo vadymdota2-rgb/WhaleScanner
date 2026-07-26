@@ -13,6 +13,7 @@
 #include <memory>
 #include <csignal>
 #include <cstdlib>
+#include <cmath>
 #include <curl/curl.h>
 #include <sstream>
 #include <iomanip>
@@ -917,11 +918,45 @@ std::string getSymbol(const std::string& addr) {
 uint64_t getPriceNanos(const std::string& token) {
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
-    double p=0; auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
-    try { auto j=json::parse(r); if (j.contains("pairs")&&j["pairs"].is_array()&&!j["pairs"].empty()&&j["pairs"][0].contains("priceUsd")&&j["pairs"][0]["priceUsd"].is_string()) p=std::stod(j["pairs"][0]["priceUsd"].get<std::string>()); } catch (...) {}
-    if (p==0) { auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/binance-smart-chain?contract_addresses="+token+"&vs_currencies=usd");
-        try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) p=j2[a]["usd"].get<double>(); } catch (...) {} }
-    uint64_t n=static_cast<uint64_t>(p*1000000000.0);
+    double p=0;
+    auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
+    try {
+        auto j=json::parse(r);
+        if (j.contains("pairs") && j["pairs"].is_array()) {
+            // Сервис отдаёт пары СО ВСЕХ сетей и в произвольном порядке.
+            // Брать первую попавшуюся нельзя: цена может прийти из чужой сети
+            // или из пустого пула, где она задрана в тысячи раз. Выбираем пару
+            // своей сети с наибольшей ликвидностью - она ближе всего к реальной.
+            const std::string wantChain = chainCtx().dexscreenerChainId;
+            double bestLiquidity = -1.0;
+            for (const auto& pair : j["pairs"]) {
+                if (!pair.is_object()) continue;
+                if (!wantChain.empty() && pair.value("chainId", std::string()) != wantChain) continue;
+                if (!pair.contains("priceUsd") || !pair["priceUsd"].is_string()) continue;
+                double liq = 0.0;
+                if (pair.contains("liquidity") && pair["liquidity"].is_object() &&
+                    pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
+                    liq = pair["liquidity"]["usd"].get<double>();
+                double price = 0.0;
+                try { price = std::stod(pair["priceUsd"].get<std::string>()); } catch (...) { continue; }
+                if (!std::isfinite(price) || price <= 0.0) continue;
+                if (liq > bestLiquidity) { bestLiquidity = liq; p = price; }
+            }
+        }
+    } catch (...) {}
+    if (p==0) {
+        const std::string platform = chainCtx().coingeckoPlatform.empty()
+                                   ? std::string("binance-smart-chain") : chainCtx().coingeckoPlatform;
+        auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/"+platform+"?contract_addresses="+token+"&vs_currencies=usd");
+        try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) {
+            double cg = j2[a]["usd"].get<double>();
+            if (std::isfinite(cg) && cg > 0.0) p = cg;
+        } } catch (...) {} }
+    // Защита от абсурдных значений: выше этого порога цена заведомо мусорная,
+    // а перевод в наносы переполнил бы счётчик.
+    constexpr double MAX_SANE_PRICE_USD = 1e9;
+    uint64_t n = (std::isfinite(p) && p > 0.0 && p < MAX_SANE_PRICE_USD)
+               ? static_cast<uint64_t>(p * 1000000000.0) : 0;
     if (n>0) { { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; } saveTokenPrice(a,n); }
     else { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&PRICE_NANOS_CACHE[a].first>0) { g_stats.price_fallbacks.fetch_add(1); std::cerr << "[PRICE] Stale cache: " << a << std::endl; return PRICE_NANOS_CACHE[a].first; } }
     return n;
