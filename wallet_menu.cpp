@@ -332,7 +332,8 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
     std::vector<PortfolioItem> held;
     cpp_int totalUsdNanos = 0;
-    int failedReads = 0;   // сколько балансов не удалось прочитать
+    int failedReads = 0;     // сколько балансов не удалось прочитать
+    int illiquidCount = 0;   // позиции, ограниченные объёмом пула
 
     // 1) Нативный актив
     {
@@ -372,8 +373,25 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
         cpp_int usd = (raw * cpp_int(price)) / denom;
         if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
-        held.push_back({safeString(getSymbol(t), 12), formatAmount(raw, dec), usd});
+
+        // Проверка реализуемости: продать позицию можно только в пул, и не
+        // больше, чем в нём есть. Если позиция крупнее ликвидности, цена по
+        // рынку недостижима - показываем оценку по объёму пула и помечаем.
+        bool illiquid = false;
+        double liq = getPoolLiquidityUsd(t);
+        if (liq > 0.0) {
+            // Реалистично извлечь можно порядка половины пула, дальше цена
+            // проседает слишком сильно.
+            cpp_int cap = cpp_int(static_cast<long long>(liq * 0.5 * 1e9));
+            if (usd > cap) { usd = cap; illiquid = true; }
+        }
+        if (usd < cpp_int(DUST_USD_NANOS)) continue;
+
+        std::string sym = safeString(getSymbol(t), 12);
+        if (illiquid) sym += " \u26A0";     // предупреждающий знак
+        held.push_back({sym, formatAmount(raw, dec), usd});
         totalUsdNanos += usd;
+        if (illiquid) ++illiquidCount;
     }
 
     std::sort(held.begin(), held.end(),
@@ -397,6 +415,8 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         }
         text << "\n<i>" << tr(lang, "hold_dust_note") << "</i>";
     }
+    if (illiquidCount > 0)
+        text << "\n<i>\u26A0 " << tr(lang, "hold_illiquid") << "</i>";
     if (failedReads > 0)
         text << "\n<i>" << tr(lang, "hold_partial") << "</i>";
 
