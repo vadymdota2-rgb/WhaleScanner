@@ -17,6 +17,9 @@ struct TxResult {
     std::string venue;
     std::string counterAddr;
     cpp_int counterAmount;
+    // Реальная плата за газ этой транзакции в долларах (наносы). Считается из
+    // чека - фактический расход, а не допущение. Ноль, если данных нет.
+    cpp_int gasUsdNanos = 0;
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
     bool isGenericMulticall = false;
