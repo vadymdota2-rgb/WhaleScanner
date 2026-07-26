@@ -55,6 +55,8 @@ void forgetWalletToken(const std::string& wallet, const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
 uint64_t getPriceNanos(const std::string& token);
+// Ликвидность пула, по которому взята цена (0 - неизвестна).
+double getPoolLiquidityUsd(const std::string& token);
 
 namespace TelegramUI {
 UIMessage buildAccountMenu(const std::string& chatId);
