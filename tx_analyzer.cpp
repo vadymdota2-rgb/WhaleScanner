@@ -341,6 +341,8 @@ bool flowLinkedToPool(
 
 // Текущая сеть. Стартовое значение задаёт main.cpp через setChainContext;
 // до этого - пустая конфигурация, чтобы анализатор не зависел от chains.
+// Текущая сеть. Стартовое значение задаёт main.cpp через setChainContext;
+// до этого - пустая конфигурация, чтобы анализатор не зависел от chains.
 ChainContext g_chain;
 const ChainContext& chainCtx() { return g_chain; }
 void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
