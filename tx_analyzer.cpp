@@ -347,6 +347,33 @@ ChainContext g_chain;
 const ChainContext& chainCtx() { return g_chain; }
 void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
 
+
+// Оценка сделки по ВСТРЕЧНОМУ активу. Если на другой стороне стейблкоин или
+// обёрнутый нативный токен, сумма известна из самой транзакции - это точное
+// число, не зависящее ни от свежести котировок, ни от выбора пула. Оценка
+// через цену покупаемого токена остаётся запасным путём.
+// Возвращает 0, если встречный актив не годится для оценки.
+cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& counterAmount) {
+    if (counterAddr.empty() || counterAmount <= 0) return 0;
+
+    // Нативный актив (BNB/ETH) и его обёрнутая форма: цена ликвидная и надёжная.
+    const bool isNative = (counterAddr == g_chain.nativeMarker) ||
+                          (!g_chain.wrappedNative.empty() && counterAddr == g_chain.wrappedNative);
+    if (isNative) {
+        uint64_t np = getPriceNanos(g_chain.wrappedNative);
+        if (!np) return 0;
+        return calcUsdNanos(counterAmount, 18, np);
+    }
+
+    // Стейблкоин: один к одному к доллару, котировка не нужна вовсе.
+    if (g_chain.stablecoins.count(counterAddr)) {
+        const int dec = getDecimals(counterAddr);
+        cpp_int d = 1; for (int k = 0; k < dec; ++k) d *= 10;
+        return (counterAmount * cpp_int(1000000000)) / d;
+    }
+    return 0;
+}
+
 bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
 bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
 std::string lookupRouterLabel(const std::string& addr) {
@@ -714,8 +741,11 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                         r.counterAmount = vCounterAbs;
                         r.venue = "Bot Trade";
                         r.diagnosticReason = "VAULT_FLOW_ATTRIBUTED";
-                        const int dec = getDecimals(r.tokenAddr);
-                        r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
+                        r.usdNanos = usdFromCounterAsset(r.counterAddr, r.counterAmount);
+                        if (r.usdNanos <= 0) {
+                            const int dec = getDecimals(r.tokenAddr);
+                            r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
+                        }
                         vaultAttributed = true;
                     }
                 }
@@ -996,10 +1026,12 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (r.venue.empty())
             r.venue = "DEX";
 
-        const int dec = getDecimals(r.tokenAddr);
-        r.usdNanos = calcUsdNanos(
-            r.rawAmount, dec, getPriceNanos(r.tokenAddr)
-        );
+        // Точная оценка предпочтительнее: она из самой сделки, а не из котировки.
+        r.usdNanos = usdFromCounterAsset(r.counterAddr, r.counterAmount);
+        if (r.usdNanos <= 0) {
+            const int dec = getDecimals(r.tokenAddr);
+            r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
+        }
         return r;
     }
 
