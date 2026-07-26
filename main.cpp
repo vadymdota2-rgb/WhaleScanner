@@ -26,6 +26,8 @@
 #include "utils.h"
 #include "ranking.h"
 #include "alert_settings.h"
+#include "rpc_client.h"
+#include "chains.h"
 #include "wallet_menu.h"
 #include "ru.h"
 #include "premium.h"
@@ -252,47 +254,6 @@ const std::string BOT_USERNAME = []{
 }();
 const std::string DB_FILE = "whale_bot.db";
 
-const std::vector<std::string> BSC_RPC_ENDPOINTS = {
-    // Официальные dataseed-узлы BNB Chain
-    "https://bsc-dataseed.bnbchain.org",
-    "https://bsc-dataseed1.bnbchain.org",
-    "https://bsc-dataseed2.bnbchain.org",
-    "https://bsc-dataseed-public.bnbchain.org",
-    "https://bsc-dataseed1.defibit.io",
-    "https://bsc-dataseed2.ninicoin.io",
-    "https://bsc-dataseed3.ninicoin.io",
-    "https://bsc-dataseed4.ninicoin.io",
-    // Публичные провайдеры
-    "https://bsc.publicnode.com",
-    "https://binance.llamarpc.com",
-    "https://rpc.ankr.com/bsc",
-    "https://1rpc.io/bnb",
-    "https://bsc.drpc.org",
-    "https://bsc.blockpi.network/v1/rpc/public",
-    "https://bsc-mainnet.public.blastapi.io",
-    "https://bsc.meowrpc.com",
-    "https://bscrpc.pancakeswap.finance",
-    "https://bsc-dataseed.nariox.org",
-    "https://rpc.coinsdo.net/bsc",
-    "https://bsc.nodereal.io",
-};
-
-const std::vector<std::string> ETHEREUM_RPC_ENDPOINTS = {
-    "https://eth.llamarpc.com",
-    "https://ethereum.publicnode.com",
-    "https://rpc.ankr.com/eth",
-    "https://cloudflare-eth.com"
-};
-const std::vector<std::string> BASE_RPC_ENDPOINTS = {
-    "https://mainnet.base.org",
-    "https://base.publicnode.com"
-};
-const std::vector<std::string> ARBITRUM_RPC_ENDPOINTS = {
-    "https://arbitrum.llamarpc.com",
-    "https://arbitrum-one.publicnode.com"
-};
-std::vector<std::string> RPC_ENDPOINTS = BSC_RPC_ENDPOINTS;
-std::atomic<size_t> rpcIndex{0};
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
@@ -322,182 +283,6 @@ std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
 
-size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
-    d->append((char*)c, s * n); return s * n;
-}
-
-// Постоянное соединение на каждый поток. Раньше здесь были curl_easy_init/cleanup
-// на КАЖДЫЙ запрос - это заново открывало TCP-соединение и проводило полное
-// TLS-рукопожатие (~100-300мс) при каждом вызове RPC. curl_easy_reset сбрасывает
-// параметры запроса, но сохраняет живое соединение, DNS-кэш и TLS-сессии, поэтому
-// повторные обращения к тому же узлу переиспользуют уже открытый канал.
-// thread_local обязателен: easy-хэндл нельзя разделять между потоками.
-struct CurlHandleHolder {
-    CURL* h = nullptr;
-    CurlHandleHolder() : h(curl_easy_init()) {}
-    ~CurlHandleHolder() { if (h) curl_easy_cleanup(h); }
-};
-
-std::string http(const std::string& url, const std::string& post = "", int timeout = 10) {
-    thread_local CurlHandleHolder holder;
-    CURL* curl = holder.h;
-    if (!curl) return "";
-    curl_easy_reset(curl);
-    std::string res; struct curl_slist* h = nullptr;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCB);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
-        +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
-            return running.load(std::memory_order_relaxed) ? 0 : 1; });
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-    if (!post.empty()) {
-        h = curl_slist_append(h, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, h);
-    }
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        auto su = url.find("api.telegram.org") != std::string::npos ? "telegram_api" :
-                  url.length() <= 80 ? url : url.substr(0, 80);
-        std::cerr << "[HTTP] " << curl_easy_strerror(rc) << " | " << su << std::endl;
-    }
-    if (h) curl_slist_free_all(h);
-    return res;
-}
-
-// ---- Здоровье эндпоинтов ----
-// Список публичных узлов быстро устаревает: одни закрываются, другие меняют
-// адрес. Вместо того чтобы гадать, какие живы, бот определяет это сам:
-// узел, подряд не ответивший несколько раз, временно исключается из ротации,
-// а через паузу проверяется снова - вдруг ожил. Так можно смело держать
-// длинный список, не боясь, что мёртвые адреса будут тормозить работу.
-constexpr int ENDPOINT_FAIL_LIMIT = 5;        // подряд неудач до отключения
-constexpr long long ENDPOINT_COOLDOWN_SEC = 600;  // на сколько отключаем
-
-std::mutex g_healthMutex;
-std::vector<int> g_consecFails;
-std::vector<long long> g_disabledUntil;
-
-void initEndpointHealth() {
-    std::lock_guard<std::mutex> l(g_healthMutex);
-    g_consecFails.assign(RPC_ENDPOINTS.size(), 0);
-    g_disabledUntil.assign(RPC_ENDPOINTS.size(), 0);
-}
-
-bool endpointUsable(size_t idx) {
-    std::lock_guard<std::mutex> l(g_healthMutex);
-    if (idx >= g_disabledUntil.size()) return true;
-    return g_disabledUntil[idx] <= static_cast<long long>(time(nullptr));
-}
-
-void reportEndpoint(size_t idx, bool ok) {
-    std::lock_guard<std::mutex> l(g_healthMutex);
-    if (idx >= g_consecFails.size()) return;
-    if (ok) { g_consecFails[idx] = 0; g_disabledUntil[idx] = 0; return; }
-    if (++g_consecFails[idx] >= ENDPOINT_FAIL_LIMIT) {
-        g_consecFails[idx] = 0;
-        g_disabledUntil[idx] = static_cast<long long>(time(nullptr)) + ENDPOINT_COOLDOWN_SEC;
-        std::cerr << "[RPC] Endpoint disabled for " << ENDPOINT_COOLDOWN_SEC << "s: "
-                  << RPC_ENDPOINTS[idx] << std::endl;
-    }
-}
-
-// Ближайший рабочий узел начиная с idx. Если живых нет вообще - вернём
-// исходный, чтобы бот всё равно попытался, а не встал намертво.
-size_t usableEndpointFrom(size_t idx) {
-    const size_t n = RPC_ENDPOINTS.size();
-    for (size_t k = 0; k < n; ++k) {
-        size_t cand = (idx + k) % n;
-        if (endpointUsable(cand)) return cand;
-    }
-    return idx % n;
-}
-
-json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
-    json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
-    auto res = http(RPC_ENDPOINTS[idx % RPC_ENDPOINTS.size()], r.dump());
-    try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) return p["result"]; } catch (...) {}
-    return nullptr;
-}
-
-// Запрос с РАСПРЕДЕЛЕНИЕМ по узлам. Нужен для параллельной загрузки чеков:
-// если все потоки бьют в один эндпоинт, мы упираемся в его лимит (~33 запроса
-// в секунду) задолго до нехватки времени. Раскладывая запросы по 12 узлам,
-// поднимаем суммарную ёмкость примерно до 400/сек. При неудаче пробуем
-// следующие узлы, поэтому отказ одного не роняет загрузку блока.
-json rpcSpread(size_t seed, const std::string& method, json params) {
-    for (size_t attempt = 0; attempt < 3 && running.load(std::memory_order_relaxed); ++attempt) {
-        size_t idx = usableEndpointFrom(seed + attempt);
-        auto r = rpcOnEndpoint(idx, method, params);
-        reportEndpoint(idx, !r.is_null());
-        if (!r.is_null()) return r;
-        g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
-    }
-    return nullptr;
-}
-
-// Диагностика: если конкретный публичный RPC периодически "подвисает" на секунды
-// без явного сбоя (timeout/ошибка), rpc_failures это не заметит - а лаг растёт
-// точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
-// именно КАКОЙ узел тормозит, а не гадать.
-const long long RPC_SLOW_THRESHOLD_MS = 1000;
-const int RPC_SLOW_STREAK_LIMIT = 3;
-std::mutex g_rpcLatencyMutex;
-std::map<std::string, uint64_t> g_rpcSlowCount;
-std::map<std::string, int64_t> g_rpcSlowMaxMs;
-std::atomic<int> g_rpcSlowStreak{0};
-
-json rpc(const std::string& method, json params, int maxRetries = 3) {
-    json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
-    std::string body = r.dump();
-    for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
-        size_t idx = usableEndpointFrom(rpcIndex.load(std::memory_order_relaxed));
-        auto t0 = std::chrono::steady_clock::now();
-        auto res = http(RPC_ENDPOINTS[idx], body);
-        int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-        if (elapsedMs >= RPC_SLOW_THRESHOLD_MS) {
-            {
-                std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
-                g_rpcSlowCount[RPC_ENDPOINTS[idx]]++;
-                int64_t& mx = g_rpcSlowMaxMs[RPC_ENDPOINTS[idx]];
-                if (elapsedMs > mx) mx = elapsedMs;
-            }
-            std::cerr << "[RPC-SLOW] " << method << " on " << RPC_ENDPOINTS[idx] << " took " << elapsedMs << "ms" << std::endl;
-            // Уходим с узла, который стабильно тормозит, а не только с упавшего.
-            // Порог в несколько подряд - чтобы не скакать из-за одиночной заминки:
-            // при постоянных соединениях смена узла стоит нового TLS-рукопожатия.
-            if (g_rpcSlowStreak.fetch_add(1, std::memory_order_relaxed) + 1 >= RPC_SLOW_STREAK_LIMIT) {
-                g_rpcSlowStreak.store(0, std::memory_order_relaxed);
-                size_t cur = rpcIndex.load(std::memory_order_relaxed);
-                rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur] << std::endl;
-            }
-        } else {
-            g_rpcSlowStreak.store(0, std::memory_order_relaxed);
-        }
-        bool valid = false;
-        try {
-            auto p = json::parse(res);
-            if (p.contains("result") && !p["result"].is_null()) {
-                reportEndpoint(idx, true);
-                return p["result"];
-            }
-        } catch (...) {}
-        if (!valid) {
-            reportEndpoint(idx, false);
-            g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
-            g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
-            size_t cur = rpcIndex.load(std::memory_order_relaxed);
-            rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-            std::cerr << "[RPC] Switching to " << ((cur+1)%RPC_ENDPOINTS.size()) << " after failure on " << RPC_ENDPOINTS[cur] << std::endl;
-        }
-        if (a < maxRetries-1) std::this_thread::sleep_for(std::chrono::milliseconds((1<<a)*500));
-    }
-    return nullptr;
-}
 
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
@@ -1765,16 +1550,7 @@ void telegramLoop() {
                             std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
-                            {
-                                std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
-                                if (!g_rpcSlowCount.empty()) {
-                                    std::string worst; uint64_t worstCount = 0;
-                                    for (const auto& [ep, cnt] : g_rpcSlowCount) if (cnt > worstCount) { worstCount = cnt; worst = ep; }
-                                    ss2 << "\n🐢 Slow RPC (>=" << RPC_SLOW_THRESHOLD_MS << "ms): " << worst
-                                        << " x" << worstCount << " (max " << g_rpcSlowMaxMs[worst] << "ms)";
-                                    if (g_rpcSlowCount.size() > 1) ss2 << " [+" << (g_rpcSlowCount.size()-1) << " др.]";
-                                }
-                            }
+                            ss2 << rpcSlowSummary();
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
                                     uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
@@ -1903,13 +1679,21 @@ int main() {
     {
         const char* chainEnv = std::getenv("WHALE_CHAIN");
         std::string chainName = chainEnv ? toLower(std::string(chainEnv)) : "bsc";
-        if (chainName == "ethereum" || chainName == "eth") { setChainContext(makeEthereumContext()); RPC_ENDPOINTS = ETHEREUM_RPC_ENDPOINTS; }
-        else if (chainName == "base") { setChainContext(makeBaseContext()); RPC_ENDPOINTS = BASE_RPC_ENDPOINTS; }
-        else if (chainName == "arbitrum" || chainName == "arb") { setChainContext(makeArbitrumContext()); RPC_ENDPOINTS = ARBITRUM_RPC_ENDPOINTS; }
-        else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
-        std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
+        // Вся настройка сети - в одном месте: и торговый конфиг, и её узлы.
+        ChainContext cfg;
+        if (!chainConfigByName(chainName, cfg)) {
+            std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1;
+        }
+        setChainContext(cfg);
+        setRpcEndpoints(cfg.rpcEndpoints);
+        std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
+                  << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
     }
-    initEndpointHealth();
+    // Слой запросов сообщает о сбоях сюда - сам он про статистику не знает.
+    setRpcFailureHandler([]{
+        g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
+        g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
+    });
     initDB(); initRankingDB(); seedWalletTokensFromTrades();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
