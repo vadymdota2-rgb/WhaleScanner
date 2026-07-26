@@ -253,34 +253,30 @@ const std::string BOT_USERNAME = []{
 const std::string DB_FILE = "whale_bot.db";
 
 const std::vector<std::string> BSC_RPC_ENDPOINTS = {
+    // Официальные dataseed-узлы BNB Chain
     "https://bsc-dataseed.bnbchain.org",
+    "https://bsc-dataseed1.bnbchain.org",
+    "https://bsc-dataseed2.bnbchain.org",
+    "https://bsc-dataseed-public.bnbchain.org",
     "https://bsc-dataseed1.defibit.io",
     "https://bsc-dataseed2.ninicoin.io",
     "https://bsc-dataseed3.ninicoin.io",
-    "https://bsc-dataseed1.bnbchain.org",
-    "https://bsc-dataseed2.bnbchain.org",
+    "https://bsc-dataseed4.ninicoin.io",
+    // Публичные провайдеры
     "https://bsc.publicnode.com",
     "https://binance.llamarpc.com",
     "https://rpc.ankr.com/bsc",
     "https://1rpc.io/bnb",
     "https://bsc.drpc.org",
-    "https://bsc-dataseed.nariox.org",
-    "https://bsc.nodereal.io",
-    "https://bsc-dataseed-public.bnbchain.org",
-    "https://rpc.coinsdo.net/bsc",
-    "https://bsc-dataseed4.ninicoin.io",
-    "https://bsc-dataseed5.ninicoin.io",
-    "https://bsc-dataseed6.ninicoin.io",
-    "https://bsc-dataseed7.ninicoin.io",
-    "https://bsc-dataseed8.ninicoin.io",
-    "https://bsc-dataseed9.ninicoin.io",
-    "https://bsc-dataseed10.ninicoin.io",
-    "https://bsc-dataseed11.ninicoin.io",
+    "https://bsc.blockpi.network/v1/rpc/public",
     "https://bsc-mainnet.public.blastapi.io",
-    "https://bscrpc.pancakeswap.finance",
     "https://bsc.meowrpc.com",
-    "https://bsc.blockpi.network/v1/rpc/public"
+    "https://bscrpc.pancakeswap.finance",
+    "https://bsc-dataseed.nariox.org",
+    "https://rpc.coinsdo.net/bsc",
+    "https://bsc.nodereal.io",
 };
+
 const std::vector<std::string> ETHEREUM_RPC_ENDPOINTS = {
     "https://eth.llamarpc.com",
     "https://ethereum.publicnode.com",
@@ -372,6 +368,54 @@ std::string http(const std::string& url, const std::string& post = "", int timeo
     return res;
 }
 
+// ---- Здоровье эндпоинтов ----
+// Список публичных узлов быстро устаревает: одни закрываются, другие меняют
+// адрес. Вместо того чтобы гадать, какие живы, бот определяет это сам:
+// узел, подряд не ответивший несколько раз, временно исключается из ротации,
+// а через паузу проверяется снова - вдруг ожил. Так можно смело держать
+// длинный список, не боясь, что мёртвые адреса будут тормозить работу.
+constexpr int ENDPOINT_FAIL_LIMIT = 5;        // подряд неудач до отключения
+constexpr long long ENDPOINT_COOLDOWN_SEC = 600;  // на сколько отключаем
+
+std::mutex g_healthMutex;
+std::vector<int> g_consecFails;
+std::vector<long long> g_disabledUntil;
+
+void initEndpointHealth() {
+    std::lock_guard<std::mutex> l(g_healthMutex);
+    g_consecFails.assign(RPC_ENDPOINTS.size(), 0);
+    g_disabledUntil.assign(RPC_ENDPOINTS.size(), 0);
+}
+
+bool endpointUsable(size_t idx) {
+    std::lock_guard<std::mutex> l(g_healthMutex);
+    if (idx >= g_disabledUntil.size()) return true;
+    return g_disabledUntil[idx] <= static_cast<long long>(time(nullptr));
+}
+
+void reportEndpoint(size_t idx, bool ok) {
+    std::lock_guard<std::mutex> l(g_healthMutex);
+    if (idx >= g_consecFails.size()) return;
+    if (ok) { g_consecFails[idx] = 0; g_disabledUntil[idx] = 0; return; }
+    if (++g_consecFails[idx] >= ENDPOINT_FAIL_LIMIT) {
+        g_consecFails[idx] = 0;
+        g_disabledUntil[idx] = static_cast<long long>(time(nullptr)) + ENDPOINT_COOLDOWN_SEC;
+        std::cerr << "[RPC] Endpoint disabled for " << ENDPOINT_COOLDOWN_SEC << "s: "
+                  << RPC_ENDPOINTS[idx] << std::endl;
+    }
+}
+
+// Ближайший рабочий узел начиная с idx. Если живых нет вообще - вернём
+// исходный, чтобы бот всё равно попытался, а не встал намертво.
+size_t usableEndpointFrom(size_t idx) {
+    const size_t n = RPC_ENDPOINTS.size();
+    for (size_t k = 0; k < n; ++k) {
+        size_t cand = (idx + k) % n;
+        if (endpointUsable(cand)) return cand;
+    }
+    return idx % n;
+}
+
 json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     auto res = http(RPC_ENDPOINTS[idx % RPC_ENDPOINTS.size()], r.dump());
@@ -385,10 +429,10 @@ json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
 // поднимаем суммарную ёмкость примерно до 400/сек. При неудаче пробуем
 // следующие узлы, поэтому отказ одного не роняет загрузку блока.
 json rpcSpread(size_t seed, const std::string& method, json params) {
-    const size_t n = RPC_ENDPOINTS.size();
     for (size_t attempt = 0; attempt < 3 && running.load(std::memory_order_relaxed); ++attempt) {
-        size_t idx = (seed + attempt) % n;
+        size_t idx = usableEndpointFrom(seed + attempt);
         auto r = rpcOnEndpoint(idx, method, params);
+        reportEndpoint(idx, !r.is_null());
         if (!r.is_null()) return r;
         g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -410,7 +454,7 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     std::string body = r.dump();
     for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
-        size_t idx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
+        size_t idx = usableEndpointFrom(rpcIndex.load(std::memory_order_relaxed));
         auto t0 = std::chrono::steady_clock::now();
         auto res = http(RPC_ENDPOINTS[idx], body);
         int64_t elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
@@ -435,8 +479,15 @@ json rpc(const std::string& method, json params, int maxRetries = 3) {
             g_rpcSlowStreak.store(0, std::memory_order_relaxed);
         }
         bool valid = false;
-        try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) { valid=true; return p["result"]; } } catch (...) {}
+        try {
+            auto p = json::parse(res);
+            if (p.contains("result") && !p["result"].is_null()) {
+                reportEndpoint(idx, true);
+                return p["result"];
+            }
+        } catch (...) {}
         if (!valid) {
+            reportEndpoint(idx, false);
             g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
             g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
             size_t cur = rpcIndex.load(std::memory_order_relaxed);
@@ -1273,7 +1324,9 @@ bool processBlock(long long bn) {
     // базой и кэшами остаётся ниже, в один поток.
     std::vector<nlohmann::json> receipts(matched.size());
     if (!matched.empty()) {
-        const size_t CONCURRENCY = 8;
+        // Потоков ровно столько, сколько узлов: каждый круг задействует каждый
+        // эндпоинт по разу, нагрузка ложится равномерно и ни один не перегружен.
+        const size_t CONCURRENCY = RPC_ENDPOINTS.size();
         // Сдвиг от текущего узла, чтобы разные блоки начинали с разных мест
         // и нагрузка не скапливалась на первых эндпоинтах.
         const size_t spreadBase = rpcIndex.load(std::memory_order_relaxed);
@@ -1856,6 +1909,7 @@ int main() {
         else if (chainName != "bsc") { std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1; }
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol << ")" << std::endl;
     }
+    initEndpointHealth();
     initDB(); initRankingDB(); seedWalletTokensFromTrades();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
