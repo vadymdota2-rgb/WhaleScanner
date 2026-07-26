@@ -374,6 +374,25 @@ cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& count
     return 0;
 }
 
+// Плата за газ в долларах, из чека транзакции. Это фактический расход
+// трейдера, а не условный процент: в чеке есть и потраченный газ, и его цена.
+cpp_int gasCostUsdNanos(const json& receipt) {
+    if (!receipt.is_object()) return 0;
+    auto hexField = [&](const char* name) -> cpp_int {
+        if (!receipt.contains(name) || !receipt[name].is_string()) return 0;
+        return hexToCppInt(receipt[name].get<std::string>());
+    };
+    cpp_int used = hexField("gasUsed");
+    cpp_int price = hexField("effectiveGasPrice");
+    if (price <= 0) price = hexField("gasPrice");   // старый формат чека
+    if (used <= 0 || price <= 0) return 0;
+
+    uint64_t nativePrice = getPriceNanos(g_chain.wrappedNative);
+    if (!nativePrice) return 0;
+    // used * price = плата в wei (18 знаков), переводим в доллары-наносы
+    return calcUsdNanos(used * price, 18, nativePrice);
+}
+
 bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
 bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
 std::string lookupRouterLabel(const std::string& addr) {
@@ -746,6 +765,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                             const int dec = getDecimals(r.tokenAddr);
                             r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
                         }
+                        r.gasUsdNanos = gasCostUsdNanos(receipt);
                         vaultAttributed = true;
                     }
                 }
@@ -1032,6 +1052,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             const int dec = getDecimals(r.tokenAddr);
             r.usdNanos = calcUsdNanos(r.rawAmount, dec, getPriceNanos(r.tokenAddr));
         }
+        r.gasUsdNanos = gasCostUsdNanos(receipt);
         return r;
     }
 
