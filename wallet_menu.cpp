@@ -368,24 +368,26 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
             continue;
         }
         int dec = getDecimals(t);
-        uint64_t price = getPriceNanos(t);
+        // Стейблкоин стоит доллар по определению. Брать его цену из пула
+        // нельзя: там она может оказаться любой, и позиция раздувается в разы.
+        uint64_t price = chainCtx().stablecoins.count(t)
+                       ? 1000000000ULL
+                       : getPriceNanos(t);
         if (price == 0) continue;          // цены нет - монету не оценить
         cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
         cpp_int usd = (raw * cpp_int(price)) / denom;
         if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
 
-        // Проверка реализуемости: продать позицию можно только в пул, и не
-        // больше, чем в нём есть. Если позиция крупнее ликвидности, цена по
-        // рынку недостижима - показываем оценку по объёму пула и помечаем.
+        // Показываем рыночную стоимость - как принято везде, чтобы цифры
+        // сходились с обозревателем. Но если позиция крупнее своего пула,
+        // продать её по этой цене нельзя, и об этом стоит предупредить:
+        // саму сумму не трогаем, только помечаем.
         bool illiquid = false;
-        double liq = getPoolLiquidityUsd(t);
+        double liq = chainCtx().stablecoins.count(t) ? 0.0 : getPoolLiquidityUsd(t);
         if (liq > 0.0) {
-            // Реалистично извлечь можно порядка половины пула, дальше цена
-            // проседает слишком сильно.
-            cpp_int cap = cpp_int(static_cast<long long>(liq * 0.5 * 1e9));
-            if (usd > cap) { usd = cap; illiquid = true; }
+            cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5 * 1e9));
+            if (usd > poolCap) illiquid = true;
         }
-        if (usd < cpp_int(DUST_USD_NANOS)) continue;
 
         std::string sym = safeString(getSymbol(t), 12);
         if (illiquid) sym += " \u26A0";     // предупреждающий знак
