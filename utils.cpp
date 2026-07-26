@@ -161,3 +161,16 @@ std::string formatPercent(double pct, bool withPlus) {
     const char* sign = neg ? "-" : (withPlus ? "+" : "");
     return std::string(sign) + buf + "%";
 }
+
+std::string formatUsdSmall(long long nanos) {
+    if (nanos <= 0) return "$0";
+    const double usd = static_cast<double>(nanos) / 1e9;
+    char buf[48];
+    if (usd >= 0.01) {
+        std::snprintf(buf, sizeof(buf), "%.2f", usd);
+    } else {
+        // Меньше цента: показываем четыре знака, иначе виден только ноль.
+        std::snprintf(buf, sizeof(buf), "%.4f", usd);
+    }
+    return std::string("$") + buf;
+}
