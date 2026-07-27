@@ -94,6 +94,10 @@ constexpr long long HL_FILL_TTL_SEC = 45LL * 86400LL;
 constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
+// Тот же разделитель, что в спотовом рейтинге: экраны стоят рядом в одном
+// меню, и разная ширина линии сразу бросалась бы в глаза.
+const char* const HL_CARD_SEPARATOR = "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501";
+
 // ============================== Своя база ==============================
 
 sqlite3* g_hlDb = nullptr;
@@ -954,6 +958,7 @@ struct PerpRow {
     double roiPercent = 0.0;
     int winRatePercent = 0;
     int closedTrades = 0;
+    double avgLeverage = 0.0;
     long long volumeNanos = 0;
     long long lastTs = 0;
 };
@@ -976,6 +981,7 @@ std::vector<PerpRow> computeRanking() {
             " SUM(CASE WHEN closed_pnl_nanos > 0 THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN closed_pnl_nanos != 0 THEN margin_nanos ELSE 0 END),"
             " SUM(notional_nanos),"
+            " AVG(CASE WHEN leverage > 0 THEN leverage END),"
             " MAX(ts)"
             " FROM hl_fills WHERE ts >= ? GROUP BY wallet"))
         return rows;
@@ -989,7 +995,8 @@ std::vector<PerpRow> computeRanking() {
         const int wins = sqlite3_column_int(s, 3);
         const long long margin = sqlite3_column_int64(s, 4);
         r.volumeNanos = sqlite3_column_int64(s, 5);
-        r.lastTs = sqlite3_column_int64(s, 6);
+        r.avgLeverage = sqlite3_column_double(s, 6);
+        r.lastTs = sqlite3_column_int64(s, 7);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
         r.winRatePercent = static_cast<int>((100LL * wins) / r.closedTrades);
@@ -1044,12 +1051,15 @@ std::string perpKindStr(PerpKind k) {
     }
 }
 
-std::string perpKindTitleKey(PerpKind k) {
+// Заголовок страницы - в точности как у спота, включая эмодзи и ключи
+// переводов. Экраны соседние, и своя формулировка для того же самого
+// читалась бы как другой рейтинг.
+std::string perpTitle(PerpKind k, Lang lang) {
     switch (k) {
-        case PerpKind::ROI:     return "hl_rk_roi";
-        case PerpKind::WINRATE: return "hl_rk_winrate";
-        case PerpKind::ACTIVE:  return "hl_rk_active";
-        default:                return "hl_rk_pnl";
+        case PerpKind::ROI:     return "\U0001F4C8 " + tr(lang, "rk_top_roi_30d");
+        case PerpKind::WINRATE: return "\U0001F3AF " + tr(lang, "rk_top_winrate_30d");
+        case PerpKind::ACTIVE:  return "\U0001F504 " + tr(lang, "rk_most_active_30d");
+        default:                return "\U0001F4B5 " + tr(lang, "rk_top_pnl_30d");
     }
 }
 
@@ -1075,75 +1085,85 @@ void sortByKind(std::vector<PerpRow>& rows, PerpKind kind) {
     }
 }
 
-std::string rankBadge(int rank) {
-    if (rank == 1) return "\U0001F947";
-    if (rank == 2) return "\U0001F948";
-    if (rank == 3) return "\U0001F949";
-    return std::to_string(rank) + ".";
+std::string rankLabel(int rank) {
+    switch (rank) {
+        case 1: return "\U0001F947 #1";
+        case 2: return "\U0001F948 #2";
+        case 3: return "\U0001F949 #3";
+        default: return "#" + std::to_string(rank);
+    }
 }
 
 HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
-    const int maxRank = premiumTopTradersLimit(chatId);
+    int maxRank = premiumTopTradersLimit(chatId);
+    if (maxRank < 1) maxRank = 1;
     const bool showUpgrade = !isPremium(chatId);
 
     std::vector<PerpRow> rows;
     rankingSnapshot(rows);
     sortByKind(rows, kind);
-    if (static_cast<int>(rows.size()) > maxRank) rows.resize(static_cast<size_t>(maxRank));
 
-    std::stringstream t;
-    t << "\U0001F310 <b>Hyperliquid \u2014 " << tr(lang, perpKindTitleKey(kind)) << "</b>\n";
-    t << "<code>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</code>\n\n";
+    const int visible = std::min(static_cast<int>(rows.size()), maxRank);
+    const int totalPages = std::max(1, (visible + HL_PER_PAGE - 1) / HL_PER_PAGE);
+    page = std::max(1, std::min(page, totalPages));
+    const int startIdx = (page - 1) * HL_PER_PAGE;
+    const int endIdx = std::min(visible, startIdx + HL_PER_PAGE);
 
-    // Границы страницы считаем ОДИН раз: раньше та же арифметика повторялась
-    // при отрисовке текста и при сборке клавиатуры, и разъехаться они могли
-    // молча - кнопки указывали бы не на те строки, что показаны.
-    const int totalPages = rows.empty()
-        ? 0 : (static_cast<int>(rows.size()) + HL_PER_PAGE - 1) / HL_PER_PAGE;
-    if (page < 1) page = 1;
-    if (totalPages > 0 && page > totalPages) page = totalPages;
-    const size_t from = rows.empty() ? 0 : static_cast<size_t>((page - 1) * HL_PER_PAGE);
-    const size_t to = rows.empty() ? 0 : std::min(rows.size(), from + HL_PER_PAGE);
+    std::stringstream text;
+    text << "\U0001F310 <b>Hyperliquid \u2014 " << perpTitle(kind, lang) << "</b>\n\n";
 
-    if (rows.empty()) {
-        t << tr(lang, "hl_rk_empty");
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+
+    if (visible == 0) {
+        text << "\U0001F4CA " << tr(lang, "hl_rk_empty");
     } else {
-        for (size_t i = from; i < to; i++) {
-            const PerpRow& r = rows[i];
-            t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddress(r.wallet) << "</code>\n";
-            t << "   \U0001F4B0 " << formatUsdNanosSigned(r.pnlNanos, true)
-              << "   \U0001F4C8 " << formatPercent(r.roiPercent, true) << "\n";
-            t << "   \U0001F3AF " << r.winRatePercent << "%   \U0001F504 "
-              << r.closedTrades << " " << tr(lang, "hl_rk_trades") << "\n\n";
-        }
-        t << tr(lang, "hl_rk_page") << " " << page << "/" << totalPages;
-    }
-    if (showUpgrade) t << "\n\n" << tr(lang, "hl_rk_upgrade");
+        for (int i = startIdx; i < endIdx; i++) {
+            const PerpRow& r = rows[static_cast<size_t>(i)];
+            const int rank = i + 1;
+            text << rankLabel(rank) << "\n";
+            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
+            text << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+            text << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
+            // Перповый аналог среднего удержания у спота: плечо говорит о
+            // манере торговли больше, чем что-либо ещё.
+            if (r.avgLeverage > 0.0) {
+                text << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
+                     << static_cast<int>(r.avgLeverage + 0.5) << "\u00D7\n";
+            }
+            if (i + 1 < endIdx) text << "\n" << HL_CARD_SEPARATOR << "\n\n";
 
-    json kb;
-    kb["inline_keyboard"] = json::array();
-    if (!rows.empty()) {
-        // Отслеживание переиспользует спотовый tt_track: список кошельков общий,
-        // значит и операция та же. Свой обработчик здесь был бы вторым описанием
-        // одного и того же действия.
-        for (size_t i = from; i < to; i++) {
-            kb["inline_keyboard"].push_back(json::array({
-                {{"text", "\U0001F4CC " + shortAddress(rows[i].wallet)},
-                 {"callback_data", "tt_track:" + rows[i].wallet}}
+            keyboard["inline_keyboard"].push_back(json::array({
+                {{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)},
+                 {"callback_data", "tt_track:" + r.wallet}}
             }));
         }
-        json nav = json::array();
-        if (page > 1)
-            nav.push_back({{"text", "\u25C0"}, {"callback_data", "hl_page:" + perpKindStr(kind) + ":" + std::to_string(page - 1)}});
-        if (page < totalPages)
-            nav.push_back({{"text", "\u25B6"}, {"callback_data", "hl_page:" + perpKindStr(kind) + ":" + std::to_string(page + 1)}});
-        if (!nav.empty()) kb["inline_keyboard"].push_back(nav);
     }
-    kb["inline_keyboard"].push_back(json::array({
+
+    if (showUpgrade && visible > 0) {
+        text << "\n" << HL_CARD_SEPARATOR << "\n";
+        text << tr(lang, "rk_unlock_top100");
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
+        }));
+    }
+
+    const std::string kindParam = perpKindStr(kind);
+    json navRow = json::array();
+    if (page > 1)
+        navRow.push_back({{"text", "\u2B05\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page - 1)}});
+    navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
+    if (page < totalPages)
+        navRow.push_back({{"text", "\u27A1\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page + 1)}});
+    keyboard["inline_keyboard"].push_back(navRow);
+    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "hl_menu"}}
     }));
-    return {t.str(), kb.dump()};
+
+    return {text.str(), keyboard.dump()};
 }
 
 
@@ -1279,7 +1299,8 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
     json kb;
     kb["inline_keyboard"] = json::array();
     const char* kinds[4] = {"pnl", "roi", "winrate", "active"};
-    const char* keys[4]  = {"hl_rk_pnl", "hl_rk_roi", "hl_rk_winrate", "hl_rk_active"};
+    const char* keys[4]  = {"rk_btn_top_pnl", "rk_btn_top_roi",
+                            "rk_btn_top_winrate", "rk_btn_most_active"};
     for (int i = 0; i < 4; i++) {
         kb["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, keys[i])}, {"callback_data", std::string("hl_open:") + kinds[i]}}
@@ -1301,17 +1322,21 @@ std::string buildHlDailyDigest() {
     rankingSnapshot(rows);
     sortByKind(rows, PerpKind::PNL);
     if (rows.empty()) return "";
-    if (rows.size() > 5) rows.resize(5);
+    if (rows.size() > 10) rows.resize(10);
 
     std::stringstream t;
-    t << "\U0001F310 <b>Hyperliquid \u2014 " << tr(lang, "hl_rk_pnl") << " (30d)</b>\n";
-    t << "<code>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</code>\n\n";
+    t << "\U0001F310 <b>Hyperliquid \u2014 " << perpTitle(PerpKind::PNL, lang) << "</b>\n\n";
     for (size_t i = 0; i < rows.size(); i++) {
         const PerpRow& r = rows[i];
-        t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddress(r.wallet) << "</code>\n"
-          << "   " << formatUsdNanosSigned(r.pnlNanos, true)
-          << "   " << formatPercent(r.roiPercent, true)
-          << "   " << r.winRatePercent << "%\n\n";
+        t << rankLabel(static_cast<int>(i) + 1) << "\n";
+        t << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+        t << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
+        t << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+        t << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+        if (r.avgLeverage > 0.0)
+            t << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
+              << static_cast<int>(r.avgLeverage + 0.5) << "\u00D7\n";
+        if (i + 1 < rows.size()) t << "\n" << HL_CARD_SEPARATOR << "\n\n";
     }
     return t.str();
 }
