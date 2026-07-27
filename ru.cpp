@@ -287,8 +287,8 @@ const std::unordered_map<std::string, Entry>& table() {
         // --- Рейтинг перпов ---
         {"hl_venue_title",  {"Top traders", "Топ трейдеров"}},
         {"hl_venue_choose", {"Choose where to look:", "Выберите площадку:"}},
-        {"hl_venue_spot",   {"⛓ BSC — spot", "⛓ BSC — спот"}},
-        {"hl_venue_perp",   {"🌐 Hyperliquid — perps", "🌐 Hyperliquid — перпы"}},
+        {"hl_venue_spot",   {"⛓ BSC — Spot", "⛓ BSC — Спот"}},
+        {"hl_venue_perp",   {"🌐 Hyperliquid — Futures", "🌐 Hyperliquid — Фьючерсы"}},
         {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
         // Перповый аналог "среднего удержания" у спота: у перпов манеру
