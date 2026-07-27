@@ -256,6 +256,46 @@ const std::unordered_map<std::string, Entry>& table() {
                             "❌ Имя не может быть пустым.\n\nВведите имя или нажмите Отмена."}},
         {"err_name_too_long", {"❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
                                "❌ Имя слишком длинное (макс. 32 символа).\n\nВведите более короткое имя или нажмите Отмена."}},
+
+        // --- Перпетуалы Hyperliquid ---
+        {"hl_open_long",   {"OPENED LONG",   "ОТКРЫЛ ЛОНГ"}},
+        {"hl_close_long",  {"CLOSED LONG",   "ЗАКРЫЛ ЛОНГ"}},
+        {"hl_open_short",  {"OPENED SHORT",  "ОТКРЫЛ ШОРТ"}},
+        {"hl_close_short", {"CLOSED SHORT",  "ЗАКРЫЛ ШОРТ"}},
+        {"hl_flip",        {"FLIPPED",       "РАЗВЕРНУЛ ПОЗИЦИЮ"}},
+        {"hl_liquidated",  {"LIQUIDATED",    "ЛИКВИДИРОВАН"}},
+        {"hl_trade",       {"PERP TRADE",    "СДЕЛКА ПО ПЕРПАМ"}},
+        // Размер позиции и сумма под риском - разные числа: при 20x сделка на
+        // $100 000 стоит киту $5 000 своих. Названия должны это разводить.
+        {"hl_size",        {"Position size", "Размер позиции"}},
+        {"hl_margin",      {"Own funds",     "Своих денег"}},
+        {"hl_leverage",    {"Leverage",      "Плечо"}},
+        {"hl_cross",       {"cross",         "кросс"}},
+        {"hl_isolated",    {"isolated",      "изолированное"}},
+        {"hl_price",       {"Price",         "Цена"}},
+        {"hl_qty",         {"Quantity",      "Количество"}},
+        {"hl_pnl",         {"Realized PnL",  "Прибыль по сделке"}},
+        {"hl_liq",         {"Liquidation",   "Ликвидация"}},
+        {"hl_account",     {"Account value", "Размер счёта"}},
+        {"hl_venue",       {"Venue",         "Площадка"}},
+
+        // --- Рейтинг перпов ---
+        {"hl_venue_title",  {"Top traders", "Топ трейдеров"}},
+        {"hl_venue_choose", {"Choose where to look:", "Выберите площадку:"}},
+        {"hl_venue_spot",   {"⛓ BSC — spot", "⛓ BSC — спот"}},
+        {"hl_venue_perp",   {"🌐 Hyperliquid — perps", "🌐 Hyperliquid — перпы"}},
+        {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
+        {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
+        {"hl_rk_pnl",       {"💰 By profit", "💰 По прибыли"}},
+        {"hl_rk_roi",       {"📈 By ROI", "📈 По доходности"}},
+        {"hl_rk_winrate",   {"🎯 By win rate", "🎯 По доле прибыльных"}},
+        {"hl_rk_active",    {"🔄 Most active", "🔄 Самые активные"}},
+        {"hl_rk_trades",    {"trades", "сделок"}},
+        {"hl_rk_page",      {"Page", "Страница"}},
+        {"hl_rk_empty",     {"No data yet — the ranking needs at least 5 closed trades per wallet over 30 days.",
+                             "Пока нет данных — в рейтинг попадают кошельки минимум с 5 закрытыми сделками за 30 дней."}},
+        {"hl_rk_upgrade",   {"⭐️ Premium opens the full top 100.",
+                             "⭐️ Премиум открывает полный топ-100."}},
     };
     return t;
 }
