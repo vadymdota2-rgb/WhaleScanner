@@ -1625,13 +1625,11 @@ HlMessage buildVenueMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
-    // Ширину кнопок Telegram берёт от ширины самого сообщения, а не наоборот.
-    // Текст "Выберите площадку" короткий, поэтому пузырь получался узким и
-    // кнопки жались к середине. Разделитель задаёт ширину - тот же самый, что
-    // в карточках рейтинга, чтобы экраны были одной ширины.
-    return {"\U0001F3C6 <b>" + tr(lang, "hl_venue_title") + "</b>\n"
-            + HL_CARD_SEPARATOR + "\n\n" + tr(lang, "hl_venue_choose"),
-            kb.dump()};
+    // Без разделителя, как в спотовом меню: экраны выбора у обеих площадок
+    // должны выглядеть одинаково. Линия остаётся только в карточках рейтинга,
+    // где она разделяет трейдеров.
+    return {"\U0001F3C6 <b>" + tr(lang, "hl_venue_title") + "</b>\n\n"
+            + tr(lang, "hl_venue_choose"), kb.dump()};
 }
 
 HlMessage buildPerpTopMenu(const std::string& chatId) {
@@ -1649,8 +1647,8 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
     }));
-    return {"\U0001F310 <b>Hyperliquid \u2014 " + tr(lang, "hl_rk_title") + "</b>\n"
-            + HL_CARD_SEPARATOR + "\n\n" + tr(lang, "hl_rk_choose"), kb.dump()};
+    return {"\U0001F310 <b>Hyperliquid \u2014 " + tr(lang, "hl_rk_title") + "</b>\n\n"
+            + tr(lang, "hl_rk_choose"), kb.dump()};
 }
 
 std::string buildHlDailyDigest() {
