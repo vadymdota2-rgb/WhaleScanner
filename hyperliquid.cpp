@@ -546,6 +546,22 @@ void purgeNonPerpFills() {
         if (!c.empty() && !isPerpCoin(c)) alien.push_back(c);
     if (alien.empty()) return;
 
+    // ПРЕДОХРАНИТЕЛЬ. Если имена монет в сделках вдруг перестанут совпадать с
+    // именами рынков - другой регистр, префикс, изменившийся формат, - то
+    // "нефьючерсным" окажется всё подряд, и уборка сотрёт базу целиком. Такая
+    // ошибка не проявляется никак: рейтинг просто станет пустым. Поэтому
+    // массовое удаление считаем не результатом, а признаком поломки фильтра.
+    if (alien.size() > distinctCoins.size() / 2) {
+        std::cerr << "[HL] уборка ОТМЕНЕНА: нефьючерсными выглядят "
+                  << alien.size() << " рынков из " << distinctCoins.size()
+                  << " - похоже, сломалось сопоставление имён, а не данные. "
+                  << "Примеры: ";
+        for (size_t i = 0; i < alien.size() && i < 5; i++)
+            std::cerr << alien[i] << (i + 1 < std::min<size_t>(alien.size(), 5) ? ", " : "");
+        std::cerr << std::endl;
+        return;
+    }
+
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return;
     int purged = 0;
@@ -837,6 +853,7 @@ void enrichWallet(const std::string& wallet) {
                 if (g_hlDb) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr); }
 
     long long maxTs = st.lastFillTs;
+    size_t skippedNonPerp = 0, stored = 0;
     for (const auto& f : fills) {
         if (!f.is_object()) continue;
         const long long ts = f.value("time", 0LL);
@@ -846,7 +863,7 @@ void enrichWallet(const std::string& wallet) {
         // алерты построены вокруг плеча и маржи, которых у спота нет.
         // Отличаем по списку перп-рынков, а не по виду названия: спотовые
         // пары бывают и без косой черты.
-        if (!isPerpCoin(f.value("coin", std::string()))) continue;
+        if (!isPerpCoin(f.value("coin", std::string()))) { skippedNonPerp++; continue; }
 
         long long closedPnl = 0, fee = 0;
         parseDecimalToNanos(f.value("closedPnl", std::string("0")), closedPnl);
@@ -863,6 +880,7 @@ void enrichWallet(const std::string& wallet) {
         pos.stillOpen = pos.known && pos.snapshotAt >= stateAt;
 
         const bool isNew = saveFill(wallet, f, closedPnl, fee, notional, pos);
+        if (isNew) stored++;
         if (!isNew || !wasSeeded) continue;   // повтор либо первичное наполнение
         if (notional <= 0) continue;
 
@@ -871,6 +889,19 @@ void enrichWallet(const std::string& wallet) {
 
     if (bulk) { std::lock_guard<std::mutex> l(g_hlDbMutex);
                 if (g_hlDb) sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr); }
+
+    // Отсеяли всё до единой сделки - это не нормальная работа фильтра, а почти
+    // наверняка расхождение в именах рынков. Молчать об этом нельзя: снаружи
+    // выглядело бы как "кит просто не торгует".
+    if (!fills.empty() && skippedNonPerp == fills.size()) {
+        std::cerr << "[HL] ВНИМАНИЕ: у " << wallet << " отсеяны ВСЕ " << fills.size()
+                  << " сделок как нефьючерсные. Первая монета: "
+                  << fills[0].value("coin", std::string("?"))
+                  << " - сверь с именами рынков из meta." << std::endl;
+    } else if (stored > 0 && !wasSeeded) {
+        std::cout << "[HL] первичное наполнение " << wallet << ": " << stored
+                  << " сделок записано молча" << std::endl;
+    }
 
     // Гиперактивный адрес в одиночку съел бы весь бюджет - переводим на редкий опрос.
     if (fills.size() >= static_cast<size_t>(HL_HYPERACTIVE_FILLS)) {
@@ -1489,11 +1520,6 @@ bool initHyperliquid() {
         "  banned_at INTEGER NOT NULL DEFAULT 0,"
         "  trades INTEGER NOT NULL DEFAULT 0);";
 
-    // База уже могла быть создана прошлой версией без колонки oid. Ошибка
-    // "duplicate column" здесь ожидаема и означает, что колонка на месте.
-    sqlite3_exec(g_hlDb, "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
-                 nullptr, nullptr, nullptr);
-
     char* err = nullptr;
     if (sqlite3_exec(g_hlDb, schema, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[HL] схема не создана: " << (err ? err : "?") << std::endl;
@@ -1502,6 +1528,45 @@ bool initHyperliquid() {
         g_hlDb = nullptr;
         return false;
     }
+
+    // ------------------------- Перенос старых баз -------------------------
+    // CREATE TABLE IF NOT EXISTS на существующей таблице не делает НИЧЕГО - он
+    // не добавляет колонки, появившиеся позже. База, созданная ранней версией,
+    // осталась бы без них, а вставка сделки молча падала бы с "no such column":
+    // дозагрузки идут, сделок не прибавляется, алертов нет, и снаружи это
+    // выглядит как "киты просто не торгуют".
+    //
+    // Поэтому каждая колонка, добавленная после первого выпуска, отдельно
+    // досоздаётся здесь. Повторный запуск вернёт "duplicate column name" - это
+    // ожидаемо и означает, что колонка уже на месте, поэтому ошибку глушим.
+    const char* const migrations[] = {
+        "ALTER TABLE hl_fills ADD COLUMN notional_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN margin_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN leverage INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
+    };
+    for (const char* sql : migrations) {
+        char* mErr = nullptr;
+        if (sqlite3_exec(g_hlDb, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
+            std::cout << "[HL] база обновлена: " << sql << std::endl;
+        if (mErr) sqlite3_free(mErr);
+    }
+
+    // Проверка вместо надежды: если после переноса запись сделки всё равно
+    // невозможна, лучше сказать об этом громко при старте, чем выяснять по
+    // пустому рейтингу через неделю.
+    sqlite3_stmt* probe = nullptr;
+    if (sqlite3_prepare_v2(g_hlDb,
+            "SELECT tid,notional_nanos,margin_nanos,leverage,oid FROM hl_fills LIMIT 1",
+            -1, &probe, nullptr) != SQLITE_OK) {
+        logCritical(std::string("[HL] таблица сделок непригодна для записи: ")
+                    + sqlite3_errmsg(g_hlDb) + " - перпы работать не будут");
+        if (probe) sqlite3_finalize(probe);
+        sqlite3_close(g_hlDb);
+        g_hlDb = nullptr;
+        return false;
+    }
+    sqlite3_finalize(probe);
     return true;
 }
 
