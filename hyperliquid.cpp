@@ -137,11 +137,15 @@ bool parseDecimalToNanos(const std::string& s, long long& out) {
 
     long long intPart = 0;
     size_t intDigits = 0;
+    // Предел целой части: LLONG_MAX / 1e9, потому что дальше идёт умножение на
+    // наносы. Проверять ОБЯЗАТЕЛЬНО после присоединения цифры, а не до: иначе
+    // последняя цифра успевает вытолкнуть число за границу уже после проверки,
+    // и получается не отказ, а тихая порча - отрицательный размер сделки или
+    // отрицательный PnL из ниоткуда.
+    constexpr long long MAX_WHOLE_UNITS = 9223372036LL;   // LLONG_MAX / NANOS_PER_UNIT
     for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; i++) {
-        // Верхняя граница целой части: умножение на 1e9 не должно вылезти за
-        // long long (9.22e18), значит целая часть обязана остаться ниже 9.2e9.
-        if (intPart > 9000000000LL) return false;
         intPart = intPart * 10 + (s[i] - '0');
+        if (intPart > MAX_WHOLE_UNITS) return false;
         intDigits++;
     }
     if (intDigits == 0) return false;
@@ -224,6 +228,11 @@ std::string formatPriceNanos(long long nanos) {
 std::mutex g_coinsMutex;
 std::set<std::string> g_perpCoins;
 
+bool perpCoinsLoaded() {
+    std::lock_guard<std::mutex> l(g_coinsMutex);
+    return !g_perpCoins.empty();
+}
+
 bool isPerpCoin(const std::string& coin) {
     std::lock_guard<std::mutex> l(g_coinsMutex);
     if (g_perpCoins.empty()) return true;   // список ещё не загружен - не теряем данные
@@ -236,15 +245,27 @@ void setPerpCoins(const std::vector<std::string>& coins) {
     g_perpCoins.swap(fresh);
 }
 
+// Списки отдаём снимком-указателем, а не копией, по образцу WATCHERS_PTR в
+// main.cpp. Разница принципиальная: фид разбирает тысячи сделок в минуту, и
+// копирование множества на каждое сообщение - это по паре тысяч выделений
+// памяти впустую. Указатель копируется за наносекунды, а сам набор живёт,
+// пока его кто-то держит.
+using AddressSet = std::set<std::string>;
 std::mutex g_walletsMutex;
-std::set<std::string> g_watched;
-// Забаненные держим рядом со списком наблюдения: сверка нужна на каждой
-// сделке фида, ходить за ней в базу нельзя.
-std::set<std::string> g_banned;
+std::shared_ptr<const AddressSet> g_watched = std::make_shared<const AddressSet>();
+std::shared_ptr<const AddressSet> g_banned  = std::make_shared<const AddressSet>();
+
+std::shared_ptr<const AddressSet> watchedSnapshot() {
+    std::lock_guard<std::mutex> l(g_walletsMutex);
+    return g_watched;
+}
+std::shared_ptr<const AddressSet> bannedSnapshot() {
+    std::lock_guard<std::mutex> l(g_walletsMutex);
+    return g_banned;
+}
 
 bool isBanned(const std::string& addr) {
-    std::lock_guard<std::mutex> l(g_walletsMutex);
-    return g_banned.count(addr) > 0;
+    return bannedSnapshot()->count(addr) > 0;
 }
 
 std::set<std::string> loadBannedWallets() {
@@ -265,15 +286,15 @@ void reloadWatchedWallets() {
     std::vector<std::string> src = hlWatchedAddresses();
     std::set<std::string> fresh(src.begin(), src.end());
     std::set<std::string> banned = loadBannedWallets();   // до захвата, иначе
-    std::lock_guard<std::mutex> l(g_walletsMutex);        // два мьютекса разом
-    g_watched.swap(fresh);
-    g_banned.swap(banned);
+                                                          // два мьютекса разом
+    auto freshPtr  = std::make_shared<const AddressSet>(std::move(fresh));
+    auto bannedPtr = std::make_shared<const AddressSet>(std::move(banned));
+    std::lock_guard<std::mutex> l(g_walletsMutex);
+    g_watched = freshPtr;
+    g_banned = bannedPtr;
 }
 
-size_t watchedCount() {
-    std::lock_guard<std::mutex> l(g_walletsMutex);
-    return g_watched.size();
-}
+size_t watchedCount() { return watchedSnapshot()->size(); }
 
 // ============================== Счётчики ==============================
 
@@ -546,15 +567,16 @@ void purgeNonPerpFills() {
         if (!c.empty() && !isPerpCoin(c)) alien.push_back(c);
     if (alien.empty()) return;
 
-    // ПРЕДОХРАНИТЕЛЬ. Если имена монет в сделках вдруг перестанут совпадать с
-    // именами рынков - другой регистр, префикс, изменившийся формат, - то
-    // "нефьючерсным" окажется всё подряд, и уборка сотрёт базу целиком. Такая
-    // ошибка не проявляется никак: рейтинг просто станет пустым. Поэтому
-    // массовое удаление считаем не результатом, а признаком поломки фильтра.
-    if (alien.size() > distinctCoins.size() / 2) {
-        std::cerr << "[HL] уборка ОТМЕНЕНА: нефьючерсными выглядят "
-                  << alien.size() << " рынков из " << distinctCoins.size()
-                  << " - похоже, сломалось сопоставление имён, а не данные. "
+    // ПРЕДОХРАНИТЕЛЬ от сломанного сопоставления имён. Признак поломки - когда
+    // НИ ОДИН рынок из базы не опознан как фьючерсный: значит разошёлся формат
+    // имён, а не данные испортились.
+    //
+    // Раньше здесь стояло "больше половины", и это было ошибкой: после долгой
+    // работы без фильтра спотовых строк накапливается больше, чем фьючерсных,
+    // и порог блокировал бы именно ту уборку, ради которой всё писалось.
+    if (alien.size() == distinctCoins.size()) {
+        std::cerr << "[HL] уборка ОТМЕНЕНА: НИ ОДИН рынок из " << distinctCoins.size()
+                  << " не опознан как фьючерсный - сломалось сопоставление имён. "
                   << "Примеры: ";
         for (size_t i = 0; i < alien.size() && i < 5; i++)
             std::cerr << alien[i] << (i + 1 < std::min<size_t>(alien.size(), 5) ? ", " : "");
@@ -636,7 +658,14 @@ bool banWallet(const std::string& wallet, int trades) {
     }
     if (!saved) return false;
 
-    { std::lock_guard<std::mutex> l(g_walletsMutex); g_banned.insert(wallet); }
+    {
+        // Набор неизменяемый, поэтому дополняем копией и подменяем указатель.
+        // Баны редки, а чтения идут постоянно - платить за них выгоднее здесь.
+        std::lock_guard<std::mutex> l(g_walletsMutex);
+        auto updated = std::make_shared<AddressSet>(*g_banned);
+        updated->insert(wallet);
+        g_banned = updated;
+    }
     { std::lock_guard<std::mutex> l(g_rankMutex); g_rankBuiltAt = 0; }   // рейтинг пересчитать
     return true;
 }
@@ -644,12 +673,14 @@ bool banWallet(const std::string& wallet, int trades) {
 // Сохранение сделки. false - такая уже была: tid у площадки уникален, поэтому
 // первичный ключ сам гасит повторы от перекрытия окон дозагрузки. Возврат
 // заодно решает, слать ли алерт: о повторе сообщать не надо.
-bool saveFill(const std::string& wallet, const json& f, long long closedPnlNanos,
-              long long feeNanos, long long notionalNanosVal, const PositionInfo& pos) {
+// ВАЖНО: вызывается с уже захваченным g_hlDbMutex. Своей блокировки внутри нет
+// намеренно - иначе транзакция вокруг пачки оставалась бы открытой в моменты,
+// когда база никем не удерживается, и чужая запись молча попадала бы внутрь
+// чужой транзакции, а при откате исчезала бы вместе с ней.
+bool saveFillLocked(const std::string& wallet, const json& f, long long closedPnlNanos,
+                    long long feeNanos, long long notionalNanosVal, const PositionInfo& pos) {
     long long tid = f.value("tid", 0LL);
     if (tid == 0) return false;
-
-    std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return false;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
@@ -846,14 +877,21 @@ void enrichWallet(const std::string& wallet) {
     const long long stateAt = nowSec();
     if (!fills.empty()) fetchAccountState(wallet);
 
-    // Первичное наполнение приносит сотни сделок разом. Без общей транзакции
-    // каждая запись - отдельный сброс на диск, и кошелёк заливался бы минуты.
-    const bool bulk = fills.size() > 20;
-    if (bulk) { std::lock_guard<std::mutex> l(g_hlDbMutex);
-                if (g_hlDb) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr); }
-
+    // Проход 1: разбор и расчёт. Обращений к базе нет, поэтому и блокировка
+    // здесь не нужна - а заодно не приходится держать её во время работы с
+    // кэшем позиций.
+    struct Prepared {
+        const json* fill;
+        long long closedPnl;
+        long long fee;
+        long long notional;
+        PositionInfo pos;
+    };
+    std::vector<Prepared> prepared;
+    prepared.reserve(fills.size());
+    size_t skippedNonPerp = 0;
     long long maxTs = st.lastFillTs;
-    size_t skippedNonPerp = 0, stored = 0;
+
     for (const auto& f : fills) {
         if (!f.is_object()) continue;
         const long long ts = f.value("time", 0LL);
@@ -865,30 +903,53 @@ void enrichWallet(const std::string& wallet) {
         // пары бывают и без косой черты.
         if (!isPerpCoin(f.value("coin", std::string()))) { skippedNonPerp++; continue; }
 
-        long long closedPnl = 0, fee = 0;
-        parseDecimalToNanos(f.value("closedPnl", std::string("0")), closedPnl);
-        parseDecimalToNanos(f.value("fee", std::string("0")), fee);
-
-        // Считаем ДО записи: нотионал, маржа и плечо должны лечь в строку
-        // сделки, иначе рейтинг потом не сможет посчитать ROI.
-        long long notional = 0;
-        notionalNanos(f.value("px", std::string("0")), f.value("sz", std::string("0")), notional);
-        PositionInfo pos = lastKnownPosition(wallet, f.value("coin", std::string()));
+        Prepared p;
+        p.fill = &f;
+        p.closedPnl = 0;
+        p.fee = 0;
+        parseDecimalToNanos(f.value("closedPnl", std::string("0")), p.closedPnl);
+        parseDecimalToNanos(f.value("fee", std::string("0")), p.fee);
+        p.notional = 0;
+        notionalNanos(f.value("px", std::string("0")), f.value("sz", std::string("0")), p.notional);
+        p.pos = lastKnownPosition(wallet, f.value("coin", std::string()));
         // Монета есть в свежем снимке счёта - значит позиция жива: закрытие было
         // частичным. Нет - закрыли целиком, и всё, что мы помним о позиции,
         // относится к тому, чего больше не существует.
-        pos.stillOpen = pos.known && pos.snapshotAt >= stateAt;
-
-        const bool isNew = saveFill(wallet, f, closedPnl, fee, notional, pos);
-        if (isNew) stored++;
-        if (!isNew || !wasSeeded) continue;   // повтор либо первичное наполнение
-        if (notional <= 0) continue;
-
-        dispatchHlAlert(wallet, f, notional, closedPnl, pos);
+        p.pos.stillOpen = p.pos.known && p.pos.snapshotAt >= stateAt;
+        prepared.push_back(std::move(p));
     }
 
-    if (bulk) { std::lock_guard<std::mutex> l(g_hlDbMutex);
-                if (g_hlDb) sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr); }
+    // Проход 2: запись. Вся пачка под ОДНИМ захватом мьютекса - транзакция не
+    // должна существовать в моменты, когда база свободна. Первичное наполнение
+    // приносит сотни сделок разом, и без общей транзакции каждая запись была бы
+    // отдельным сбросом на диск.
+    std::vector<size_t> freshRows;
+    size_t stored = 0;
+    {
+        const bool bulk = prepared.size() > 20;
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (g_hlDb) {
+            if (bulk) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
+            for (size_t i = 0; i < prepared.size(); i++) {
+                const Prepared& p = prepared[i];
+                if (saveFillLocked(wallet, *p.fill, p.closedPnl, p.fee, p.notional, p.pos)) {
+                    stored++;
+                    if (p.notional > 0) freshRows.push_back(i);
+                }
+            }
+            if (bulk) sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+        }
+    }
+
+    // Проход 3: рассылка. ВНЕ блокировки базы перпов - здесь и обращение к
+    // главной базе за языком получателя, и постановка в очередь отправки.
+    // Держать на этом свой мьютекс значило бы вешать экран рейтинга у всех
+    // остальных на время сетевых операций.
+    if (wasSeeded)
+        for (size_t i : freshRows) {
+            const Prepared& p = prepared[i];
+            dispatchHlAlert(wallet, *p.fill, p.notional, p.closedPnl, p.pos);
+        }
 
     // Отсеяли всё до единой сделки - это не нормальная работа фильтра, а почти
     // наверняка расхождение в именах рынков. Молчать об этом нельзя: снаружи
@@ -939,7 +1000,11 @@ void enrichWallet(const std::string& wallet) {
 }
 
 void enricherLoop() {
-    long long lastCleanup = nowSec();
+    // Ноль, а не текущее время: первая уборка должна пройти сразу, как только
+    // подтянется список рынков, а не через час работы. Бот перезапускают чаще,
+    // чем раз в час, и с прежним отсчётом уборка не случалась НИ РАЗУ - мусор
+    // копился, хотя фильтр стоял.
+    long long lastCleanup = 0;
     while (keepGoing()) {
         std::set<std::string> batch;
         {
@@ -962,7 +1027,10 @@ void enricherLoop() {
                 rollbackIfOpen();
             }
         }
-        if (nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC) {
+        // Ждём список рынков: без него isPerpCoin считает фьючерсом всё подряд,
+        // и уборка прошла бы вхолостую, отметившись как выполненная.
+        if (perpCoinsLoaded() &&
+            (lastCleanup == 0 || nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC)) {
             purgeNonPerpFills();
             cleanupOldFills();
             lastCleanup = nowSec();
@@ -1018,12 +1086,10 @@ void waitReadable(CURL* c, int timeoutMs) {
 void handleTrades(const json& data) {
     if (!data.is_array()) return;
 
-    std::set<std::string> watched, banned;
-    {
-        std::lock_guard<std::mutex> l(g_walletsMutex);
-        watched = g_watched;
-        banned = g_banned;
-    }
+    const auto watchedPtr = watchedSnapshot();
+    const auto bannedPtr = bannedSnapshot();
+    const AddressSet& watched = *watchedPtr;
+    const AddressSet& banned = *bannedPtr;
     if (watched.empty()) {
         g_tradesSeen.fetch_add(data.size(), std::memory_order_relaxed);
         return;
