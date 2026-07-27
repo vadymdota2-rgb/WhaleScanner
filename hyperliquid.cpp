@@ -38,9 +38,6 @@ std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
 // Из wallet_menu.cpp - тот же формат адреса, что на остальных экранах.
 std::string shortAddress(const std::string& a);
-// Из wallet_menu.cpp - снятие кошелька с сервисного аккаунта. Та же функция,
-// которой пользуется детектор ботов в споте.
-void untrackWalletFromService(const std::string& wallet);
 
 namespace {
 
@@ -220,6 +217,25 @@ std::string formatPriceNanos(long long nanos) {
 // сделку, поэтому список держим своей копией в памяти, а не берём блокировку
 // главной базы тысячи раз в минуту.
 
+// Список перп-рынков. Нужен не только для подписки: дозагрузка обязана по
+// нему отсеивать спотовые сделки - userFillsByTime отдаёт ВСЕ сделки кошелька
+// на площадке, а у спота нет ни плеча, ни маржи, ни ликвидации, и в перповом
+// рейтинге такие строки дают ROI 0% и пустое плечо.
+std::mutex g_coinsMutex;
+std::set<std::string> g_perpCoins;
+
+bool isPerpCoin(const std::string& coin) {
+    std::lock_guard<std::mutex> l(g_coinsMutex);
+    if (g_perpCoins.empty()) return true;   // список ещё не загружен - не теряем данные
+    return g_perpCoins.count(coin) > 0;
+}
+
+void setPerpCoins(const std::vector<std::string>& coins) {
+    std::set<std::string> fresh(coins.begin(), coins.end());
+    std::lock_guard<std::mutex> l(g_coinsMutex);
+    g_perpCoins.swap(fresh);
+}
+
 std::mutex g_walletsMutex;
 std::set<std::string> g_watched;
 // Забаненные держим рядом со списком наблюдения: сверка нужна на каждой
@@ -342,24 +358,30 @@ void interruptibleSleep(int seconds) {
 
 // ========================= Список рынков (REST) =========================
 
-std::vector<std::string> fetchPerpCoins() {
-    std::vector<std::string> coins;
+// Два списка из одного запроса, и они РАЗНЫЕ:
+//   subscribe - на что подписываться (делистнутые не нужны, сделок не дают);
+//   all       - что считать фьючерсом при отсеве спота. Делистнутый рынок
+//               по-прежнему фьючерс, и закрывающие сделки по нему идут -
+//               выкинуть их значило бы потерять настоящие перп-сделки.
+bool fetchPerpCoins(std::vector<std::string>& subscribe, std::vector<std::string>& all) {
+    subscribe.clear();
+    all.clear();
     json body;
     body["type"] = "meta";
     body["dex"] = "";
     json j = infoPost(body, HL_WEIGHT_META);
     if (!j.is_object() || !j.contains("universe") || !j["universe"].is_array()) {
         std::cerr << "[HL] meta: неожиданный ответ" << std::endl;
-        return coins;
+        return false;
     }
     for (const auto& u : j["universe"]) {
         if (!u.is_object() || !u.contains("name") || !u["name"].is_string()) continue;
-        // Делистнутые рынки сделок не дают - подписка на них тратит лимит впустую.
-        if (u.value("isDelisted", false)) continue;
         std::string name = u["name"].get<std::string>();
-        if (!name.empty()) coins.push_back(name);
+        if (name.empty()) continue;
+        all.push_back(name);
+        if (!u.value("isDelisted", false)) subscribe.push_back(name);
     }
-    return coins;
+    return !all.empty();
 }
 
 // ====================== Состояние позиций (REST) ======================
@@ -504,6 +526,41 @@ void rollbackIfOpen() {
 
 // Уборка. Без неё база растёт вечно: рейтинг смотрит 30 дней, всё остальное -
 // мёртвый груз. Запас в 15 дней на случай пересчёта задним числом.
+// Вычистка нефьючерсных строк по СПИСКУ РЫНКОВ, а не по виду названия:
+// угадывать спот по косой черте ненадёжно, названия на площадке разные.
+// Мьютексы берём по очереди, а не вложенно - список монет и база защищены
+// разными замками.
+void purgeNonPerpFills() {
+    std::vector<std::string> distinctCoins;
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (!g_hlDb) return;
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(g_hlDb, &s, "SELECT DISTINCT coin FROM hl_fills")) return;
+        while (sqlite3_step(s) == SQLITE_ROW) distinctCoins.push_back(safeColumnText(s, 0));
+        sqlite3_finalize(s);
+    }
+
+    std::vector<std::string> alien;
+    for (const std::string& c : distinctCoins)
+        if (!c.empty() && !isPerpCoin(c)) alien.push_back(c);
+    if (alien.empty()) return;
+
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return;
+    int purged = 0;
+    for (const std::string& c : alien) {
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(g_hlDb, &s, "DELETE FROM hl_fills WHERE coin=?")) continue;
+        sqlite3_bind_text(s, 1, c.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_DONE) purged += sqlite3_changes(g_hlDb);
+        sqlite3_finalize(s);
+    }
+    if (purged > 0)
+        std::cout << "[HL] удалено нефьючерсных строк: " << purged
+                  << " по " << alien.size() << " рынкам" << std::endl;
+}
+
 void cleanupOldFills() {
     const long long cutoffMs = (nowSec() - HL_FILL_TTL_SEC) * 1000LL;
     std::lock_guard<std::mutex> l(g_hlDbMutex);
@@ -785,6 +842,12 @@ void enrichWallet(const std::string& wallet) {
         const long long ts = f.value("time", 0LL);
         if (ts > maxTs) maxTs = ts;
 
+        // Спотовые сделки на Hyperliquid сюда попадать не должны: рейтинг и
+        // алерты построены вокруг плеча и маржи, которых у спота нет.
+        // Отличаем по списку перп-рынков, а не по виду названия: спотовые
+        // пары бывают и без косой черты.
+        if (!isPerpCoin(f.value("coin", std::string()))) continue;
+
         long long closedPnl = 0, fee = 0;
         parseDecimalToNanos(f.value("closedPnl", std::string("0")), closedPnl);
         parseDecimalToNanos(f.value("fee", std::string("0")), fee);
@@ -834,12 +897,14 @@ void enrichWallet(const std::string& wallet) {
     const int total = countFillsInWindow(wallet);
     if (total > HL_MAX_BOT_TRADES && banWallet(wallet, total)) {
         g_botsBanned.fetch_add(1, std::memory_order_relaxed);
-        std::cout << "[HL] бот: " << wallet << " - " << total
-                  << " сделок за 30 дней, исключён из рейтинга" << std::endl;
-        // Снятие с сервисного аккаунта берёт главный мьютекс базы, поэтому
-        // вызывается здесь, вне любых наших блокировок - иначе взаимоблокировка.
-        untrackWalletFromService(wallet);
+        std::cout << "[HL] бот на фьючерсах: " << wallet << " - " << total
+                  << " ордеров за 30 дней, исключён из перп-рейтинга" << std::endl;
     }
+    // С сервисного аккаунта кошелёк НЕ снимаем, в отличие от спотового
+    // детектора. Маркет-мейкер на фьючерсах не обязан быть алгоритмом на BSC:
+    // это разные площадки и разные стратегии. Спотовая часть судит сама, по
+    // своему порогу. Бан здесь остаётся местным - перп-рейтинг, дозагрузка и
+    // перп-алерты, - а спотовое отслеживание продолжается как ни в чём не бывало.
 }
 
 void enricherLoop() {
@@ -867,6 +932,7 @@ void enricherLoop() {
             }
         }
         if (nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC) {
+            purgeNonPerpFills();
             cleanupOldFills();
             lastCleanup = nowSec();
         }
@@ -1095,9 +1161,10 @@ void feedLoop() {
         const long long now = nowSec();
 
         if (coins.empty() || now - coinsFetchedAt >= HL_COINS_REFRESH_SEC) {
-            std::vector<std::string> fresh = fetchPerpCoins();
-            if (!fresh.empty()) {
+            std::vector<std::string> fresh, allPerps;
+            if (fetchPerpCoins(fresh, allPerps)) {
                 coins.swap(fresh);
+                setPerpCoins(allPerps);      // отсев ведём по ПОЛНОМУ списку
                 coinsFetchedAt = now;
             } else if (coins.empty()) {
                 std::cerr << "[HL] список рынков получить не удалось, повтор через "
@@ -1139,6 +1206,7 @@ struct PerpRow {
     int winRatePercent = 0;
     int closedTrades = 0;
     double avgLeverage = 0.0;
+    bool roiKnown = false;
     long long volumeNanos = 0;
     long long lastTs = 0;
 };
@@ -1183,8 +1251,10 @@ std::vector<PerpRow> computeRanking() {
         r.winRatePercent = static_cast<int>((100LL * wins) / r.closedTrades);
         // ROI считаем от суммы вложенной маржи, а не от оборота: у перпов
         // оборот раздут плечом и завысил бы результат в десятки раз.
-        if (margin > 0)
+        if (margin > 0) {
             r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(margin);
+            r.roiKnown = true;
+        }
         rows.push_back(r);
     }
     sqlite3_finalize(s);
@@ -1247,8 +1317,10 @@ std::string perpTitle(PerpKind k, Lang lang) {
 void sortByKind(std::vector<PerpRow>& rows, PerpKind kind) {
     switch (kind) {
         case PerpKind::ROI:
-            std::sort(rows.begin(), rows.end(),
-                      [](const PerpRow& a, const PerpRow& b) { return a.roiPercent > b.roiPercent; });
+            std::sort(rows.begin(), rows.end(), [](const PerpRow& a, const PerpRow& b) {
+                if (a.roiKnown != b.roiKnown) return a.roiKnown;   // неизвестные - вниз
+                return a.roiPercent > b.roiPercent;
+            });
             break;
         case PerpKind::WINRATE:
             std::sort(rows.begin(), rows.end(), [](const PerpRow& a, const PerpRow& b) {
@@ -1306,7 +1378,8 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
             text << rankLabel(rank) << "\n";
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
-            text << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+            if (r.roiKnown)
+                text << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
             text << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
             // Перповый аналог среднего удержания у спота: плечо говорит о
@@ -1533,7 +1606,8 @@ std::string buildHlDailyDigest() {
         t << rankLabel(static_cast<int>(i) + 1) << "\n";
         t << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
         t << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
-        t << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+        if (r.roiKnown)
+            t << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
         t << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
         if (r.avgLeverage > 0.0)
             t << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
