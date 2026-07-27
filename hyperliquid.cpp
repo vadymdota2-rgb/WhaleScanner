@@ -38,6 +38,9 @@ std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
 // Из wallet_menu.cpp - тот же формат адреса, что на остальных экранах.
 std::string shortAddress(const std::string& a);
+// Из wallet_menu.cpp - снятие кошелька с сервисного аккаунта. Та же функция,
+// которой пользуется детектор ботов в споте.
+void untrackWalletFromService(const std::string& wallet);
 
 namespace {
 
@@ -93,6 +96,17 @@ constexpr long long NANOS_PER_UNIT = 1000000000LL;
 constexpr long long HL_FILL_TTL_SEC = 45LL * 86400LL;
 constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
+
+// Порог детектора ботов: столько сделок за 30 дней ни один человек не делает.
+// Такой кошелёк - маркет-мейкер или алгоритм: в рейтинге он бессмыслен (его
+// прибыль не воспроизводима), а бюджет дозагрузки съедает весь.
+constexpr long long HL_RANK_WINDOW_SEC = 30LL * 86400LL;
+constexpr int HL_MAX_BOT_TRADES = 3000;
+
+// Кэш рейтинга объявлен здесь, а не рядом с рейтингом: бан обнуляет его
+// отметку, чтобы исключённый кошелёк исчез из топа сразу, а не через 5 минут.
+std::mutex g_rankMutex;
+long long g_rankBuiltAt = 0;
 
 // Тот же разделитель, что в спотовом рейтинге: экраны стоят рядом в одном
 // меню, и разная ширина линии сразу бросалась бы в глаза.
@@ -208,12 +222,36 @@ std::string formatPriceNanos(long long nanos) {
 
 std::mutex g_walletsMutex;
 std::set<std::string> g_watched;
+// Забаненные держим рядом со списком наблюдения: сверка нужна на каждой
+// сделке фида, ходить за ней в базу нельзя.
+std::set<std::string> g_banned;
+
+bool isBanned(const std::string& addr) {
+    std::lock_guard<std::mutex> l(g_walletsMutex);
+    return g_banned.count(addr) > 0;
+}
+
+std::set<std::string> loadBannedWallets() {
+    std::set<std::string> out;
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return out;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s, "SELECT wallet FROM hl_banned")) return out;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        std::string w = safeColumnText(s, 0);
+        if (!w.empty()) out.insert(w);
+    }
+    sqlite3_finalize(s);
+    return out;
+}
 
 void reloadWatchedWallets() {
     std::vector<std::string> src = hlWatchedAddresses();
     std::set<std::string> fresh(src.begin(), src.end());
-    std::lock_guard<std::mutex> l(g_walletsMutex);
+    std::set<std::string> banned = loadBannedWallets();   // до захвата, иначе
+    std::lock_guard<std::mutex> l(g_walletsMutex);        // два мьютекса разом
     g_watched.swap(fresh);
+    g_banned.swap(banned);
 }
 
 size_t watchedCount() {
@@ -229,6 +267,7 @@ std::atomic<unsigned long long> g_enriched{0};
 std::atomic<unsigned long long> g_alertsSent{0};
 std::atomic<unsigned long long> g_budgetSkips{0};
 std::atomic<unsigned long long> g_reconnects{0};
+std::atomic<unsigned long long> g_botsBanned{0};
 std::atomic<int> g_subscribedCoins{0};
 std::atomic<long long> g_lastMsgTs{0};
 std::atomic<bool> g_connected{false};
@@ -485,6 +524,50 @@ void cleanupOldFills() {
     }
 }
 
+// Сколько сделок у кошелька в окне рейтинга. Индекс (wallet, ts) закрывает
+// этот запрос целиком.
+int countFillsInWindow(const std::string& wallet) {
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return 0;
+    sqlite3_stmt* s = nullptr;
+    // Считаем РАЗНЫЕ ордера, а не строки: у кита, работающего крупными
+    // заявками, строк втрое больше, чем реальных сделок, и порог сработал бы
+    // на живом человеке.
+    if (!prepareOrLog(g_hlDb, &s,
+            "SELECT COUNT(DISTINCT CASE WHEN oid > 0 THEN oid ELSE tid END)"
+            " FROM hl_fills WHERE wallet=? AND ts >= ?")) return 0;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL);
+    int n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
+// Заносит кошелёк в бан. true - бан именно сейчас записан (а не был раньше):
+// по нему решается, снимать ли кошелёк с сервисного аккаунта.
+bool banWallet(const std::string& wallet, int trades) {
+    bool saved = false;
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (!g_hlDb) return false;
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(g_hlDb, &s,
+                "INSERT OR IGNORE INTO hl_banned(wallet,banned_at,trades) VALUES(?,?,?)"))
+            return false;
+        sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, nowSec());
+        sqlite3_bind_int(s, 3, trades);
+        if (sqlite3_step(s) == SQLITE_DONE) saved = sqlite3_changes(g_hlDb) > 0;
+        sqlite3_finalize(s);
+    }
+    if (!saved) return false;
+
+    { std::lock_guard<std::mutex> l(g_walletsMutex); g_banned.insert(wallet); }
+    { std::lock_guard<std::mutex> l(g_rankMutex); g_rankBuiltAt = 0; }   // рейтинг пересчитать
+    return true;
+}
+
 // Сохранение сделки. false - такая уже была: tid у площадки уникален, поэтому
 // первичный ключ сам гасит повторы от перекрытия окон дозагрузки. Возврат
 // заодно решает, слать ли алерт: о повторе сообщать не надо.
@@ -499,8 +582,8 @@ bool saveFill(const std::string& wallet, const json& f, long long closedPnlNanos
     if (!prepareOrLog(g_hlDb, &s,
             "INSERT OR IGNORE INTO hl_fills"
             "(tid,wallet,coin,dir,side,px,sz,closed_pnl_nanos,fee_nanos,"
-            "notional_nanos,margin_nanos,leverage,ts,hash) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "notional_nanos,margin_nanos,leverage,oid,ts,hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
@@ -520,8 +603,9 @@ bool saveFill(const std::string& wallet, const json& f, long long closedPnlNanos
     sqlite3_bind_int64(s, 10, notionalNanosVal);
     sqlite3_bind_int64(s, 11, pos.known ? pos.marginUsedNanos : 0);
     sqlite3_bind_int(s,   12, pos.known ? pos.leverage : 0);
-    sqlite3_bind_int64(s, 13, f.value("time", 0LL));
-    sqlite3_bind_text(s,  14, hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 13, f.value("oid", 0LL));
+    sqlite3_bind_int64(s, 14, f.value("time", 0LL));
+    sqlite3_bind_text(s,  15, hash.c_str(), -1, SQLITE_TRANSIENT);
     bool ok = sqlite3_step(s) == SQLITE_DONE;
     int changed = sqlite3_changes(g_hlDb);
     sqlite3_finalize(s);
@@ -650,6 +734,8 @@ void dispatchHlAlert(const std::string& wallet, const json& f, long long notiona
 // ============================== Дозагрузка ==============================
 
 void enrichWallet(const std::string& wallet) {
+    if (isBanned(wallet)) return;   // мог попасть в очередь до бана
+
     WalletState st;
     const bool known = loadWalletState(wallet, st);
     const long long now = nowSec();
@@ -668,6 +754,11 @@ void enrichWallet(const std::string& wallet) {
     body["type"] = "userFillsByTime";
     body["user"] = wallet;
     body["startTime"] = startMs;
+    // Без этого один ордер, исполненный стаканом по кускам, приходит
+    // несколькими записями - и вместо одной сделки на $50 000 ушло бы пять
+    // алертов на случайные доли от неё. Ни одно из показанных чисел не
+    // соответствовало бы решению, которое кит принял.
+    body["aggregateByTime"] = true;
     json fills = infoPost(body, HL_WEIGHT_USER_FILLS);
     if (!fills.is_array()) {
         queueWallet(wallet);   // бюджет исчерпан или площадка не ответила
@@ -736,6 +827,19 @@ void enrichWallet(const std::string& wallet) {
     st.lastEnriched = now;
     saveWalletState(wallet, st);
     setNextEnrich(wallet, now + st.debounce);
+
+    // Детектор ботов. Считаем ПОСЛЕ записи, по фактическому содержимому базы,
+    // а не по размеру последней пачки: алгоритм может торговать ровно, не
+    // выдавая себя всплесками, и попадётся только на объёме за месяц.
+    const int total = countFillsInWindow(wallet);
+    if (total > HL_MAX_BOT_TRADES && banWallet(wallet, total)) {
+        g_botsBanned.fetch_add(1, std::memory_order_relaxed);
+        std::cout << "[HL] бот: " << wallet << " - " << total
+                  << " сделок за 30 дней, исключён из рейтинга" << std::endl;
+        // Снятие с сервисного аккаунта берёт главный мьютекс базы, поэтому
+        // вызывается здесь, вне любых наших блокировок - иначе взаимоблокировка.
+        untrackWalletFromService(wallet);
+    }
 }
 
 void enricherLoop() {
@@ -817,10 +921,11 @@ void waitReadable(CURL* c, int timeoutMs) {
 void handleTrades(const json& data) {
     if (!data.is_array()) return;
 
-    std::set<std::string> watched;
+    std::set<std::string> watched, banned;
     {
         std::lock_guard<std::mutex> l(g_walletsMutex);
         watched = g_watched;
+        banned = g_banned;
     }
     if (watched.empty()) {
         g_tradesSeen.fetch_add(data.size(), std::memory_order_relaxed);
@@ -836,6 +941,9 @@ void handleTrades(const json& data) {
             if (!u.is_string()) continue;
             const std::string addr = toLower(u.get<std::string>());
             if (!watched.count(addr)) continue;
+            // Забаненный алгоритм не должен ни тратить бюджет дозагрузки, ни
+            // порождать алерты - отсекаем в самом начале, до всех расчётов.
+            if (banned.count(addr)) continue;
 
             g_hits.fetch_add(1, std::memory_order_relaxed);
 
@@ -1020,7 +1128,6 @@ void feedLoop() {
 // Считается проще спотового: площадка отдаёт готовый closedPnl по каждой
 // закрывающей сделке, поэтому себестоимость восстанавливать не нужно.
 
-constexpr long long HL_RANK_WINDOW_SEC = 30LL * 86400LL;
 constexpr int HL_MIN_CLOSED_TRADES = 5;
 constexpr int HL_PER_PAGE = 5;
 constexpr long long HL_RANK_CACHE_SEC = 300;
@@ -1036,9 +1143,8 @@ struct PerpRow {
     long long lastTs = 0;
 };
 
-std::mutex g_rankMutex;
+
 std::vector<PerpRow> g_rankCache;
-long long g_rankBuiltAt = 0;
 
 std::vector<PerpRow> computeRanking() {
     std::vector<PerpRow> rows;
@@ -1056,7 +1162,9 @@ std::vector<PerpRow> computeRanking() {
             " SUM(notional_nanos),"
             " AVG(CASE WHEN leverage > 0 THEN leverage END),"
             " MAX(ts)"
-            " FROM hl_fills WHERE ts >= ? GROUP BY wallet"))
+            " FROM hl_fills f WHERE f.ts >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
+            " GROUP BY wallet"))
         return rows;
     sqlite3_bind_int64(s, 1, sinceMs);
 
@@ -1281,6 +1389,10 @@ bool initHyperliquid() {
         "  notional_nanos INTEGER NOT NULL DEFAULT 0,"
         "  margin_nanos INTEGER NOT NULL DEFAULT 0,"
         "  leverage INTEGER NOT NULL DEFAULT 0,"
+        // Номер ордера. Детектор ботов считает именно ордера: одна крупная
+        // заявка может дробиться стаканом на десятки исполнений, и по ним
+        // живой человек выглядел бы алгоритмом.
+        "  oid INTEGER NOT NULL DEFAULT 0,"
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
@@ -1296,7 +1408,18 @@ bool initHyperliquid() {
         "  seeded INTEGER NOT NULL DEFAULT 0,"
         "  last_fill_ts INTEGER NOT NULL DEFAULT 0,"
         "  last_enriched INTEGER NOT NULL DEFAULT 0,"
-        "  debounce_sec INTEGER NOT NULL DEFAULT 30);";
+        "  debounce_sec INTEGER NOT NULL DEFAULT 30);"
+        // Бан навсегда, как в споте: алгоритм, один раз опознанный по объёму,
+        // человеком уже не станет.
+        "CREATE TABLE IF NOT EXISTS hl_banned ("
+        "  wallet TEXT PRIMARY KEY,"
+        "  banned_at INTEGER NOT NULL DEFAULT 0,"
+        "  trades INTEGER NOT NULL DEFAULT 0);";
+
+    // База уже могла быть создана прошлой версией без колонки oid. Ошибка
+    // "duplicate column" здесь ожидаема и означает, что колонка на месте.
+    sqlite3_exec(g_hlDb, "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
+                 nullptr, nullptr, nullptr);
 
     char* err = nullptr;
     if (sqlite3_exec(g_hlDb, schema, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -1343,6 +1466,7 @@ std::string hyperliquidStatsLine() {
        << " (в очереди " << queued << ")"
        << "\n\U0001F4E8 алертов: " << g_alertsSent.load(std::memory_order_relaxed)
        << "\n\U0001F6D1 пропусков по бюджету: " << g_budgetSkips.load(std::memory_order_relaxed)
+       << "\n\U0001F916 ботов исключено: " << g_botsBanned.load(std::memory_order_relaxed)
        << "\n\u267B\uFE0F переподключений: " << g_reconnects.load(std::memory_order_relaxed);
     if (last > 0) ss << "\n\u23F1 тишина: " << (nowSec() - last) << "с";
     return ss.str();
@@ -1363,7 +1487,12 @@ HlMessage buildVenueMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
-    return {"\U0001F3C6 <b>" + tr(lang, "hl_venue_title") + "</b>\n\n" + tr(lang, "hl_venue_choose"),
+    // Ширину кнопок Telegram берёт от ширины самого сообщения, а не наоборот.
+    // Текст "Выберите площадку" короткий, поэтому пузырь получался узким и
+    // кнопки жались к середине. Разделитель задаёт ширину - тот же самый, что
+    // в карточках рейтинга, чтобы экраны были одной ширины.
+    return {"\U0001F3C6 <b>" + tr(lang, "hl_venue_title") + "</b>\n"
+            + HL_CARD_SEPARATOR + "\n\n" + tr(lang, "hl_venue_choose"),
             kb.dump()};
 }
 
@@ -1382,8 +1511,8 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
     }));
-    return {"\U0001F310 <b>Hyperliquid \u2014 " + tr(lang, "hl_rk_title") + "</b>\n\n"
-            + tr(lang, "hl_rk_choose"), kb.dump()};
+    return {"\U0001F310 <b>Hyperliquid \u2014 " + tr(lang, "hl_rk_title") + "</b>\n"
+            + HL_CARD_SEPARATOR + "\n\n" + tr(lang, "hl_rk_choose"), kb.dump()};
 }
 
 std::string buildHlDailyDigest() {
