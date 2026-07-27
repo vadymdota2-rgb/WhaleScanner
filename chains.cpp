@@ -90,6 +90,19 @@ ChainContext makeBscContext() {
     "https://bsc-dataseed.nariox.org",
     "https://rpc.coinsdo.net/bsc",
     "https://bsc.nodereal.io",
+    // Добавлено: официальные dataseed на устаревшем домене binance.org и
+    // базовые адреса семейств, которых не хватало (были только пронумерованные).
+    "https://bsc-dataseed.binance.org",
+    "https://bsc-dataseed1.binance.org",
+    "https://bsc-dataseed2.binance.org",
+    "https://bsc-dataseed.defibit.io",
+    "https://bsc-dataseed.ninicoin.io",
+    // Прочие публичные провайдеры
+    "https://binance.nodereal.io",
+    "https://bnb.rpc.subquery.network/public",
+    "https://bsc-rpc.publicnode.com",
+    "https://bscrpc.com",
+    "https://bsc-mainnet.gateway.tatum.io",
     };
 
     c.dexscreenerChainId = "bsc";
