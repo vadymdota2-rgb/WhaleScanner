@@ -36,6 +36,8 @@ std::string http(const std::string& url, const std::string& post, int timeout);
 void logCritical(const std::string& msg);
 std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
+// Из wallet_menu.cpp - тот же формат адреса, что на остальных экранах.
+std::string shortAddress(const std::string& a);
 
 namespace {
 
@@ -87,6 +89,11 @@ constexpr long long HL_HYPERACTIVE_DEBOUNCE_SEC = 600;
 
 constexpr long long NANOS_PER_UNIT = 1000000000LL;
 
+// Срок хранения сделок. Рейтинг считает за 30 дней, остальное - мёртвый груз.
+constexpr long long HL_FILL_TTL_SEC = 45LL * 86400LL;
+constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
+constexpr size_t HL_POSITION_CACHE_CAP = 20000;
+
 // ============================== Своя база ==============================
 
 sqlite3* g_hlDb = nullptr;
@@ -116,7 +123,9 @@ bool parseDecimalToNanos(const std::string& s, long long& out) {
     long long intPart = 0;
     size_t intDigits = 0;
     for (; i < s.size() && s[i] >= '0' && s[i] <= '9'; i++) {
-        if (intPart > (9000000000000LL)) return false;   // заведомо вне разумного
+        // Верхняя граница целой части: умножение на 1e9 не должно вылезти за
+        // long long (9.22e18), значит целая часть обязана остаться ниже 9.2e9.
+        if (intPart > 9000000000LL) return false;
         intPart = intPart * 10 + (s[i] - '0');
         intDigits++;
     }
@@ -218,10 +227,25 @@ json infoPost(const json& body, int weight) {
 
 std::mutex g_queueMutex;
 std::set<std::string> g_enrichQueue;
+// Когда кошелёк можно трогать снова. Держим в памяти, а не читаем из базы:
+// иначе при дебаунсе в 30 секунд и цикле в 2 секунды каждый ждущий кошелёк
+// давал бы полтора десятка бессмысленных запросов к базе.
+std::unordered_map<std::string, long long> g_nextEnrichAt;
 
 void queueWallet(const std::string& addr) {
     std::lock_guard<std::mutex> l(g_queueMutex);
     g_enrichQueue.insert(addr);
+}
+
+bool readyToEnrich(const std::string& addr) {
+    std::lock_guard<std::mutex> l(g_queueMutex);
+    auto it = g_nextEnrichAt.find(addr);
+    return it == g_nextEnrichAt.end() || nowSec() >= it->second;
+}
+
+void setNextEnrich(const std::string& addr, long long at) {
+    std::lock_guard<std::mutex> l(g_queueMutex);
+    g_nextEnrichAt[addr] = at;
 }
 
 // ====================== Поток и его состояние ======================
@@ -302,6 +326,13 @@ void fetchAccountState(const std::string& wallet) {
     if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) return;
 
     std::lock_guard<std::mutex> l(g_posMutex);
+    // Закрытые позиции мы намеренно не удаляем - из них берётся плечо для
+    // алерта о закрытии. Но расти бесконечно кэш не должен, поэтому при
+    // переполнении сбрасываем целиком: он восстановится сам за один проход.
+    if (g_lastPositions.size() > HL_POSITION_CACHE_CAP) {
+        g_lastPositions.clear();
+        std::cout << "[HL] кэш позиций сброшен по достижении предела" << std::endl;
+    }
     for (const auto& ap : j["assetPositions"]) {
         if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
         const json& p = ap["position"];
@@ -378,6 +409,36 @@ void saveWalletState(const std::string& wallet, const WalletState& st) {
     sqlite3_bind_int64(s, 5, st.debounce);
     sqlite3_step(s);
     sqlite3_finalize(s);
+}
+
+// Откат незакрытой транзакции. Если запись прервалась на середине пачки,
+// открытый BEGIN остался бы висеть и заблокировал бы всю дальнейшую запись.
+void rollbackIfOpen() {
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (g_hlDb && sqlite3_get_autocommit(g_hlDb) == 0)
+        sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+}
+
+// Уборка. Без неё база растёт вечно: рейтинг смотрит 30 дней, всё остальное -
+// мёртвый груз. Запас в 15 дней на случай пересчёта задним числом.
+void cleanupOldFills() {
+    const long long cutoffMs = (nowSec() - HL_FILL_TTL_SEC) * 1000LL;
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return;
+    sqlite3_stmt* s = nullptr;
+    if (prepareOrLog(g_hlDb, &s, "DELETE FROM hl_fills WHERE ts < ?")) {
+        sqlite3_bind_int64(s, 1, cutoffMs);
+        const int deleted = (sqlite3_step(s) == SQLITE_DONE) ? sqlite3_changes(g_hlDb) : 0;
+        sqlite3_finalize(s);
+        if (deleted > 0) std::cout << "[HL] удалено сделок старше срока: " << deleted << std::endl;
+    }
+    // Состояние кошельков, которые давно не появлялись, тоже незачем хранить:
+    // при следующей встрече оно просто создастся заново.
+    if (prepareOrLog(g_hlDb, &s, "DELETE FROM hl_wallet_state WHERE last_enriched < ?")) {
+        sqlite3_bind_int64(s, 1, nowSec() - HL_FILL_TTL_SEC);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
 }
 
 // Сохранение сделки. false - такая уже была: tid у площадки уникален, поэтому
@@ -493,13 +554,13 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
 
 void dispatchHlAlert(const std::string& wallet, const json& f, long long notionalNanosVal,
                      long long closedPnlNanos, const PositionInfo& pos) {
+    if (notionalNanosVal < 0) return;
     std::vector<HlRecipient> recipients = hlWatchersFor(wallet);
     if (recipients.empty()) return;
 
     std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
     for (const HlRecipient& r : recipients) {
         if (r.chatId == SERVICE_CHAT_ID) continue;
-        if (notionalNanosVal < 0) continue;
         if (static_cast<uint64_t>(notionalNanosVal) < r.thresholdNanos) continue;
         Lang lang = langFromCode(getUserLanguage(r.chatId));
         byLabelLang[{r.label, lang}].push_back(r.chatId);
@@ -522,6 +583,7 @@ void enrichWallet(const std::string& wallet) {
     const long long now = nowSec();
 
     if (known && now - st.lastEnriched < st.debounce) {
+        setNextEnrich(wallet, st.lastEnriched + st.debounce);
         queueWallet(wallet);   // ещё рано - вернём в очередь, разберём позже
         return;
     }
@@ -547,6 +609,12 @@ void enrichWallet(const std::string& wallet) {
     // состояние счёта общее, а вес запроса тратится каждый раз.
     if (!fills.empty()) fetchAccountState(wallet);
 
+    // Первичное наполнение приносит сотни сделок разом. Без общей транзакции
+    // каждая запись - отдельный сброс на диск, и кошелёк заливался бы минуты.
+    const bool bulk = fills.size() > 20;
+    if (bulk) { std::lock_guard<std::mutex> l(g_hlDbMutex);
+                if (g_hlDb) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr); }
+
     long long maxTs = st.lastFillTs;
     for (const auto& f : fills) {
         if (!f.is_object()) continue;
@@ -570,6 +638,9 @@ void enrichWallet(const std::string& wallet) {
         dispatchHlAlert(wallet, f, notional, closedPnl, pos);
     }
 
+    if (bulk) { std::lock_guard<std::mutex> l(g_hlDbMutex);
+                if (g_hlDb) sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr); }
+
     // Гиперактивный адрес в одиночку съел бы весь бюджет - переводим на редкий опрос.
     if (fills.size() >= static_cast<size_t>(HL_HYPERACTIVE_FILLS)) {
         if (st.debounce < HL_HYPERACTIVE_DEBOUNCE_SEC) {
@@ -578,13 +649,20 @@ void enrichWallet(const std::string& wallet) {
                       << HL_HYPERACTIVE_DEBOUNCE_SEC << "с" << std::endl;
         }
     }
+    // Если сделок не было, maxTs остаётся нулём - и следующий запрос ушёл бы с
+    // startTime=1, то есть забрал бы ВСЮ историю кошелька. А так как seeded к
+    // тому моменту уже true, по всей этой истории полетели бы алерты. Двигаем
+    // границу к началу запрошенного окна.
+    if (maxTs < startMs) maxTs = startMs - 1;
     st.seeded = true;
     st.lastFillTs = maxTs;
     st.lastEnriched = now;
     saveWalletState(wallet, st);
+    setNextEnrich(wallet, now + st.debounce);
 }
 
 void enricherLoop() {
+    long long lastCleanup = nowSec();
     while (keepGoing()) {
         std::set<std::string> batch;
         {
@@ -593,8 +671,25 @@ void enricherLoop() {
         }
         for (const std::string& w : batch) {
             if (!keepGoing()) break;
-            enrichWallet(w);
+            if (!readyToEnrich(w)) { queueWallet(w); continue; }
+            // Исключение на одном кошельке не должно уносить поток: без
+            // перехвата оно вышло бы из потока и обрушило весь процесс,
+            // а вместе с ним и спотовую часть бота.
+            try {
+                enrichWallet(w);
+            } catch (const std::exception& e) {
+                std::cerr << "[HL] сбой дозагрузки " << w << ": " << e.what() << std::endl;
+                rollbackIfOpen();
+            } catch (...) {
+                std::cerr << "[HL] неизвестный сбой дозагрузки " << w << std::endl;
+                rollbackIfOpen();
+            }
         }
+        if (nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC) {
+            cleanupOldFills();
+            lastCleanup = nowSec();
+        }
+
         for (int i = 0; i < 20 && keepGoing(); i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
@@ -706,7 +801,14 @@ void handleWsMessage(const std::string& raw) {
 
     const std::string channel = j.value("channel", std::string());
     if (channel == "trades") {
-        if (j.contains("data")) handleTrades(j["data"]);
+        // Данные приходят из сети и формат может измениться без предупреждения.
+        // Уронить на них поток фида нельзя - переподключение не поможет,
+        // прилетит то же самое.
+        try {
+            if (j.contains("data")) handleTrades(j["data"]);
+        } catch (const std::exception& e) {
+            std::cerr << "[HL] сбой разбора сделок: " << e.what() << std::endl;
+        }
     } else if (channel == "subscriptionResponse") {
         g_subscribedCoins.fetch_add(1, std::memory_order_relaxed);
     } else if (channel == "error") {
@@ -901,14 +1003,26 @@ std::vector<PerpRow> computeRanking() {
     return rows;
 }
 
-const std::vector<PerpRow>& rankingSnapshot(std::vector<PerpRow>& localCopy) {
-    std::lock_guard<std::mutex> l(g_rankMutex);
-    if (nowSec() - g_rankBuiltAt >= HL_RANK_CACHE_SEC || g_rankCache.empty()) {
-        g_rankCache = computeRanking();
-        g_rankBuiltAt = nowSec();
+void rankingSnapshot(std::vector<PerpRow>& localCopy) {
+    // Пересчёт делаем ВНЕ блокировки кэша. Иначе один пользователь, открывший
+    // рейтинг в момент, когда дозагрузчик держит базу пачкой вставок, вешал бы
+    // экран рейтинга всем остальным: он ждал бы базу, удерживая кэш.
+    bool needRebuild;
+    {
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        needRebuild = g_rankCache.empty() || nowSec() - g_rankBuiltAt >= HL_RANK_CACHE_SEC;
+        if (needRebuild) g_rankBuiltAt = nowSec();   // метку ставим сразу, чтобы
+    }                                               // соседние запросы не считали то же самое
+
+    if (needRebuild) {
+        std::vector<PerpRow> fresh = computeRanking();
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        g_rankCache.swap(fresh);
+        localCopy = g_rankCache;
+        return;
     }
+    std::lock_guard<std::mutex> l(g_rankMutex);
     localCopy = g_rankCache;
-    return localCopy;
 }
 
 enum class PerpKind { PNL, ROI, WINRATE, ACTIVE };
@@ -961,11 +1075,6 @@ void sortByKind(std::vector<PerpRow>& rows, PerpKind kind) {
     }
 }
 
-std::string shortAddr(const std::string& a) {
-    if (a.size() < 12) return a;
-    return a.substr(0, 6) + "..." + a.substr(a.size() - 4);
-}
-
 std::string rankBadge(int rank) {
     if (rank == 1) return "\U0001F947";
     if (rank == 2) return "\U0001F948";
@@ -987,18 +1096,22 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     t << "\U0001F310 <b>Hyperliquid \u2014 " << tr(lang, perpKindTitleKey(kind)) << "</b>\n";
     t << "<code>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</code>\n\n";
 
+    // Границы страницы считаем ОДИН раз: раньше та же арифметика повторялась
+    // при отрисовке текста и при сборке клавиатуры, и разъехаться они могли
+    // молча - кнопки указывали бы не на те строки, что показаны.
+    const int totalPages = rows.empty()
+        ? 0 : (static_cast<int>(rows.size()) + HL_PER_PAGE - 1) / HL_PER_PAGE;
+    if (page < 1) page = 1;
+    if (totalPages > 0 && page > totalPages) page = totalPages;
+    const size_t from = rows.empty() ? 0 : static_cast<size_t>((page - 1) * HL_PER_PAGE);
+    const size_t to = rows.empty() ? 0 : std::min(rows.size(), from + HL_PER_PAGE);
+
     if (rows.empty()) {
         t << tr(lang, "hl_rk_empty");
     } else {
-        if (page < 1) page = 1;
-        const int totalPages = (static_cast<int>(rows.size()) + HL_PER_PAGE - 1) / HL_PER_PAGE;
-        if (page > totalPages) page = totalPages;
-        const size_t from = static_cast<size_t>((page - 1) * HL_PER_PAGE);
-        const size_t to = std::min(rows.size(), from + HL_PER_PAGE);
-
         for (size_t i = from; i < to; i++) {
             const PerpRow& r = rows[i];
-            t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddr(r.wallet) << "</code>\n";
+            t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddress(r.wallet) << "</code>\n";
             t << "   \U0001F4B0 " << formatUsdNanosSigned(r.pnlNanos, true)
               << "   \U0001F4C8 " << formatPercent(r.roiPercent, true) << "\n";
             t << "   \U0001F3AF " << r.winRatePercent << "%   \U0001F504 "
@@ -1011,16 +1124,12 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     json kb;
     kb["inline_keyboard"] = json::array();
     if (!rows.empty()) {
-        const int totalPages = (static_cast<int>(rows.size()) + HL_PER_PAGE - 1) / HL_PER_PAGE;
-        int shownPage = page < 1 ? 1 : (page > totalPages ? totalPages : page);
-        const size_t from = static_cast<size_t>((shownPage - 1) * HL_PER_PAGE);
-        const size_t to = std::min(rows.size(), from + HL_PER_PAGE);
         // Отслеживание переиспользует спотовый tt_track: список кошельков общий,
         // значит и операция та же. Свой обработчик здесь был бы вторым описанием
         // одного и того же действия.
         for (size_t i = from; i < to; i++) {
             kb["inline_keyboard"].push_back(json::array({
-                {{"text", "\U0001F4CC " + shortAddr(rows[i].wallet)},
+                {{"text", "\U0001F4CC " + shortAddress(rows[i].wallet)},
                  {"callback_data", "tt_track:" + rows[i].wallet}}
             }));
         }
@@ -1082,6 +1191,9 @@ bool initHyperliquid() {
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
+        // Рейтинг отбирает по времени и группирует по кошельку - индекса по
+        // (wallet, ts) для этого мало, начинать надо со времени.
+        "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         // Служебное состояние дозагрузки. seeded отвечает за то, чтобы при
         // первой встрече кошелька его прошлые сделки попали в базу молча:
         // иначе человек получил бы пачку алертов о том, что случилось до
@@ -1196,7 +1308,7 @@ std::string buildHlDailyDigest() {
     t << "<code>\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501</code>\n\n";
     for (size_t i = 0; i < rows.size(); i++) {
         const PerpRow& r = rows[i];
-        t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddr(r.wallet) << "</code>\n"
+        t << rankBadge(static_cast<int>(i) + 1) << " <code>" << shortAddress(r.wallet) << "</code>\n"
           << "   " << formatUsdNanosSigned(r.pnlNanos, true)
           << "   " << formatPercent(r.roiPercent, true)
           << "   " << r.winRatePercent << "%\n\n";
@@ -1229,7 +1341,6 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
 bool handleHyperliquidCallback(const std::string& chatId, const std::string& action,
                                const std::string& param, const std::string& data,
                                long long messageId, const std::string& callbackQueryId) {
-    (void)callbackQueryId;
     HlMessage msg;
     if (!renderHyperliquidView(chatId, action, param, msg)) return false;
     rememberView(chatId, data);
