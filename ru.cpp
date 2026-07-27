@@ -267,8 +267,13 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_trade",       {"PERP TRADE",    "СДЕЛКА ПО ПЕРПАМ"}},
         // Размер позиции и сумма под риском - разные числа: при 20x сделка на
         // $100 000 стоит киту $5 000 своих. Названия должны это разводить.
-        {"hl_size",        {"Position size", "Размер позиции"}},
-        {"hl_margin",      {"Own funds",     "Своих денег"}},
+        // Три разных числа, которые легко перепутать: сколько наторговал в этой
+        // сделке, какова вся позиция и сколько под неё заложено.
+        {"hl_trade_size",    {"Trade size",     "Размер сделки"}},
+        {"hl_position_size", {"Position size",  "Размер позиции"}},
+        {"hl_collateral",    {"Collateral",     "Залог позиции"}},
+        {"hl_of_account",    {"of account",     "счёта"}},
+        {"hl_position_closed", {"Position fully closed", "Позиция закрыта полностью"}},
         {"hl_leverage",    {"Leverage",      "Плечо"}},
         {"hl_cross",       {"cross",         "кросс"}},
         {"hl_isolated",    {"isolated",      "изолированное"}},
