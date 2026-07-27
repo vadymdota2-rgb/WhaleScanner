@@ -35,6 +35,7 @@
 #include "message_queue.h"
 #include "tx_analyzer.h"
 #include "beneficiary_stats.h"
+#include "hyperliquid.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -507,6 +508,35 @@ void refreshWatchers() {
     }
     std::unique_lock l(watchersMutex);
     WATCHERS_PTR = m;
+}
+
+// ===================== Сервисы для модуля перпетуалов =====================
+// Своего списка кошельков у перпов нет: он общий со спотом, поэтому источник
+// один и тот же - WATCHERS_PTR. Здесь он только раскрывается наружу в том
+// виде, который нужен модулю, чтобы не тащить туда описание Watcher и не
+// заводить второе описание одной и той же сущности.
+
+std::vector<std::string> hlWatchedAddresses() {
+    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
+    { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
+    std::vector<std::string> out;
+    if (!snapshot) return out;
+    out.reserve(snapshot->size());
+    for (const auto& kv : *snapshot) out.push_back(kv.first);
+    return out;
+}
+
+std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
+    std::vector<HlRecipient> out;
+    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
+    { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
+    if (!snapshot) return out;
+    auto it = snapshot->find(addressLower);
+    if (it == snapshot->end()) return out;
+    out.reserve(it->second.size());
+    for (const Watcher& w : it->second)
+        out.push_back(HlRecipient{w.chatId, w.label, w.thresholdNanos});
+    return out;
 }
 
 // Вызывается из ranking.cpp, когда детектор навсегда забанил кошелёк в рейтинге.
@@ -1266,11 +1296,17 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
     if (action == "menu") {
         if (param == "my_wallets") return TelegramUI::buildWalletsList(chatId);
         if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), langFromCode(getUserLanguage(chatId)));
-        if (param == "toptrader") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
+        // Развилка площадок: спот на BSC или перпы Hyperliquid.
+        if (param == "toptrader") { auto r = buildVenueMenu(chatId); return {r.text, r.keyboard}; }
+        if (param == "toptrader_spot") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
         if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
         if (param == "help") return TelegramUI::buildHelpMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
+    }
+    {
+        HlMessage hl;
+        if (renderHyperliquidView(chatId, action, param, hl)) return {hl.text, hl.keyboard};
     }
     if (action == "mw_page") {
         int page = 1;
@@ -1373,6 +1409,11 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
         else if (param == "toptrader") {
             rememberView(chatId, data);
+            auto msg = buildVenueMenu(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+        else if (param == "toptrader_spot") {
+            rememberView(chatId, data);
             auto msg = buildGlobalTopMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
@@ -1450,6 +1491,9 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "tt_page" || action == "tt_track" || action == "tt_noop" ||
              action == "gt_open" || action == "gt_page" || action == "gt_token") {
         handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
+    }
+    else if (action == "hl_menu" || action == "hl_open" || action == "hl_page") {
+        handleHyperliquidCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
 }
 
@@ -1646,6 +1690,7 @@ void telegramLoop() {
                                     << "\nNative refund adjusted: " << g_stats.diag_native_refund.load()
                                     << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
                             }
+                            ss2 << hyperliquidStatsLine();
                             if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
                             sendMsg(cid,ss2.str());
                         }
@@ -1760,6 +1805,13 @@ int main() {
     loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
+    // Перпы: своя база и два своих потока. Сбой инициализации не должен ронять
+    // бота - спотовая часть от перпов не зависит и работает без них.
+    if (!initHyperliquid()) {
+        std::cerr << "[STARTUP] Hyperliquid init failed - perps DISABLED for this run" << std::endl;
+    } else {
+        startHyperliquidLoop();
+    }
     setupBotCommands();
     size_t initialWatcherAddrs;
     { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
@@ -1798,6 +1850,7 @@ int main() {
                 if (!CHANNEL_ID.empty()) {
                     long long nowTs = static_cast<long long>(time(nullptr));
                     if (nowTs / 86400 > getChannelDigestAt() / 86400 && (nowTs % 86400) >= DIGEST_HOUR_UTC * 3600) {
+                        bool digestSent = false;
                         auto digest = buildDailyChannelDigest();
                         if (!digest.text.empty()) {
                             if (!BOT_USERNAME.empty()) {
@@ -1805,10 +1858,26 @@ int main() {
                                 digest.text += "\n\n🤖 Track these wallets with @" + safeString(BOT_USERNAME, 32);
                             }
                             if (g_msgQueue.enqueueToRecipients(digest.text, {CHANNEL_ID})) {
-                                saveChannelDigestAt(nowTs);
+                                digestSent = true;
                                 std::cout << "[CHANNEL] Daily Top 10 digest sent" << std::endl;
                             }
                         }
+                        // Перпы - отдельным сообщением: площадка другая, и слитые
+                        // в одно два рейтинга читались бы как один общий.
+                        std::string hlDigest = buildHlDailyDigest();
+                        if (!hlDigest.empty()) {
+                            if (!BOT_USERNAME.empty()) {
+                                while (!hlDigest.empty() && (hlDigest.back() == '\n' || hlDigest.back() == ' ')) hlDigest.pop_back();
+                                hlDigest += "\n\n🤖 Track these wallets with @" + safeString(BOT_USERNAME, 32);
+                            }
+                            if (g_msgQueue.enqueueToRecipients(hlDigest, {CHANNEL_ID})) {
+                                digestSent = true;
+                                std::cout << "[CHANNEL] Daily Hyperliquid digest sent" << std::endl;
+                            }
+                        }
+                        // Отметку дня ставим, если ушёл хотя бы один из двух:
+                        // иначе пустой спотовый рейтинг блокировал бы и перповый.
+                        if (digestSent) saveChannelDigestAt(nowTs);
                     }
                 }
                 lsq=std::chrono::steady_clock::now();
@@ -1829,6 +1898,7 @@ int main() {
     rk.join();
     af.join();
     dm.join();
+    stopHyperliquid();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
