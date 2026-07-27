@@ -286,16 +286,11 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_venue_perp",   {"🌐 Hyperliquid — perps", "🌐 Hyperliquid — перпы"}},
         {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
-        {"hl_rk_pnl",       {"💰 By profit", "💰 По прибыли"}},
-        {"hl_rk_roi",       {"📈 By ROI", "📈 По доходности"}},
-        {"hl_rk_winrate",   {"🎯 By win rate", "🎯 По доле прибыльных"}},
-        {"hl_rk_active",    {"🔄 Most active", "🔄 Самые активные"}},
-        {"hl_rk_trades",    {"trades", "сделок"}},
-        {"hl_rk_page",      {"Page", "Страница"}},
+        // Перповый аналог "среднего удержания" у спота: у перпов манеру
+        // торговли определяет плечо, а не время в позиции.
+        {"hl_rk_leverage",  {"Avg leverage", "Среднее плечо"}},
         {"hl_rk_empty",     {"No data yet — the ranking needs at least 5 closed trades per wallet over 30 days.",
                              "Пока нет данных — в рейтинг попадают кошельки минимум с 5 закрытыми сделками за 30 дней."}},
-        {"hl_rk_upgrade",   {"⭐️ Premium opens the full top 100.",
-                             "⭐️ Премиум открывает полный топ-100."}},
     };
     return t;
 }
