@@ -152,19 +152,9 @@ json rpcSpread(size_t seed, const std::string& method, json params) {
 
 // Диагностика: если конкретный публичный RPC периодически "подвисает" на секунды
 // без явного сбоя (timeout/ошибка), rpc_failures это не заметит - а лаг растёт
-// точно так же. Накопление по каждому эндпоинту отдельно, чтобы увидеть именно
-// КАКОЙ узел тормозит, а не гадать. Порогов два, и это не избыточность:
-// замечать медленное и уходить с узла - разные решения с разной ценой ошибки.
-//
-// Порог для СТАТИСТИКИ: с него ответ попадает в счётчик по узлу. Держим низким
-// намеренно - именно по этим цифрам видно, тормозит конкретный узел или не
-// хватает мощности всем сразу. Поднимешь порог - ослепнешь.
+// точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
+// именно КАКОЙ узел тормозит, а не гадать.
 const long long RPC_SLOW_THRESHOLD_MS = 1000;
-// Порог для РОТАЦИИ: уходить с узла из-за ответа в секунду смысла нет. Под
-// нагрузкой в сотни запросов в секунду хвост распределения вылезает за секунду
-// даже у здорового узла, а смена узла стоит нового TLS-рукопожатия. Уходим
-// только с того, кто тормозит по-настоящему.
-const long long RPC_ROTATE_THRESHOLD_MS = 2500;
 const int RPC_SLOW_STREAK_LIMIT = 3;
 std::mutex g_rpcLatencyMutex;
 std::map<std::string, uint64_t> g_rpcSlowCount;
@@ -187,17 +177,14 @@ json rpc(const std::string& method, json params, int maxRetries) {
                 if (elapsedMs > mx) mx = elapsedMs;
             }
             std::cerr << "[RPC-SLOW] " << method << " on " << RPC_ENDPOINTS[idx] << " took " << elapsedMs << "ms" << std::endl;
-        }
-        // Ротация считается по своему, более высокому порогу. Счётчик подряд -
-        // чтобы не скакать из-за одиночной заминки: при постоянных соединениях
-        // смена узла стоит нового TLS-рукопожатия.
-        if (elapsedMs >= RPC_ROTATE_THRESHOLD_MS) {
+            // Уходим с узла, который стабильно тормозит, а не только с упавшего.
+            // Порог в несколько подряд - чтобы не скакать из-за одиночной заминки:
+            // при постоянных соединениях смена узла стоит нового TLS-рукопожатия.
             if (g_rpcSlowStreak.fetch_add(1, std::memory_order_relaxed) + 1 >= RPC_SLOW_STREAK_LIMIT) {
                 g_rpcSlowStreak.store(0, std::memory_order_relaxed);
                 size_t cur = rpcIndex.load(std::memory_order_relaxed);
                 rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur]
-                          << " (" << elapsedMs << "ms)" << std::endl;
+                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur] << std::endl;
             }
         } else {
             g_rpcSlowStreak.store(0, std::memory_order_relaxed);
@@ -229,8 +216,7 @@ std::string rpcSlowSummary() {
     std::string worst; uint64_t worstCount = 0;
     for (const auto& [ep, cnt] : g_rpcSlowCount)
         if (cnt > worstCount) { worstCount = cnt; worst = ep; }
-    std::string s = "\n\U0001F422 Slow RPC (>=" + std::to_string(RPC_SLOW_THRESHOLD_MS)
-                  + "ms, rotate >=" + std::to_string(RPC_ROTATE_THRESHOLD_MS) + "ms): "
+    std::string s = "\n\U0001F422 Slow RPC (>=" + std::to_string(RPC_SLOW_THRESHOLD_MS) + "ms): "
                   + worst + " x" + std::to_string(worstCount)
                   + " (max " + std::to_string(g_rpcSlowMaxMs[worst]) + "ms)";
     if (g_rpcSlowCount.size() > 1)
