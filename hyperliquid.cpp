@@ -168,6 +168,39 @@ bool notionalNanos(const std::string& pxStr, const std::string& szStr, long long
 
 std::string fmtUsd(long long nanos) { return formatUsdNanosSigned(nanos, false); }
 
+// Цена требует своей точности. Общий форматтер округляет до центов, и монета
+// за $0.014682 превращается в "$0.01" - число, по которому ничего не сходится:
+// умножишь на количество и получишь совсем не тот размер сделки, что строкой
+// выше. Знаков после запятой берём тем больше, чем дешевле монета.
+std::string formatPriceNanos(long long nanos) {
+    const bool neg = nanos < 0;
+    if (neg) nanos = -nanos;
+
+    int digits;
+    if (nanos >= 1000LL * NANOS_PER_UNIT)      digits = 2;   // от $1000
+    else if (nanos >= NANOS_PER_UNIT)          digits = 4;   // от $1
+    else if (nanos >= NANOS_PER_UNIT / 100)    digits = 6;   // от $0.01
+    else                                       digits = 9;   // дешевле цента
+
+    long long scale = 1;
+    for (int i = 0; i < 9 - digits; i++) scale *= 10;
+    long long units = nanos / NANOS_PER_UNIT;
+    long long frac = (nanos % NANOS_PER_UNIT + scale / 2) / scale;
+
+    long long fracLimit = 1;
+    for (int i = 0; i < digits; i++) fracLimit *= 10;
+    if (frac >= fracLimit) { units++; frac = 0; }            // округление вверх через разряд
+
+    std::string fracStr = std::to_string(frac);
+    fracStr.insert(0, static_cast<size_t>(digits) - fracStr.size(), '0');
+    // Хвостовые нули только мешают, но два знака оставляем всегда - иначе
+    // ровные цены выглядели бы как целые числа без копеек.
+    while (fracStr.size() > 2 && fracStr.back() == '0') fracStr.pop_back();
+
+    return std::string(neg ? "-$" : "$") +
+           formatThousands(static_cast<uint64_t>(units)) + "." + fracStr;
+}
+
 // ========================= Кэш отслеживаемых адресов =========================
 // Фид отдаёт ВСЕ сделки площадки, а нужны единицы. Сверка идёт на каждую
 // сделку, поэтому список держим своей копией в памяти, а не берём блокировку
@@ -297,6 +330,12 @@ std::vector<std::string> fetchPerpCoins() {
 
 struct PositionInfo {
     bool known = false;
+    // Когда снимок сделан и жива ли позиция СЕЙЧАС. Без этого не отличить
+    // частичное закрытие (позиция осталась, цена ликвидации настоящая и
+    // сдвинулась) от полного (позиции нет, ликвидировать нечего). Разница
+    // видна только по тому, вернул ли счёт эту монету последним запросом.
+    long long snapshotAt = 0;
+    bool stillOpen = false;
     int leverage = 0;
     bool isolated = false;
     long long marginUsedNanos = 0;
@@ -345,6 +384,7 @@ void fetchAccountState(const std::string& wallet) {
 
         PositionInfo info;
         info.known = true;
+        info.snapshotAt = nowSec();
         info.accountValueNanos = accountValue;
         if (p.contains("leverage") && p["leverage"].is_object()) {
             const json& lev = p["leverage"];
@@ -518,21 +558,39 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     m << "\U0001F4BC <b>" << safeString(label) << "</b>\n\n";
     m << dirEmoji(key) << " <b>" << tr(lang, key) << " " << coin << "</b>\n";
 
-    m << "\U0001F4B0 " << tr(lang, "hl_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
+    // Размер СДЕЛКИ и размер ПОЗИЦИИ - разные вещи, и путать их нельзя:
+    // кит может закрыть $146 из позиции в $28 800. Раньше первая строка
+    // называлась "размер позиции" и стояла рядом с залогом всей позиции,
+    // отчего выходило, что человек вложил в сто раз больше, чем наторговал.
+    m << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
+
+    if (pos.stillOpen && pos.positionValueNanos > 0) {
+        m << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
+          << fmtUsd(pos.positionValueNanos) << "</b>\n";
+    }
 
     if (pos.known && pos.leverage > 0) {
         m << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>" << pos.leverage << "\u00D7 "
           << tr(lang, pos.isolated ? "hl_isolated" : "hl_cross") << "</b>\n";
     }
-    // Главное отличие перпов от спота: размер позиции и сумма под риском - разные
-    // числа. При двадцатом плече сделка на $100 000 стоит киту $5 000 своих.
-    if (pos.known && pos.marginUsedNanos > 0) {
-        m << "\U0001F4B5 " << tr(lang, "hl_margin") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>\n";
+
+    // Залог ВСЕЙ позиции, а не этой сделки. При кросс-марже это вообще
+    // бухгалтерская доля: формально позицию обеспечивает весь счёт. Поэтому
+    // рядом даём процент от счёта - иначе "$9,602" ни о чём не говорит, пока
+    // не знаешь, три это миллиона на счету или десять тысяч.
+    if (pos.stillOpen && pos.marginUsedNanos > 0) {
+        m << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>";
+        if (pos.accountValueNanos > 0) {
+            const double share = 100.0 * static_cast<double>(pos.marginUsedNanos)
+                                       / static_cast<double>(pos.accountValueNanos);
+            m << " <i>(" << formatPercent(share, false) << " " << tr(lang, "hl_of_account") << ")</i>";
+        }
+        m << "\n";
     }
 
     long long pxNanos = 0;
     if (parseDecimalToNanos(f.value("px", std::string("0")), pxNanos) && pxNanos > 0)
-        m << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>" << fmtUsd(pxNanos) << "</b>\n";
+        m << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>" << formatPriceNanos(pxNanos) << "</b>\n";
 
     m << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
       << safeString(f.value("sz", std::string("?")), 32) << " " << coin << "</b>\n";
@@ -543,8 +601,18 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
         m << (closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") << tr(lang, "hl_pnl") << ": <b>"
           << formatUsdNanosSigned(closedPnlNanos, true) << "</b>\n";
     }
-    if (pos.known && pos.liquidationPxNanos > 0) {
-        m << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>" << fmtUsd(pos.liquidationPxNanos) << "</b>\n";
+
+    // Ликвидация показывается всегда, пока позиция жива - в том числе при
+    // частичном закрытии, где она как раз самое интересное: кит уменьшил
+    // позицию, и цена ликвидации отъехала на безопасное расстояние. Скрывать
+    // её нужно только тогда, когда закрывать больше нечего.
+    if (pos.stillOpen && pos.liquidationPxNanos > 0) {
+        m << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
+          << formatPriceNanos(pos.liquidationPxNanos) << "</b>\n";
+    } else if (pos.known && !pos.stillOpen && closedPnlNanos != 0) {
+        // Явная строка лучше молчания: иначе непонятно, то ли позиция закрыта
+        // целиком, то ли данные просто не пришли.
+        m << "\u2705 " << tr(lang, "hl_position_closed") << "\n";
     }
     if (pos.known && pos.accountValueNanos > 0) {
         m << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(pos.accountValueNanos) << "</b>\n";
@@ -611,6 +679,7 @@ void enrichWallet(const std::string& wallet) {
     const bool wasSeeded = known && st.seeded;
     // Плечо и маржу берём одним запросом на весь кошелёк, а не на сделку:
     // состояние счёта общее, а вес запроса тратится каждый раз.
+    const long long stateAt = nowSec();
     if (!fills.empty()) fetchAccountState(wallet);
 
     // Первичное наполнение приносит сотни сделок разом. Без общей транзакции
@@ -633,7 +702,11 @@ void enrichWallet(const std::string& wallet) {
         // сделки, иначе рейтинг потом не сможет посчитать ROI.
         long long notional = 0;
         notionalNanos(f.value("px", std::string("0")), f.value("sz", std::string("0")), notional);
-        const PositionInfo pos = lastKnownPosition(wallet, f.value("coin", std::string()));
+        PositionInfo pos = lastKnownPosition(wallet, f.value("coin", std::string()));
+        // Монета есть в свежем снимке счёта - значит позиция жива: закрытие было
+        // частичным. Нет - закрыли целиком, и всё, что мы помним о позиции,
+        // относится к тому, чего больше не существует.
+        pos.stillOpen = pos.known && pos.snapshotAt >= stateAt;
 
         const bool isNew = saveFill(wallet, f, closedPnl, fee, notional, pos);
         if (!isNew || !wasSeeded) continue;   // повтор либо первичное наполнение
