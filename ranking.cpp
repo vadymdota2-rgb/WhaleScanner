@@ -198,6 +198,18 @@ int64_t cppIntToClampedI64(const cpp_int& v) {
 std::string formatUsdSigned(int64_t usdNanos) { return formatUsdNanosSigned(usdNanos); }
 std::string formatPercentSigned(double pct)   { return formatPercent(pct, true); }
 
+// Метка направления письма. Telegram выбирает направление КАЖДОЙ строки по её
+// первому буквенному символу: строка с арабской подписью встаёт справа, а
+// строка, начинающаяся с "PnL" или с адреса 0x..., - слева. В арабском
+// интерфейсе соседние строки из-за этого разъезжаются.
+//
+// U+200F - символ нулевой ширины, невидимый, но "сильный" справа налево.
+// Поставленный первым, он задаёт направление всей строки явно. Для остальных
+// языков возвращается пустая строка, и ничего не меняется.
+const char* dirMark(Lang lang) {
+    return lang == Lang::AR ? "\u200F" : "";
+}
+
 std::string rankLabel(int rank) {
     switch (rank) {
         case 1: return "🥇 #1";
@@ -413,28 +425,30 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
 
     std::stringstream text;
 
-    text << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
-    text << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
-    text << "<code>" << safeString(token, 42) << "</code>\n\n";
+    const char* const dm = dirMark(lang);
+
+    text << dm << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
+    text << dm << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
+    text << dm << "<code>" << safeString(token, 42) << "</code>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
     if (rows.empty()) {
-        text << "📊 " << tr(lang, "rk_no_wallets_min_trades1") << " " << MIN_COMPLETED_TRADES
+        text << dm << "📊 " << tr(lang, "rk_no_wallets_min_trades1") << " " << MIN_COMPLETED_TRADES
              << " " << tr(lang, "rk_no_wallets_min_trades2");
     } else {
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
             int rank = i + 1;
-            text << rankLabel(rank) << "\n";
-            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
-            text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentSigned(r.roiPercent) << "\n";
-            text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
-            text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
-            text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
-            if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
+            text << dm << rankLabel(rank) << "\n";
+            text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << dm << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
+            text << dm << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentSigned(r.roiPercent) << "\n";
+            text << dm << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << dm << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
+            text << dm << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
+            if (i + 1 < endIdx) text << "\n" << dm << CARD_SEPARATOR << "\n\n";
 
             json row;
             row.push_back({{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
@@ -619,25 +633,27 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     int endIdx = std::min(visible, startIdx + GLOBAL_PER_PAGE);
 
     std::stringstream text;
-    text << "🏆 <b>" << globalTitle(kind, lang) << "</b>\n\n";
+    const char* const dm = dirMark(lang);
+
+    text << dm << "🏆 <b>" << globalTitle(kind, lang) << "</b>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
     if (rows.empty()) {
-        text << "📊 " << tr(lang, "rk_no_completed_trades");
+        text << dm << "📊 " << tr(lang, "rk_no_completed_trades");
     } else {
         for (int i = startIdx; i < endIdx; i++) {
             const PnlRow& r = rows[i];
             int rank = i + 1;
-            text << rankLabel(rank) << "\n";
-            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
-            text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentPlain(r.roiPercent) << "\n";
-            text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
-            text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
-            text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
-            if (i + 1 < endIdx) text << "\n" << CARD_SEPARATOR << "\n\n";
+            text << dm << rankLabel(rank) << "\n";
+            text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << dm << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
+            text << dm << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentPlain(r.roiPercent) << "\n";
+            text << dm << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << dm << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
+            text << dm << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
+            if (i + 1 < endIdx) text << "\n" << dm << CARD_SEPARATOR << "\n\n";
 
             json row;
             row.push_back({{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
@@ -646,8 +662,8 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     }
 
     if (showUpgrade && !rows.empty()) {
-        text << "\n" << CARD_SEPARATOR << "\n";
-        text << tr(lang, "rk_unlock_top100");
+        text << "\n" << dm << CARD_SEPARATOR << "\n";
+        text << dm << tr(lang, "rk_unlock_top100");
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
         }));
