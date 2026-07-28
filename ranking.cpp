@@ -430,7 +430,7 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
             text << rankLabel(rank) << "\n";
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << "📈 <b>ROI:</b> " << formatPercentSigned(r.roiPercent) << "\n";
+            text << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentSigned(r.roiPercent) << "\n";
             text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
@@ -633,7 +633,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             text << rankLabel(rank) << "\n";
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << "📈 <b>ROI:</b> " << formatPercentPlain(r.roiPercent) << "\n";
+            text << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentPlain(r.roiPercent) << "\n";
             text << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             text << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
