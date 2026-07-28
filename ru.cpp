@@ -2,7 +2,9 @@
 #include <unordered_map>
 
 Lang langFromCode(const std::string& code) {
-    return code == "ru" ? Lang::RU : Lang::EN;
+    if (code == "ru") return Lang::RU;
+    if (code == "es") return Lang::ES;
+    return Lang::EN;
 }
 
 namespace {
@@ -339,7 +341,15 @@ const std::unordered_map<std::string, Entry>& table() {
 std::string tr(Lang lang, const std::string& key) {
     auto it = table().find(key);
     if (it == table().end()) return key;
-    return lang == Lang::RU ? it->second.ru : it->second.en;
+    if (lang == Lang::RU) return it->second.ru;
+    // Языки из отдельных файлов: нет перевода - показываем английский, а не
+    // пустую строку и не голый ключ. Неполный перевод должен выглядеть как
+    // смесь языков, а не как поломка.
+    if (lang == Lang::ES) {
+        if (const char* v = trEs(key)) return v;
+        return it->second.en;
+    }
+    return it->second.en;
 }
 
 std::string pluralRu(long long n, const std::string& one, const std::string& few, const std::string& many) {
