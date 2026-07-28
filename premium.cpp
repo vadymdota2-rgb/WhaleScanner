@@ -30,7 +30,11 @@ const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
-constexpr int    FREE_TOP_TRADERS    = 10;
+// Тридцать, а не десять: шесть страниц вместо двух, и топ перестаёт выглядеть
+// обрезанным. Стена смещается с "покажите хоть что-то" на "хочу глубже" - это
+// другой мотив к оплате. Поднять до пятидесяти потом можно спокойно, а вот
+// опустить обратно уже нет: отнять привычное дороже, чем не дать сразу.
+constexpr int    FREE_TOP_TRADERS    = 30;
 constexpr int    PREMIUM_TOP_TRADERS = 100;
 
 std::string g_botToken;
