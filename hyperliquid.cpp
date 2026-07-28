@@ -858,6 +858,7 @@ void dispatchHlAlert(const std::string& wallet, const json& f, long long notiona
     std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
     for (const HlRecipient& r : recipients) {
         if (r.chatId == SERVICE_CHAT_ID) continue;
+        if (!isPremium(r.chatId)) continue;          // перп-алерты только по подписке
         if (static_cast<uint64_t>(notionalNanosVal) < r.thresholdNanos) continue;
         Lang lang = langFromCode(getUserLanguage(r.chatId));
         byLabelLang[{r.label, lang}].push_back(r.chatId);
@@ -1164,11 +1165,15 @@ void handleTrades(const json& data) {
             // Сервисный аккаунт наполняет рейтинг, а не получает алерты:
             // порог к нему не применяется, иначе кошельки, залитые через
             // /import, не попали бы в hl_fills и рейтинг остался бы пустым.
+            // Перпы доступны только по подписке, поэтому и дозагрузку затевать
+            // стоит лишь ради тех, кто её получит. Бесплатный подписчик на
+            // кошелёк не повод тратить лимит площадки.
             bool serviceWatched = false;
             uint64_t minThreshold = 0;
             bool haveUser = false;
             for (const HlRecipient& r : hlWatchersFor(addr)) {
                 if (r.chatId == SERVICE_CHAT_ID) { serviceWatched = true; continue; }
+                if (!isPremium(r.chatId)) continue;
                 if (!haveUser || r.thresholdNanos < minThreshold) {
                     minThreshold = r.thresholdNanos;
                     haveUser = true;
@@ -1739,8 +1744,11 @@ HlMessage buildVenueMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "hl_venue_spot")}, {"callback_data", "menu:toptrader_spot"}}
     }));
+    // Замок ставим до нажатия: упереться в стену, уже нажав, обиднее.
+    const std::string perpLabel = tr(lang, "hl_venue_perp")
+                                + (isPremium(chatId) ? "" : "  \U0001F512");
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "hl_venue_perp")}, {"callback_data", "hl_menu"}}
+        {{"text", perpLabel}, {"callback_data", "hl_menu"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
@@ -1800,8 +1808,35 @@ std::string buildHlDailyDigest() {
     return t.str();
 }
 
+// Что видит бесплатный пользователь вместо рейтинга. Показываем не голый
+// отказ, а из чего состоит перп-карточка: плечо, залог, цена ликвидации и
+// готовый PnL - именно того, чего нет в спотовой части, и ради чего подписка.
+HlMessage buildPerpLocked(const std::string& chatId) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    std::stringstream t;
+    t << "\U0001F310 <b>Hyperliquid \u2014 " << tr(lang, "hl_rk_title") << "</b>\n";
+    t << HL_CARD_SEPARATOR << "\n\n";
+    t << "\U0001F512 " << tr(lang, "hl_locked_body") << "\n";
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
+    }));
+    return {t.str(), kb.dump()};
+}
+
 bool renderHyperliquidView(const std::string& chatId, const std::string& action,
                            const std::string& param, HlMessage& out) {
+    // Перпы целиком под подпиской - и меню, и страницы рейтинга.
+    if ((action == "hl_menu" || action == "hl_open" || action == "hl_page") &&
+        !isPremium(chatId)) {
+        out = buildPerpLocked(chatId);
+        return true;
+    }
     if (action == "hl_menu") { out = buildPerpTopMenu(chatId); return true; }
     if (action == "hl_open") {
         PerpKind kind;
