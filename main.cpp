@@ -783,7 +783,11 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     text += tr(lang, "help_premium_4") + "\n\n";
     text += tr(lang, "help_support") + "\n";
     text += tr(lang, "help_channel") + "\n\n";
-    text += tr(lang, "help_footer");
+    text += tr(lang, "help_footer") + "\n\n";
+    // Отказ от ответственности - последним. Продукт показывает факты из цепи,
+    // но человек читает их как подсказку к действию, поэтому границу стоит
+    // обозначить словами, а не подразумевать.
+    text += tr(lang, "help_disclaimer");
 
     return {text, keyboard.dump()};
 }
