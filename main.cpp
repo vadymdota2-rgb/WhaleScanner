@@ -331,6 +331,10 @@ void initDB() {
         CREATE TABLE IF NOT EXISTS token_cache (
             address TEXT PRIMARY KEY, symbol TEXT DEFAULT '', decimals INTEGER DEFAULT 0,
             price_nanos INTEGER DEFAULT 0, price_ts INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS token_price_history (
+            address TEXT NOT NULL, ts INTEGER NOT NULL, price_nanos INTEGER NOT NULL,
+            PRIMARY KEY (address, ts));
+        CREATE INDEX IF NOT EXISTS idx_price_hist_ts ON token_price_history(ts);
         CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL, created_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS deliveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL, chat_id TEXT NOT NULL,
@@ -396,6 +400,59 @@ void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
     sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,sym.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int(s,3,dec);
     sqlite3_step(s); sqlite3_finalize(s);
 }
+// Снимок цены в историю. Время округляется до часа, поэтому на токен
+// набегает не больше 24 строк в сутки, сколько бы раз цену ни спрашивали, а
+// INSERT OR IGNORE делает повторную запись в тот же час бесплатной.
+constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
+constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
+
+void savePriceHistory(const std::string& a, uint64_t pn) {
+    if (!pn) return;
+    const long long slot = (static_cast<long long>(time(nullptr)) / PRICE_HISTORY_STEP_SEC)
+                         * PRICE_HISTORY_STEP_SEC;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "INSERT OR IGNORE INTO token_price_history(address,ts,price_nanos) VALUES(?,?,?)")) return;
+    sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, slot);
+    sqlite3_bind_int64(s, 3, static_cast<sqlite3_int64>(pn));
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
+// Цена токена на момент времени. Берём ближайший снимок НЕ ПОЗЖЕ запрошенного:
+// цена, снятая после интересующего момента, отвечала бы на другой вопрос.
+// Ноль означает "в этот период мы токен не наблюдали", а не "стоил ноль".
+uint64_t getPriceNanosAt(const std::string& token, long long ts) {
+    const std::string a = toLower(token);
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT price_nanos FROM token_price_history "
+        "WHERE address=? AND ts<=? ORDER BY ts DESC LIMIT 1")) return 0;
+    sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, ts);
+    uint64_t out = 0;
+    if (sqlite3_step(s) == SQLITE_ROW)
+        out = static_cast<uint64_t>(sqlite3_column_int64(s, 0));
+    sqlite3_finalize(s);
+    return out;
+}
+
+void cleanupPriceHistory() {
+    const long long cutoff = static_cast<long long>(time(nullptr)) - PRICE_HISTORY_TTL_SEC;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "DELETE FROM token_price_history WHERE ts<?")) return;
+    sqlite3_bind_int64(s, 1, cutoff);
+    if (sqlite3_step(s) == SQLITE_DONE) {
+        const int n = sqlite3_changes(db);
+        if (n > 0) std::cout << "[PRICE-HIST] удалено снимков старше срока: " << n << std::endl;
+    }
+    sqlite3_finalize(s);
+}
+
 void saveTokenPrice(const std::string& a, uint64_t pn) {
     if (!pn) return; std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,price_nanos,price_ts) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET price_nanos=excluded.price_nanos, price_ts=excluded.price_ts")) return;
@@ -1002,7 +1059,11 @@ uint64_t getPriceNanos(const std::string& token) {
     constexpr double MAX_SANE_PRICE_USD = 1e9;
     uint64_t n = (std::isfinite(p) && p > 0.0 && p < MAX_SANE_PRICE_USD)
                ? static_cast<uint64_t>(p * 1000000000.0) : 0;
-    if (n>0) { { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; } saveTokenPrice(a,n); }
+    if (n>0) {
+        { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; }
+        saveTokenPrice(a,n);
+        savePriceHistory(a,n);   // кэш затирается, история копится
+    }
     else { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&PRICE_NANOS_CACHE[a].first>0) { g_stats.price_fallbacks.fetch_add(1); std::cerr << "[PRICE] Stale cache: " << a << std::endl; return PRICE_NANOS_CACHE[a].first; } }
     return n;
 }
@@ -1547,6 +1608,7 @@ void dbMaintenanceLoop() {
             walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);
             if (doTruncate) {
                 cleanupOldTx(g_lastProcessedBlock.load(std::memory_order_relaxed));
+                cleanupPriceHistory();
                 lastTruncate = std::chrono::steady_clock::now();
             }
         } catch (const std::exception& e) { std::cerr << "[DB-MAINT][ERROR] " << e.what() << std::endl; }
