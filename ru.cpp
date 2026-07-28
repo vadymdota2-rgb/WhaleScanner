@@ -5,6 +5,7 @@ Lang langFromCode(const std::string& code) {
     if (code == "ru") return Lang::RU;
     if (code == "es") return Lang::ES;
     if (code == "pt") return Lang::PT;
+    if (code == "fr") return Lang::FR;
     return Lang::EN;
 }
 
@@ -346,6 +347,7 @@ const char* external(Lang lang, const std::string& key) {
     switch (lang) {
         case Lang::ES: return trEs(key);
         case Lang::PT: return trPt(key);
+        case Lang::FR: return trFr(key);
         default:       return nullptr;
     }
 }
