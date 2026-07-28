@@ -4,6 +4,7 @@
 Lang langFromCode(const std::string& code) {
     if (code == "ru") return Lang::RU;
     if (code == "es") return Lang::ES;
+    if (code == "pt") return Lang::PT;
     return Lang::EN;
 }
 
@@ -338,6 +339,18 @@ const std::unordered_map<std::string, Entry>& table() {
 }
 }
 
+namespace {
+// Единственное место, где перечислены внешние языки. Добавить следующий -
+// одна строка здесь и один новый файл; трогать tr() больше не придётся.
+const char* external(Lang lang, const std::string& key) {
+    switch (lang) {
+        case Lang::ES: return trEs(key);
+        case Lang::PT: return trPt(key);
+        default:       return nullptr;
+    }
+}
+}
+
 std::string tr(Lang lang, const std::string& key) {
     auto it = table().find(key);
     if (it == table().end()) return key;
@@ -345,10 +358,7 @@ std::string tr(Lang lang, const std::string& key) {
     // Языки из отдельных файлов: нет перевода - показываем английский, а не
     // пустую строку и не голый ключ. Неполный перевод должен выглядеть как
     // смесь языков, а не как поломка.
-    if (lang == Lang::ES) {
-        if (const char* v = trEs(key)) return v;
-        return it->second.en;
-    }
+    if (const char* v = external(lang, key)) return v;
     return it->second.en;
 }
 
