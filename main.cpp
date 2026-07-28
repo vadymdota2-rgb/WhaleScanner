@@ -1513,7 +1513,10 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "lang") {
-        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru"};
+        // Список обязан совпадать с LANGUAGES в buildLanguagesMenu: кнопка
+        // рисуется по одному перечню, а принимается по этому. Разойдутся -
+        // кнопка будет видна и не будет работать, молча, без единой ошибки.
+        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
             rememberView(chatId, "menu:languages");
