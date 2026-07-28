@@ -209,8 +209,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"pr_includes", {"<b>Premium includes:</b>", "<b>Премиум включает:</b>"}},
         {"pr_50_wallets", {"✅ Track up to 50 wallets instead of 1 on the free plan",
                            "✅ Отслеживание до 50 кошельков вместо 1 в бесплатном плане"}},
-        {"pr_top100", {"✅ Access the full Top 100 Traders (Top 10 is free)",
-                       "✅ Полный Топ-100 трейдеров (Топ-10 доступен бесплатно)"}},
+        {"pr_top100", {"✅ Access the full Top 100 Traders (Top 30 is free)",
+                       "✅ Полный Топ-100 трейдеров (Топ-30 доступен бесплатно)"}},
         {"pr_subscription_label", {"<b>Subscription:</b> 30 days", "<b>Подписка:</b> 30 дней"}},
         {"pr_price_label", {"<b>Price:</b>", "<b>Цена:</b>"}},
         {"pr_buy", {"⭐ Buy Premium", "⭐ Купить Премиум"}},
@@ -300,6 +300,14 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_venue_perp",   {"🔵 Hyperliquid — Futures", "🔵 Hyperliquid — Фьючерсы"}},
         {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
+        // Текст стены. Перечисляем то, чего нет в спотовой части, - иначе
+        // непонятно, за что платить.
+        {"hl_locked_body",  {"Perpetual futures are available with Premium.\n\n"
+                             "You get leverage, collateral and liquidation price on every trade, "
+                             "realized PnL straight from the exchange, and the 30-day trader ranking.",
+                             "Фьючерсы доступны по подписке.\n\n"
+                             "Вы получаете плечо, залог и цену ликвидации по каждой сделке, "
+                             "готовую прибыль от биржи и рейтинг трейдеров за 30 дней."}},
         // Перповый аналог "среднего удержания" у спота: у перпов манеру
         // торговли определяет плечо, а не время в позиции.
         {"hl_rk_leverage",  {"Avg leverage", "Среднее плечо"}},
