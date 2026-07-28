@@ -741,6 +741,7 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         {"pt", "🇧🇷 Português"},
         {"fr", "🇫🇷 Français"},
         {"tr", "🇹🇷 Türkçe"},
+        {"ar", "🇸🇦 العربية"},
     };
     std::string current = getUserLanguage(chatId);
     Lang lang = langFromCode(current);
@@ -1519,7 +1520,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         // Список обязан совпадать с LANGUAGES в buildLanguagesMenu: кнопка
         // рисуется по одному перечню, а принимается по этому. Разойдутся -
         // кнопка будет видна и не будет работать, молча, без единой ошибки.
-        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr"};
+        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
             rememberView(chatId, "menu:languages");
