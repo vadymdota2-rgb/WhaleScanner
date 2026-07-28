@@ -737,6 +737,7 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
     static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
         {"en", "🇬🇧 English"},
         {"ru", "🇷🇺 Русский"},
+        {"es", "🇪🇸 Español"},
     };
     std::string current = getUserLanguage(chatId);
     Lang lang = langFromCode(current);
