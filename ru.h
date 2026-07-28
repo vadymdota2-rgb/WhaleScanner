@@ -1,7 +1,7 @@
 #pragma once
 #include <string>
 
-enum class Lang { EN, RU, ES, PT, FR };
+enum class Lang { EN, RU, ES, PT, FR, TR };
 
 Lang langFromCode(const std::string& code);
 std::string tr(Lang lang, const std::string& key);
@@ -13,5 +13,6 @@ std::string tr(Lang lang, const std::string& key);
 const char* trEs(const std::string& key);   // nullptr, если ключа нет
 const char* trPt(const std::string& key);   // то же для португальского
 const char* trFr(const std::string& key);   // то же для французского
+const char* trTr(const std::string& key);   // то же для турецкого
 
 std::string pluralRu(long long n, const std::string& one, const std::string& few, const std::string& many);
