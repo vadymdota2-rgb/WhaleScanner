@@ -434,7 +434,6 @@ struct PositionInfo {
     long long marginUsedNanos = 0;
     long long positionValueNanos = 0;
     long long liquidationPxNanos = 0;
-    long long accountValueNanos = 0;
 };
 
 // При полном закрытии позиция исчезает из ответа, и плеча там больше нет.
@@ -442,6 +441,11 @@ struct PositionInfo {
 // показывает плечо, с которым позиция велась.
 std::mutex g_posMutex;
 std::unordered_map<std::string, PositionInfo> g_lastPositions;  // "адрес|монета"
+// Депозит по кошельку. Отдельно от позиций намеренно: он приходит в том же
+// ответе, но относится ко всему счёту. Хранить его внутри позиции значило бы
+// терять его у китов, закрывающих позиции целиком, - а это как раз те, у кого
+// доходность интереснее всего.
+std::unordered_map<std::string, long long> g_accountValue;
 
 std::string posKey(const std::string& wallet, const std::string& coin) {
     return wallet + "|" + coin;
@@ -459,6 +463,13 @@ void fetchAccountState(const std::string& wallet) {
     if (j.contains("marginSummary") && j["marginSummary"].is_object())
         parseDecimalToNanos(j["marginSummary"].value("accountValue", std::string("0")), accountValue);
 
+    // Депозит записываем ДО разбора позиций: даже если открытых позиций нет
+    // вовсе, счёт существует и его размер известен.
+    {
+        std::lock_guard<std::mutex> l(g_posMutex);
+        if (accountValue > 0) g_accountValue[wallet] = accountValue;
+    }
+
     if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) return;
 
     std::lock_guard<std::mutex> l(g_posMutex);
@@ -467,6 +478,7 @@ void fetchAccountState(const std::string& wallet) {
     // переполнении сбрасываем целиком: он восстановится сам за один проход.
     if (g_lastPositions.size() > HL_POSITION_CACHE_CAP) {
         g_lastPositions.clear();
+        g_accountValue.clear();
         std::cout << "[HL] кэш позиций сброшен по достижении предела" << std::endl;
     }
     for (const auto& ap : j["assetPositions"]) {
@@ -478,7 +490,6 @@ void fetchAccountState(const std::string& wallet) {
         PositionInfo info;
         info.known = true;
         info.snapshotAt = nowSec();
-        info.accountValueNanos = accountValue;
         if (p.contains("leverage") && p["leverage"].is_object()) {
             const json& lev = p["leverage"];
             if (lev.contains("value") && lev["value"].is_number())
@@ -491,6 +502,12 @@ void fetchAccountState(const std::string& wallet) {
 
         g_lastPositions[posKey(wallet, coin)] = info;
     }
+}
+
+long long lastKnownAccountValue(const std::string& wallet) {
+    std::lock_guard<std::mutex> l(g_posMutex);
+    auto it = g_accountValue.find(wallet);
+    return it == g_accountValue.end() ? 0 : it->second;
 }
 
 PositionInfo lastKnownPosition(const std::string& wallet, const std::string& coin) {
@@ -694,7 +711,8 @@ bool banWallet(const std::string& wallet, int trades) {
 // когда база никем не удерживается, и чужая запись молча попадала бы внутрь
 // чужой транзакции, а при откате исчезала бы вместе с ней.
 bool saveFillLocked(const std::string& wallet, const json& f, long long closedPnlNanos,
-                    long long feeNanos, long long notionalNanosVal, const PositionInfo& pos) {
+                    long long feeNanos, long long notionalNanosVal, const PositionInfo& pos,
+                    long long accountValueNanos) {
     long long tid = f.value("tid", 0LL);
     if (tid == 0) return false;
     if (!g_hlDb) return false;
@@ -724,7 +742,7 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_int64(s, 11, pos.known ? pos.marginUsedNanos : 0);
     sqlite3_bind_int(s,   12, pos.known ? pos.leverage : 0);
     sqlite3_bind_int64(s, 13, f.value("oid", 0LL));
-    sqlite3_bind_int64(s, 14, pos.known ? pos.accountValueNanos : 0);
+    sqlite3_bind_int64(s, 14, accountValueNanos);
     sqlite3_bind_int64(s, 15, f.value("time", 0LL));
     sqlite3_bind_text(s,  16, hash.c_str(), -1, SQLITE_TRANSIENT);
     bool ok = sqlite3_step(s) == SQLITE_DONE;
@@ -754,7 +772,8 @@ std::string dirEmoji(const std::string& key) {
 }
 
 std::string buildHlAlert(const std::string& label, const json& f, long long notionalNanosVal,
-                         long long closedPnlNanos, const PositionInfo& pos, Lang lang) {
+                         long long closedPnlNanos, const PositionInfo& pos,
+                         long long accountValueNanos, Lang lang) {
     const std::string coin = safeString(f.value("coin", std::string("?")), 32);
     const std::string dir  = f.value("dir", std::string());
     const std::string key  = dirKey(dir);
@@ -785,9 +804,9 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     // не знаешь, три это миллиона на счету или десять тысяч.
     if (pos.stillOpen && pos.marginUsedNanos > 0) {
         m << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>";
-        if (pos.accountValueNanos > 0) {
+        if (accountValueNanos > 0) {
             const double share = 100.0 * static_cast<double>(pos.marginUsedNanos)
-                                       / static_cast<double>(pos.accountValueNanos);
+                                       / static_cast<double>(accountValueNanos);
             m << " <i>(" << formatPercent(share, false) << " " << tr(lang, "hl_of_account") << ")</i>";
         }
         m << "\n";
@@ -819,8 +838,8 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
         // целиком, то ли данные просто не пришли.
         m << "\u2705 " << tr(lang, "hl_position_closed") << "\n";
     }
-    if (pos.known && pos.accountValueNanos > 0) {
-        m << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(pos.accountValueNanos) << "</b>\n";
+    if (accountValueNanos > 0) {
+        m << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(accountValueNanos) << "</b>\n";
     }
 
     m << "\n\U0001F310 " << tr(lang, "hl_venue") << ": <b>Hyperliquid</b>";
@@ -830,7 +849,8 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
 }
 
 void dispatchHlAlert(const std::string& wallet, const json& f, long long notionalNanosVal,
-                     long long closedPnlNanos, const PositionInfo& pos) {
+                     long long closedPnlNanos, const PositionInfo& pos,
+                     long long accountValueNanos) {
     if (notionalNanosVal < 0) return;
     std::vector<HlRecipient> recipients = hlWatchersFor(wallet);
     if (recipients.empty()) return;
@@ -846,7 +866,8 @@ void dispatchHlAlert(const std::string& wallet, const json& f, long long notiona
 
     for (auto& entry : byLabelLang) {
         std::string msg = buildHlAlert(entry.first.first, f, notionalNanosVal,
-                                       closedPnlNanos, pos, entry.first.second);
+                                       closedPnlNanos, pos, accountValueNanos,
+                                       entry.first.second);
         if (g_msgQueue.enqueueToRecipients(msg, entry.second))
             g_alertsSent.fetch_add(1, std::memory_order_relaxed);
     }
@@ -940,6 +961,8 @@ void enrichWallet(const std::string& wallet) {
     // должна существовать в моменты, когда база свободна. Первичное наполнение
     // приносит сотни сделок разом, и без общей транзакции каждая запись была бы
     // отдельным сбросом на диск.
+    const long long accountValue = lastKnownAccountValue(wallet);
+
     std::vector<size_t> freshRows;
     size_t stored = 0;
     {
@@ -949,7 +972,8 @@ void enrichWallet(const std::string& wallet) {
             if (bulk) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
             for (size_t i = 0; i < prepared.size(); i++) {
                 const Prepared& p = prepared[i];
-                if (saveFillLocked(wallet, *p.fill, p.closedPnl, p.fee, p.notional, p.pos)) {
+                if (saveFillLocked(wallet, *p.fill, p.closedPnl, p.fee, p.notional, p.pos,
+                                   accountValue)) {
                     stored++;
                     if (p.notional > 0) freshRows.push_back(i);
                 }
@@ -965,7 +989,7 @@ void enrichWallet(const std::string& wallet) {
     if (wasSeeded)
         for (size_t i : freshRows) {
             const Prepared& p = prepared[i];
-            dispatchHlAlert(wallet, *p.fill, p.notional, p.closedPnl, p.pos);
+            dispatchHlAlert(wallet, *p.fill, p.notional, p.closedPnl, p.pos, accountValue);
         }
 
     // Отсеяли всё до единой сделки - это не нормальная работа фильтра, а почти
