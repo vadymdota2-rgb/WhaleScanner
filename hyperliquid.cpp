@@ -702,8 +702,8 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     if (!prepareOrLog(g_hlDb, &s,
             "INSERT OR IGNORE INTO hl_fills"
             "(tid,wallet,coin,dir,side,px,sz,closed_pnl_nanos,fee_nanos,"
-            "notional_nanos,margin_nanos,leverage,oid,ts,hash) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
@@ -724,8 +724,9 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_int64(s, 11, pos.known ? pos.marginUsedNanos : 0);
     sqlite3_bind_int(s,   12, pos.known ? pos.leverage : 0);
     sqlite3_bind_int64(s, 13, f.value("oid", 0LL));
-    sqlite3_bind_int64(s, 14, f.value("time", 0LL));
-    sqlite3_bind_text(s,  15, hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 14, pos.known ? pos.accountValueNanos : 0);
+    sqlite3_bind_int64(s, 15, f.value("time", 0LL));
+    sqlite3_bind_text(s,  16, hash.c_str(), -1, SQLITE_TRANSIENT);
     bool ok = sqlite3_step(s) == SQLITE_DONE;
     int changed = sqlite3_changes(g_hlDb);
     sqlite3_finalize(s);
@@ -1339,9 +1340,9 @@ std::vector<PerpRow> computeRanking() {
             " SUM(closed_pnl_nanos),"
             " SUM(CASE WHEN closed_pnl_nanos != 0 THEN 1 ELSE 0 END),"
             " SUM(CASE WHEN closed_pnl_nanos > 0 THEN 1 ELSE 0 END),"
-            " SUM(CASE WHEN closed_pnl_nanos != 0 THEN margin_nanos ELSE 0 END),"
             " SUM(notional_nanos),"
             " AVG(CASE WHEN leverage > 0 THEN leverage END),"
+            " AVG(CASE WHEN account_value_nanos > 0 THEN account_value_nanos END),"
             " MAX(ts)"
             " FROM hl_fills f WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
@@ -1355,17 +1356,23 @@ std::vector<PerpRow> computeRanking() {
         r.pnlNanos = sqlite3_column_int64(s, 1);
         r.closedTrades = sqlite3_column_int(s, 2);
         const int wins = sqlite3_column_int(s, 3);
-        const long long margin = sqlite3_column_int64(s, 4);
-        r.volumeNanos = sqlite3_column_int64(s, 5);
-        r.avgLeverage = sqlite3_column_double(s, 6);
+        r.volumeNanos = sqlite3_column_int64(s, 4);
+        r.avgLeverage = sqlite3_column_double(s, 5);
+        const double avgAccount = sqlite3_column_double(s, 6);
         r.lastTs = sqlite3_column_int64(s, 7);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
         r.winRatePercent = static_cast<int>((100LL * wins) / r.closedTrades);
-        // ROI считаем от суммы вложенной маржи, а не от оборота: у перпов
-        // оборот раздут плечом и завысил бы результат в десятки раз.
-        if (margin > 0) {
-            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(margin);
+        // ROI = прибыль к депозиту. Знаменатель - СРЕДНИЙ размер счёта за окно,
+        // а не сумма по сделкам: депозит один и тот же, сколько бы раз кит ни
+        // торговал. Через сумму получалось бы "сколько снято с одной сделки",
+        // и у маркет-мейкера с тремя сотнями сделок выходили доли процента при
+        // реальной прибыли в тысячи долларов.
+        //
+        // Спотовый рейтинг считает ROI иначе - прибыль к затратам, то есть
+        // доходность сделки. Числа с двух экранов напрямую не сравнимы.
+        if (avgAccount > 0.0) {
+            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / avgAccount;
             r.roiKnown = true;
         }
         rows.push_back(r);
@@ -1492,7 +1499,7 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
             text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
             if (r.roiKnown)
-                text << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+                text << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
             text << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
             // Перповый аналог среднего удержания у спота: плечо говорит о
@@ -1579,6 +1586,11 @@ bool initHyperliquid() {
         // заявка может дробиться стаканом на десятки исполнений, и по ним
         // живой человек выглядел бы алгоритмом.
         "  oid INTEGER NOT NULL DEFAULT 0,"
+        // Депозит кита на момент сделки. Нужен для второй метрики: насколько
+        // он нарастил СЧЁТ, а не сколько снял с одной сделки. Кит с двумя
+        // миллионами и прибылью в сто тысяч сделал 5% - и это честнее говорит
+        // о его результате, чем средняя доходность сделки.
+        "  account_value_nanos INTEGER NOT NULL DEFAULT 0,"
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
@@ -1626,6 +1638,7 @@ bool initHyperliquid() {
         "ALTER TABLE hl_fills ADD COLUMN margin_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN leverage INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN account_value_nanos INTEGER NOT NULL DEFAULT 0",
     };
     for (const char* sql : migrations) {
         char* mErr = nullptr;
@@ -1639,7 +1652,8 @@ bool initHyperliquid() {
     // пустому рейтингу через неделю.
     sqlite3_stmt* probe = nullptr;
     if (sqlite3_prepare_v2(g_hlDb,
-            "SELECT tid,notional_nanos,margin_nanos,leverage,oid FROM hl_fills LIMIT 1",
+            "SELECT tid,notional_nanos,margin_nanos,leverage,oid,account_value_nanos"
+            " FROM hl_fills LIMIT 1",
             -1, &probe, nullptr) != SQLITE_OK) {
         logCritical(std::string("[HL] таблица сделок непригодна для записи: ")
                     + sqlite3_errmsg(g_hlDb) + " - перпы работать не будут");
@@ -1752,7 +1766,7 @@ std::string buildHlDailyDigest() {
         t << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
         t << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
         if (r.roiKnown)
-            t << "\U0001F4C8 <b>ROI:</b> " << formatPercent(r.roiPercent, false) << "\n";
+            t << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
         t << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
         if (r.avgLeverage > 0.0)
             t << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
