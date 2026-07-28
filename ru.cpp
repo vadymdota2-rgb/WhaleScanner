@@ -191,6 +191,21 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_premium_2", {"• Track up to 50 wallets", "• Отслеживание до 50 кошельков"}},
         {"help_premium_3", {"• Advanced features", "• Расширенные функции"}},
         {"help_premium_4", {"• Priority access to new updates", "• Приоритетный доступ к новым функциям"}},
+        // Формулировка держится на том, чем бот и является: он показывает
+        // произошедшее, а не предсказывает будущее. Отдельно названо плечо -
+        // именно на нём теряют деньги, повторяя за китами.
+        {"help_disclaimer", {"⚠️ <b>Disclaimer</b>\n"
+                             "The bot shows on-chain transactions that have already happened. "
+                             "It is an information service, not investment advice and not a recommendation to trade. "
+                             "Past results of any wallet do not predict future ones. "
+                             "Leveraged trading can cost you your entire deposit. "
+                             "You make your own decisions and bear your own risk.",
+                             "⚠️ <b>Отказ от ответственности</b>\n"
+                             "Бот показывает уже совершённые транзакции из блокчейна. "
+                             "Это информационный сервис, а не инвестиционная рекомендация и не призыв к сделкам. "
+                             "Прошлые результаты кошелька не предсказывают будущие. "
+                             "Торговля с плечом может стоить вам всего депозита. "
+                             "Решения вы принимаете сами и риск несёте сами."}},
         {"help_support", {"📞 Support: @WalletTrackerHelp", "📞 Поддержка: @WalletTrackerHelp"}},
         {"help_channel", {"📢 Channel: t.me/WalletTrackerOfficial", "📢 Канал: t.me/WalletTrackerOfficial"}},
         {"help_footer", {"Use the main menu for quick access to all features.",
