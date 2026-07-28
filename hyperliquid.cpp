@@ -194,6 +194,19 @@ bool notionalNanos(const std::string& pxStr, const std::string& szStr, long long
 
 std::string fmtUsd(long long nanos) { return formatUsdNanosSigned(nanos, false); }
 
+// Метка направления письма. Telegram выбирает направление КАЖДОЙ строки по её
+// первому буквенному символу: строка с арабской подписью встаёт справа, а
+// строка, начинающаяся с "PnL" или с адреса 0x..., - слева. В арабском
+// интерфейсе соседние строки из-за этого разъезжаются.
+//
+// U+200F - нулевой ширины символ, сам по себе невидимый, но "сильный" справа
+// налево. Поставленный первым, он задаёт направление всей строки явно.
+// Для остальных языков возвращается пустая строка, и ничего не меняется.
+const char* dirMark(Lang lang) {
+    return lang == Lang::AR ? "\u200F" : "";
+}
+
+
 // Цена требует своей точности. Общий форматтер округляет до центов, и монета
 // за $0.014682 превращается в "$0.01" - число, по которому ничего не сходится:
 // умножишь на количество и получишь совсем не тот размер сделки, что строкой
@@ -778,23 +791,25 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     const std::string dir  = f.value("dir", std::string());
     const std::string key  = dirKey(dir);
 
+    const char* const dm = dirMark(lang);
+
     std::stringstream m;
-    m << "\U0001F4BC <b>" << safeString(label) << "</b>\n\n";
-    m << dirEmoji(key) << " <b>" << tr(lang, key) << " " << coin << "</b>\n";
+    m << dm << "\U0001F4BC <b>" << safeString(label) << "</b>\n\n";
+    m << dm << dirEmoji(key) << " <b>" << tr(lang, key) << " " << coin << "</b>\n";
 
     // Размер СДЕЛКИ и размер ПОЗИЦИИ - разные вещи, и путать их нельзя:
     // кит может закрыть $146 из позиции в $28 800. Раньше первая строка
     // называлась "размер позиции" и стояла рядом с залогом всей позиции,
     // отчего выходило, что человек вложил в сто раз больше, чем наторговал.
-    m << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
+    m << dm << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
 
     if (pos.stillOpen && pos.positionValueNanos > 0) {
-        m << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
+        m << dm << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
           << fmtUsd(pos.positionValueNanos) << "</b>\n";
     }
 
     if (pos.known && pos.leverage > 0) {
-        m << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>" << pos.leverage << "\u00D7 "
+        m << dm << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>" << pos.leverage << "\u00D7 "
           << tr(lang, pos.isolated ? "hl_isolated" : "hl_cross") << "</b>\n";
     }
 
@@ -803,7 +818,7 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     // рядом даём процент от счёта - иначе "$9,602" ни о чём не говорит, пока
     // не знаешь, три это миллиона на счету или десять тысяч.
     if (pos.stillOpen && pos.marginUsedNanos > 0) {
-        m << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>";
+        m << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>";
         if (accountValueNanos > 0) {
             const double share = 100.0 * static_cast<double>(pos.marginUsedNanos)
                                        / static_cast<double>(accountValueNanos);
@@ -814,15 +829,15 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
 
     long long pxNanos = 0;
     if (parseDecimalToNanos(f.value("px", std::string("0")), pxNanos) && pxNanos > 0)
-        m << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>" << formatPriceNanos(pxNanos) << "</b>\n";
+        m << dm << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>" << formatPriceNanos(pxNanos) << "</b>\n";
 
-    m << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
+    m << dm << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
       << safeString(f.value("sz", std::string("?")), 32) << " " << coin << "</b>\n";
 
     // closedPnl отличен от нуля только у закрывающих сделок - у открывающих
     // прибыли ещё нет, и строка была бы обманчивым "+$0".
     if (closedPnlNanos != 0) {
-        m << (closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") << tr(lang, "hl_pnl") << ": <b>"
+        m << dm << (closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") << tr(lang, "hl_pnl") << ": <b>"
           << formatUsdNanosSigned(closedPnlNanos, true) << "</b>\n";
     }
 
@@ -831,18 +846,18 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     // позицию, и цена ликвидации отъехала на безопасное расстояние. Скрывать
     // её нужно только тогда, когда закрывать больше нечего.
     if (pos.stillOpen && pos.liquidationPxNanos > 0) {
-        m << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
+        m << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
           << formatPriceNanos(pos.liquidationPxNanos) << "</b>\n";
     } else if (pos.known && !pos.stillOpen && closedPnlNanos != 0) {
         // Явная строка лучше молчания: иначе непонятно, то ли позиция закрыта
         // целиком, то ли данные просто не пришли.
-        m << "\u2705 " << tr(lang, "hl_position_closed") << "\n";
+        m << dm << "\u2705 " << tr(lang, "hl_position_closed") << "\n";
     }
     if (accountValueNanos > 0) {
-        m << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(accountValueNanos) << "</b>\n";
+        m << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(accountValueNanos) << "</b>\n";
     }
 
-    m << "\n\U0001F310 " << tr(lang, "hl_venue") << ": <b>Hyperliquid</b>";
+    m << "\n" << dm << "\U0001F310 " << tr(lang, "hl_venue") << ": <b>Hyperliquid</b>";
     // Ссылки на обозреватель нет намеренно: сеть другая, ссылка на BSC-скан
     // здесь вела бы в никуда.
     return m.str();
@@ -1512,32 +1527,34 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     const int startIdx = (page - 1) * HL_PER_PAGE;
     const int endIdx = std::min(visible, startIdx + HL_PER_PAGE);
 
+    const char* const dm = dirMark(lang);
+
     std::stringstream text;
-    text << "\U0001F310 <b>Hyperliquid \u2014 " << perpTitle(kind, lang) << "</b>\n\n";
+    text << dm << "\U0001F310 <b>Hyperliquid \u2014 " << perpTitle(kind, lang) << "</b>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
 
     if (visible == 0) {
-        text << "\U0001F4CA " << tr(lang, "hl_rk_empty");
+        text << dm << "\U0001F4CA " << tr(lang, "hl_rk_empty");
     } else {
         for (int i = startIdx; i < endIdx; i++) {
             const PerpRow& r = rows[static_cast<size_t>(i)];
             const int rank = i + 1;
-            text << rankLabel(rank) << "\n";
-            text << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
-            text << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
+            text << dm << rankLabel(rank) << "\n";
+            text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
+            text << dm << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
             if (r.roiKnown)
-                text << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
-            text << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
-            text << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
+                text << dm << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
+            text << dm << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            text << dm << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
             // Перповый аналог среднего удержания у спота: плечо говорит о
             // манере торговли больше, чем что-либо ещё.
             if (r.avgLeverage > 0.0) {
-                text << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
+                text << dm << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
                      << static_cast<int>(r.avgLeverage + 0.5) << "\u00D7\n";
             }
-            if (i + 1 < endIdx) text << "\n" << HL_CARD_SEPARATOR << "\n\n";
+            if (i + 1 < endIdx) text << "\n" << dm << HL_CARD_SEPARATOR << "\n\n";
 
             keyboard["inline_keyboard"].push_back(json::array({
                 {{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)},
@@ -1547,8 +1564,8 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     }
 
     if (showUpgrade && visible > 0) {
-        text << "\n" << HL_CARD_SEPARATOR << "\n";
-        text << tr(lang, "rk_unlock_top100");
+        text << "\n" << dm << HL_CARD_SEPARATOR << "\n";
+        text << dm << tr(lang, "rk_unlock_top100");
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
         }));
