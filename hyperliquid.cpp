@@ -67,7 +67,7 @@ constexpr int HL_RECONNECT_MAX_SEC = 60;
 
 // Бюджет REST: площадка даёт 1200 весов в минуту на IP. Держимся ниже потолка,
 // чтобы случайный всплеск не выбил нас из лимита целиком.
-constexpr int HL_BUDGET_PER_MINUTE = 1000;
+constexpr int HL_BUDGET_PER_MINUTE = 1150;
 constexpr int HL_WEIGHT_USER_FILLS = 20;
 constexpr int HL_WEIGHT_CLEARINGHOUSE = 2;
 constexpr int HL_WEIGHT_META = 20;
