@@ -83,8 +83,5 @@ bool handleHyperliquidCallback(const std::string& chatId, const std::string& act
                                const std::string& param, const std::string& data,
                                long long messageId, const std::string& callbackQueryId);
 
-// Дневной дайджест по перпам для канала. Пустая строка - данных пока нет.
-std::string buildHlDailyDigest();
-
 // --- Статистика для /stats ---
 std::string hyperliquidStatsLine();
