@@ -239,6 +239,7 @@ const std::unordered_map<std::string, const char*>& tableEs() {
         {"hl_collateral", "Garantía"},
         {"hl_of_account", "de la cuenta"},
         {"hl_position_closed", "Posición cerrada por completo"},
+        {"hl_fills_in_series", "Operaciones en esta serie"},
         {"hl_leverage", "Apalancamiento"},
         {"hl_cross", "cruzado"},
         {"hl_isolated", "aislado"},
