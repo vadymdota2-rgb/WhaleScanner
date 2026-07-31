@@ -246,14 +246,6 @@ const std::string TG_TOKEN = []{
 
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
-const std::string CHANNEL_ID = []{
-    const char* env = std::getenv("WHALE_CHANNEL_ID");
-    return env ? std::string(env) : std::string();
-}();
-const std::string BOT_USERNAME = []{
-    const char* env = std::getenv("WHALE_BOT_USERNAME");
-    return (env && *env) ? std::string(env) : std::string("WalletTrackerAppBot");
-}();
 const std::string DB_FILE = "whale_bot.db";
 
 
@@ -263,7 +255,6 @@ const long long TX_TTL_BLOCKS = 6700; // ~50 минут при 0.45с/блок (
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
-constexpr int DIGEST_HOUR_UTC = 12;
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 std::atomic<bool> running{true};
@@ -339,8 +330,10 @@ void initDB() {
         CREATE TABLE IF NOT EXISTS deliveries (
             id INTEGER PRIMARY KEY AUTOINCREMENT, alert_id INTEGER NOT NULL, chat_id TEXT NOT NULL,
             status INTEGER DEFAULT 0, retry_count INTEGER DEFAULT 0, next_retry_at INTEGER DEFAULT 0,
+            priority INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
+        CREATE INDEX IF NOT EXISTS idx_deliveries_prio ON deliveries(status, next_retry_at, priority DESC, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
         CREATE TABLE IF NOT EXISTS wallet_tokens (
             wallet TEXT NOT NULL,
@@ -353,6 +346,18 @@ void initDB() {
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
+    }
+
+    // Перенос старых баз: CREATE TABLE IF NOT EXISTS не добавляет колонки в уже
+    // существующую таблицу. Без этого очередь падала бы на "no such column:
+    // priority" - ровно та ловушка, на которой мы потеряли сутки в перпах.
+    // Повторный запуск вернёт "duplicate column name", это ожидаемо.
+    {
+        char* mErr = nullptr;
+        if (sqlite3_exec(db, "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
+                         nullptr, nullptr, &mErr) == SQLITE_OK)
+            std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
+        if (mErr) sqlite3_free(mErr);
     }
 
     // Разовая нормализация: минимальный порог алертов - $50. Пользователи,
@@ -478,16 +483,6 @@ void saveTgOffset(long o) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('tg_offset',?)")) return;
     std::string v=std::to_string(o); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
-}
-long long getChannelDigestAt() {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"SELECT value FROM state WHERE key='channel_digest_at'")) return 0;
-    long long t=0; if (sqlite3_step(s)==SQLITE_ROW) { std::string v=safeColumnText(s,0); try { if (!v.empty()) t=std::stoll(v); } catch (...) {} } sqlite3_finalize(s); return t;
-}
-void saveChannelDigestAt(long long t) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT OR REPLACE INTO state(key,value) VALUES('channel_digest_at',?)")) return;
-    std::string v=std::to_string(t); sqlite3_bind_text(s,1,v.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
 }
 long long getLastBlock() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -1921,39 +1916,6 @@ int main() {
             flushPendingAlerts(false);
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) {
                 g_msgQueue.syncSize();
-                if (!CHANNEL_ID.empty()) {
-                    long long nowTs = static_cast<long long>(time(nullptr));
-                    if (nowTs / 86400 > getChannelDigestAt() / 86400 && (nowTs % 86400) >= DIGEST_HOUR_UTC * 3600) {
-                        bool digestSent = false;
-                        auto digest = buildDailyChannelDigest();
-                        if (!digest.text.empty()) {
-                            if (!BOT_USERNAME.empty()) {
-                                while (!digest.text.empty() && (digest.text.back() == '\n' || digest.text.back() == ' ')) digest.text.pop_back();
-                                digest.text += "\n\n🤖 Track these wallets with @" + safeString(BOT_USERNAME, 32);
-                            }
-                            if (g_msgQueue.enqueueToRecipients(digest.text, {CHANNEL_ID})) {
-                                digestSent = true;
-                                std::cout << "[CHANNEL] Daily Top 10 digest sent" << std::endl;
-                            }
-                        }
-                        // Перпы - отдельным сообщением: площадка другая, и слитые
-                        // в одно два рейтинга читались бы как один общий.
-                        std::string hlDigest = buildHlDailyDigest();
-                        if (!hlDigest.empty()) {
-                            if (!BOT_USERNAME.empty()) {
-                                while (!hlDigest.empty() && (hlDigest.back() == '\n' || hlDigest.back() == ' ')) hlDigest.pop_back();
-                                hlDigest += "\n\n🤖 Track these wallets with @" + safeString(BOT_USERNAME, 32);
-                            }
-                            if (g_msgQueue.enqueueToRecipients(hlDigest, {CHANNEL_ID})) {
-                                digestSent = true;
-                                std::cout << "[CHANNEL] Daily Hyperliquid digest sent" << std::endl;
-                            }
-                        }
-                        // Отметку дня ставим, если ушёл хотя бы один из двух:
-                        // иначе пустой спотовый рейтинг блокировал бы и перповый.
-                        if (digestSent) saveChannelDigestAt(nowTs);
-                    }
-                }
                 lsq=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
