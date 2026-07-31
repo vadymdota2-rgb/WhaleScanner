@@ -67,6 +67,9 @@ constexpr int HL_RECONNECT_MAX_SEC = 60;
 
 // Бюджет REST: площадка даёт 1200 весов в минуту на IP. Держимся ниже потолка,
 // чтобы случайный всплеск не выбил нас из лимита целиком.
+// Потолок площадки - 1200 весов в минуту. Держим 1150: запаса меньше, чем
+// раньше, но всплески гасит очередь, а не резерв - непрошедшая дозагрузка
+// возвращается в очередь и разбирается следующей минутой.
 constexpr int HL_BUDGET_PER_MINUTE = 1150;
 constexpr int HL_WEIGHT_USER_FILLS = 20;
 constexpr int HL_WEIGHT_CLEARINGHOUSE = 2;
@@ -193,6 +196,21 @@ bool notionalNanos(const std::string& pxStr, const std::string& szStr, long long
 }
 
 std::string fmtUsd(long long nanos) { return formatUsdNanosSigned(nanos, false); }
+
+// Количество монет. В сериях размеры складываются, поэтому печатать строку из
+// ответа площадки уже нельзя - число собирается у нас. Хвостовые нули убираем:
+// "3100" читается лучше, чем "3100.000000000".
+std::string formatQtyNanos(long long nanos) {
+    if (nanos < 0) nanos = -nanos;
+    const long long whole = nanos / NANOS_PER_UNIT;
+    long long frac = nanos % NANOS_PER_UNIT;
+    std::string out = formatThousands(static_cast<uint64_t>(whole));
+    if (frac == 0) return out;
+    std::string f = std::to_string(frac);
+    f.insert(0, 9 - f.size(), '0');
+    while (!f.empty() && f.back() == '0') f.pop_back();
+    return out + "." + f;
+}
 
 // Метка направления письма. Telegram выбирает направление КАЖДОЙ строки по её
 // первому буквенному символу: строка с арабской подписью встаёт справа, а
@@ -671,12 +689,13 @@ int countFillsInWindow(const std::string& wallet) {
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return 0;
     sqlite3_stmt* s = nullptr;
-    // Считаем РАЗНЫЕ ордера, а не строки: у кита, работающего крупными
-    // заявками, строк втрое больше, чем реальных сделок, и порог сработал бы
-    // на живом человеке.
+    // Считаем ЗАКРЫВАЮЩИЕ сделки - ровно то число, которое видно в карточке
+    // рейтинга строкой "Сделки". Раньше здесь считались разные ордера, и это
+    // было логично само по себе, но снаружи выглядело поломкой: в карточке
+    // 1025 при пороге 1000, а бана нет. Показанное и судимое должны совпадать.
     if (!prepareOrLog(g_hlDb, &s,
-            "SELECT COUNT(DISTINCT CASE WHEN oid > 0 THEN oid ELSE tid END)"
-            " FROM hl_fills WHERE wallet=? AND ts >= ?")) return 0;
+            "SELECT COUNT(*) FROM hl_fills"
+            " WHERE wallet=? AND ts >= ? AND closed_pnl_nanos != 0")) return 0;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 2, (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL);
     int n = 0;
@@ -784,12 +803,30 @@ std::string dirEmoji(const std::string& key) {
     return "\u26A1";
 }
 
-std::string buildHlAlert(const std::string& label, const json& f, long long notionalNanosVal,
-                         long long closedPnlNanos, const PositionInfo& pos,
-                         long long accountValueNanos, Lang lang) {
-    const std::string coin = safeString(f.value("coin", std::string("?")), 32);
-    const std::string dir  = f.value("dir", std::string());
-    const std::string key  = dirKey(dir);
+// Одна серия сделок: подряд идущие операции по одной монете в одну сторону,
+// собранные за окно дебаунса. Кит, набиравший позицию тремя заходами за
+// минуту, принял одно решение - и человеку должно прийти одно сообщение, а не
+// три. Разные монеты и разные направления в одну серию не сливаются: это уже
+// разные решения, и склеивать их значило бы потерять смысл.
+struct HlAlertData {
+    std::string coin;
+    std::string dirKey;
+    int fillCount = 0;
+    long long notionalNanos = 0;   // сумма по серии
+    long long closedPnlNanos = 0;  // сумма по серии
+    long long qtyNanos = 0;        // сумма по серии
+    long long avgPxNanos = 0;      // средняя цена исполнения серии
+    PositionInfo pos;
+    long long accountValueNanos = 0;
+};
+
+std::string buildHlAlert(const std::string& label, const HlAlertData& a, Lang lang) {
+    const std::string coin = safeString(a.coin.empty() ? "?" : a.coin, 32);
+    const std::string& key = a.dirKey;
+    const long long closedPnlNanos = a.closedPnlNanos;
+    const long long notionalNanosVal = a.notionalNanos;
+    const PositionInfo& pos = a.pos;
+    const long long accountValueNanos = a.accountValueNanos;
 
     const char* const dm = dirMark(lang);
 
@@ -802,6 +839,13 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     // называлась "размер позиции" и стояла рядом с залогом всей позиции,
     // отчего выходило, что человек вложил в сто раз больше, чем наторговал.
     m << dm << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
+
+    // Показываем, что сообщение покрывает несколько сделок - иначе сумма и
+    // средняя цена выглядели бы как параметры одной операции.
+    if (a.fillCount > 1) {
+        m << dm << "\U0001F522 " << tr(lang, "hl_fills_in_series") << ": <b>"
+          << a.fillCount << "</b>\n";
+    }
 
     if (pos.stillOpen && pos.positionValueNanos > 0) {
         m << dm << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
@@ -827,12 +871,15 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
         m << "\n";
     }
 
-    long long pxNanos = 0;
-    if (parseDecimalToNanos(f.value("px", std::string("0")), pxNanos) && pxNanos > 0)
-        m << dm << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>" << formatPriceNanos(pxNanos) << "</b>\n";
+    // Цена серии - средневзвешенная по объёму, а не последняя: при наборе
+    // позиции заходами последняя цена не описывает сделку целиком.
+    if (a.avgPxNanos > 0)
+        m << dm << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
+          << formatPriceNanos(a.avgPxNanos) << "</b>\n";
 
-    m << dm << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
-      << safeString(f.value("sz", std::string("?")), 32) << " " << coin << "</b>\n";
+    if (a.qtyNanos > 0)
+        m << dm << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
+          << formatQtyNanos(a.qtyNanos) << " " << coin << "</b>\n";
 
     // closedPnl отличен от нуля только у закрывающих сделок - у открывающих
     // прибыли ещё нет, и строка была бы обманчивым "+$0".
@@ -863,10 +910,9 @@ std::string buildHlAlert(const std::string& label, const json& f, long long noti
     return m.str();
 }
 
-void dispatchHlAlert(const std::string& wallet, const json& f, long long notionalNanosVal,
-                     long long closedPnlNanos, const PositionInfo& pos,
-                     long long accountValueNanos) {
-    if (notionalNanosVal < 0) return;
+void dispatchHlAlert(const std::string& wallet, const HlAlertData& a) {
+    const long long notionalNanosVal = a.notionalNanos;
+    if (notionalNanosVal <= 0) return;
     std::vector<HlRecipient> recipients = hlWatchersFor(wallet);
     if (recipients.empty()) return;
 
@@ -881,9 +927,7 @@ void dispatchHlAlert(const std::string& wallet, const json& f, long long notiona
     if (byLabelLang.empty()) return;
 
     for (auto& entry : byLabelLang) {
-        std::string msg = buildHlAlert(entry.first.first, f, notionalNanosVal,
-                                       closedPnlNanos, pos, accountValueNanos,
-                                       entry.first.second);
+        std::string msg = buildHlAlert(entry.first.first, a, entry.first.second);
         if (g_msgQueue.enqueueToRecipients(msg, entry.second))
             g_alertsSent.fetch_add(1, std::memory_order_relaxed);
     }
@@ -998,15 +1042,50 @@ void enrichWallet(const std::string& wallet) {
         }
     }
 
-    // Проход 3: рассылка. ВНЕ блокировки базы перпов - здесь и обращение к
-    // главной базе за языком получателя, и постановка в очередь отправки.
-    // Держать на этом свой мьютекс значило бы вешать экран рейтинга у всех
-    // остальных на время сетевых операций.
-    if (wasSeeded)
+    // Проход 3: сборка серий и рассылка. ВНЕ блокировки базы перпов - здесь и
+    // обращение к главной базе за языком получателя, и постановка в очередь
+    // отправки. Держать на этом свой мьютекс значило бы вешать экран рейтинга
+    // у всех остальных на время сетевых операций.
+    //
+    // Сделки за окно дебаунса собираются по монете и направлению: кит, бравший
+    // позицию тремя заходами за минуту, принял одно решение, и сообщение
+    // должно быть одно. Разные монеты и разные стороны остаются раздельными.
+    if (wasSeeded && !freshRows.empty()) {
+        std::map<std::string, HlAlertData> series;
         for (size_t i : freshRows) {
             const Prepared& p = prepared[i];
-            dispatchHlAlert(wallet, *p.fill, p.notional, p.closedPnl, p.pos, accountValue);
+            const std::string coin = p.fill->value("coin", std::string());
+            const std::string dk = dirKey(p.fill->value("dir", std::string()));
+
+            HlAlertData& a = series[coin + "|" + dk];
+            if (a.fillCount == 0) {          // первая сделка серии задаёт общее
+                a.coin = coin;
+                a.dirKey = dk;
+            }
+            a.fillCount++;
+            a.notionalNanos += p.notional;
+            a.closedPnlNanos += p.closedPnl;
+            long long sz = 0;
+            if (parseDecimalToNanos(p.fill->value("sz", std::string("0")), sz)) {
+                if (sz < 0) sz = -sz;
+                a.qtyNanos += sz;
+            }
+            // Состояние позиции берём от ПОСЛЕДНЕЙ сделки серии: плечо, залог и
+            // цена ликвидации к этому моменту уже учитывают всю серию целиком.
+            a.pos = p.pos;
+            a.accountValueNanos = accountValue;
         }
+
+        for (auto& kv : series) {
+            HlAlertData& a = kv.second;
+            // Средневзвешенная цена: сумма денег делится на сумму монет.
+            if (a.qtyNanos > 0) {
+                const __int128 num = static_cast<__int128>(a.notionalNanos) * NANOS_PER_UNIT;
+                a.avgPxNanos = static_cast<long long>(num / a.qtyNanos);
+            }
+            dispatchHlAlert(wallet, a);
+        }
+    }
 
     // Отсеяли всё до единой сделки - это не нормальная работа фильтра, а почти
     // наверняка расхождение в именах рынков. Молчать об этом нельзя: снаружи
