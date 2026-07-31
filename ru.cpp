@@ -301,6 +301,9 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_collateral",    {"Collateral",     "Залог позиции"}},
         {"hl_of_account",    {"of account",     "счёта"}},
         {"hl_position_closed", {"Position fully closed", "Позиция закрыта полностью"}},
+        // Появляется только когда сообщение покрывает несколько сделок: иначе
+        // сумма и средняя цена читались бы как параметры одной операции.
+        {"hl_fills_in_series", {"Trades in this series", "Сделок в серии"}},
         {"hl_leverage",    {"Leverage",      "Плечо"}},
         {"hl_cross",       {"cross",         "кросс"}},
         {"hl_isolated",    {"isolated",      "изолированное"}},
