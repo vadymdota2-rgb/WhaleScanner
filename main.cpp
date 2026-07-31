@@ -343,21 +343,24 @@ void initDB() {
         );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
-    char* err = nullptr;
-    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
-    }
-
-    // Перенос старых баз: CREATE TABLE IF NOT EXISTS не добавляет колонки в уже
-    // существующую таблицу. Без этого очередь падала бы на "no such column:
-    // priority" - ровно та ловушка, на которой мы потеряли сутки в перпах.
-    // Повторный запуск вернёт "duplicate column name", это ожидаемо.
+    // ПЕРЕНОС СТАРЫХ БАЗ - строго ДО создания схемы. CREATE TABLE IF NOT EXISTS
+    // не добавляет колонки в уже существующую таблицу, а в схеме выше есть
+    // индекс по deliveries.priority. Если поставить этот блок ПОСЛЕ схемы -
+    // индекс не найдёт колонку, весь sqlite3_exec упадёт, и бот не поднимется
+    // вовсе. Так и случилось: падал по кругу с "no such column: priority".
+    //
+    // На новой базе таблицы ещё нет, ALTER вернёт ошибку - она глушится.
     {
         char* mErr = nullptr;
         if (sqlite3_exec(db, "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                          nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
         if (mErr) sqlite3_free(mErr);
+    }
+
+    char* err = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
     }
 
     // Разовая нормализация: минимальный порог алертов - $50. Пользователи,
