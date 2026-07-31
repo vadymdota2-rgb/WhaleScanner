@@ -1,4 +1,5 @@
 #include "message_queue.h"
+#include "premium.h"   // isPremium: приоритет доставки подписчикам
 
 #include <sqlite3.h>
 #include <mutex>
@@ -86,7 +87,7 @@ void SafeMessageQueue::senderLoop() {
         std::vector<std::tuple<int64_t,std::string,std::string>> batch;
         bool prepFailed=false;
         { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.id ASC LIMIT 100")) { prepFailed=true; }
+          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.priority DESC, d.id ASC LIMIT 100")) { prepFailed=true; }
           else {
               sqlite3_bind_int64(s,1,time(nullptr));
               while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
@@ -154,6 +155,12 @@ bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::v
     if (recipients.empty()) return true;
     size_t batchSize = recipients.size();
 
+    // Приоритет считаем ДО захвата мьютекса: isPremium читает ту же базу и
+    // берёт тот же замок, вызов внутри дал бы взаимоблокировку.
+    std::vector<int> prio;
+    prio.reserve(recipients.size());
+    for (const auto& c : recipients) prio.push_back(isPremium(c) ? 1 : 0);
+
     auto txStart=std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> l(dbMutex);
 
@@ -174,9 +181,11 @@ bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::v
     sqlite3_bind_text(s,1,text.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,time(nullptr));
     if (sqlite3_step(s)!=SQLITE_DONE) { std::cerr << "[QUEUE] alert insert failed: " << sqlite3_errmsg(db) << std::endl; sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
-    if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at) VALUES(?,?,0,0,0)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
-    for (auto& c:recipients) {
+    if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at,priority) VALUES(?,?,0,0,0,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+    for (size_t i=0;i<recipients.size();i++) {
+        const std::string& c = recipients[i];
         sqlite3_reset(s); sqlite3_bind_int64(s,1,aid); sqlite3_bind_text(s,2,c.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_bind_int(s,3,prio[i]);
         if (sqlite3_step(s)!=SQLITE_DONE) {
             std::cerr << "[QUEUE] delivery insert failed: " << sqlite3_errmsg(db) << std::endl;
             sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
