@@ -34,7 +34,6 @@ RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& 
 
 RankingMessage buildTopPnlPage(const std::string& chatId, int page);
 
-RankingMessage buildDailyChannelDigest();
 
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
