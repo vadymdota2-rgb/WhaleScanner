@@ -1875,34 +1875,6 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
             + tr(lang, "hl_rk_choose"), kb.dump()};
 }
 
-std::string buildHlDailyDigest() {
-    // В канал пишем по-английски, как и спотовый дайджест: у канала нет
-    // одного пользователя, чей язык можно было бы взять.
-    const Lang lang = Lang::EN;
-
-    std::vector<PerpRow> rows;
-    rankingSnapshot(rows);
-    sortByKind(rows, PerpKind::PNL);
-    if (rows.empty()) return "";
-    if (rows.size() > 10) rows.resize(10);
-
-    std::stringstream t;
-    t << "\U0001F310 <b>Hyperliquid \u2014 " << perpTitle(PerpKind::PNL, lang) << "</b>\n\n";
-    for (size_t i = 0; i < rows.size(); i++) {
-        const PerpRow& r = rows[i];
-        t << rankLabel(static_cast<int>(i) + 1) << "\n";
-        t << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
-        t << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
-        if (r.roiKnown)
-            t << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
-        t << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
-        if (r.avgLeverage > 0.0)
-            t << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
-              << static_cast<int>(r.avgLeverage + 0.5) << "\u00D7\n";
-        if (i + 1 < rows.size()) t << "\n" << HL_CARD_SEPARATOR << "\n\n";
-    }
-    return t.str();
-}
 
 // Что видит бесплатный пользователь вместо рейтинга. Показываем не голый
 // отказ, а из чего состоит перп-карточка: плечо, залог, цена ликвидации и
