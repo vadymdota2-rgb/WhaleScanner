@@ -1539,6 +1539,181 @@ HlMessage buildPerpLocked(const std::string& chatId) {
     return {t.str(), kb.dump()};
 }
 
+struct OpenPosition {
+    std::string wallet;
+    std::string label;
+    std::string coin;
+    bool isLong = false;
+    long long sizeNanos = 0;
+    long long entryPxNanos = 0;
+    long long liqPxNanos = 0;
+    long long marginNanos = 0;
+    long long unrealizedNanos = 0;
+    double roePercent = 0.0;
+    int leverage = 0;
+    bool isolated = false;
+};
+
+bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out) {
+    json body;
+    body["type"] = "clearinghouseState";
+    body["user"] = wallet;
+    body["dex"] = "";
+    json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
+    if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
+        return false;
+
+    for (const auto& ap : j["assetPositions"]) {
+        if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
+        const json& p = ap["position"];
+
+        OpenPosition op;
+        op.wallet = wallet;
+        op.coin = p.value("coin", std::string());
+        if (op.coin.empty()) continue;
+
+        // szi отрицателен у шорта - знак и есть сторона позиции.
+        long long szi = 0;
+        parseDecimalToNanos(p.value("szi", std::string("0")), szi);
+        if (szi == 0) continue;
+        op.isLong = szi > 0;
+        op.sizeNanos = szi < 0 ? -szi : szi;
+
+        parseDecimalToNanos(p.value("entryPx", std::string("0")), op.entryPxNanos);
+        parseDecimalToNanos(p.value("liquidationPx", std::string("0")), op.liqPxNanos);
+        parseDecimalToNanos(p.value("marginUsed", std::string("0")), op.marginNanos);
+        parseDecimalToNanos(p.value("unrealizedPnl", std::string("0")), op.unrealizedNanos);
+
+        // returnOnEquity приходит долей, а не процентом.
+        long long roe = 0;
+        if (parseDecimalToNanos(p.value("returnOnEquity", std::string("0")), roe))
+            op.roePercent = 100.0 * static_cast<double>(roe) / static_cast<double>(NANOS_PER_UNIT);
+
+        if (p.contains("leverage") && p["leverage"].is_object()) {
+            const json& lev = p["leverage"];
+            if (lev.contains("value") && lev["value"].is_number())
+                op.leverage = lev["value"].get<int>();
+            op.isolated = lev.value("type", std::string()) == "isolated";
+        }
+        out.push_back(std::move(op));
+    }
+    return true;
+}
+
+HlMessage buildPositionsLocked(Lang lang) {
+    std::stringstream t;
+    const char* const dm = dirMark(lang);
+    t << dm << "\U0001F4C8 <b>" << tr(lang, "hl_open_positions") << "</b>\n"
+      << HL_CARD_SEPARATOR << "\n\n"
+      << dm << "\U0001F512 " << tr(lang, "hl_locked_body");
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+    }));
+    return {t.str(), kb.dump()};
+}
+
+// Выбор кошелька. Опрашивать все сразу незачем: человека интересует конкретный,
+// а каждый лишний запрос - это ожидание на его же экране.
+HlMessage buildPositionsPicker(const std::string& chatId) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    if (!isPremium(chatId)) return buildPositionsLocked(lang);
+
+    const char* const dm = dirMark(lang);
+    const std::vector<HlUserWallet> wallets = hlUserWallets(chatId);
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    for (const auto& w : wallets) {
+        const std::string label = w.label.empty() ? shortAddress(w.address) : safeString(w.label, 32);
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", "\U0001F4BC " + label}, {"callback_data", "hl_pos:" + w.address}}
+        }));
+    }
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+    }));
+
+    std::stringstream t;
+    t << dm << "\U0001F4C8 <b>" << tr(lang, "hl_open_positions") << "</b>\n"
+      << HL_CARD_SEPARATOR << "\n\n";
+    t << dm << (wallets.empty() ? tr(lang, "mw_no_wallets") : tr(lang, "hl_positions_choose"));
+    return {t.str(), kb.dump()};
+}
+
+HlMessage buildWalletPositions(const std::string& chatId, const std::string& address) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    if (!isPremium(chatId)) return buildPositionsLocked(lang);
+
+    const char* const dm = dirMark(lang);
+    const std::string addr = toLower(address);
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "hl_positions"}}
+    }));
+
+    // Метку берём из списка пользователя: показывать голый адрес там, где у
+    // человека есть своё имя для кошелька, значит терять узнаваемость.
+    std::string label = shortAddress(addr);
+    for (const auto& w : hlUserWallets(chatId))
+        if (w.address == addr && !w.label.empty()) { label = safeString(w.label, 32); break; }
+
+    std::stringstream t;
+    t << dm << "\U0001F4BC <b>" << label << "</b>\n";
+    t << dm << "<code>" << safeString(addr, 42) << "</code>\n";
+    t << HL_CARD_SEPARATOR << "\n\n";
+
+    std::vector<OpenPosition> pos;
+    if (!fetchOpenPositions(addr, pos)) {
+        t << dm << tr(lang, "generic_error_retry");
+        return {t.str(), kb.dump()};
+    }
+    if (pos.empty()) {
+        t << dm << tr(lang, "hl_no_open_positions");
+        return {t.str(), kb.dump()};
+    }
+
+    // Крупные позиции выше: если их несколько, сверху должно быть главное.
+    std::sort(pos.begin(), pos.end(), [](const OpenPosition& a, const OpenPosition& b) {
+        return a.marginNanos > b.marginNanos;
+    });
+
+    for (size_t i = 0; i < pos.size(); i++) {
+        const OpenPosition& p = pos[i];
+        if (i) t << "\n" << dm << HL_CARD_SEPARATOR << "\n\n";
+
+        t << dm << (p.isLong ? "\U0001F7E2" : "\U0001F534") << " <b>"
+          << safeString(p.coin, 32) << "</b>\n";
+        t << dm << tr(lang, p.isLong ? "hl_side_long" : "hl_side_short") << ": <b>"
+          << fmtUsd(p.marginNanos * (p.leverage > 0 ? p.leverage : 1)) << "</b>";
+        if (p.leverage > 0)
+            t << " \u00B7 " << p.leverage << "\u00D7 "
+              << tr(lang, p.isolated ? "hl_isolated" : "hl_cross");
+        t << "\n";
+        if (p.marginNanos > 0)
+            t << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
+              << fmtUsd(p.marginNanos) << "</b>\n";
+        if (p.entryPxNanos > 0)
+            t << dm << "\U0001F4CD " << tr(lang, "hl_entry_price") << ": <b>"
+              << formatPriceNanos(p.entryPxNanos) << "</b>\n";
+        t << dm << (p.unrealizedNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+          << tr(lang, "hl_unrealized") << ": <b>"
+          << formatUsdNanosSigned(p.unrealizedNanos, true) << "</b>";
+        if (p.roePercent != 0.0) t << " (" << formatPercent(p.roePercent, true) << ")";
+        t << "\n";
+        if (p.liqPxNanos > 0)
+            t << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
+              << formatPriceNanos(p.liqPxNanos) << "</b>\n";
+    }
+    return {t.str(), kb.dump()};
+}
+
 bool renderHyperliquidView(const std::string& chatId, const std::string& action,
                            const std::string& param, HlMessage& out) {
     if ((action == "hl_menu" || action == "hl_open" || action == "hl_page") &&
@@ -1546,6 +1721,8 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
         out = buildPerpLocked(chatId);
         return true;
     }
+    if (action == "hl_positions") { out = buildPositionsPicker(chatId); return true; }
+    if (action == "hl_pos") { out = buildWalletPositions(chatId, param); return true; }
     if (action == "hl_menu") { out = buildPerpTopMenu(chatId); return true; }
     if (action == "hl_open") {
         PerpKind kind;
