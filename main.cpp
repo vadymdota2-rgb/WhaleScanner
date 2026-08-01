@@ -722,7 +722,7 @@ std::string buildCancelWithTopTraders(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader_spot"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
@@ -1479,6 +1479,9 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "add_wallet") {
+            // Экран обязан попасть в историю наравне с остальными: без этого
+            // "Отмена" снимала предыдущий экран и уводила на два шага назад.
+            rememberView(chatId, data);
             startAddWalletFlow(chatId, messageId);
         }
         else if (param == "account") {
