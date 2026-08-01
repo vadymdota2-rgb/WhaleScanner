@@ -1265,10 +1265,16 @@ void cleanupOldAlerts() {
 }
 
 std::mutex g_lastViewMutex;
+// Идёт ли сейчас возврат назад. navigateBack переигрывает предыдущий адрес
+// через handleCallbackQuery, а тот на каждом экране зовёт rememberView - и
+// снятый экран немедленно возвращался в стек. Флаг на время возврата это
+// подавляет. Локальный для потока: обработчики разных чатов идут параллельно.
+thread_local bool g_navigatingBack = false;
 std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
 constexpr size_t VIEW_STACK_MAX = 12;
 
 void rememberView(const std::string& chatId, const std::string& data) {
+    if (g_navigatingBack) return;
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto& st = g_viewStack[chatId];
     if (!st.empty() && st.back() == data) return;
@@ -1353,7 +1359,9 @@ bool navigateBack(const std::string& chatId, long long messageId) {
     synthetic["from"]["id"] = std::stoll(chatId);
     synthetic["message"] = json::object();
     synthetic["message"]["message_id"] = messageId;
+    g_navigatingBack = true;
     handleCallbackQuery(synthetic);
+    g_navigatingBack = false;
     return true;
 }
 
