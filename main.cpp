@@ -47,8 +47,8 @@ struct Stats {
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
     std::atomic<time_t> last_rpc_failure{0};
-    std::atomic<int64_t> current_lag{0};   // lat - lb, живой снимок на момент последнего опроса
-    std::atomic<int64_t> max_lag_seen{0};  // максимум за время работы процесса
+    std::atomic<int64_t> current_lag{0};
+    std::atomic<int64_t> max_lag_seen{0};
 
     std::atomic<uint64_t> sig_swap_event{0};
     std::atomic<uint64_t> sig_universal_router{0};
@@ -248,10 +248,9 @@ const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
 
-
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
-const long long TX_TTL_BLOCKS = 6700; // ~50 минут при 0.45с/блок (BSC после хардфорка Fermi, было 1000 при старых ~3с/блок)
+const long long TX_TTL_BLOCKS = 6700;
 constexpr time_t PRICE_TTL = 120;
 constexpr size_t MAX_USERS = 1000000;
 
@@ -275,7 +274,6 @@ struct Watcher {
 std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
-
 
 void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
@@ -343,13 +341,6 @@ void initDB() {
         );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
-    // ПЕРЕНОС СТАРЫХ БАЗ - строго ДО создания схемы. CREATE TABLE IF NOT EXISTS
-    // не добавляет колонки в уже существующую таблицу, а в схеме выше есть
-    // индекс по deliveries.priority. Если поставить этот блок ПОСЛЕ схемы -
-    // индекс не найдёт колонку, весь sqlite3_exec упадёт, и бот не поднимется
-    // вовсе. Так и случилось: падал по кругу с "no such column: priority".
-    //
-    // На новой базе таблицы ещё нет, ALTER вернёт ошибку - она глушится.
     {
         char* mErr = nullptr;
         if (sqlite3_exec(db, "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
@@ -363,9 +354,6 @@ void initDB() {
         std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
     }
 
-    // Разовая нормализация: минимальный порог алертов - $50. Пользователи,
-    // успевшие поставить меньше до введения ограничения, подтягиваются к нему,
-    // иначе интерфейс запрещает такие значения, а в базе они остаются навсегда.
     {
         const char* clampSql = "UPDATE users SET threshold_nanos = 50000000000 WHERE threshold_nanos < 50000000000";
         char* cerr2 = nullptr;
@@ -408,9 +396,6 @@ void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
     sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,sym.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int(s,3,dec);
     sqlite3_step(s); sqlite3_finalize(s);
 }
-// Снимок цены в историю. Время округляется до часа, поэтому на токен
-// набегает не больше 24 строк в сутки, сколько бы раз цену ни спрашивали, а
-// INSERT OR IGNORE делает повторную запись в тот же час бесплатной.
 constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
 constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
 
@@ -427,25 +412,6 @@ void savePriceHistory(const std::string& a, uint64_t pn) {
     sqlite3_bind_int64(s, 3, static_cast<sqlite3_int64>(pn));
     sqlite3_step(s);
     sqlite3_finalize(s);
-}
-
-// Цена токена на момент времени. Берём ближайший снимок НЕ ПОЗЖЕ запрошенного:
-// цена, снятая после интересующего момента, отвечала бы на другой вопрос.
-// Ноль означает "в этот период мы токен не наблюдали", а не "стоил ноль".
-uint64_t getPriceNanosAt(const std::string& token, long long ts) {
-    const std::string a = toLower(token);
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "SELECT price_nanos FROM token_price_history "
-        "WHERE address=? AND ts<=? ORDER BY ts DESC LIMIT 1")) return 0;
-    sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, ts);
-    uint64_t out = 0;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        out = static_cast<uint64_t>(sqlite3_column_int64(s, 0));
-    sqlite3_finalize(s);
-    return out;
 }
 
 void cleanupPriceHistory() {
@@ -565,12 +531,6 @@ void refreshWatchers() {
     WATCHERS_PTR = m;
 }
 
-// ===================== Сервисы для модуля перпетуалов =====================
-// Своего списка кошельков у перпов нет: он общий со спотом, поэтому источник
-// один и тот же - WATCHERS_PTR. Здесь он только раскрывается наружу в том
-// виде, который нужен модулю, чтобы не тащить туда описание Watcher и не
-// заводить второе описание одной и той же сущности.
-
 std::vector<std::string> hlWatchedAddresses() {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
     { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
@@ -594,10 +554,6 @@ std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
     return out;
 }
 
-// Вызывается из ranking.cpp, когда детектор навсегда забанил кошелёк в рейтинге.
-// Снимаем его ТОЛЬКО с сервисного аккаунта - чтобы не тратить RPC на бота с
-// сотнями сделок. Обычные пользователи, если следят за этим кошельком,
-// продолжают получать алерты как ни в чём не бывало.
 std::string getUserLanguage(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT language FROM users WHERE chat_id=?")) return "en";
@@ -615,7 +571,6 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     sqlite3_bind_text(s,1,lang.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_step(s); sqlite3_finalize(s);
 }
-
 
 void removeUser(const std::string& chatId) {
 
@@ -716,8 +671,6 @@ std::string buildCancelButton(Lang lang) {
     return keyboard.dump();
 }
 
-// То же, но с быстрым переходом в Топ трейдеров: на экране ввода адреса это
-// избавляет от лишнего пути "выйти - найти в меню - вернуться".
 std::string buildCancelWithTopTraders(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -729,7 +682,6 @@ std::string buildCancelWithTopTraders(Lang lang) {
     }));
     return keyboard.dump();
 }
-
 
 UIMessage buildLanguagesMenu(const std::string& chatId) {
     static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
@@ -787,9 +739,6 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     text += tr(lang, "help_support") + "\n";
     text += tr(lang, "help_channel") + "\n\n";
     text += tr(lang, "help_footer") + "\n\n";
-    // Отказ от ответственности - последним. Продукт показывает факты из цепи,
-    // но человек читает их как подсказку к действию, поэтому границу стоит
-    // обозначить словами, а не подразумевать.
     text += tr(lang, "help_disclaimer");
 
     return {text, keyboard.dump()};
@@ -843,9 +792,6 @@ bool editMsg(const std::string& c, long long messageId, const std::string& t, co
     try {
         auto p = json::parse(r);
         if (p.value("ok", false)) return true;
-        // "message is not modified" - это НЕ сбой: содержимое уже такое, какое
-        // нужно. Раньше мы считали это ошибкой и отправляли копию сообщения,
-        // из-за чего в чате появлялись дубли меню.
         std::string desc = p.value("description", std::string());
         if (desc.find("message is not modified") != std::string::npos) return true;
         return false;
@@ -859,8 +805,6 @@ void replyInPlace(const std::string& chatId, long long messageId, const std::str
     }
 }
 
-// Удаление собственного сообщения бота. Нужно, чтобы после завершения диалога
-// (ввод адреса/имени) не оставалось второе "мёртвое" меню в чате.
 void deleteMsg(const std::string& chatId, long long messageId) {
     if (messageId <= 0) return;
     json j;
@@ -884,9 +828,6 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
-// Разовый перенос истории токенов из таблицы сделок. Вызывается ПОСЛЕ
-// initRankingDB(), потому что таблицу trades создаёт именно она. Без этого
-// у экрана "Портфель" не было бы кандидатов и показывался бы только BNB.
 void seedWalletTokensFromTrades() {
     std::lock_guard<std::mutex> l(dbMutex);
     const char* sql =
@@ -912,10 +853,6 @@ void rememberWalletToken(const std::string& wallet, const std::string& token, lo
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// Забыть токен: вызывается, когда при открытии портфеля баланс оказался
-// нулевым - значит кошелёк эту монету продал или перевёл. Чистим по ФАКТУ,
-// а не по возрасту записи: иначе потеряли бы монеты, которые держат годами
-// не трогая, и продолжали бы тратить запросы на давно проданные.
 void forgetWalletToken(const std::string& wallet, const std::string& token) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"DELETE FROM wallet_tokens WHERE wallet=? AND token=?")) return;
@@ -924,10 +861,6 @@ void forgetWalletToken(const std::string& wallet, const std::string& token) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// Из чека транзакции вытаскиваем ВСЕ токены, где кошелёк был отправителем или
-// получателем - не только результат свопа. Так в портфель попадают и обычные
-// переводы, и раздачи, и вторая нога сложных сделок. Всё считаем сами,
-// без внешних сервисов: данные уже есть в чеке, который мы и так загрузили.
 void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& receipt, long long ts) {
     if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array()) return;
     static const std::string TRANSFER_TOPIC =
@@ -941,7 +874,6 @@ void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& 
         if (tp.size() < 3 || !tp[0].is_string()) continue;
         if (toLower(tp[0].get<std::string>()) != TRANSFER_TOPIC) continue;
 
-        // topics[1] = отправитель, topics[2] = получатель (адрес в 32 байтах)
         bool involvesWallet = false;
         for (int i = 1; i <= 2 && !involvesWallet; ++i) {
             if (!tp[i].is_string()) continue;
@@ -968,7 +900,6 @@ std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
     return out;
 }
 
-// Нативный баланс (BNB/ETH) в wei. false - узнать не удалось.
 bool getNativeBalance(const std::string& wallet, cpp_int& out) {
     auto r = rpc("eth_getBalance", {wallet, "latest"});
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
@@ -976,10 +907,6 @@ bool getNativeBalance(const std::string& wallet, cpp_int& out) {
     return true;
 }
 
-// balanceOf(address) - селектор 0x70a08231 + адрес, дополненный до 32 байт.
-// Возвращает false, если УЗНАТЬ баланс не удалось. Отличать это от честного
-// нуля критично: по нулю мы удаляем монету из списка, и без такой проверки
-// одна сетевая заминка стирала бы её навсегда.
 bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_int& out) {
     std::string w = toLower(wallet);
     if (w.size() == 42 && w.rfind("0x",0) == 0) w = w.substr(2);
@@ -1009,9 +936,6 @@ std::string getSymbol(const std::string& addr) {
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
-// Ликвидность пула, из которого взята цена. Нужна, чтобы отличить реальную
-// стоимость позиции от бумажной: продать больше, чем есть в пуле, невозможно,
-// и цена такой позиции - фикция.
 std::map<std::string, double> POOL_LIQUIDITY_CACHE;
 
 double getPoolLiquidityUsd(const std::string& token) {
@@ -1028,10 +952,6 @@ uint64_t getPriceNanos(const std::string& token) {
     try {
         auto j=json::parse(r);
         if (j.contains("pairs") && j["pairs"].is_array()) {
-            // Сервис отдаёт пары СО ВСЕХ сетей и в произвольном порядке.
-            // Брать первую попавшуюся нельзя: цена может прийти из чужой сети
-            // или из пустого пула, где она задрана в тысячи раз. Выбираем пару
-            // своей сети с наибольшей ликвидностью - она ближе всего к реальной.
             const std::string wantChain = chainCtx().dexscreenerChainId;
             double bestLiquidity = -1.0;
             for (const auto& pair : j["pairs"]) {
@@ -1061,15 +981,13 @@ uint64_t getPriceNanos(const std::string& token) {
             double cg = j2[a]["usd"].get<double>();
             if (std::isfinite(cg) && cg > 0.0) p = cg;
         } } catch (...) {} }
-    // Защита от абсурдных значений: выше этого порога цена заведомо мусорная,
-    // а перевод в наносы переполнил бы счётчик.
     constexpr double MAX_SANE_PRICE_USD = 1e9;
     uint64_t n = (std::isfinite(p) && p > 0.0 && p < MAX_SANE_PRICE_USD)
                ? static_cast<uint64_t>(p * 1000000000.0) : 0;
     if (n>0) {
         { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; }
         saveTokenPrice(a,n);
-        savePriceHistory(a,n);   // кэш затирается, история копится
+        savePriceHistory(a,n);
     }
     else { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&PRICE_NANOS_CACHE[a].first>0) { g_stats.price_fallbacks.fetch_add(1); std::cerr << "[PRICE] Stale cache: " << a << std::endl; return PRICE_NANOS_CACHE[a].first; } }
     return n;
@@ -1110,10 +1028,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         msg += (res.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ") + counterLabel + ": <b>" +
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    // Плата за газ - фактическая, из чека транзакции.
     if (res.gasUsdNanos > 0) {
-        // Через строку: у cpp_int нет прямого приведения к long long во всех
-        // сборках, а строковое представление есть всегда.
         long long gasLL = 0;
         try { gasLL = std::stoll(res.gasUsdNanos.convert_to<std::string>()); } catch (...) {}
         msg += "\u26FD " + tr(lang, "alert_gas") + ": <b>" +
@@ -1135,8 +1050,7 @@ struct PendingAlert {
     std::string hash;
     long long block = 0;
     long long blockTs = 0;
-    long long firstSeen = 0; // Unix-время БЛОКА (blockTs), не время обработки -
-                              // иначе при догоне после лага все сделки слипаются в "только что"
+    long long firstSeen = 0;
 };
 
 std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
@@ -1237,7 +1151,6 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
 
-    // ---- Проход 1: находим совпадения. Запросов к сети нет, только сравнения. ----
     struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; };
     std::vector<Matched> matched;
     for (auto& tx:block["transactions"]) {
@@ -1249,28 +1162,14 @@ bool processBlock(long long bn) {
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
         std::string mA;
         if (watchers->count(from)) mA=from; else if (watchers->count(to)) mA=to;
-        // Дедупликация нужна только там, где возможен алерт. Транзакции без
-        // совпадения с отслеживаемым кошельком алертов не создают, поэтому не
-        // пишем и не проверяем их в processed_tx - иначе это ~87 SELECT+INSERT
-        // в секунду и таблица на миллионы строк вместо десятков тысяч.
         if (mA.empty()) continue;
         if (isTxProcessed(hash)) continue;
         matched.push_back({&tx, hash, mA});
     }
 
-    // ---- Проход 2: чеки тянем ПАРАЛЛЕЛЬНО. ----
-    // Раньше они запрашивались строго по одному, и именно это упирало потолок
-    // числа отслеживаемых кошельков: время блока = сумма всех ожиданий сети.
-    // Параллелить безопасно: curl-хэндлы у нас thread_local, выбор эндпоинта
-    // атомарный, а каждый поток пишет в свою ячейку результата. Вся работа с
-    // базой и кэшами остаётся ниже, в один поток.
     std::vector<nlohmann::json> receipts(matched.size());
     if (!matched.empty()) {
-        // Потоков ровно столько, сколько узлов: каждый круг задействует каждый
-        // эндпоинт по разу, нагрузка ложится равномерно и ни один не перегружен.
         const size_t CONCURRENCY = RPC_ENDPOINTS.size();
-        // Сдвиг от текущего узла, чтобы разные блоки начинали с разных мест
-        // и нагрузка не скапливалась на первых эндпоинтах.
         const size_t spreadBase = rpcIndex.load(std::memory_order_relaxed);
         std::atomic<size_t> next{0};
         std::vector<std::thread> pool;
@@ -1280,8 +1179,6 @@ bool processBlock(long long bn) {
                 for (;;) {
                     size_t i = next.fetch_add(1, std::memory_order_relaxed);
                     if (i >= matched.size() || !running.load(std::memory_order_relaxed)) return;
-                    // Каждая задача идёт на свой узел: seed = базовый сдвиг + номер
-                    // задачи. Так нагрузка размазывается по всем эндпоинтам.
                     receipts[i] = rpcSpread(spreadBase + i, "eth_getTransactionReceipt", {matched[i].hash});
                 }
             });
@@ -1289,7 +1186,6 @@ bool processBlock(long long bn) {
         for (auto& th : pool) th.join();
     }
 
-    // ---- Проход 3: анализ и запись - последовательно, как и раньше. ----
     for (size_t i = 0; i < matched.size(); ++i) {
         if (!running.load(std::memory_order_relaxed)) return false;
         const auto& tx = *matched[i].tx;
@@ -1319,9 +1215,6 @@ bool processBlock(long long bn) {
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        // Единственный источник кандидатов для "Портфеля": в блокчейне нет
-        // запроса "покажи все токены адреса". Собираем сами из чека, который
-        // и так загружен, - без внешних сервисов и лишних запросов.
         rememberTokensFromReceipt(mA, receipt, blockTs);
         if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
         else dispatchAlert(mA, res, hash);
@@ -1341,44 +1234,29 @@ void cleanupOldAlerts() {
 }
 
 std::mutex g_lastViewMutex;
-// История экранов, а не один последний. С одной ячейкой "назад" возвращало
-// туда же, откуда пришли: вход на экран затирал её собственным адресом, и
-// кнопка выглядела неработающей. Глубина ограничена - меню неглубокое, а
-// бесконечная история просто копила бы память.
 std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
 constexpr size_t VIEW_STACK_MAX = 12;
 
 void rememberView(const std::string& chatId, const std::string& data) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto& st = g_viewStack[chatId];
-    // Повторный вход на тот же экран истории не добавляет - иначе "назад"
-    // пришлось бы нажимать дважды подряд на одном и том же месте.
     if (!st.empty() && st.back() == data) return;
     st.push_back(data);
     if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
 }
 
-// Текущий экран - вершина стека. Нужен там, где после действия надо показать
-// то же место, а не уйти назад: добавили кошелёк - остались в списке.
 std::string getLastView(const std::string& chatId) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto it = g_viewStack.find(chatId);
     return (it == g_viewStack.end() || it->second.empty()) ? "" : it->second.back();
 }
 
-// Достаёт ПРЕДЫДУЩИЙ экран и снимает текущий: тот, на котором стоим, для
-// возврата не годится.
 std::string popPreviousView(const std::string& chatId) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto it = g_viewStack.find(chatId);
     if (it == g_viewStack.end() || it->second.size() < 2) return "";
     it->second.pop_back();
     return it->second.back();
-}
-
-void clearViewStack(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(g_lastViewMutex);
-    g_viewStack.erase(chatId);
 }
 
 void handleCallbackQuery(const json& callbackQuery);
@@ -1391,7 +1269,6 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
     if (action == "menu") {
         if (param == "my_wallets") return TelegramUI::buildWalletsList(chatId);
         if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), langFromCode(getUserLanguage(chatId)));
-        // Развилка площадок: спот на BSC или перпы Hyperliquid.
         if (param == "toptrader") { auto r = buildVenueMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "toptrader_spot") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
@@ -1479,8 +1356,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
         else if (param == "add_wallet") {
-            // Экран обязан попасть в историю наравне с остальными: без этого
-            // "Отмена" снимала предыдущий экран и уводила на два шага назад.
             rememberView(chatId, data);
             startAddWalletFlow(chatId, messageId);
         }
@@ -1539,8 +1414,6 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "back") {
-        // Шаг назад по истории. Если истории нет - главное меню как запасной
-        // выход: оставить человека на экране без работающей кнопки нельзя.
         g_sessionManager.clearSession(chatId);
         if (!navigateBack(chatId, messageId)) {
             auto msg = TelegramUI::buildMainMenu(chatId);
@@ -1556,9 +1429,6 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "lang") {
-        // Список обязан совпадать с LANGUAGES в buildLanguagesMenu: кнопка
-        // рисуется по одному перечню, а принимается по этому. Разойдутся -
-        // кнопка будет видна и не будет работать, молча, без единой ошибки.
         static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
@@ -1570,8 +1440,6 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "premium_buy") {
 
         if (!sendPremiumInvoice(chatId)) {
-            // Возвращаем страницу премиума под сообщением об ошибке: иначе
-            // пользователь остаётся с голым текстом без единой кнопки.
             Lang lang = langFromCode(getUserLanguage(chatId));
             auto page = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId,
@@ -1643,15 +1511,6 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
     return false;
 }
 
-// Отдельный поток сброса алертов - не зависит от того, чем занят главный цикл
-// обработки блоков. Раньше flushPendingAlerts вызывался только ПОСЛЕ полного
-// прохода цикла "while (lb<lat)", поэтому при отставании (лаг RPC, пачка блоков)
-// бот "деньги мял" по несколько минут молча, а потом высыпал всё одной лавиной.
-// Обслуживание БД (WAL-чекпойнт + чистка старых processed_tx) в отдельном потоке -
-// раньше это делалось внутри цикла обработки блоков раз в N блоков, и любое
-// изменение скорости сети (как хардфорк Fermi, ускоривший блок в ~7 раз) сразу
-// меняло частоту стоп-мир пауз. Теперь обслуживание полностью на таймере,
-// не зависит от того, сколько блоков успели обработать.
 void dbMaintenanceLoop() {
     auto lastTruncate = std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
@@ -1815,9 +1674,6 @@ void telegramLoop() {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
                         } else {
-                            // Массовая заливка кошельков на СЕРВИСНЫЙ аккаунт.
-                            // Адреса выбираем из текста регуляркой, поэтому годится
-                            // список через запятую, пробел или с новой строки.
                             std::vector<std::string> found;
                             {
                                 std::string s = toLower(txt);
@@ -1842,7 +1698,6 @@ void telegramLoop() {
                                         default:                                  ++failed; break;
                                     }
                                 }
-                                // Один раз в конце, а не после каждого кошелька.
                                 refreshWatchers();
                                 std::stringstream rep;
                                 rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
@@ -1899,7 +1754,6 @@ int main() {
     {
         const char* chainEnv = std::getenv("WHALE_CHAIN");
         std::string chainName = chainEnv ? toLower(std::string(chainEnv)) : "bsc";
-        // Вся настройка сети - в одном месте: и торговый конфиг, и её узлы.
         ChainContext cfg;
         if (!chainConfigByName(chainName, cfg)) {
             std::cerr << "[FATAL] Unknown WHALE_CHAIN: " << chainName << std::endl; return 1;
@@ -1909,7 +1763,6 @@ int main() {
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
                   << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
     }
-    // Слой запросов сообщает о сбоях сюда - сам он про статистику не знает.
     setRpcFailureHandler([]{
         g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
         g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
@@ -1921,8 +1774,6 @@ int main() {
     loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
-    // Перпы: своя база и два своих потока. Сбой инициализации не должен ронять
-    // бота - спотовая часть от перпов не зависит и работает без них.
     if (!initHyperliquid()) {
         std::cerr << "[STARTUP] Hyperliquid init failed - perps DISABLED for this run" << std::endl;
     } else {
