@@ -20,8 +20,6 @@ bool liftPermanentBan(const std::string& wallet);
 
 void rankingCacheLoop();
 
-std::string resolveTokenArg(const std::string& arg);
-
 struct RankingMessage {
     std::string text;
     std::string keyboard;
@@ -34,21 +32,6 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page);
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out);
-std::string globalRankKindToString(GlobalRankKind k);
-
-struct TraderStats {
-    int rank = 0;
-    long long pnlNanos = 0;
-    double roiPercent = 0.0;
-    int winRatePercent = 0;
-    int trades = 0;
-    long long lastTs = 0;
-    long long avgHoldSeconds = 0;
-};
-
-std::string formatHoldTime(long long seconds, Lang lang);
-
-bool getTraderStats(const std::string& wallet, TraderStats& out);
 
 std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
