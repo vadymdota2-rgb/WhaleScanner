@@ -344,12 +344,10 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
     json kb;
     kb["inline_keyboard"] = json::array();
+    // Ссылки на обозреватель нет: раздел работает по любому адресу, в том числе
+    // чужому, и увод из бота посреди разведки только мешает.
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", "\U0001F50D " + chainCtx().explorerName},
-         {"url", chainCtx().explorerUrl + "/address/" + address}}
-    }));
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
     return {text.str(), kb.dump()};
 }
@@ -435,7 +433,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {text.str(), keyboard.dump()};
