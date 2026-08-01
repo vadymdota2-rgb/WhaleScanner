@@ -619,14 +619,19 @@ std::string dirKey(const std::string& dir) {
     if (dir.find("Close Short") != std::string::npos) return "hl_close_short";
     if (dir.find("Long > Short") != std::string::npos ||
         dir.find("Short > Long") != std::string::npos) return "hl_flip";
-    if (dir.find("Liquidat")    != std::string::npos) return "hl_liquidated";
+    if (dir.find("Liquidat") != std::string::npos) {
+        if (dir.find("Long")  != std::string::npos) return "hl_liq_long";
+        if (dir.find("Short") != std::string::npos) return "hl_liq_short";
+        return "hl_liquidated";
+    }
     return "hl_trade";
 }
 
 std::string dirEmoji(const std::string& key) {
     if (key == "hl_open_long" || key == "hl_close_short") return "\U0001F7E2";
     if (key == "hl_close_long" || key == "hl_open_short") return "\U0001F534";
-    if (key == "hl_liquidated") return "\U0001F4A5";
+    if (key == "hl_liquidated" || key == "hl_liq_long" || key == "hl_liq_short")
+        return "\U0001F4A5";
     return "\u26A1";
 }
 
