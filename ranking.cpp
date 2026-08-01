@@ -1037,42 +1037,6 @@ RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
     return buildTokenRankingFromCache(token, page, lang);
 }
 
-bool getTraderStats(const std::string& walletArg, TraderStats& out) {
-    const std::string wallet = toLower(walletArg);
-    out = TraderStats{};
-    std::string payload;
-    if (loadCachedPayload("global_pnl", payload)) {
-        std::vector<PnlRow> rows;
-        if (rowsFromJson(payload, rows)) {
-            for (size_t i = 0; i < rows.size(); i++) {
-                if (toLower(rows[i].wallet) == wallet) {
-                    out.rank = static_cast<int>(i) + 1;
-                    out.pnlNanos = rows[i].pnlNanos;
-                    out.roiPercent = rows[i].roiPercent;
-                    out.winRatePercent = rows[i].winRatePercent;
-                    out.trades = rows[i].completedTrades;
-                    out.avgHoldSeconds = rows[i].avgHoldSeconds;
-                    break;
-                }
-            }
-        }
-    }
-    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
-    std::unique_lock<std::mutex> readLock, writeLock;
-    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
-    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
-    sqlite3_stmt* s;
-    if (prepareOrLog(rdb, &s, "SELECT MAX(timestamp), COUNT(*) FROM trades WHERE wallet=?")) {
-        sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(s) == SQLITE_ROW) {
-            out.lastTs = sqlite3_column_int64(s, 0);
-            if (out.trades == 0) out.trades = sqlite3_column_int(s, 1);
-        }
-        sqlite3_finalize(s);
-    }
-    return out.rank > 0 || out.lastTs > 0;
-}
-
 RankingMessage buildGlobalTopMenu(const std::string& chatId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     json keyboard;
