@@ -148,11 +148,6 @@ const std::unordered_map<std::string, Entry>& table() {
         {"rk_top_pnl_30d", {"Top PnL (30D)", "Топ по PnL (30д)"}},
         {"rk_top_traders_30d", {"Top Traders (30D)", "Топ трейдеров (30д)"}},
         {"rk_top_roi_30d", {"Top ROI (30D)", "Топ по ROI (30д)"}},
-        // Спот и перпы считают доходность по-разному, поэтому подписи разные.
-        // На споте это средняя доходность ОДНОЙ сделки: прибыль делится на
-        // затраты, и обе величины растут вместе, сколько бы раз кит ни
-        // прокручивал один и тот же капитал. Просто "ROI" читают как результат
-        // за месяц, а это не он.
         {"rk_roi_per_trade", {"ROI per trade", "ROI за сделку"}},
         {"rk_top_winrate_30d", {"Top Win Rate (30D)", "Топ по винрейту (30д)"}},
         {"rk_most_active_30d", {"Most Active (30D)", "Самые активные (30д)"}},
@@ -183,23 +178,20 @@ const std::unordered_map<std::string, Entry>& table() {
                         "⏳ Этот рейтинг устарел. Пожалуйста, найдите токен заново через меню."}},
 
         {"help_title", {"❓ <b>Help</b>", "❓ <b>Помощь</b>"}},
-        {"help_intro", {"🏆 Discover top on-chain traders, track wallets, and receive real-time trading alerts across supported networks.",
-                        "🏆 Находите лучших ончейн-трейдеров, отслеживайте кошельки и получайте уведомления о сделках в реальном времени на поддерживаемых сетях."}},
+        {"help_intro", {"🏆 See what large wallets buy and sell — BSC spot swaps and Hyperliquid perpetual futures.",
+                        "🏆 Смотрите, что покупают и продают крупные кошельки — спот на BSC и бессрочные фьючерсы Hyperliquid."}},
         {"help_commands", {"<b>Use the menu buttons to:</b>", "<b>Используйте кнопки меню, чтобы:</b>"}},
         {"help_menu_add", {"➕ Add Wallet — track a new wallet", "➕ Добавить кошелёк — начать отслеживание"}},
-        {"help_menu_mywallets", {"💼 My Wallets — view and manage your tracked wallets", "💼 Мои кошельки — просмотр и управление отслеживаемыми кошельками"}},
+        {"help_menu_mywallets", {"👤 My Account — view and manage your tracked wallets", "👤 Мой аккаунт — просмотр и управление отслеживаемыми кошельками"}},
         {"help_menu_threshold", {"💰 Alert Threshold — set the minimum alert amount", "💰 Порог алертов — задать минимальную сумму алерта"}},
-        {"help_menu_top", {"🏆 Top Traders — browse top-performing wallets", "🏆 Топ трейдеров — лучшие по доходности кошельки"}},
+        {"help_menu_top", {"🏆 Top Traders — wallet rankings by 30-day results, spot and futures", "🏆 Топ трейдеров — рейтинг кошельков по результатам за 30 дней, спот и фьючерсы"}},
         {"help_menu_premium", {"⭐ Premium — view Premium plans", "⭐ Премиум — тарифы Премиум"}},
         {"help_menu_languages", {"🌐 Languages — change language", "🌐 Язык — сменить язык"}},
         {"help_premium_title", {"⭐ <b>Premium</b>", "⭐ <b>Премиум</b>"}},
-        {"help_premium_1", {"• Full access to Top 100 Traders", "• Полный доступ к Топ-100 трейдеров"}},
-        {"help_premium_2", {"• Track up to 50 wallets", "• Отслеживание до 50 кошельков"}},
-        {"help_premium_3", {"• Advanced features", "• Расширенные функции"}},
-        {"help_premium_4", {"• Priority access to new updates", "• Приоритетный доступ к новым функциям"}},
-        // Формулировка держится на том, чем бот и является: он показывает
-        // произошедшее, а не предсказывает будущее. Отдельно названо плечо -
-        // именно на нём теряют деньги, повторяя за китами.
+        {"help_premium_1", {"• Hyperliquid futures: ranking and alerts with leverage, collateral and liquidation price", "• Фьючерсы Hyperliquid: рейтинг и алерты с плечом, залогом и ценой ликвидации"}},
+        {"help_premium_2", {"• Track up to 50 wallets instead of 1", "• Отслеживание до 50 кошельков вместо одного"}},
+        {"help_premium_3", {"• Full Top 100 traders (Top 30 is free)", "• Полный Топ-100 трейдеров (Топ-30 бесплатно)"}},
+        {"help_premium_4", {"• Priority alert delivery", "• Приоритетная доставка алертов"}},
         {"help_disclaimer", {"⚠️ <b>Disclaimer</b>\n"
                              "The bot shows on-chain transactions that have already happened. "
                              "It is an information service, not investment advice and not a recommendation to trade. "
@@ -284,7 +276,6 @@ const std::unordered_map<std::string, Entry>& table() {
         {"err_name_too_long", {"❌ Name is too long (max 32 characters).\n\nPlease enter a shorter name or press Cancel.",
                                "❌ Имя слишком длинное (макс. 32 символа).\n\nВведите более короткое имя или нажмите Отмена."}},
 
-        // --- Перпетуалы Hyperliquid ---
         {"hl_open_long",   {"OPENED LONG",   "ОТКРЫЛ ЛОНГ"}},
         {"hl_close_long",  {"CLOSED LONG",   "ЗАКРЫЛ ЛОНГ"}},
         {"hl_open_short",  {"OPENED SHORT",  "ОТКРЫЛ ШОРТ"}},
@@ -292,17 +283,11 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_flip",        {"FLIPPED",       "РАЗВЕРНУЛ ПОЗИЦИЮ"}},
         {"hl_liquidated",  {"LIQUIDATED",    "ЛИКВИДИРОВАН"}},
         {"hl_trade",       {"PERP TRADE",    "СДЕЛКА ПО ПЕРПАМ"}},
-        // Размер позиции и сумма под риском - разные числа: при 20x сделка на
-        // $100 000 стоит киту $5 000 своих. Названия должны это разводить.
-        // Три разных числа, которые легко перепутать: сколько наторговал в этой
-        // сделке, какова вся позиция и сколько под неё заложено.
         {"hl_trade_size",    {"Trade size",     "Размер сделки"}},
         {"hl_position_size", {"Position size",  "Размер позиции"}},
         {"hl_collateral",    {"Collateral",     "Залог позиции"}},
         {"hl_of_account",    {"of account",     "счёта"}},
         {"hl_position_closed", {"Position fully closed", "Позиция закрыта полностью"}},
-        // Появляется только когда сообщение покрывает несколько сделок: иначе
-        // сумма и средняя цена читались бы как параметры одной операции.
         {"hl_fills_in_series", {"Trades in this series", "Сделок в серии"}},
         {"hl_leverage",    {"Leverage",      "Плечо"}},
         {"hl_cross",       {"cross",         "кросс"}},
@@ -312,31 +297,22 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_pnl",         {"Realized PnL",  "Прибыль по сделке"}},
         {"hl_liq",         {"Liquidation",   "Ликвидация"}},
         {"hl_account",     {"Account value", "Размер счёта"}},
-        {"hl_venue",       {"Venue",         "Площадка"}},
+        {"hl_venue",       {"Network",       "Сеть"}},
 
-        // --- Рейтинг перпов ---
         {"hl_venue_title",  {"Top traders", "Топ трейдеров"}},
-        {"hl_venue_choose", {"Choose where to look:\n<i>BSC spot swaps or Hyperliquid perpetual futures</i>",
-                             "Выберите площадку:\n<i>Спот на BSC или бессрочные фьючерсы Hyperliquid</i>"}},
-        // Цветные кружки под цвет брендов: жёлтый у BNB, синий у Hyperliquid.
-        // Логотипы в кнопках Telegram невозможны - там только текст и эмодзи.
+        {"hl_venue_choose", {"Choose a network — BSC spot or Hyperliquid perpetual futures",
+                             "Выберите сеть — спот на BSC или бессрочные фьючерсы Hyperliquid"}},
         {"hl_venue_spot",   {"🟡 BSC — Spot", "🟡 BSC — Спот"}},
         {"hl_venue_perp",   {"🔵 Hyperliquid — Futures", "🔵 Hyperliquid — Фьючерсы"}},
         {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
-        // Текст стены. Перечисляем то, чего нет в спотовой части, - иначе
-        // непонятно, за что платить.
         {"hl_locked_body",  {"Perpetual futures are available with Premium.\n\n"
                              "You get leverage, collateral and liquidation price on every trade, "
                              "realized PnL straight from the exchange, and the 30-day trader ranking.",
                              "Фьючерсы доступны по подписке.\n\n"
                              "Вы получаете плечо, залог и цену ликвидации по каждой сделке, "
                              "готовую прибыль от биржи и рейтинг трейдеров за 30 дней."}},
-        // Перповый аналог "среднего удержания" у спота: у перпов манеру
-        // торговли определяет плечо, а не время в позиции.
         {"hl_rk_leverage",  {"Avg leverage", "Среднее плечо"}},
-        // На перпах доходность считается к депозиту - это рост счёта за месяц,
-        // а не результат одной сделки. Подпись обязана это различать.
         {"hl_rk_roi_account", {"ROI on deposit", "ROI к депозиту"}},
         {"hl_rk_empty",     {"No data yet — the ranking needs at least 5 closed trades per wallet over 30 days.",
                              "Пока нет данных — в рейтинг попадают кошельки минимум с 5 закрытыми сделками за 30 дней."}},
@@ -346,8 +322,6 @@ const std::unordered_map<std::string, Entry>& table() {
 }
 
 namespace {
-// Единственное место, где перечислены внешние языки. Добавить следующий -
-// одна строка здесь и один новый файл; трогать tr() больше не придётся.
 const char* external(Lang lang, const std::string& key) {
     switch (lang) {
         case Lang::ES: return trEs(key);
@@ -364,9 +338,6 @@ std::string tr(Lang lang, const std::string& key) {
     auto it = table().find(key);
     if (it == table().end()) return key;
     if (lang == Lang::RU) return it->second.ru;
-    // Языки из отдельных файлов: нет перевода - показываем английский, а не
-    // пустую строку и не голый ключ. Неполный перевод должен выглядеть как
-    // смесь языков, а не как поломка.
     if (const char* v = external(lang, key)) return v;
     return it->second.en;
 }
