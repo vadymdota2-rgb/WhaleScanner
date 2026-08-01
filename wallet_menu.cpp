@@ -31,18 +31,6 @@ std::map<std::string, int> g_lastWalletPage;
 
 namespace {
 std::mutex g_holdPageMutex;
-std::map<std::string, int> g_lastHoldPage;
-}
-
-void rememberHoldPage(const std::string& chatId, int page) {
-    std::lock_guard<std::mutex> l(g_holdPageMutex);
-    g_lastHoldPage[chatId] = page < 1 ? 1 : page;
-}
-
-int lastHoldPage(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(g_holdPageMutex);
-    auto it = g_lastHoldPage.find(chatId);
-    return it != g_lastHoldPage.end() ? it->second : 1;
 }
 
 void rememberWalletPage(const std::string& chatId, int page) {
@@ -89,8 +77,6 @@ std::string fmtUsdNanos(const cpp_int& nanos) {
 }
 
 // Форматирование вынесено в utils - одна реализация на весь проект.
-std::string fmtPnlSigned(long long pnlNanos) { return formatUsdNanosSigned(pnlNanos); }
-std::string fmtPctSigned(double p)            { return formatPercent(p, true); }
 
 // ========================= Операции хранилища ==========================
 
@@ -108,7 +94,6 @@ size_t countUserWhales(const std::string& chatId) {
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
-
 
 void untrackWalletFromService(const std::string& wallet) {
     bool removed = false;
@@ -229,7 +214,6 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     return removed;
 }
 
-
 // ================================ Меню =================================
 
 namespace TelegramUI {
@@ -258,70 +242,6 @@ UIMessage buildAccountMenu(const std::string& chatId) {
 }
 
 // Список кошельков для выбора: у каждого своя кнопка "информация".
-UIMessage buildHoldWalletList(const std::string& chatId, int page) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    json kb;
-    kb["inline_keyboard"] = json::array();
-
-    std::vector<std::pair<std::string, std::string>> wallets; // адрес, имя
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (prepareOrLog(db, &s,
-            "SELECT wa.address, uw.label FROM user_whales uw "
-            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
-            sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-            while (sqlite3_step(s) == SQLITE_ROW)
-                wallets.emplace_back(safeColumnText(s, 0), safeColumnText(s, 1));
-            sqlite3_finalize(s);
-        }
-    }
-
-    constexpr int PER_PAGE = 5;
-    const int total = static_cast<int>(wallets.size());
-    const int totalPages = total > 0 ? (total + PER_PAGE - 1) / PER_PAGE : 1;
-    if (page < 1) page = 1;
-    if (page > totalPages) page = totalPages;
-    const int startIdx = (page - 1) * PER_PAGE;
-    const int endIdx = std::min(startIdx + PER_PAGE, total);
-
-    std::stringstream text;
-    rememberHoldPage(chatId, page);
-    text << tr(lang, "hold_title");
-    if (totalPages > 1) text << " (" << page << "/" << totalPages << ")";
-    text << "\n\n";
-
-    if (wallets.empty()) {
-        text << tr(lang, "mw_no_wallets") << "\n\n" << tr(lang, "mw_tap_add");
-    } else {
-        text << tr(lang, "hold_choose");
-        for (int i = startIdx; i < endIdx; ++i) {
-            const auto& [addr, label] = wallets[i];
-            std::string name = (toLower(label) == toLower(addr)) ? shortAddress(addr) : label;
-            kb["inline_keyboard"].push_back(json::array({
-                {{"text", "\U0001F4BC " + safeString(name, 28)}, {"callback_data", "hold_info:" + addr}}
-            }));
-        }
-    }
-
-    if (totalPages > 1) {
-        json nav = json::array();
-        if (page > 1)
-            nav.push_back({{"text", "\u2039"}, {"callback_data", "hold_page:" + std::to_string(page - 1)}});
-        nav.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)},
-                       {"callback_data", "hold_noop"}});
-        if (page < totalPages)
-            nav.push_back({{"text", "\u203A"}, {"callback_data", "hold_page:" + std::to_string(page + 1)}});
-        kb["inline_keyboard"].push_back(nav);
-    }
-
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:account"}}
-    }));
-    return {text.str(), kb.dump()};
-}
-
 // Карточка холда: нативный баланс + монеты дороже порога пыли.
 // Список токенов берём из wallet_tokens (что кошелёк торговал при нас) -
 // в блокчейне нет запроса "все токены адреса", поэтому иначе никак.
@@ -429,8 +349,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
          {"url", chainCtx().explorerUrl + "/address/" + address}}
     }));
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")},
-         {"callback_data", "hold_page:" + std::to_string(lastHoldPage(chatId))}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
     return {text.str(), kb.dump()};
 }
@@ -484,21 +403,11 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
-        TraderStats ts;
-        bool hasStats = getTraderStats(address, ts);
-        if (hasStats && ts.rank > 0) text << "🏆 <b>#" << ts.rank << "</b>" << status << "\n";
-        else text << "🏆 —" << status << "\n";
-        text << "👤 <b>" << shownLabel << "</b>\n";
-        if (hasStats && ts.rank > 0) {
-            text << "💰 " << fmtPnlSigned(ts.pnlNanos)
-                 << " | 📈 " << fmtPctSigned(ts.roiPercent)
-                 << " | 🎯 " << ts.winRatePercent << "%\n";
-        }
+        text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
         text << "<code>" << safeString(address, 42) << "</code>\n\n";
 
         json row;
-        row.push_back({{"text", "📊 " + shortAddress(address)}, {"callback_data", "wstats:" + address}});
-        row.push_back({{"text", "✏️"}, {"callback_data", "rename:" + address}});
+        row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
     }
@@ -572,54 +481,6 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         try { page = std::stoi(param); } catch (...) {}
         auto msg = TelegramUI::buildWalletsList(chatId, page);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "wstats") {
-        rememberView(chatId, data);
-        Lang lang = langFromCode(getUserLanguage(chatId));
-        std::string address = toLower(param);
-        std::string wlabel = address;
-        {
-            std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-            if (prepareOrLog(db,&s,"SELECT uw.label FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? AND wa.address=?")) {
-                sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-                sqlite3_bind_text(s,2,address.c_str(),-1,SQLITE_TRANSIENT);
-                if (sqlite3_step(s)==SQLITE_ROW) wlabel = safeColumnText(s,0);
-                sqlite3_finalize(s);
-            }
-        }
-        TraderStats ts;
-        bool hasStats = getTraderStats(address, ts);
-        std::stringstream card;
-        card << tr(lang, "ws_title") << "\n\n";
-        if (hasStats && ts.rank > 0) card << "🏆 " << tr(lang, "ws_rank") << ": <b>#" << ts.rank << "</b>\n";
-        else card << "🏆 " << tr(lang, "ws_rank") << ": <b>—</b> " << tr(lang, "ws_not_in_ranking") << "\n";
-        card << "👤 <b>" << safeString(wlabel, 32) << "</b>\n";
-        if (hasStats && ts.rank > 0) {
-            card << "💰 PnL: <b>" << fmtPnlSigned(ts.pnlNanos) << "</b>\n";
-            card << "📈 ROI: <b>" << fmtPctSigned(ts.roiPercent) << "</b>\n";
-            card << "🎯 " << tr(lang, "ws_winrate") << ": <b>" << ts.winRatePercent << "%</b>\n";
-        }
-        card << "🔄 " << tr(lang, "ws_trades_30d") << ": <b>" << ts.trades << "</b>\n";
-        if (ts.avgHoldSeconds > 0)
-            card << "⏳ " << tr(lang, "rk_avg_hold") << ": <b>" << formatHoldTime(ts.avgHoldSeconds, lang) << "</b>\n";
-        if (ts.lastTs > 0) {
-            time_t t = static_cast<time_t>(ts.lastTs);
-            char buf[32];
-            strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M UTC", gmtime(&t));
-            card << "📅 " << tr(lang, "ws_last_trade") << ": <b>" << buf << "</b>\n";
-        } else {
-            card << "📅 " << tr(lang, "ws_last_trade") << ": <b>—</b>\n";
-        }
-        card << "\n<code>" << safeString(address, 42) << "</code>";
-        json kb;
-        kb["inline_keyboard"] = json::array();
-        kb["inline_keyboard"].push_back(json::array({
-            {{"text", "🔗 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + address}}
-        }));
-        kb["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "back_button")}, {"callback_data", backToWalletsData(chatId)}}
-        }));
-        replyInPlace(chatId, messageId, card.str(), kb.dump());
     }
     else if (action == "rename") {
         std::string address = toLower(param);
