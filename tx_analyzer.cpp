@@ -346,24 +346,13 @@ bool flowLinkedToPool(
     return reachesAny(graph, token, wallet, pools);
 }
 
-// Текущая сеть. Стартовое значение задаёт main.cpp через setChainContext;
-// до этого - пустая конфигурация, чтобы анализатор не зависел от chains.
-// Текущая сеть. Стартовое значение задаёт main.cpp через setChainContext;
-// до этого - пустая конфигурация, чтобы анализатор не зависел от chains.
 ChainContext g_chain;
 const ChainContext& chainCtx() { return g_chain; }
 void setChainContext(const ChainContext& ctx) { g_chain = ctx; }
 
-
-// Оценка сделки по ВСТРЕЧНОМУ активу. Если на другой стороне стейблкоин или
-// обёрнутый нативный токен, сумма известна из самой транзакции - это точное
-// число, не зависящее ни от свежести котировок, ни от выбора пула. Оценка
-// через цену покупаемого токена остаётся запасным путём.
-// Возвращает 0, если встречный актив не годится для оценки.
 cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& counterAmount) {
     if (counterAddr.empty() || counterAmount <= 0) return 0;
 
-    // Нативный актив (BNB/ETH) и его обёрнутая форма: цена ликвидная и надёжная.
     const bool isNative = (counterAddr == g_chain.nativeMarker) ||
                           (!g_chain.wrappedNative.empty() && counterAddr == g_chain.wrappedNative);
     if (isNative) {
@@ -372,7 +361,6 @@ cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& count
         return calcUsdNanos(counterAmount, 18, np);
     }
 
-    // Стейблкоин: один к одному к доллару, котировка не нужна вовсе.
     if (g_chain.stablecoins.count(counterAddr)) {
         const int dec = getDecimals(counterAddr);
         cpp_int d = 1; for (int k = 0; k < dec; ++k) d *= 10;
@@ -381,8 +369,6 @@ cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& count
     return 0;
 }
 
-// Плата за газ в долларах, из чека транзакции. Это фактический расход
-// трейдера, а не условный процент: в чеке есть и потраченный газ, и его цена.
 cpp_int gasCostUsdNanos(const json& receipt) {
     if (!receipt.is_object()) return 0;
     auto hexField = [&](const char* name) -> cpp_int {
@@ -391,12 +377,11 @@ cpp_int gasCostUsdNanos(const json& receipt) {
     };
     cpp_int used = hexField("gasUsed");
     cpp_int price = hexField("effectiveGasPrice");
-    if (price <= 0) price = hexField("gasPrice");   // старый формат чека
+    if (price <= 0) price = hexField("gasPrice");
     if (used <= 0 || price <= 0) return 0;
 
     uint64_t nativePrice = getPriceNanos(g_chain.wrappedNative);
     if (!nativePrice) return 0;
-    // used * price = плата в wei (18 знаков), переводим в доллары-наносы
     return calcUsdNanos(used * price, 18, nativePrice);
 }
 
@@ -413,7 +398,7 @@ const std::set<std::string> SWAP_EVENT_TOPICS = {
     "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822",
     "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67",
     "0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83",
-    "0x04206ad2b7c0f463bff3dd4f33c5735b0f2957a351e4f79763a4fa9e775dd237", // PancakeSwap Infinity CLPoolManager Swap
+    "0x04206ad2b7c0f463bff3dd4f33c5735b0f2957a351e4f79763a4fa9e775dd237",
 };
 const std::string ERC20_TRANSFER_TOPIC =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -682,20 +667,9 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                     if (!e.from.empty()) perAddr[e.from][token] -= e.amount;
                 }
 
-            // --- Vault-flow attribution ---
-            // Паттерн: кошелёк вызывает контракт-исполнитель (напр. MEV/арбитражный бот,
-            // платящий "Puissant: Payment" за приоритет включения в блок), а реальный
-            // своп проходит через ОДИН выделенный вспомогательный адрес ("vault"),
-            // который сам кошельком не является. Если такой адрес единственный и имеет
-            // явную покупку одного токена за счёт другого - считаем это свопом кошелька,
-            // но помечаем отдельным venue, чтобы не путать с прямыми свопами.
             std::string vaultAddr;
             int vaultCandidates = 0;
             for (const auto& [addr, flows] : perAddr) {
-                // Примечание: txTo НЕ исключается здесь - некоторые боты сами являются
-                // своим settlement-адресом (держат и двигают токены напрямую с адреса,
-                // на который звонит кошелёк), а не делегируют отдельному внутреннему
-                // vault-адресу. Подтверждено реальной транзакцией.
                 if (addr == wallet || addr == "0x0000000000000000000000000000000000000000" ||
                     swapPools.count(addr) || g_chain.knownPoolInfra.count(addr)) continue;
                 bool hasPos = false, hasNeg = false;
@@ -730,19 +704,8 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                             vCounterSet = true; vCounter = token; vCounterAbs = absInt(amt); vCounterRank = candidateRank;
                         }
                     }
-                    // Протокол-агностичная проверка: вместо привязки к известному
-                    // Swap-топику (который есть не у всех DEX - например, у PancakeSwap
-                    // Infinity/singleton-архитектур с хуками свой нестандартный набор
-                    // событий) требуем прямого совпадения контрагента: адрес, которому
-                    // vault отдал один токен, должен быть тем же адресом, от которого
-                    // пришёл другой - это и есть "своп с одним контрагентом" независимо
-                    // от того, какой конкретно DEX за этим стоит.
                     std::set<std::string> outCounterparties, inCounterparties;
                     if (vCounterSet) {
-                        // Направление зависит от BUY/SELL: при покупке vault платит vCounter
-                        // и получает vMainToken; при продаже - наоборот, отдаёт vMainToken
-                        // и получает vCounter. Без этого различия проверка молча не находит
-                        // совпадение для SELL-направления (подтверждено реальной транзакцией).
                         const std::string& outToken = (vMainNet > 0) ? vCounter : vMainToken;
                         const std::string& inToken  = (vMainNet > 0) ? vMainToken : vCounter;
                         auto outIt = graph.find(outToken);
@@ -1053,7 +1016,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (r.venue.empty())
             r.venue = "DEX";
 
-        // Точная оценка предпочтительнее: она из самой сделки, а не из котировки.
         r.usdNanos = usdFromCounterAsset(r.counterAddr, r.counterAmount);
         if (r.usdNanos <= 0) {
             const int dec = getDecimals(r.tokenAddr);
@@ -1119,5 +1081,3 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
 
     return r;
 }
-
-
