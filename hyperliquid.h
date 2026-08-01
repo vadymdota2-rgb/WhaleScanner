@@ -13,6 +13,12 @@ struct HlRecipient {
 };
 std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower);
 
+struct HlUserWallet {
+    std::string address;
+    std::string label;
+};
+std::vector<HlUserWallet> hlUserWallets(const std::string& chatId);
+
 bool initHyperliquid();
 
 void startHyperliquidLoop();
@@ -24,8 +30,10 @@ struct HlMessage {
     std::string keyboard;
 };
 
+HlMessage buildPositionsPicker(const std::string& chatId);
+HlMessage buildWalletPositions(const std::string& chatId, const std::string& address);
+
 HlMessage buildVenueMenu(const std::string& chatId);
-HlMessage buildPerpTopMenu(const std::string& chatId);
 
 bool renderHyperliquidView(const std::string& chatId, const std::string& action,
                            const std::string& param, HlMessage& out);
