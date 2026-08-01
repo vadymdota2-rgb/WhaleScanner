@@ -304,7 +304,6 @@ const std::unordered_map<std::string, Entry>& table() {
                              "Выберите сеть — спот на BSC или бессрочные фьючерсы Hyperliquid"}},
         {"hl_venue_spot",   {"🟡 BSC — Spot", "🟡 BSC — Спот"}},
         {"hl_venue_perp",   {"🔵 Hyperliquid — Futures", "🔵 Hyperliquid — Фьючерсы"}},
-        {"hl_rk_title",     {"top traders, 30 days", "топ трейдеров за 30 дней"}},
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
         {"hl_locked_body",  {"Perpetual futures are available with Premium.\n\n"
                              "You get leverage, collateral and liquidation price on every trade, "
