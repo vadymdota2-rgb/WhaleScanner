@@ -276,6 +276,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_close_short", {"CLOSED SHORT",  "ЗАКРЫЛ ШОРТ"}},
         {"hl_flip",        {"FLIPPED",       "РАЗВЕРНУЛ ПОЗИЦИЮ"}},
         {"hl_liquidated",  {"LIQUIDATED",    "ЛИКВИДИРОВАН"}},
+        {"hl_liq_long",    {"LONG LIQUIDATED",  "ЛОНГ ЛИКВИДИРОВАН"}},
+        {"hl_liq_short",   {"SHORT LIQUIDATED", "ШОРТ ЛИКВИДИРОВАН"}},
         {"hl_trade",       {"PERP TRADE",    "СДЕЛКА ПО ПЕРПАМ"}},
         {"hl_trade_size",    {"Trade size",     "Размер сделки"}},
         {"hl_position_size", {"Position size",  "Размер позиции"}},
