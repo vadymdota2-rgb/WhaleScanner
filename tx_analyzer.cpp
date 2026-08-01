@@ -33,7 +33,14 @@ std::string formatAmount(const cpp_int& raw, int dec) {
     if (dec < 0 || dec > 36) dec = 18;
     if (raw==0) return "0.00"; cpp_int d=1; for (int i=0;i<dec;i++) d*=10;
     std::string ip=(raw/d).convert_to<std::string>(), fp=(raw%d).convert_to<std::string>();
-    while ((int)fp.length()<dec) fp="0"+fp; if (fp.length()>2) fp=fp.substr(0,2); while (fp.length()<2) fp+="0"; return ip+"."+fp;
+    while ((int)fp.length()<dec) fp="0"+fp; if (fp.length()>2) fp=fp.substr(0,2); while (fp.length()<2) fp+="0";
+    std::string grouped; int cnt=0;
+    for (auto it=ip.rbegin(); it!=ip.rend(); ++it) {
+        if (cnt && cnt%3==0 && *it>='0' && *it<='9') grouped.push_back(',');
+        grouped.push_back(*it); cnt++;
+    }
+    std::reverse(grouped.begin(), grouped.end());
+    return grouped+"."+fp;
 }
 cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return 0; cpp_int d=1; for (int i=0;i<dec;i++) d*=10; return (raw*pn)/d; }
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
