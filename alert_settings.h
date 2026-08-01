@@ -17,6 +17,7 @@ UIMessage buildMainMenu(const std::string& chatId);
 std::string buildCancelButton(Lang lang = Lang::EN);
 // Вариант с быстрым переходом в Топ трейдеров - для экрана ввода адреса.
 std::string buildCancelWithTopTraders(Lang lang = Lang::EN);
+std::string buildCancelWithSpotTop(Lang lang = Lang::EN);
 UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos, Lang lang = Lang::EN);
 
 }
