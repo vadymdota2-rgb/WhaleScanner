@@ -2,7 +2,7 @@
 
 #include <string>
 #include "tx_analyzer.h"
-#include "ru.h"   // Lang - для formatHoldTime
+#include "ru.h"
 
 void initRankingDB();
 
@@ -15,11 +15,8 @@ void closeRankingDB();
 
 void cleanupOldTrades();
 
-// Проверка/снятие пожизненного бана в рейтинге (детектор ботов).
 bool isPermanentlyBanned(const std::string& wallet);
 bool liftPermanentBan(const std::string& wallet);
-
-
 
 void rankingCacheLoop();
 
@@ -33,7 +30,6 @@ struct RankingMessage {
 RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page = 1);
 
 RankingMessage buildTopPnlPage(const std::string& chatId, int page);
-
 
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
@@ -50,20 +46,15 @@ struct TraderStats {
     long long avgHoldSeconds = 0;
 };
 
-// Читаемая длительность ("2ч 15м" / "2h 15m") - используется и в рейтинге,
-// и в карточке кошелька, чтобы формат совпадал.
 std::string formatHoldTime(long long seconds, Lang lang);
 
 bool getTraderStats(const std::string& wallet, TraderStats& out);
 
-// --- Сервисы main.cpp, нужные обработчику рейтинга ---
 std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
 size_t countUserWhales(const std::string& chatId);
 extern const std::string SERVICE_CHAT_ID;
 
-// Обработка callback'ов рейтинга: tt_page, tt_track, tt_noop, gt_open,
-// gt_page, gt_token. Возвращает true, если действие распознано.
 bool handleRankingCallback(const std::string& chatId, const std::string& action,
                            const std::string& param, const std::string& data,
                            long long messageId, const std::string& callbackQueryId);
