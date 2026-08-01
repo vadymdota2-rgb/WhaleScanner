@@ -1341,17 +1341,44 @@ void cleanupOldAlerts() {
 }
 
 std::mutex g_lastViewMutex;
-std::unordered_map<std::string, std::string> g_lastView;
+// История экранов, а не один последний. С одной ячейкой "назад" возвращало
+// туда же, откуда пришли: вход на экран затирал её собственным адресом, и
+// кнопка выглядела неработающей. Глубина ограничена - меню неглубокое, а
+// бесконечная история просто копила бы память.
+std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
+constexpr size_t VIEW_STACK_MAX = 12;
 
 void rememberView(const std::string& chatId, const std::string& data) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
-    g_lastView[chatId] = data;
+    auto& st = g_viewStack[chatId];
+    // Повторный вход на тот же экран истории не добавляет - иначе "назад"
+    // пришлось бы нажимать дважды подряд на одном и том же месте.
+    if (!st.empty() && st.back() == data) return;
+    st.push_back(data);
+    if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
 }
 
+// Текущий экран - вершина стека. Нужен там, где после действия надо показать
+// то же место, а не уйти назад: добавили кошелёк - остались в списке.
 std::string getLastView(const std::string& chatId) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
-    auto it = g_lastView.find(chatId);
-    return it != g_lastView.end() ? it->second : "";
+    auto it = g_viewStack.find(chatId);
+    return (it == g_viewStack.end() || it->second.empty()) ? "" : it->second.back();
+}
+
+// Достаёт ПРЕДЫДУЩИЙ экран и снимает текущий: тот, на котором стоим, для
+// возврата не годится.
+std::string popPreviousView(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(g_lastViewMutex);
+    auto it = g_viewStack.find(chatId);
+    if (it == g_viewStack.end() || it->second.size() < 2) return "";
+    it->second.pop_back();
+    return it->second.back();
+}
+
+void clearViewStack(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(g_lastViewMutex);
+    g_viewStack.erase(chatId);
 }
 
 void handleCallbackQuery(const json& callbackQuery);
@@ -1410,7 +1437,7 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
 }
 
 bool navigateBack(const std::string& chatId, long long messageId) {
-    std::string back = getLastView(chatId);
+    std::string back = popPreviousView(chatId);
     if (back.empty()) return false;
     json synthetic;
     synthetic["data"] = back;
@@ -1505,6 +1532,15 @@ void handleCallbackQuery(const json& callbackQuery) {
         else if (param == "help") {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildHelpMessage(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+    }
+    else if (action == "back") {
+        // Шаг назад по истории. Если истории нет - главное меню как запасной
+        // выход: оставить человека на экране без работающей кнопки нельзя.
+        g_sessionManager.clearSession(chatId);
+        if (!navigateBack(chatId, messageId)) {
+            auto msg = TelegramUI::buildMainMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
