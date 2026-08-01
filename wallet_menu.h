@@ -20,8 +20,6 @@ extern const std::string SERVICE_CHAT_ID;
 
 // --- Форматирование, используемое в кошельковых представлениях ---
 std::string shortAddress(const std::string& a);
-std::string fmtPnlSigned(long long pnlNanos);
-std::string fmtPctSigned(double p);
 
 // --- Операции хранилища кошельков ---
 enum class AddWhaleResult { OK, ALREADY_EXISTS, LIMIT_REACHED, BAD_ADDRESS, PERMANENTLY_BANNED, ERROR };
@@ -60,14 +58,13 @@ double getPoolLiquidityUsd(const std::string& token);
 
 namespace TelegramUI {
 UIMessage buildAccountMenu(const std::string& chatId);
-UIMessage buildHoldWalletList(const std::string& chatId, int page = 1);
 UIMessage buildHoldCard(const std::string& chatId, const std::string& address);
 }
 
 // --- Точки входа диспетчеризации ---
 // Запуск диалога добавления кошелька (menu:add_wallet)
 void startAddWalletFlow(const std::string& chatId, long long messageId);
-// Обработка callback'ов: mw_page, wstats, rename, askremove, remove. true = обработано.
+// Обработка callback'ов: mw_page, rename, askremove, remove. true = обработано.
 bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
                           const std::string& data, long long messageId, const std::string& callbackQueryId);
 // Обработка текстовых состояний: AWAITING_WALLET_ADDRESS / AWAITING_WALLET_NAME /
