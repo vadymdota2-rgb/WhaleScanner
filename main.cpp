@@ -1282,6 +1282,13 @@ void rememberView(const std::string& chatId, const std::string& data) {
     if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
 }
 
+// Начать историю заново. /start - это корень: всё, что было до него, к новой
+// навигации отношения не имеет.
+void resetViewStack(const std::string& chatId, const std::string& root) {
+    std::lock_guard<std::mutex> l(g_lastViewMutex);
+    g_viewStack[chatId] = { root };
+}
+
 std::string getLastView(const std::string& chatId) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto it = g_viewStack.find(chatId);
@@ -1626,6 +1633,10 @@ void telegramLoop() {
                             sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
                             ensureUser(cid);
+                            // /start - корень навигации, история начинается заново.
+                            // Без этого стек оставался пустым, и "Назад" со второго
+                            // экрана уводило в главное меню вместо шага назад.
+                            resetViewStack(cid, "menu:main");
                             if (isNewUser) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
@@ -1770,6 +1781,7 @@ void telegramLoop() {
                     }
                     else {
                         sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "unknown_command"));
+                        resetViewStack(cid, "menu:main");
                         auto msg = TelegramUI::buildMainMenu(cid);
                         sendMsg(cid, msg.text, msg.keyboard);
                     }
@@ -1777,6 +1789,7 @@ void telegramLoop() {
                 else if (handleTextInput(cid, txt)) {
                 }
                 else {
+                    resetViewStack(cid, "menu:main");
                     auto msg = TelegramUI::buildMainMenu(cid);
                     sendMsg(cid, msg.text, msg.keyboard);
                 }
