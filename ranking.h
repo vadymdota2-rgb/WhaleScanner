@@ -38,6 +38,8 @@ void rememberView(const std::string& chatId, const std::string& data);
 size_t countUserWhales(const std::string& chatId);
 extern const std::string SERVICE_CHAT_ID;
 
+std::string formatHoldTime(long long seconds, Lang lang);
+
 bool handleRankingCallback(const std::string& chatId, const std::string& action,
                            const std::string& param, const std::string& data,
                            long long messageId, const std::string& callbackQueryId);
