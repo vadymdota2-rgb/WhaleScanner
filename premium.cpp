@@ -30,10 +30,6 @@ const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
-// Тридцать, а не десять: шесть страниц вместо двух, и топ перестаёт выглядеть
-// обрезанным. Стена смещается с "покажите хоть что-то" на "хочу глубже" - это
-// другой мотив к оплате. Поднять до пятидесяти потом можно спокойно, а вот
-// опустить обратно уже нет: отнять привычное дороже, чем не дать сразу.
 constexpr int    FREE_TOP_TRADERS    = 30;
 constexpr int    PREMIUM_TOP_TRADERS = 100;
 
@@ -134,7 +130,6 @@ bool initPremium(const std::string& botToken, const std::string& serviceChatId) 
     }
     return ok;
 }
-
 
 bool isPremium(const std::string& chatId) {
 
@@ -312,7 +307,6 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     return wasAlreadyActive ? PaymentApplyResult::Extended : PaymentApplyResult::Activated;
 }
 
-
 size_t premiumMaxWallets(const std::string& chatId) {
     return isPremium(chatId) ? PREMIUM_MAX_WALLETS : FREE_MAX_WALLETS;
 }
@@ -346,7 +340,11 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
         text << tr(lang, "pr_active_title") << "\n\n"
              << tr(lang, "pr_valid_until_inline") << " <b>" << formatDateDDMMYYYY(expire)
              << "</b> (" << tr(lang, "pr_days_left") << " " << daysLeft << ")\n\n"
-             << tr(lang, "pr_active_benefits");
+             << tr(lang, "pr_includes") << "\n"
+             << tr(lang, "help_premium_1") << "\n"
+             << tr(lang, "help_premium_2") << "\n"
+             << tr(lang, "help_premium_3") << "\n"
+             << tr(lang, "help_premium_4");
 
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
@@ -355,8 +353,10 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
         text << tr(lang, "pr_title") << "\n\n"
              << tr(lang, "pr_unlock") << "\n\n"
              << tr(lang, "pr_includes") << "\n"
-             << tr(lang, "pr_50_wallets") << "\n"
-             << tr(lang, "pr_top100") << "\n\n"
+             << tr(lang, "help_premium_1") << "\n"
+             << tr(lang, "help_premium_2") << "\n"
+             << tr(lang, "help_premium_3") << "\n"
+             << tr(lang, "help_premium_4") << "\n\n"
              << tr(lang, "pr_subscription_label") << " · "
              << tr(lang, "pr_price_label") << " ⭐ " << PREMIUM_PRICE_STARS << " Stars";
 
@@ -514,4 +514,3 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     }
     return true;
 }
-
