@@ -67,11 +67,11 @@ constexpr long long HL_HYPERACTIVE_DEBOUNCE_SEC = 600;
 
 constexpr long long NANOS_PER_UNIT = 1000000000LL;
 
-constexpr long long HL_FILL_TTL_SEC = 45LL * 86400LL;
 constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
 constexpr long long HL_RANK_WINDOW_SEC = 30LL * 86400LL;
+constexpr long long HL_FILL_TTL_SEC = HL_RANK_WINDOW_SEC;
 
 constexpr int HL_MAX_BOT_TRADES = 1000;
 
@@ -1512,14 +1512,14 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
     }));
-    return {"\U0001F535 <b>Hyperliquid \u2014 " + tr(lang, "hl_rk_title") + "</b>\n\n"
+    return {"\U0001F535 <b>Hyperliquid \u2014 " + tr(lang, "rk_top_traders_30d") + "</b>\n\n"
             + tr(lang, "hl_rk_choose"), kb.dump()};
 }
 
 HlMessage buildPerpLocked(const std::string& chatId) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
     std::stringstream t;
-    t << "\U0001F535 <b>Hyperliquid \u2014 " << tr(lang, "hl_rk_title") << "</b>\n";
+    t << "\U0001F535 <b>Hyperliquid \u2014 " << tr(lang, "rk_top_traders_30d") << "</b>\n";
     t << HL_CARD_SEPARATOR << "\n\n";
     t << "\U0001F512 " << tr(lang, "hl_locked_body") << "\n";
 
