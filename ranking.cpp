@@ -17,9 +17,9 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ru.h"
-#include "premium.h"       // isPremium, premiumMaxWallets, premiumTopTradersLimit
-#include "wallet_menu.h"   // isTrackingWallet, TelegramUI::buildCancelButton
-#include "alert_settings.h" // g_sessionManager, replyInPlace, answerCallbackQuery
+#include "premium.h"
+#include "wallet_menu.h"
+#include "alert_settings.h"
 
 std::string getUserLanguage(const std::string& chatId);
 
@@ -193,19 +193,9 @@ int64_t cppIntToClampedI64(const cpp_int& v) {
     return v.convert_to<int64_t>();
 }
 
-// Форматирование вынесено в utils, чтобы одно и то же число выглядело
-// одинаково во всех модулях и правки не приходилось дублировать.
 std::string formatUsdSigned(int64_t usdNanos) { return formatUsdNanosSigned(usdNanos); }
 std::string formatPercentSigned(double pct)   { return formatPercent(pct, true); }
 
-// Метка направления письма. Telegram выбирает направление КАЖДОЙ строки по её
-// первому буквенному символу: строка с арабской подписью встаёт справа, а
-// строка, начинающаяся с "PnL" или с адреса 0x..., - слева. В арабском
-// интерфейсе соседние строки из-за этого разъезжаются.
-//
-// U+200F - символ нулевой ширины, невидимый, но "сильный" справа налево.
-// Поставленный первым, он задаёт направление всей строки явно. Для остальных
-// языков возвращается пустая строка, и ничего не меняется.
 const char* dirMark(Lang lang) {
     return lang == Lang::AR ? "\u200F" : "";
 }
@@ -227,14 +217,8 @@ struct PnlRow {
     double roiPercent = 0.0;
     int winRatePercent = 0;
     int completedTrades = 0;
-    // Среднее время удержания позиции (покупка -> продажа), в секундах.
-    // Показывает стиль трейдера и, главное, реально ли за ним успеть:
-    // скальпера с удержанием в минуты скопировать по алерту невозможно.
     long long avgHoldSeconds = 0;
 };
-
-// "5m", "2h 15m", "3d 4h" - компактно и читаемо в строке рейтинга.
-
 
 std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
     ok = false;
@@ -248,8 +232,6 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
     cpp_int totalCostDeployed = 0;
     int completedTrades = 0;
     int winningTrades = 0;
-    // Взвешенная по количеству сумма времён покупок - позволяет получить
-    // среднюю дату входа так же, как heldCost даёт среднюю себестоимость.
     cpp_int heldTimeWeighted = 0;
     long long totalHoldSeconds = 0;
 
@@ -322,7 +304,6 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
             completedTrades++;
             if (proceedsMatched > costOfMatched) winningTrades++;
 
-            // Средняя дата входа проданной части = взвешенное время / количество.
             cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
             long long held = tradeTs - avgBuyTs.convert_to<long long>();
             if (held > 0) totalHoldSeconds += held;
@@ -354,7 +335,6 @@ std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
 std::mutex g_cacheMutex;
 std::map<std::string, std::string> g_lastTokenByChat;
 std::atomic<bool> g_forceRebuild{false};
-
 
 std::string rowsToJson(const std::vector<PnlRow>& rows) {
     json a = json::array();
@@ -427,7 +407,7 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
 
     const char* const dm = dirMark(lang);
 
-    text << dm << "🏆 <b>" << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
+    text << dm << "🟡 <b>BSC \u2014 " << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
     text << dm << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
     text << dm << "<code>" << safeString(token, 42) << "</code>\n\n";
 
@@ -635,7 +615,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     std::stringstream text;
     const char* const dm = dirMark(lang);
 
-    text << dm << "🏆 <b>" << globalTitle(kind, lang) << "</b>\n\n";
+    text << dm << "🟡 <b>BSC \u2014 " << globalTitle(kind, lang) << "</b>\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -1008,8 +988,6 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
 
     if (blockedNow) {
         g_forceRebuild.store(true, std::memory_order_relaxed);
-        // Вне области действия dbMutex: снятие с отслеживания берёт тот же
-        // мьютекс, и вызов внутри блокировки привёл бы к взаимоблокировке.
         untrackWalletFromService(wallet);
     }
 }
@@ -1119,7 +1097,7 @@ RankingMessage buildGlobalTopMenu(const std::string& chatId) {
         {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
-    return {std::string("🏆 <b>" + tr(lang, "rk_top_traders_30d") + "</b>\n")
+    return {std::string("🟡 <b>BSC \u2014 " + tr(lang, "rk_top_traders_30d") + "</b>\n")
             + "<code>" + MENU_STRETCH + "</code>"
             + "\n" + tr(lang, "rk_choose_ranking"), keyboard.dump()};
 }
@@ -1135,7 +1113,6 @@ RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind
     Lang lang = langFromCode(getUserLanguage(chatId));
     return buildGlobalFromCache(kind, page, maxRank, showUpgrade, lang);
 }
-
 
 void rankingCacheLoop() {
     while (running.load(std::memory_order_relaxed)) {
