@@ -1,34 +1,12 @@
 #include "ru.h"
 #include <unordered_map>
 
-// ==================== Переводы сверх базовых EN/RU ====================
-// Базовые английский и русский лежат в ru.cpp, всё остальное - здесь.
-// Отсутствующий ключ откатывается на английский: tr() получает nullptr и
-// подставляет базовое значение, поэтому неполный перевод выглядит как смесь
-// языков, а не как поломка.
-//
-// Каждая таблица отделена заголовком; чтобы добавить язык, нужно завести
-// таблицу и функцию доступа здесь, дописать значение в enum Lang, а также
-// три места в main.cpp и ru.cpp - перечень кнопок, белый список кодов и
-// распознавание кода языка.
-
 namespace {
 
 using Table = std::unordered_map<std::string, const char*>;
 
-// ============================ Испанский ============================
-// Отдельный файл на язык: добавление следующего не требует правок ни здесь,
-// ни в ru.cpp. Ключа может не быть - tr() тогда покажет английский.
-//
-// Терминология подобрана по тому, как говорят в криптосообществе Латинской
-// Америки и Испании: "wallet" переведено как "billetera" (нейтрально для обоих
-// регионов), а заимствования, ставшие стандартом - trader, long, short, PnL -
-// оставлены как есть. Переводить их значило бы усложнить чтение тем, кто
-// каждый день видит их по-английски на биржах.
-
 const Table& tableEs() {
     static const Table t = {
-        // --- Типы операций в алертах ---
         {"alert_buy", "COMPRA"},
         {"alert_sell", "VENTA"},
         {"alert_transfer", "TRANSFERENCIA"},
@@ -52,7 +30,6 @@ const Table& tableEs() {
         {"alert_wallet", "Billetera"},
         {"alert_transaction", "Transacción"},
 
-        // --- Главное меню ---
         {"menu_title", "🚨 <b>Wallet Tracker</b>"},
         {"menu_add_wallet", "➕ Añadir billetera"},
         {"menu_my_wallets", "💼 Mis billeteras"},
@@ -81,7 +58,6 @@ const Table& tableEs() {
         {"back_button", "← Atrás"},
         {"cancel_button", "❌ Cancelar"},
 
-        // --- Añadir billetera ---
         {"add_wallet_title", "➕ <b>Añadir billetera</b>\n\nEnvía la dirección de la billetera que quieres seguir — formato 0x..., 42 caracteres.\n\n💡 <b>¿No sabes qué billetera añadir?</b>\nLa pestaña 🏆 <b>Mejores traders</b> ordena las billeteras más rentables de los últimos 30 días: elige cualquiera y empieza a seguirla con un toque.\nO pega una dirección desde un explorador de bloques o un servicio de análisis."},
         {"add_wallet_addr_ok", "✅ Dirección aceptada.\n\nAhora escribe un nombre para esta billetera — hasta 32 caracteres (por ejemplo, \"Binance\"):"},
         {"add_wallet_invalid", "❌ Dirección de billetera no válida.\n\nLa dirección debe empezar por 0x y tener 42 caracteres. Escribe una dirección válida o pulsa Cancelar."},
@@ -97,7 +73,6 @@ const Table& tableEs() {
         {"remove_yes", "🗑️ Sí, eliminar"},
         {"toast_wallet_removed", "✅ Billetera eliminada"},
 
-        // --- Umbral de alertas ---
         {"err_invalid_number", "❌ Número no válido."},
         {"err_threshold_positive", "❌ El umbral debe ser positivo."},
         {"err_threshold_too_small", "❌ El umbral mínimo de alerta es $50. Introduce $50 o más."},
@@ -115,12 +90,10 @@ const Table& tableEs() {
         {"threshold_custom_title", "💰 <b>Umbral personalizado</b>\n\nIntroduce el importe mínimo de alerta en USD — desde $50 en adelante (por ejemplo, 7500 o 7500.50):"},
         {"unknown_command", "🤔 Usa el menú de abajo."},
 
-        // --- Idioma ---
         {"lang_title", "🌐 <b>Idioma</b>"},
         {"lang_current", "Idioma actual:"},
         {"lang_choose", "Elige el idioma de las alertas y los menús:"},
 
-        // --- Mis billeteras ---
         {"rk_generating", "⏳ El ranking se está generando.\n\nInténtalo de nuevo en un minuto."},
         {"mw_no_wallets", "Todavía no sigues ninguna billetera."},
         {"mw_tap_add", "Pulsa ➕ <b>Añadir billetera</b> para empezar a seguirla."},
@@ -134,7 +107,6 @@ const Table& tableEs() {
         {"ws_trades_30d", "Operaciones (30D)"},
         {"ws_last_trade", "Última operación"},
 
-        // --- Rankings ---
         {"rk_top_pnl_30d", "Mejor PnL (30D)"},
         {"rk_top_traders_30d", "Mejores traders (30D)"},
         {"rk_top_roi_30d", "Mejor ROI (30D)"},
@@ -165,27 +137,25 @@ const Table& tableEs() {
         {"rk_unknown_token2", "Indica la dirección del contrato directamente, o un símbolo que el bot ya haya visto en alguna operación."},
         {"rk_expired", "⏳ Este ranking ha caducado. Busca el token de nuevo desde el menú."},
 
-        // --- Ayuda ---
         {"help_title", "❓ <b>Ayuda</b>"},
-        {"help_intro", "🏆 Descubre a los mejores traders on-chain, sigue billeteras y recibe alertas de operaciones en tiempo real en las redes admitidas."},
+        {"help_intro", "🏆 Mira lo que compran y venden las grandes billeteras: swaps al contado en BSC y futuros perpetuos en Hyperliquid."},
         {"help_commands", "<b>Usa los botones del menú para:</b>"},
         {"help_menu_add", "➕ Añadir billetera — seguir una billetera nueva"},
-        {"help_menu_mywallets", "💼 Mis billeteras — ver y gestionar las billeteras que sigues"},
+        {"help_menu_mywallets", "👤 Mi cuenta — ver y gestionar las billeteras que sigues"},
         {"help_menu_threshold", "💰 Umbral de alertas — fijar el importe mínimo de alerta"},
-        {"help_menu_top", "🏆 Mejores traders — ver el ranking de billeteras por resultados"},
+        {"help_menu_top", "🏆 Mejores traders — ranking por resultados de 30 días, contado y futuros"},
         {"help_menu_premium", "⭐ Premium — ver los planes Premium"},
         {"help_menu_languages", "🌐 Idioma — cambiar de idioma"},
         {"help_premium_title", "⭐ <b>Premium</b>"},
-        {"help_premium_1", "• Acceso completo al Top 100 de traders"},
-        {"help_premium_2", "• Seguimiento de hasta 50 billeteras"},
-        {"help_premium_3", "• Funciones avanzadas"},
-        {"help_premium_4", "• Acceso prioritario a las novedades"},
+        {"help_premium_1", "• Futuros de Hyperliquid: ranking y alertas con apalancamiento, garantía y precio de liquidación"},
+        {"help_premium_2", "• Seguimiento de hasta 50 billeteras en lugar de 1"},
+        {"help_premium_3", "• Top 100 de traders completo (el Top 30 es gratuito)"},
+        {"help_premium_4", "• Entrega prioritaria de alertas"},
         {"help_disclaimer", "⚠️ <b>Aviso legal</b>\nEl bot muestra transacciones on-chain que ya han ocurrido. Es un servicio de información, no asesoramiento financiero ni una recomendación de inversión. Los resultados pasados de una billetera no predicen los futuros. Operar con apalancamiento puede costarte todo tu depósito. Las decisiones las tomas tú y el riesgo lo asumes tú."},
         {"help_support", "📞 Soporte: @WalletTrackerHelp"},
         {"help_channel", "📢 Canal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Usa el menú principal para acceder rápido a todas las funciones."},
 
-        // --- Premium ---
         {"pr_active_title", "⭐ <b>Premium activo</b>"},
         {"pr_service_account", "Cuenta de servicio — el acceso Premium es permanente."},
         {"pr_valid_until_inline", "Tu suscripción es válida hasta"},
@@ -212,7 +182,6 @@ const Table& tableEs() {
         {"payment_success_activated", "Wallet Tracker Premium se ha activado."},
         {"payment_success_duration", "Válido durante 30 días."},
 
-        // --- Límites y errores ---
         {"limit_50_reached", "⚠️ Has alcanzado el límite de 50 billeteras seguidas."},
         {"already_tracking", "⚠️ Ya estás siguiendo esta billetera."},
         {"toast_already_tracking", "✅ Ya la sigues"},
@@ -239,12 +208,11 @@ const Table& tableEs() {
         {"err_name_empty", "❌ El nombre no puede estar vacío.\n\nIntroduce un nombre o pulsa Cancelar."},
         {"err_name_too_long", "❌ El nombre es demasiado largo (máx. 32 caracteres).\n\nIntroduce un nombre más corto o pulsa Cancelar."},
 
-        // --- Futuros perpetuos de Hyperliquid ---
-        {"hl_open_long", "ABRIÓ LARGO"},
-        {"hl_close_long", "CERRÓ LARGO"},
-        {"hl_open_short", "ABRIÓ CORTO"},
-        {"hl_close_short", "CERRÓ CORTO"},
-        {"hl_flip", "DIO LA VUELTA"},
+        {"hl_open_long", "ABRIÓ LONG"},
+        {"hl_close_long", "CERRÓ LONG"},
+        {"hl_open_short", "ABRIÓ SHORT"},
+        {"hl_close_short", "CERRÓ SHORT"},
+        {"hl_flip", "INVIRTIÓ POSICIÓN"},
         {"hl_liquidated", "LIQUIDADO"},
         {"hl_trade", "OPERACIÓN PERP"},
         {"hl_trade_size", "Tamaño de la operación"},
@@ -261,9 +229,9 @@ const Table& tableEs() {
         {"hl_pnl", "PnL realizado"},
         {"hl_liq", "Liquidación"},
         {"hl_account", "Valor de la cuenta"},
-        {"hl_venue", "Plataforma"},
+        {"hl_venue", "Red"},
         {"hl_venue_title", "Mejores traders"},
-        {"hl_venue_choose", "Elige la plataforma:\n<i>Spot en BSC o futuros perpetuos en Hyperliquid</i>"},
+        {"hl_venue_choose", "Elige una red — spot en BSC o futuros perpetuos en Hyperliquid"},
         {"hl_venue_spot", "🟡 BSC — Spot"},
         {"hl_venue_perp", "🔵 Hyperliquid — Futuros"},
         {"hl_rk_title", "mejores traders, 30 días"},
@@ -276,21 +244,8 @@ const Table& tableEs() {
     return t;
 }
 
-// ========================= Português (Brasil) =========================
-// Отдельный файл на язык - см. lang_es.cpp. Ключа может не быть: tr() тогда
-// покажет английский, а не пустоту.
-//
-// Вариант бразильский, а не европейский: Бразилия - крупнейший рынок Telegram
-// среди португалоязычных и один из крупнейших крипто-рынков мира. Различия
-// заметны в бытовой лексике ("carteira" против "carteira", но "usuário"
-// против "utilizador"), и выбирать надо тот, где аудитория.
-//
-// Устоявшиеся заимствования - trader, long, short, PnL, spot, wrap - оставлены
-// как есть: на биржах они каждый день видны по-английски.
-
 const Table& tablePt() {
     static const Table t = {
-        // --- Tipos de operação nos alertas ---
         {"alert_buy", "COMPRA"},
         {"alert_sell", "VENDA"},
         {"alert_transfer", "TRANSFERÊNCIA"},
@@ -314,7 +269,6 @@ const Table& tablePt() {
         {"alert_wallet", "Carteira"},
         {"alert_transaction", "Transação"},
 
-        // --- Menu principal ---
         {"menu_title", "🚨 <b>Wallet Tracker</b>"},
         {"menu_add_wallet", "➕ Adicionar carteira"},
         {"menu_my_wallets", "💼 Minhas carteiras"},
@@ -343,7 +297,6 @@ const Table& tablePt() {
         {"back_button", "← Voltar"},
         {"cancel_button", "❌ Cancelar"},
 
-        // --- Adicionar carteira ---
         {"add_wallet_title", "➕ <b>Adicionar carteira</b>\n\nEnvie o endereço da carteira que você quer monitorar — formato 0x..., 42 caracteres.\n\n💡 <b>Não sabe qual carteira adicionar?</b>\nA aba 🏆 <b>Melhores traders</b> abaixo lista as carteiras mais lucrativas dos últimos 30 dias: escolha qualquer uma e comece a monitorar com um toque.\nOu cole um endereço de um explorador de blocos ou de um serviço de análise."},
         {"add_wallet_addr_ok", "✅ Endereço aceito.\n\nAgora digite um nome para esta carteira — até 32 caracteres (por exemplo, \"Binance\"):"},
         {"add_wallet_invalid", "❌ Endereço de carteira inválido.\n\nO endereço deve começar com 0x e ter 42 caracteres. Digite um endereço válido ou toque em Cancelar."},
@@ -359,7 +312,6 @@ const Table& tablePt() {
         {"remove_yes", "🗑️ Sim, remover"},
         {"toast_wallet_removed", "✅ Carteira removida"},
 
-        // --- Valor mínimo do alerta ---
         {"err_invalid_number", "❌ Número inválido."},
         {"err_threshold_positive", "❌ O valor mínimo deve ser positivo."},
         {"err_threshold_too_small", "❌ O valor mínimo de alerta é $50. Digite $50 ou mais."},
@@ -377,12 +329,10 @@ const Table& tablePt() {
         {"threshold_custom_title", "💰 <b>Valor personalizado</b>\n\nDigite o valor mínimo do alerta em USD — a partir de $50 (por exemplo, 7500 ou 7500.50):"},
         {"unknown_command", "🤔 Use o menu abaixo."},
 
-        // --- Idioma ---
         {"lang_title", "🌐 <b>Idioma</b>"},
         {"lang_current", "Idioma atual:"},
         {"lang_choose", "Escolha o idioma dos alertas e dos menus:"},
 
-        // --- Minhas carteiras ---
         {"rk_generating", "⏳ O ranking está sendo gerado.\n\nTente novamente em um minuto."},
         {"mw_no_wallets", "Você ainda não monitora nenhuma carteira."},
         {"mw_tap_add", "Toque em ➕ <b>Adicionar carteira</b> para começar."},
@@ -396,7 +346,6 @@ const Table& tablePt() {
         {"ws_trades_30d", "Operações (30D)"},
         {"ws_last_trade", "Última operação"},
 
-        // --- Rankings ---
         {"rk_top_pnl_30d", "Maiores PnL (30D)"},
         {"rk_top_traders_30d", "Melhores traders (30D)"},
         {"rk_top_roi_30d", "Maiores ROI (30D)"},
@@ -427,27 +376,25 @@ const Table& tablePt() {
         {"rk_unknown_token2", "Informe o endereço do contrato diretamente, ou um símbolo que o bot já tenha visto em alguma operação."},
         {"rk_expired", "⏳ Este ranking expirou. Busque o token novamente pelo menu."},
 
-        // --- Ajuda ---
         {"help_title", "❓ <b>Ajuda</b>"},
-        {"help_intro", "🏆 Descubra os melhores traders on-chain, monitore carteiras e receba alertas de operações em tempo real nas redes disponíveis."},
+        {"help_intro", "🏆 Veja o que as grandes carteiras compram e vendem: swaps à vista na BSC e futuros perpétuos na Hyperliquid."},
         {"help_commands", "<b>Use os botões do menu para:</b>"},
         {"help_menu_add", "➕ Adicionar carteira — monitorar uma carteira nova"},
-        {"help_menu_mywallets", "💼 Minhas carteiras — ver e gerenciar as carteiras monitoradas"},
+        {"help_menu_mywallets", "👤 Minha conta — ver e gerenciar as carteiras monitoradas"},
         {"help_menu_threshold", "💰 Valor mínimo do alerta — definir o valor mínimo"},
-        {"help_menu_top", "🏆 Melhores traders — ver o ranking de carteiras por resultado"},
+        {"help_menu_top", "🏆 Melhores traders — ranking por resultado de 30 dias, à vista e futuros"},
         {"help_menu_premium", "⭐ Premium — ver os planos Premium"},
         {"help_menu_languages", "🌐 Idioma — trocar de idioma"},
         {"help_premium_title", "⭐ <b>Premium</b>"},
-        {"help_premium_1", "• Acesso completo ao Top 100 de traders"},
-        {"help_premium_2", "• Monitoramento de até 50 carteiras"},
-        {"help_premium_3", "• Recursos avançados"},
-        {"help_premium_4", "• Acesso prioritário às novidades"},
+        {"help_premium_1", "• Futuros da Hyperliquid: ranking e alertas com alavancagem, margem e preço de liquidação"},
+        {"help_premium_2", "• Monitoramento de até 50 carteiras em vez de 1"},
+        {"help_premium_3", "• Top 100 de traders completo (o Top 30 é gratuito)"},
+        {"help_premium_4", "• Entrega prioritária de alertas"},
         {"help_disclaimer", "⚠️ <b>Aviso</b>\nO bot mostra transações on-chain que já aconteceram. É um serviço de informação, não é recomendação de investimento nem convite a operar. Resultados passados de uma carteira não preveem os futuros. Operar com alavancagem pode custar todo o seu depósito. As decisões são suas e o risco é seu."},
         {"help_support", "📞 Suporte: @WalletTrackerHelp"},
         {"help_channel", "📢 Canal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Use o menu principal para acessar rapidamente todos os recursos."},
 
-        // --- Premium ---
         {"pr_active_title", "⭐ <b>Premium ativo</b>"},
         {"pr_service_account", "Conta de serviço — o acesso Premium é permanente."},
         {"pr_valid_until_inline", "Sua assinatura é válida até"},
@@ -474,7 +421,6 @@ const Table& tablePt() {
         {"payment_success_activated", "O Wallet Tracker Premium foi ativado."},
         {"payment_success_duration", "Válido por 30 dias."},
 
-        // --- Limites e erros ---
         {"limit_50_reached", "⚠️ Você atingiu o limite de 50 carteiras monitoradas."},
         {"already_tracking", "⚠️ Você já monitora esta carteira."},
         {"toast_already_tracking", "✅ Já monitorada"},
@@ -501,11 +447,10 @@ const Table& tablePt() {
         {"err_name_empty", "❌ O nome não pode ficar vazio.\n\nDigite um nome ou toque em Cancelar."},
         {"err_name_too_long", "❌ O nome é longo demais (máx. 32 caracteres).\n\nDigite um nome mais curto ou toque em Cancelar."},
 
-        // --- Futuros perpétuos da Hyperliquid ---
-        {"hl_open_long", "ABRIU COMPRADO"},
-        {"hl_close_long", "ENCERROU COMPRADO"},
-        {"hl_open_short", "ABRIU VENDIDO"},
-        {"hl_close_short", "ENCERROU VENDIDO"},
+        {"hl_open_long", "ABRIU LONG"},
+        {"hl_close_long", "ENCERROU LONG"},
+        {"hl_open_short", "ABRIU SHORT"},
+        {"hl_close_short", "ENCERROU SHORT"},
         {"hl_flip", "INVERTEU A POSIÇÃO"},
         {"hl_liquidated", "LIQUIDADO"},
         {"hl_trade", "OPERAÇÃO PERP"},
@@ -523,9 +468,9 @@ const Table& tablePt() {
         {"hl_pnl", "PnL realizado"},
         {"hl_liq", "Liquidação"},
         {"hl_account", "Valor da conta"},
-        {"hl_venue", "Plataforma"},
+        {"hl_venue", "Rede"},
         {"hl_venue_title", "Melhores traders"},
-        {"hl_venue_choose", "Escolha a plataforma:\n<i>Spot na BSC ou futuros perpétuos na Hyperliquid</i>"},
+        {"hl_venue_choose", "Escolha uma rede — spot na BSC ou futuros perpétuos na Hyperliquid"},
         {"hl_venue_spot", "🟡 BSC — Spot"},
         {"hl_venue_perp", "🔵 Hyperliquid — Futuros"},
         {"hl_rk_title", "melhores traders, 30 dias"},
@@ -538,19 +483,8 @@ const Table& tablePt() {
     return t;
 }
 
-// ============================== Français ==============================
-// Отдельный файл на язык - см. lang_es.cpp. Ключа может не быть: tr() тогда
-// покажет английский, а не пустоту.
-//
-// Две терминологические развилки решены так:
-//   "portefeuille" - кошелёк, а раздел с активами назван "Avoirs". По-французски
-//   портфель тоже "portefeuille", и два разных экрана назывались бы одинаково.
-//   long / short оставлены как есть: во французской крипте их не переводят,
-//   "position longue" звучит по-учебному и длиннее вдвое.
-
 const Table& tableFr() {
     static const Table t = {
-        // --- Types d'opérations dans les alertes ---
         {"alert_buy", "ACHAT"},
         {"alert_sell", "VENTE"},
         {"alert_transfer", "TRANSFERT"},
@@ -574,7 +508,6 @@ const Table& tableFr() {
         {"alert_wallet", "Portefeuille"},
         {"alert_transaction", "Transaction"},
 
-        // --- Menu principal ---
         {"menu_title", "🚨 <b>Wallet Tracker</b>"},
         {"menu_add_wallet", "➕ Ajouter un portefeuille"},
         {"menu_my_wallets", "💼 Mes portefeuilles"},
@@ -603,7 +536,6 @@ const Table& tableFr() {
         {"back_button", "← Retour"},
         {"cancel_button", "❌ Annuler"},
 
-        // --- Ajouter un portefeuille ---
         {"add_wallet_title", "➕ <b>Ajouter un portefeuille</b>\n\nEnvoyez l'adresse du portefeuille que vous souhaitez suivre — format 0x..., 42 caractères.\n\n💡 <b>Vous ne savez pas quel portefeuille ajouter ?</b>\nL'onglet 🏆 <b>Meilleurs traders</b> ci-dessous classe les portefeuilles les plus rentables des 30 derniers jours : choisissez-en un et suivez-le en un appui.\nOu collez une adresse depuis un explorateur de blocs ou un service d'analyse."},
         {"add_wallet_addr_ok", "✅ Adresse acceptée.\n\nSaisissez maintenant un nom pour ce portefeuille — 32 caractères maximum (par exemple, \"Binance\") :"},
         {"add_wallet_invalid", "❌ Adresse de portefeuille invalide.\n\nL'adresse doit commencer par 0x et compter 42 caractères. Saisissez une adresse valide ou appuyez sur Annuler."},
@@ -619,7 +551,6 @@ const Table& tableFr() {
         {"remove_yes", "🗑️ Oui, supprimer"},
         {"toast_wallet_removed", "✅ Portefeuille supprimé"},
 
-        // --- Seuil d'alerte ---
         {"err_invalid_number", "❌ Nombre invalide."},
         {"err_threshold_positive", "❌ Le seuil doit être positif."},
         {"err_threshold_too_small", "❌ Le seuil minimal d'alerte est de 50 $. Saisissez 50 $ ou plus."},
@@ -637,12 +568,10 @@ const Table& tableFr() {
         {"threshold_custom_title", "💰 <b>Seuil personnalisé</b>\n\nSaisissez le montant minimal d'alerte en USD — à partir de 50 $ (par exemple, 7500 ou 7500.50) :"},
         {"unknown_command", "🤔 Utilisez le menu ci-dessous."},
 
-        // --- Langue ---
         {"lang_title", "🌐 <b>Langue</b>"},
         {"lang_current", "Langue actuelle :"},
         {"lang_choose", "Choisissez la langue des alertes et des menus :"},
 
-        // --- Mes portefeuilles ---
         {"rk_generating", "⏳ Le classement est en cours de génération.\n\nRéessayez dans une minute."},
         {"mw_no_wallets", "Vous ne suivez encore aucun portefeuille."},
         {"mw_tap_add", "Appuyez sur ➕ <b>Ajouter un portefeuille</b> pour commencer."},
@@ -656,7 +585,6 @@ const Table& tableFr() {
         {"ws_trades_30d", "Opérations (30J)"},
         {"ws_last_trade", "Dernière opération"},
 
-        // --- Classements ---
         {"rk_top_pnl_30d", "Meilleurs PnL (30J)"},
         {"rk_top_traders_30d", "Meilleurs traders (30J)"},
         {"rk_top_roi_30d", "Meilleurs ROI (30J)"},
@@ -687,27 +615,25 @@ const Table& tableFr() {
         {"rk_unknown_token2", "Indiquez directement l'adresse du contrat, ou un symbole que le bot a déjà vu dans une opération."},
         {"rk_expired", "⏳ Ce classement a expiré. Recherchez le jeton à nouveau depuis le menu."},
 
-        // --- Aide ---
         {"help_title", "❓ <b>Aide</b>"},
-        {"help_intro", "🏆 Découvrez les meilleurs traders on-chain, suivez des portefeuilles et recevez des alertes en temps réel sur les réseaux pris en charge."},
+        {"help_intro", "🏆 Voyez ce que les gros portefeuilles achètent et vendent : swaps au comptant sur BSC et futures perpétuels sur Hyperliquid."},
         {"help_commands", "<b>Utilisez les boutons du menu pour :</b>"},
         {"help_menu_add", "➕ Ajouter un portefeuille — suivre un nouveau portefeuille"},
-        {"help_menu_mywallets", "💼 Mes portefeuilles — consulter et gérer les portefeuilles suivis"},
+        {"help_menu_mywallets", "👤 Mon compte — consulter et gérer les portefeuilles suivis"},
         {"help_menu_threshold", "💰 Seuil d'alerte — définir le montant minimal"},
-        {"help_menu_top", "🏆 Meilleurs traders — voir le classement des portefeuilles par résultat"},
+        {"help_menu_top", "🏆 Meilleurs traders — classement sur 30 jours, comptant et futures"},
         {"help_menu_premium", "⭐ Premium — voir les offres Premium"},
         {"help_menu_languages", "🌐 Langue — changer de langue"},
         {"help_premium_title", "⭐ <b>Premium</b>"},
-        {"help_premium_1", "• Accès complet au Top 100 des traders"},
-        {"help_premium_2", "• Suivi de 50 portefeuilles"},
-        {"help_premium_3", "• Fonctions avancées"},
-        {"help_premium_4", "• Accès prioritaire aux nouveautés"},
+        {"help_premium_1", "• Futures Hyperliquid : classement et alertes avec effet de levier, marge et prix de liquidation"},
+        {"help_premium_2", "• Suivi de 50 portefeuilles au lieu d'un seul"},
+        {"help_premium_3", "• Top 100 des traders complet (le Top 30 est gratuit)"},
+        {"help_premium_4", "• Livraison prioritaire des alertes"},
         {"help_disclaimer", "⚠️ <b>Avertissement</b>\nLe bot affiche des transactions on-chain déjà réalisées. Il s'agit d'un service d'information, non d'un conseil en investissement ni d'une incitation à négocier. Les résultats passés d'un portefeuille ne préjugent pas des résultats futurs. Le trading avec effet de levier peut vous coûter la totalité de votre dépôt. Vous décidez seul et assumez seul le risque."},
         {"help_support", "📞 Assistance : @WalletTrackerHelp"},
         {"help_channel", "📢 Canal : t.me/WalletTrackerOfficial"},
         {"help_footer", "Utilisez le menu principal pour accéder rapidement à toutes les fonctions."},
 
-        // --- Premium ---
         {"pr_active_title", "⭐ <b>Premium actif</b>"},
         {"pr_service_account", "Compte de service — l'accès Premium est permanent."},
         {"pr_valid_until_inline", "Votre abonnement est valable jusqu'au"},
@@ -734,7 +660,6 @@ const Table& tableFr() {
         {"payment_success_activated", "Wallet Tracker Premium a été activé."},
         {"payment_success_duration", "Valable 30 jours."},
 
-        // --- Limites et erreurs ---
         {"limit_50_reached", "⚠️ Vous avez atteint la limite de 50 portefeuilles suivis."},
         {"already_tracking", "⚠️ Vous suivez déjà ce portefeuille."},
         {"toast_already_tracking", "✅ Déjà suivi"},
@@ -761,7 +686,6 @@ const Table& tableFr() {
         {"err_name_empty", "❌ Le nom ne peut pas être vide.\n\nSaisissez un nom ou appuyez sur Annuler."},
         {"err_name_too_long", "❌ Le nom est trop long (32 caractères maximum).\n\nSaisissez un nom plus court ou appuyez sur Annuler."},
 
-        // --- Futures perpétuels Hyperliquid ---
         {"hl_open_long", "LONG OUVERT"},
         {"hl_close_long", "LONG CLÔTURÉ"},
         {"hl_open_short", "SHORT OUVERT"},
@@ -783,9 +707,9 @@ const Table& tableFr() {
         {"hl_pnl", "PnL réalisé"},
         {"hl_liq", "Liquidation"},
         {"hl_account", "Valeur du compte"},
-        {"hl_venue", "Plateforme"},
+        {"hl_venue", "Réseau"},
         {"hl_venue_title", "Meilleurs traders"},
-        {"hl_venue_choose", "Choisissez la plateforme :\n<i>Spot sur BSC ou futures perpétuels sur Hyperliquid</i>"},
+        {"hl_venue_choose", "Choisissez un réseau — spot sur BSC ou futures perpétuels sur Hyperliquid"},
         {"hl_venue_spot", "🟡 BSC — Spot"},
         {"hl_venue_perp", "🔵 Hyperliquid — Futures"},
         {"hl_rk_title", "meilleurs traders, 30 jours"},
@@ -798,21 +722,8 @@ const Table& tableFr() {
     return t;
 }
 
-// ============================== Türkçe ==============================
-// Отдельный файл на язык - см. lang_es.cpp. Ключа может не быть: tr() тогда
-// покажет английский, а не пустоту.
-//
-// Турецкий агглютинативный: смысл достраивается окончаниями, и подставлять
-// слова в готовую фразу нельзя так же свободно, как в европейских языках.
-// Поэтому части фраз, которые в коде склеиваются из двух ключей, переведены с
-// оглядкой на итоговый порядок слов, а не пословно.
-//
-// Заимствования, ставшие стандартом на биржах - trader, long, short, spot,
-// PnL - оставлены как есть.
-
 const Table& tableTr() {
     static const Table t = {
-        // --- Uyarılardaki işlem türleri ---
         {"alert_buy", "ALIM"},
         {"alert_sell", "SATIM"},
         {"alert_transfer", "TRANSFER"},
@@ -836,7 +747,6 @@ const Table& tableTr() {
         {"alert_wallet", "Cüzdan"},
         {"alert_transaction", "İşlem"},
 
-        // --- Ana menü ---
         {"menu_title", "🚨 <b>Wallet Tracker</b>"},
         {"menu_add_wallet", "➕ Cüzdan ekle"},
         {"menu_my_wallets", "💼 Cüzdanlarım"},
@@ -865,7 +775,6 @@ const Table& tableTr() {
         {"back_button", "← Geri"},
         {"cancel_button", "❌ İptal"},
 
-        // --- Cüzdan ekleme ---
         {"add_wallet_title", "➕ <b>Cüzdan ekle</b>\n\nTakip etmek istediğin cüzdanın adresini gönder — 0x... biçiminde, 42 karakter.\n\n💡 <b>Hangi cüzdanı ekleyeceğini bilmiyor musun?</b>\nAşağıdaki 🏆 <b>En iyi trader'lar</b> sekmesi son 30 günün en kârlı cüzdanlarını sıralar: herhangi birini seç ve tek dokunuşla takibe al.\nYa da bir blok gezgininden veya analiz servisinden bir adres yapıştır."},
         {"add_wallet_addr_ok", "✅ Adres kabul edildi.\n\nŞimdi bu cüzdan için bir isim gir — en fazla 32 karakter (örneğin \"Binance\"):"},
         {"add_wallet_invalid", "❌ Geçersiz cüzdan adresi.\n\nAdres 0x ile başlamalı ve 42 karakter olmalı. Geçerli bir adres gir ya da İptal'e dokun."},
@@ -881,7 +790,6 @@ const Table& tableTr() {
         {"remove_yes", "🗑️ Evet, sil"},
         {"toast_wallet_removed", "✅ Cüzdan silindi"},
 
-        // --- Uyarı eşiği ---
         {"err_invalid_number", "❌ Geçersiz sayı."},
         {"err_threshold_positive", "❌ Eşik pozitif olmalı."},
         {"err_threshold_too_small", "❌ En düşük uyarı eşiği 50 $. 50 $ veya üzeri gir."},
@@ -899,12 +807,10 @@ const Table& tableTr() {
         {"threshold_custom_title", "💰 <b>Özel eşik</b>\n\nUyarı için en düşük tutarı USD olarak gir — 50 $ ve üzeri (örneğin 7500 ya da 7500.50):"},
         {"unknown_command", "🤔 Aşağıdaki menüyü kullan."},
 
-        // --- Dil ---
         {"lang_title", "🌐 <b>Dil</b>"},
         {"lang_current", "Mevcut dil:"},
         {"lang_choose", "Uyarılar ve menüler için dili seç:"},
 
-        // --- Cüzdanlarım ---
         {"rk_generating", "⏳ Sıralama hazırlanıyor.\n\nBir dakika sonra tekrar dene."},
         {"mw_no_wallets", "Henüz hiçbir cüzdanı takip etmiyorsun."},
         {"mw_tap_add", "Takibe başlamak için ➕ <b>Cüzdan ekle</b>'ye dokun."},
@@ -918,7 +824,6 @@ const Table& tableTr() {
         {"ws_trades_30d", "İşlem (30G)"},
         {"ws_last_trade", "Son işlem"},
 
-        // --- Sıralamalar ---
         {"rk_top_pnl_30d", "En yüksek PnL (30G)"},
         {"rk_top_traders_30d", "En iyi trader'lar (30G)"},
         {"rk_top_roi_30d", "En yüksek ROI (30G)"},
@@ -949,27 +854,25 @@ const Table& tableTr() {
         {"rk_unknown_token2", "Sözleşme adresini doğrudan ver, ya da botun bir işlemde daha önce gördüğü bir sembol kullan."},
         {"rk_expired", "⏳ Bu sıralamanın süresi doldu. Tokenı menüden yeniden ara."},
 
-        // --- Yardım ---
         {"help_title", "❓ <b>Yardım</b>"},
-        {"help_intro", "🏆 En iyi on-chain trader'ları keşfet, cüzdanları takip et ve desteklenen ağlarda işlem uyarılarını anında al."},
+        {"help_intro", "🏆 Büyük cüzdanların ne alıp sattığını gör: BSC üzerinde spot takaslar ve Hyperliquid üzerinde vadeli işlemler."},
         {"help_commands", "<b>Menü düğmelerini şunlar için kullan:</b>"},
         {"help_menu_add", "➕ Cüzdan ekle — yeni bir cüzdanı takibe al"},
-        {"help_menu_mywallets", "💼 Cüzdanlarım — takip ettiğin cüzdanları gör ve yönet"},
+        {"help_menu_mywallets", "👤 Hesabım — takip ettiğin cüzdanları gör ve yönet"},
         {"help_menu_threshold", "💰 Uyarı eşiği — en düşük uyarı tutarını belirle"},
-        {"help_menu_top", "🏆 En iyi trader'lar — cüzdanları sonuçlarına göre sıralı gör"},
+        {"help_menu_top", "🏆 En iyi trader'lar — 30 günlük sonuçlara göre sıralama, spot ve vadeli"},
         {"help_menu_premium", "⭐ Premium — Premium planlarını gör"},
         {"help_menu_languages", "🌐 Dil — dili değiştir"},
         {"help_premium_title", "⭐ <b>Premium</b>"},
-        {"help_premium_1", "• Top 100 trader listesine tam erişim"},
-        {"help_premium_2", "• 50 cüzdana kadar takip"},
-        {"help_premium_3", "• Gelişmiş özellikler"},
-        {"help_premium_4", "• Yeniliklere öncelikli erişim"},
+        {"help_premium_1", "• Hyperliquid vadeli işlemler: kaldıraç, teminat ve likidasyon fiyatıyla sıralama ve uyarılar"},
+        {"help_premium_2", "• 1 yerine 50 cüzdana kadar takip"},
+        {"help_premium_3", "• Top 100 trader listesinin tamamı (Top 30 ücretsiz)"},
+        {"help_premium_4", "• Öncelikli uyarı teslimi"},
         {"help_disclaimer", "⚠️ <b>Sorumluluk reddi</b>\nBot, zaten gerçekleşmiş on-chain işlemleri gösterir. Bu bir bilgi hizmetidir; yatırım tavsiyesi ya da işlem yapma çağrısı değildir. Bir cüzdanın geçmiş sonuçları gelecekteki sonuçlarını göstermez. Kaldıraçlı işlem tüm mevduatına mal olabilir. Kararı sen verirsin, riski sen taşırsın."},
         {"help_support", "📞 Destek: @WalletTrackerHelp"},
         {"help_channel", "📢 Kanal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Tüm özelliklere hızlı erişim için ana menüyü kullan."},
 
-        // --- Premium ---
         {"pr_active_title", "⭐ <b>Premium etkin</b>"},
         {"pr_service_account", "Servis hesabı — Premium erişimi kalıcıdır."},
         {"pr_valid_until_inline", "Aboneliğin şu tarihe kadar geçerli:"},
@@ -996,7 +899,6 @@ const Table& tableTr() {
         {"payment_success_activated", "Wallet Tracker Premium etkinleştirildi."},
         {"payment_success_duration", "30 gün geçerli."},
 
-        // --- Sınırlar ve hatalar ---
         {"limit_50_reached", "⚠️ 50 cüzdan takibi sınırına ulaştın."},
         {"already_tracking", "⚠️ Bu cüzdanı zaten takip ediyorsun."},
         {"toast_already_tracking", "✅ Zaten takipte"},
@@ -1023,7 +925,6 @@ const Table& tableTr() {
         {"err_name_empty", "❌ İsim boş olamaz.\n\nBir isim gir ya da İptal'e dokun."},
         {"err_name_too_long", "❌ İsim çok uzun (en fazla 32 karakter).\n\nDaha kısa bir isim gir ya da İptal'e dokun."},
 
-        // --- Hyperliquid vadeli işlemler ---
         {"hl_open_long", "LONG AÇTI"},
         {"hl_close_long", "LONG KAPATTI"},
         {"hl_open_short", "SHORT AÇTI"},
@@ -1045,9 +946,9 @@ const Table& tableTr() {
         {"hl_pnl", "Gerçekleşen PnL"},
         {"hl_liq", "Likidasyon"},
         {"hl_account", "Hesap değeri"},
-        {"hl_venue", "Platform"},
+        {"hl_venue", "Ağ"},
         {"hl_venue_title", "En iyi trader'lar"},
-        {"hl_venue_choose", "Platformu seç:\n<i>BSC'de spot ya da Hyperliquid'de vadeli işlemler</i>"},
+        {"hl_venue_choose", "Bir ağ seç — BSC'de spot ya da Hyperliquid'de vadeli işlemler"},
         {"hl_venue_spot", "🟡 BSC — Spot"},
         {"hl_venue_perp", "🔵 Hyperliquid — Vadeli"},
         {"hl_rk_title", "en iyi trader'lar, 30 gün"},
@@ -1060,25 +961,8 @@ const Table& tableTr() {
     return t;
 }
 
-// ============================== العربية ==============================
-// Отдельный файл на язык - см. lang_es.cpp. Ключа может не быть: tr() тогда
-// покажет английский, а не пустоту.
-//
-// ВАЖНОЕ ОТЛИЧИЕ ОТ ОСТАЛЬНЫХ ЯЗЫКОВ: арабское письмо идёт справа налево, а в
-// строках бота вперемешку арабские подписи и латинские вставки - суммы, тикеры,
-// адреса. Порядок их отображения определяет не этот файл, а алгоритм Unicode
-// при отрисовке, и результат виден только на экране.
-//
-// Поэтому здесь сознательно НЕ расставлены управляющие символы направления
-// (RLM/LRM): вслепую они чаще ломают вёрстку, чем чинят. Если после проверки
-// какая-то строка встанет неправильно, править надо точечно - именно её.
-//
-// Термины взяты из обихода арабоязычных крипто-сообществ: заимствования
-// "لونغ"/"شورت" вместо книжных описаний, "توكن" вместо "رمز مميز".
-
 const Table& tableAr() {
     static const Table t = {
-        // --- أنواع العمليات في التنبيهات ---
         {"alert_buy", "شراء"},
         {"alert_sell", "بيع"},
         {"alert_transfer", "تحويل"},
@@ -1102,7 +986,6 @@ const Table& tableAr() {
         {"alert_wallet", "المحفظة"},
         {"alert_transaction", "المعاملة"},
 
-        // --- القائمة الرئيسية ---
         {"menu_title", "🚨 <b>Wallet Tracker</b>"},
         {"menu_add_wallet", "➕ إضافة محفظة"},
         {"menu_my_wallets", "💼 محافظي"},
@@ -1131,7 +1014,6 @@ const Table& tableAr() {
         {"back_button", "← رجوع"},
         {"cancel_button", "❌ إلغاء"},
 
-        // --- إضافة محفظة ---
         {"add_wallet_title", "➕ <b>إضافة محفظة</b>\n\nأرسل عنوان المحفظة التي تريد متابعتها — بصيغة 0x... من 42 خانة.\n\n💡 <b>لا تعرف أي محفظة تضيف؟</b>\nتبويب 🏆 <b>أفضل المتداولين</b> بالأسفل يرتّب أكثر المحافظ ربحًا خلال آخر 30 يومًا: اختر أي واحدة وابدأ متابعتها بضغطة واحدة.\nأو الصق عنوانًا من مستكشف البلوكشين أو من خدمة تحليلات."},
         {"add_wallet_addr_ok", "✅ تم قبول العنوان.\n\nالآن أدخل اسمًا لهذه المحفظة — حتى 32 خانة (مثل \"Binance\"):"},
         {"add_wallet_invalid", "❌ عنوان محفظة غير صالح.\n\nيجب أن يبدأ العنوان بـ 0x وأن يتكوّن من 42 خانة. أدخل عنوانًا صحيحًا أو اضغط إلغاء."},
@@ -1147,7 +1029,6 @@ const Table& tableAr() {
         {"remove_yes", "🗑️ نعم، احذف"},
         {"toast_wallet_removed", "✅ تم حذف المحفظة"},
 
-        // --- حد التنبيه ---
         {"err_invalid_number", "❌ رقم غير صالح."},
         {"err_threshold_positive", "❌ يجب أن يكون الحد رقمًا موجبًا."},
         {"err_threshold_too_small", "❌ الحد الأدنى للتنبيه هو 50 دولارًا. أدخل 50 دولارًا أو أكثر."},
@@ -1165,12 +1046,10 @@ const Table& tableAr() {
         {"threshold_custom_title", "💰 <b>حد مخصّص</b>\n\nأدخل أقل مبلغ للتنبيه بالدولار — ابتداءً من 50 دولارًا (مثل 7500 أو 7500.50):"},
         {"unknown_command", "🤔 استخدم القائمة بالأسفل."},
 
-        // --- اللغة ---
         {"lang_title", "🌐 <b>اللغة</b>"},
         {"lang_current", "اللغة الحالية:"},
         {"lang_choose", "اختر لغة التنبيهات والقوائم:"},
 
-        // --- محافظي ---
         {"rk_generating", "⏳ جارٍ إعداد الترتيب.\n\nحاول مرة أخرى بعد دقيقة."},
         {"mw_no_wallets", "لا تتابع أي محفظة بعد."},
         {"mw_tap_add", "اضغط ➕ <b>إضافة محفظة</b> لتبدأ المتابعة."},
@@ -1184,7 +1063,6 @@ const Table& tableAr() {
         {"ws_trades_30d", "الصفقات (30 يومًا)"},
         {"ws_last_trade", "آخر صفقة"},
 
-        // --- الترتيبات ---
         {"rk_top_pnl_30d", "أعلى ربح (30 يومًا)"},
         {"rk_top_traders_30d", "أفضل المتداولين (30 يومًا)"},
         {"rk_top_roi_30d", "أعلى عائد (30 يومًا)"},
@@ -1215,27 +1093,25 @@ const Table& tableAr() {
         {"rk_unknown_token2", "أعطِ عنوان العقد مباشرة، أو رمزًا سبق للبوت أن رآه في إحدى الصفقات."},
         {"rk_expired", "⏳ انتهت صلاحية هذا الترتيب. ابحث عن التوكن مجددًا من القائمة."},
 
-        // --- المساعدة ---
         {"help_title", "❓ <b>المساعدة</b>"},
-        {"help_intro", "🏆 اكتشف أفضل المتداولين على البلوكشين، تابع المحافظ، واستقبل تنبيهات الصفقات لحظة حدوثها على الشبكات المدعومة."},
+        {"help_intro", "🏆 شاهد ما تشتريه وتبيعه المحافظ الكبيرة: تداول فوري على BSC وعقود دائمة على Hyperliquid."},
         {"help_commands", "<b>استخدم أزرار القائمة لـ:</b>"},
         {"help_menu_add", "➕ إضافة محفظة — متابعة محفظة جديدة"},
-        {"help_menu_mywallets", "💼 محافظي — عرض وإدارة المحافظ التي تتابعها"},
+        {"help_menu_mywallets", "👤 حسابي — عرض وإدارة المحافظ التي تتابعها"},
         {"help_menu_threshold", "💰 حد التنبيه — تحديد أقل مبلغ للتنبيه"},
-        {"help_menu_top", "🏆 أفضل المتداولين — ترتيب المحافظ حسب النتائج"},
+        {"help_menu_top", "🏆 أفضل المتداولين — ترتيب حسب نتائج 30 يومًا، الفوري والعقود الدائمة"},
         {"help_menu_premium", "⭐ بريميوم — عرض خطط بريميوم"},
         {"help_menu_languages", "🌐 اللغة — تغيير اللغة"},
         {"help_premium_title", "⭐ <b>بريميوم</b>"},
-        {"help_premium_1", "• وصول كامل إلى أفضل 100 متداول"},
-        {"help_premium_2", "• متابعة حتى 50 محفظة"},
-        {"help_premium_3", "• ميزات متقدمة"},
-        {"help_premium_4", "• أولوية في الحصول على الجديد"},
+        {"help_premium_1", "• عقود Hyperliquid الدائمة: ترتيب وتنبيهات مع الرافعة والهامش وسعر التصفية"},
+        {"help_premium_2", "• متابعة حتى 50 محفظة بدلًا من واحدة"},
+        {"help_premium_3", "• قائمة أفضل 100 متداول كاملة (أفضل 30 مجانًا)"},
+        {"help_premium_4", "• أولوية في تسليم التنبيهات"},
         {"help_disclaimer", "⚠️ <b>إخلاء مسؤولية</b>\nيعرض البوت معاملات وقعت فعلًا على البلوكشين. هذه خدمة معلوماتية، وليست نصيحة استثمارية ولا دعوة للتداول. نتائج أي محفظة في الماضي لا تدل على نتائجها في المستقبل. التداول بالرافعة قد يكلّفك كامل رصيدك. القرار قرارك والمخاطرة مخاطرتك."},
         {"help_support", "📞 الدعم: @WalletTrackerHelp"},
         {"help_channel", "📢 القناة: t.me/WalletTrackerOfficial"},
         {"help_footer", "استخدم القائمة الرئيسية للوصول السريع إلى كل الميزات."},
 
-        // --- بريميوم ---
         {"pr_active_title", "⭐ <b>بريميوم مفعّل</b>"},
         {"pr_service_account", "حساب خدمي — وصول بريميوم دائم."},
         {"pr_valid_until_inline", "اشتراكك صالح حتى"},
@@ -1262,7 +1138,6 @@ const Table& tableAr() {
         {"payment_success_activated", "تم تفعيل Wallet Tracker Premium."},
         {"payment_success_duration", "صالح لمدة 30 يومًا."},
 
-        // --- الحدود والأخطاء ---
         {"limit_50_reached", "⚠️ بلغت حد 50 محفظة متابَعة."},
         {"already_tracking", "⚠️ أنت تتابع هذه المحفظة بالفعل."},
         {"toast_already_tracking", "✅ متابَعة بالفعل"},
@@ -1289,7 +1164,6 @@ const Table& tableAr() {
         {"err_name_empty", "❌ لا يمكن ترك الاسم فارغًا.\n\nأدخل اسمًا أو اضغط إلغاء."},
         {"err_name_too_long", "❌ الاسم طويل جدًا (32 خانة كحد أقصى).\n\nأدخل اسمًا أقصر أو اضغط إلغاء."},
 
-        // --- عقود Hyperliquid الدائمة ---
         {"hl_open_long", "فتح لونغ"},
         {"hl_close_long", "إغلاق لونغ"},
         {"hl_open_short", "فتح شورت"},
@@ -1311,9 +1185,9 @@ const Table& tableAr() {
         {"hl_pnl", "الربح المحقق"},
         {"hl_liq", "سعر التصفية"},
         {"hl_account", "قيمة الحساب"},
-        {"hl_venue", "المنصة"},
+        {"hl_venue", "الشبكة"},
         {"hl_venue_title", "أفضل المتداولين"},
-        {"hl_venue_choose", "اختر المنصة:\n<i>سبوت على BSC أو عقود دائمة على Hyperliquid</i>"},
+        {"hl_venue_choose", "اختر الشبكة — سبوت على BSC أو عقود دائمة على Hyperliquid"},
         {"hl_venue_spot", "🟡 BSC — سبوت"},
         {"hl_venue_perp", "🔵 Hyperliquid — عقود دائمة"},
         {"hl_rk_title", "أفضل المتداولين، 30 يومًا"},
