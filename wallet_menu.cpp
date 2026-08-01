@@ -21,9 +21,6 @@ using json = nlohmann::json;
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
-// ==================== Память навигации по списку =========================
-// Кнопка "Назад" с карточки кошелька или из подтверждения удаления должна
-// возвращать на ТУ ЖЕ страницу списка, где был пользователь, а не на первую.
 namespace {
 std::mutex g_walletPageMutex;
 std::map<std::string, int> g_lastWalletPage;
@@ -48,8 +45,6 @@ std::string backToWalletsData(const std::string& chatId) {
     return "mw_page:" + std::to_string(lastWalletPage(chatId));
 }
 
-// Клавиатура для экранов ошибок: без неё пользователь оставался в тупике -
-// сообщение об ошибке вообще без кнопок, выйти можно было только через /start.
 std::string errorBackKeyboard(const std::string& chatId, Lang lang) {
     json kb;
     kb["inline_keyboard"] = json::array();
@@ -59,15 +54,10 @@ std::string errorBackKeyboard(const std::string& chatId, Lang lang) {
     return kb.dump();
 }
 
-// ============================ Форматирование ============================
-
 std::string shortAddress(const std::string& a) {
     if (a.length() <= 12) return a;
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
-// Деньги из наносов в едином виде проекта ($1,234.56). Через строку, а не
-// прямым приведением: строковое представление есть всегда, а для сумм за
-// пределами long long честно откатываемся на форматтер больших чисел.
 std::string fmtUsdNanos(const cpp_int& nanos) {
     std::string s = nanos.convert_to<std::string>();
     if (s.size() > 18) return formatUsd(nanos);
@@ -75,10 +65,6 @@ std::string fmtUsdNanos(const cpp_int& nanos) {
     try { v = std::stoll(s); } catch (...) { return formatUsd(nanos); }
     return formatUsdNanosSigned(v, false);
 }
-
-// Форматирование вынесено в utils - одна реализация на весь проект.
-
-// ========================= Операции хранилища ==========================
 
 bool isTrackingWallet(const std::string& chatId, const std::string& address) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -119,10 +105,6 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
-    // Сервисному аккаунту нельзя повторно взять на отслеживание кошелёк,
-    // который детектор пометил как бота - чтобы не вернуть его случайно.
-    // На обычных пользователей это не распространяется: им можно следить
-    // за любым адресом, бан касается только рейтинга и сервисного аккаунта.
     if (chatId == SERVICE_CHAT_ID && isPermanentlyBanned(address)) {
         return AddWhaleResult::PERMANENTLY_BANNED;
     }
@@ -214,11 +196,8 @@ bool removeUserWhale(const std::string& chatId, const std::string& address) {
     return removed;
 }
 
-// ================================ Меню =================================
-
 namespace TelegramUI {
 
-// Экран "Мой аккаунт" - развилка между списком кошельков и холдом.
 UIMessage buildAccountMenu(const std::string& chatId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     size_t count = countUserWhales(chatId);
@@ -241,21 +220,16 @@ UIMessage buildAccountMenu(const std::string& chatId) {
     return {text.str(), kb.dump()};
 }
 
-// Список кошельков для выбора: у каждого своя кнопка "информация".
-// Карточка холда: нативный баланс + монеты дороже порога пыли.
-// Список токенов берём из wallet_tokens (что кошелёк торговал при нас) -
-// в блокчейне нет запроса "все токены адреса", поэтому иначе никак.
 UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     Lang lang = langFromCode(getUserLanguage(chatId));
-    constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;  // $10
-    constexpr int MAX_TOKENS_TO_CHECK = 40;                      // потолок RPC-запросов
+    constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;
+    constexpr int MAX_TOKENS_TO_CHECK = 40;
 
     std::vector<PortfolioItem> held;
     cpp_int totalUsdNanos = 0;
-    int failedReads = 0;     // сколько балансов не удалось прочитать
-    int illiquidCount = 0;   // позиции, ограниченные объёмом пула
+    int failedReads = 0;
+    int illiquidCount = 0;
 
-    // 1) Нативный актив
     {
         cpp_int wei = 0;
         if (!getNativeBalance(address, wei)) {
@@ -272,36 +246,26 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         }
     }
 
-    // 2) Токены, которые кошелёк трогал
     std::vector<std::string> tokens = getWalletTokens(address, MAX_TOKENS_TO_CHECK);
     for (const auto& t : tokens) {
         cpp_int raw = 0;
         if (!getTokenBalance(t, address, raw)) {
-            // Узнать не удалось - НЕ удаляем запись, иначе сетевая заминка
-            // стёрла бы монету навсегда. Просто пропускаем в этот раз.
             ++failedReads;
             continue;
         }
         if (raw <= 0) {
-            // Баланс честно нулевой - монеты у кошелька больше нет.
             forgetWalletToken(address, t);
             continue;
         }
         int dec = getDecimals(t);
-        // Стейблкоин стоит доллар по определению. Брать его цену из пула
-        // нельзя: там она может оказаться любой, и позиция раздувается в разы.
         uint64_t price = chainCtx().stablecoins.count(t)
                        ? 1000000000ULL
                        : getPriceNanos(t);
-        if (price == 0) continue;          // цены нет - монету не оценить
+        if (price == 0) continue;
         cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
         cpp_int usd = (raw * cpp_int(price)) / denom;
-        if (usd < cpp_int(DUST_USD_NANOS)) continue;   // мусор не показываем
+        if (usd < cpp_int(DUST_USD_NANOS)) continue;
 
-        // Показываем рыночную стоимость - как принято везде, чтобы цифры
-        // сходились с обозревателем. Но если позиция крупнее своего пула,
-        // продать её по этой цене нельзя, и об этом стоит предупредить:
-        // саму сумму не трогаем, только помечаем.
         bool illiquid = false;
         double liq = chainCtx().stablecoins.count(t) ? 0.0 : getPoolLiquidityUsd(t);
         if (liq > 0.0) {
@@ -310,7 +274,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         }
 
         std::string sym = safeString(getSymbol(t), 12);
-        if (illiquid) sym += " \u26A0";     // предупреждающий знак
+        if (illiquid) sym += " \u26A0";
         held.push_back({sym, formatAmount(raw, dec), usd});
         totalUsdNanos += usd;
         if (illiquid) ++illiquidCount;
@@ -344,8 +308,6 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
     json kb;
     kb["inline_keyboard"] = json::array();
-    // Ссылки на обозреватель нет: раздел работает по любому адресу, в том числе
-    // чужому, и увод из бота посреди разведки только мешает.
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
@@ -354,8 +316,6 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
 UIMessage buildWalletsList(const std::string& chatId, int page) {
 
-    // isPremium() уже возвращает true для сервисного аккаунта - отдельная
-    // проверка здесь была бы дублированием.
     bool premium = isPremium(chatId);
     Lang lang = langFromCode(getUserLanguage(chatId));
 
@@ -461,8 +421,6 @@ UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& addre
 
 }
 
-// ======================= Диспетчеризация callback'ов ====================
-
 void startAddWalletFlow(const std::string& chatId, long long messageId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     g_sessionManager.setState(chatId, UserState::AWAITING_WALLET_ADDRESS, "", messageId);
@@ -548,10 +506,10 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         if (removed) {
             refreshWatchers();
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "toast_wallet_removed"), false);
-            if (!navigateBack(chatId, messageId)) {
-                auto msg = TelegramUI::buildWalletsList(chatId);
-                replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-            }
+            int page = lastWalletPage(chatId);
+            auto msg = TelegramUI::buildWalletsList(chatId, page);
+            rememberView(chatId, "mw_page:" + std::to_string(page));
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         } else {
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
@@ -560,8 +518,6 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
     else return false;
     return true;
 }
-
-// ======================= Текстовые состояния ============================
 
 bool handleWalletText(const std::string& chatId, const std::string& text, const UserSession& session) {
     if (session.state == UserState::AWAITING_WALLET_ADDRESS) {
@@ -601,8 +557,6 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         if (result == AddWhaleResult::OK) {
             refreshWatchers();
             g_sessionManager.clearSession(chatId);
-            // Возвращаем в список кошельков, а не в главное меню: пользователь
-            // сразу видит только что добавленный кошелёк на своём месте.
             auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
             replyInPlace(chatId, session.promptMessageId, tr(lang, "add_wallet_success") + "\n\n" + tr(lang, "add_wallet_name_label") + " <b>" + safeString(label, 32) +
                     "</b>\n" + tr(lang, "add_wallet_address_label") + " <code>" + session.pendingAddress + "</code>\n\n" + tr(lang, "add_wallet_tracking_enabled") + "\n\n" + msg.text,
