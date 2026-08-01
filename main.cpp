@@ -541,6 +541,25 @@ std::vector<std::string> hlWatchedAddresses() {
     return out;
 }
 
+std::vector<HlUserWallet> hlUserWallets(const std::string& chatId) {
+    std::vector<HlUserWallet> out;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT wa.address, uw.label FROM user_whales uw "
+        "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+        "WHERE uw.user_id = ? ORDER BY uw.created_at")) return out;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        HlUserWallet w;
+        w.address = toLower(safeColumnText(s, 0));
+        w.label = safeColumnText(s, 1);
+        if (!w.address.empty()) out.push_back(std::move(w));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
 std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
     std::vector<HlRecipient> out;
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
@@ -672,6 +691,18 @@ std::string buildCancelButton(Lang lang) {
 }
 
 std::string buildCancelWithTopTraders(Lang lang) {
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
+    }));
+    return keyboard.dump();
+}
+
+std::string buildCancelWithSpotTop(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
@@ -1369,7 +1400,7 @@ void handleCallbackQuery(const json& callbackQuery) {
             Lang lang = langFromCode(getUserLanguage(chatId));
             g_sessionManager.setState(chatId, UserState::AWAITING_HOLD_ADDRESS);
             replyInPlace(chatId, messageId, tr(lang, "hold_prompt"),
-                         TelegramUI::buildCancelWithTopTraders(lang));
+                         TelegramUI::buildCancelWithSpotTop(lang));
         }
         else if (param == "my_wallets") {
             rememberView(chatId, data);
@@ -1458,7 +1489,8 @@ void handleCallbackQuery(const json& callbackQuery) {
              action == "gt_open" || action == "gt_page" || action == "gt_token") {
         handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
-    else if (action == "hl_menu" || action == "hl_open" || action == "hl_page") {
+    else if (action == "hl_menu" || action == "hl_open" || action == "hl_page" ||
+             action == "hl_positions" || action == "hl_pos") {
         handleHyperliquidCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
 }
@@ -1497,7 +1529,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
         if (!isValidAddress(addr)) {
             sendMsg(chatId, tr(lang, "hold_bad_address"),
-                    TelegramUI::buildCancelWithTopTraders(lang));
+                    TelegramUI::buildCancelWithSpotTop(lang));
             return true;
         }
 
