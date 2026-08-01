@@ -17,8 +17,6 @@ struct TxResult {
     std::string venue;
     std::string counterAddr;
     cpp_int counterAmount;
-    // Реальная плата за газ этой транзакции в долларах (наносы). Считается из
-    // чека - фактический расход, а не допущение. Ноль, если данных нет.
     cpp_int gasUsdNanos = 0;
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
@@ -45,20 +43,13 @@ struct ChainContext {
     std::map<std::string, std::string> routers;
     std::set<std::string> bridges;
     std::set<std::string> knownPoolInfra;
-    // Узлы этой сети хранятся здесь же: чтобы добавить сеть, достаточно
-    // описать её в ОДНОМ месте, а не искать по трём файлам.
     std::vector<std::string> rpcEndpoints;
-    // Идентификаторы сети у ценовых сервисов. Без них цена может быть взята
-    // из пары ЧУЖОЙ сети: сервисы отдают пары по адресу токена со всех
-    // блокчейнов сразу, а одинаковые адреса встречаются в разных сетях.
     std::string dexscreenerChainId;
     std::string coingeckoPlatform;
 };
 
 const ChainContext& chainCtx();
 void setChainContext(const ChainContext& ctx);
-// Конфигурации сетей вынесены в chains.h
-
 
 bool isBaseAsset(const std::string& a);
 bool isStablecoin(const std::string& a);
