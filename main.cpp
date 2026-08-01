@@ -1461,8 +1461,10 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
         else if (param == "hold") {
             rememberView(chatId, data);
-            auto msg = TelegramUI::buildHoldWalletList(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            g_sessionManager.setState(chatId, UserState::AWAITING_HOLD_ADDRESS);
+            replyInPlace(chatId, messageId, tr(lang, "hold_prompt"),
+                         TelegramUI::buildCancelWithTopTraders(lang));
         }
         else if (param == "my_wallets") {
             rememberView(chatId, data);
@@ -1537,21 +1539,7 @@ void handleCallbackQuery(const json& callbackQuery) {
                 tr(lang, "err_invoice_failed") + "\n\n" + page.text, page.keyboard);
         }
     }
-    else if (action == "hold_page") {
-        int p = 1; try { p = std::stoi(param); } catch (...) {}
-        rememberView(chatId, data);
-        auto msg = TelegramUI::buildHoldWalletList(chatId, p);
-        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "hold_noop") {
-    }
-    else if (action == "hold_info") {
-        Lang lang = langFromCode(getUserLanguage(chatId));
-        replyInPlace(chatId, messageId, tr(lang, "hold_loading"), "");
-        auto msg = TelegramUI::buildHoldCard(chatId, param);
-        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "mw_page" || action == "wstats" || action == "rename" ||
+    else if (action == "mw_page" || action == "rename" ||
              action == "askremove" || action == "remove") {
         handleWalletCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
@@ -1593,6 +1581,23 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
         RankingMessage result = buildTopPnlMessage(chatId, tokenArg, 1);
         g_sessionManager.clearSession(chatId);
         sendMsg(chatId, result.text, result.keyboard);
+        return true;
+    }
+
+    if (session.state == UserState::AWAITING_HOLD_ADDRESS) {
+        const std::string addr = toLower(trim(text));
+        Lang lang = langFromCode(getUserLanguage(chatId));
+
+        if (!isValidAddress(addr)) {
+            sendMsg(chatId, tr(lang, "hold_bad_address"),
+                    TelegramUI::buildCancelWithTopTraders(lang));
+            return true;
+        }
+
+        g_sessionManager.clearSession(chatId);
+        sendMsg(chatId, tr(lang, "hold_loading"));
+        auto msg = TelegramUI::buildHoldCard(chatId, addr);
+        sendMsg(chatId, msg.text, msg.keyboard);
         return true;
     }
 
