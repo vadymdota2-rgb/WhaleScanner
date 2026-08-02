@@ -322,7 +322,7 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
         json kb;
         kb["inline_keyboard"] = json::array();
         kb["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+            {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
         }));
         return {tr(lang, "pr_active_title") + "\n\n" + tr(lang, "pr_service_account"), kb.dump()};
     }
@@ -366,7 +366,7 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
     }
 
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {text.str(), keyboard.dump()};
@@ -379,7 +379,7 @@ PremiumMessage buildWalletLimitMessage(Lang lang) {
         {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     std::string text =
