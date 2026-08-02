@@ -73,7 +73,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"menu_no_wallets", {"You're not tracking any wallets yet.\nTap <b>Add Wallet</b> to start getting alerts.",
                              "Вы пока не отслеживаете ни одного кошелька.\nНажмите <b>Добавить кошелёк</b>, чтобы начать получать алерты."}},
         {"menu_tracking_prefix", {"Tracking", "Отслеживается"}},
-        {"menu_alerts_above", {"alerts above", "алерты от"}},
+        {"menu_alerts_above", {"alert threshold — from", "порог алертов — от"}},
 
         {"back_button", {"← Back", "← Назад"}},
         {"cancel_button", {"❌ Cancel", "❌ Отмена"}},
