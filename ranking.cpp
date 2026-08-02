@@ -1158,6 +1158,7 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
     else if (action == "gt_token") {
         Lang lang = langFromCode(getUserLanguage(chatId));
         g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
+        rememberView(chatId, data);
 
         replyInPlace(
             chatId,
