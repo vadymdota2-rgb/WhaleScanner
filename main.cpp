@@ -803,6 +803,7 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     text += tr(lang, "help_menu_mywallets") + "\n";
     text += tr(lang, "help_menu_threshold") + "\n";
     text += tr(lang, "help_menu_top") + "\n";
+    text += tr(lang, "help_menu_positions") + "\n";
     text += tr(lang, "help_menu_premium") + "\n";
     text += tr(lang, "help_menu_languages") + "\n\n";
     text += tr(lang, "help_premium_title") + "\n";
