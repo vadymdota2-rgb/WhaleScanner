@@ -205,6 +205,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_footer", {"Use the main menu for quick access to all features.",
                          "Используйте главное меню для быстрого доступа ко всем функциям."}},
 
+        {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
+                           "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
         {"pr_active_title", {"⭐ <b>Premium Active</b>", "⭐ <b>Премиум активен</b>"}},
         {"pr_service_account", {"Service account — Premium access is permanent.",
                                 "Сервисный аккаунт — доступ Премиум постоянный."}},
