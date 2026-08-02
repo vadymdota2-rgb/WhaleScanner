@@ -392,7 +392,7 @@ RankingMessage buildGeneratingMessage(Lang lang) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
     return {tr(lang, "rk_generating"), keyboard.dump()};
 }
@@ -443,7 +443,7 @@ RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& r
     if (page < totalPages) navRow.push_back({{"text", tr(lang, "rk_next")}, {"callback_data", "tt_page:" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {text.str(), keyboard.dump()};
@@ -656,7 +656,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {text.str(), keyboard.dump()};
@@ -1058,7 +1058,7 @@ RankingMessage buildGlobalTopMenu(const std::string& chatId) {
         {{"text", tr(lang, "rk_btn_top_pnl_by_token")}, {"callback_data", "gt_token"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {std::string("🟡 <b>BSC \u2014 " + tr(lang, "rk_top_traders_30d") + "</b>\n")
