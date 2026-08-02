@@ -152,6 +152,7 @@ const Table& tableEs() {
         {"help_channel", "📢 Canal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Usa el menú principal para acceder rápido a todas las funciones."},
 
+        {"trial_granted", "🎁 <b>7 días de Premium — de regalo</b>\n\nYa tienes: futuros de Hyperliquid, hasta 50 billeteras, el Top 100 completo y alertas prioritarias.\n\nSe entrega una sola vez por cuenta."},
         {"pr_active_title", "⭐ <b>Premium activo</b>"},
         {"pr_service_account", "Cuenta de servicio — el acceso Premium es permanente."},
         {"pr_valid_until_inline", "Tu suscripción es válida hasta"},
@@ -393,6 +394,7 @@ const Table& tablePt() {
         {"help_channel", "📢 Canal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Use o menu principal para acessar rapidamente todos os recursos."},
 
+        {"trial_granted", "🎁 <b>7 dias de Premium — por nossa conta</b>\n\nVocê já tem: futuros da Hyperliquid, até 50 carteiras, o Top 100 completo e alertas prioritários.\n\nConcedido uma única vez por conta."},
         {"pr_active_title", "⭐ <b>Premium ativo</b>"},
         {"pr_service_account", "Conta de serviço — o acesso Premium é permanente."},
         {"pr_valid_until_inline", "Sua assinatura é válida até"},
@@ -634,6 +636,7 @@ const Table& tableFr() {
         {"help_channel", "📢 Canal : t.me/WalletTrackerOfficial"},
         {"help_footer", "Utilisez le menu principal pour accéder rapidement à toutes les fonctions."},
 
+        {"trial_granted", "🎁 <b>7 jours de Premium offerts</b>\n\nVous avez désormais : les futures Hyperliquid, jusqu'à 50 portefeuilles, le Top 100 complet et les alertes prioritaires.\n\nOffert une seule fois par compte."},
         {"pr_active_title", "⭐ <b>Premium actif</b>"},
         {"pr_service_account", "Compte de service — l'accès Premium est permanent."},
         {"pr_valid_until_inline", "Votre abonnement est valable jusqu'au"},
@@ -875,6 +878,7 @@ const Table& tableTr() {
         {"help_channel", "📢 Kanal: t.me/WalletTrackerOfficial"},
         {"help_footer", "Tüm özelliklere hızlı erişim için ana menüyü kullan."},
 
+        {"trial_granted", "🎁 <b>7 gün Premium — hediye</b>\n\nArtık sende: Hyperliquid vadeli işlemler, 50 cüzdana kadar takip, Top 100'ün tamamı ve öncelikli uyarılar.\n\nHesap başına bir kez verilir."},
         {"pr_active_title", "⭐ <b>Premium etkin</b>"},
         {"pr_service_account", "Servis hesabı — Premium erişimi kalıcıdır."},
         {"pr_valid_until_inline", "Aboneliğin şu tarihe kadar geçerli:"},
@@ -1116,6 +1120,7 @@ const Table& tableAr() {
         {"help_channel", "📢 القناة: t.me/WalletTrackerOfficial"},
         {"help_footer", "استخدم القائمة الرئيسية للوصول السريع إلى كل الميزات."},
 
+        {"trial_granted", "🎁 <b>7 أيام بريميوم هدية</b>\n\nصار متاحًا لك: عقود Hyperliquid الدائمة، وحتى 50 محفظة، وقائمة أفضل 100 كاملة، وتنبيهات ذات أولوية.\n\nتُمنح مرة واحدة لكل حساب."},
         {"pr_active_title", "⭐ <b>بريميوم مفعّل</b>"},
         {"pr_service_account", "حساب خدمي — وصول بريميوم دائم."},
         {"pr_valid_until_inline", "اشتراكك صالح حتى"},
