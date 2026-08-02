@@ -736,7 +736,7 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         }));
     }
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     std::string currentLabel = current;
@@ -750,7 +750,7 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     std::string text = tr(lang, "help_title") + "\n\n";
