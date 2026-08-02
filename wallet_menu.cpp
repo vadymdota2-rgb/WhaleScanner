@@ -466,6 +466,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             sqlite3_finalize(s);
 
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
+            rememberView(chatId, data);
             replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
                     "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
         } else {
@@ -494,6 +495,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             }
         }
         auto msg = TelegramUI::buildRemoveConfirm(chatId, address, label, langFromCode(getUserLanguage(chatId)));
+        rememberView(chatId, data);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "remove") {
