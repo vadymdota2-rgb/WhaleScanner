@@ -181,10 +181,11 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_menu_mywallets", {"👤 My Account — view and manage your tracked wallets", "👤 Мой аккаунт — просмотр и управление отслеживаемыми кошельками"}},
         {"help_menu_threshold", {"💰 Alert Threshold — set the minimum alert amount", "💰 Порог алертов — задать минимальную сумму алерта"}},
         {"help_menu_top", {"🏆 Top Traders — wallet rankings by 30-day results, spot and futures", "🏆 Топ трейдеров — рейтинг кошельков по результатам за 30 дней, спот и фьючерсы"}},
+        {"help_menu_positions", {"📈 Open positions — see what your wallets hold on Hyperliquid right now", "📈 Открытые позиции — что ваши кошельки держат на Hyperliquid прямо сейчас"}},
         {"help_menu_premium", {"⭐ Premium — view Premium plans", "⭐ Премиум — тарифы Премиум"}},
         {"help_menu_languages", {"🌐 Languages — change language", "🌐 Язык — сменить язык"}},
         {"help_premium_title", {"⭐ <b>Premium</b>", "⭐ <b>Премиум</b>"}},
-        {"help_premium_1", {"• Hyperliquid futures: ranking and alerts with leverage, collateral and liquidation price", "• Фьючерсы Hyperliquid: рейтинг и алерты с плечом, залогом и ценой ликвидации"}},
+        {"help_premium_1", {"• Hyperliquid futures: ranking, alerts and open positions with leverage, collateral and liquidation price", "• Фьючерсы Hyperliquid: рейтинг, алерты и открытые позиции с плечом, залогом и ценой ликвидации"}},
         {"help_premium_2", {"• Track up to 50 wallets instead of 1", "• Отслеживание до 50 кошельков вместо одного"}},
         {"help_premium_3", {"• Full Top 100 BSC spot traders (Top 30 is free)", "• Полный Топ-100 трейдеров BSC Спот (Топ-30 бесплатно)"}},
         {"help_premium_4", {"• Priority alert delivery", "• Приоритетная доставка алертов"}},
@@ -205,8 +206,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_footer", {"Use the main menu for quick access to all features.",
                          "Используйте главное меню для быстрого доступа ко всем функциям."}},
 
-        {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
-                           "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
+        {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures with ranking, alerts and open positions, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
+                           "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid с рейтингом, алертами и открытыми позициями, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
         {"pr_active_title", {"⭐ <b>Premium Active</b>", "⭐ <b>Премиум активен</b>"}},
         {"pr_service_account", {"Service account — Premium access is permanent.",
                                 "Сервисный аккаунт — доступ Премиум постоянный."}},
@@ -311,10 +312,12 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_rk_choose",    {"Choose a ranking:", "Выберите рейтинг:"}},
         {"hl_locked_body",  {"Perpetual futures are available with Premium.\n\n"
                              "You get leverage, collateral and liquidation price on every trade, "
-                             "realized PnL straight from the exchange, and the 30-day trader ranking.",
+                             "realized PnL straight from the exchange, open positions of your wallets "
+                             "and the 30-day trader ranking.",
                              "Фьючерсы доступны по подписке.\n\n"
                              "Вы получаете плечо, залог и цену ликвидации по каждой сделке, "
-                             "готовую прибыль от биржи и рейтинг трейдеров за 30 дней."}},
+                             "готовую прибыль от биржи, открытые позиции ваших кошельков "
+                             "и рейтинг трейдеров за 30 дней."}},
         {"hl_rk_leverage",  {"Avg leverage", "Среднее плечо"}},
         {"hl_rk_roi_account", {"ROI on deposit", "ROI к депозиту"}},
         {"hl_rk_empty",     {"No data yet — the ranking needs at least 5 closed trades per wallet over 30 days.",
