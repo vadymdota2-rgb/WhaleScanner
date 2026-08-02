@@ -200,6 +200,34 @@ bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlre
 
 }
 
+bool grantPremiumDays(const std::string& chatId, int days) {
+    if (chatId.empty() || days <= 0 || days > 3650) return false;
+    if (!g_premiumSchemaOk) return false;
+
+    ensureUser(chatId);
+    const long long now = static_cast<long long>(time(nullptr));
+    std::lock_guard<std::mutex> l(dbMutex);
+
+    int flag = 0; long long start = 0, expire = 0;
+    if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
+
+    // Действующую подписку продлеваем от её конца, истёкшую - от сегодня.
+    const bool active = (flag != 0 && expire > now);
+    const long long newExpire = (active ? expire : now) + static_cast<long long>(days) * 86400LL;
+    const long long newStart  = active ? (start > 0 ? start : now) : now;
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?"))
+        return false;
+    sqlite3_bind_int64(s, 1, newStart);
+    sqlite3_bind_int64(s, 2, newExpire);
+    sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(s);
+    sqlite3_finalize(s);
+    return rc == SQLITE_DONE;
+}
+
 PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp) {
     if (!sp.is_object()) return PaymentApplyResult::Rejected;
 
