@@ -215,7 +215,7 @@ UIMessage buildAccountMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_positions")}, {"callback_data", "hl_positions"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     std::stringstream text;
