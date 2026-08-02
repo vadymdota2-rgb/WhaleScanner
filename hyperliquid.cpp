@@ -1351,7 +1351,7 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
         navRow.push_back({{"text", "\u27A1\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page + 1)}});
     keyboard["inline_keyboard"].push_back(navRow);
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "hl_menu"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     return {text.str(), keyboard.dump()};
@@ -1496,7 +1496,7 @@ HlMessage buildVenueMenu(const std::string& chatId) {
         {{"text", perpLabel}, {"callback_data", "hl_menu"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
     return {"\U0001F3C6 <b>" + tr(lang, "hl_venue_title") + "</b>\n\n"
             + tr(lang, "hl_venue_choose"), kb.dump()};
@@ -1515,7 +1515,7 @@ HlMessage buildPerpTopMenu(const std::string& chatId) {
         }));
     }
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
     return {"\U0001F535 <b>Hyperliquid \u2014 " + tr(lang, "rk_top_traders_30d") + "</b>\n\n"
             + tr(lang, "hl_rk_choose"), kb.dump()};
@@ -1534,7 +1534,7 @@ HlMessage buildPerpLocked(const std::string& chatId) {
         {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
     return {t.str(), kb.dump()};
 }
@@ -1654,8 +1654,12 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
 
     json kb;
     kb["inline_keyboard"] = json::array();
+    // Именно "back", а не "hl_positions": второе - это НОВЫЙ переход, он кладёт
+    // экран в историю поверх текущего, и стек начинает ходить по кругу
+    // positions -> pos -> positions. Шаг назад по истории приведёт туда же,
+    // но не сломает навигацию.
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "hl_positions"}}
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
     // Метку берём из списка пользователя: показывать голый адрес там, где у
