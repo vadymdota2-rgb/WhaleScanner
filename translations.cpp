@@ -55,7 +55,7 @@ const Table& tableEs() {
         {"menu_help", "❓ Ayuda"},
         {"menu_no_wallets", "Todavía no sigues ninguna billetera.\nPulsa <b>Añadir billetera</b> para empezar a recibir alertas."},
         {"menu_tracking_prefix", "Siguiendo"},
-        {"menu_alerts_above", "alertas desde"},
+        {"menu_alerts_above", "umbral de alerta — desde"},
         {"back_button", "← Atrás"},
         {"cancel_button", "❌ Cancelar"},
 
@@ -298,7 +298,7 @@ const Table& tablePt() {
         {"menu_help", "❓ Ajuda"},
         {"menu_no_wallets", "Você ainda não monitora nenhuma carteira.\nToque em <b>Adicionar carteira</b> para começar a receber alertas."},
         {"menu_tracking_prefix", "Monitorando"},
-        {"menu_alerts_above", "alertas a partir de"},
+        {"menu_alerts_above", "valor mínimo do alerta — a partir de"},
         {"back_button", "← Voltar"},
         {"cancel_button", "❌ Cancelar"},
 
@@ -541,7 +541,7 @@ const Table& tableFr() {
         {"menu_help", "❓ Aide"},
         {"menu_no_wallets", "Vous ne suivez encore aucun portefeuille.\nAppuyez sur <b>Ajouter un portefeuille</b> pour recevoir des alertes."},
         {"menu_tracking_prefix", "Suivi"},
-        {"menu_alerts_above", "alertes à partir de"},
+        {"menu_alerts_above", "seuil d'alerte — à partir de"},
         {"back_button", "← Retour"},
         {"cancel_button", "❌ Annuler"},
 
@@ -784,7 +784,7 @@ const Table& tableTr() {
         {"menu_help", "❓ Yardım"},
         {"menu_no_wallets", "Henüz hiçbir cüzdanı takip etmiyorsun.\nUyarı almaya başlamak için <b>Cüzdan ekle</b>'ye dokun."},
         {"menu_tracking_prefix", "Takipte"},
-        {"menu_alerts_above", "uyarı eşiği"},
+        {"menu_alerts_above", "uyarı eşiği —"},
         {"back_button", "← Geri"},
         {"cancel_button", "❌ İptal"},
 
@@ -1027,7 +1027,7 @@ const Table& tableAr() {
         {"menu_help", "❓ المساعدة"},
         {"menu_no_wallets", "لا تتابع أي محفظة بعد.\nاضغط <b>إضافة محفظة</b> لتبدأ باستقبال التنبيهات."},
         {"menu_tracking_prefix", "قيد المتابعة"},
-        {"menu_alerts_above", "تنبيهات ابتداءً من"},
+        {"menu_alerts_above", "حد التنبيه — من"},
         {"back_button", "← رجوع"},
         {"cancel_button", "❌ إلغاء"},
 
