@@ -244,6 +244,7 @@ const std::string TG_TOKEN = []{
     return std::string(env);
 }();
 
+constexpr int TRIAL_DAYS = 7;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
@@ -299,6 +300,10 @@ void initDB() {
             language TEXT NOT NULL DEFAULT 'en',
             threshold_nanos INTEGER NOT NULL DEFAULT 100000000000,
             created_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS trial_granted (
+            chat_id TEXT PRIMARY KEY,
+            granted_at INTEGER NOT NULL
         );
         CREATE TABLE IF NOT EXISTS whale_addresses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -591,6 +596,30 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
+// Пробный период: 7 дней премиума один раз на аккаунт. Отметка о выдаче живёт
+// в своей таблице и не удаляется вместе с пользователем - иначе достаточно было
+// бы заблокировать бота и вернуться, чтобы получить пробный период заново.
+bool trialAlreadyGranted(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "SELECT 1 FROM trial_granted WHERE chat_id=?")) return true;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const bool found = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_finalize(s);
+    return found;
+}
+
+void markTrialGranted(const std::string& chatId) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "INSERT OR IGNORE INTO trial_granted(chat_id,granted_at) VALUES(?,?)")) return;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(time(nullptr)));
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
 void removeUser(const std::string& chatId) {
 
     if (chatId == SERVICE_CHAT_ID) {
@@ -641,8 +670,22 @@ UIMessage buildMainMenu(const std::string& chatId) {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
     }));
+    // Счётчик дней прямо на кнопке: подписка кончается тихо, и человек узнавал
+    // об этом, только когда переставали приходить перп-алерты. Замок у тех, у
+    // кого её нет, - чтобы платное было видно до нажатия.
+    std::string premiumLabel = tr(lang, "menu_premium");
+    if (isPremium(chatId)) {
+        const long long expire = premiumExpireTs(chatId);
+        const long long now = static_cast<long long>(time(nullptr));
+        if (expire > now) {
+            const long long days = (expire - now + 86399) / 86400;   // вверх: последний день ещё идёт
+            premiumLabel += " (" + std::to_string(days) + " " + tr(lang, "unit_day") + ")";
+        }
+    } else {
+        premiumLabel += " \U0001F512";
+    }
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_premium")}, {"callback_data", "menu:premium"}}
+        {{"text", premiumLabel}, {"callback_data", "menu:premium"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_languages")}, {"callback_data", "menu:languages"}}
@@ -1636,6 +1679,16 @@ void telegramLoop() {
                             // /start - корень навигации, история начинается заново.
                             // Без этого стек оставался пустым, и "Назад" со второго
                             // экрана уводило в главное меню вместо шага назад.
+                            // Пробный период выдаётся один раз на аккаунт: отметка
+                            // о выдаче переживает удаление пользователя и повторный
+                            // /start, поэтому вернуться за вторым нельзя.
+                            if (!trialAlreadyGranted(cid)) {
+                                if (grantPremiumDays(cid, TRIAL_DAYS)) {
+                                    markTrialGranted(cid);
+                                    Lang tl = langFromCode(getUserLanguage(cid));
+                                    sendMsg(cid, tr(tl, "trial_granted"));
+                                }
+                            }
                             resetViewStack(cid, "menu:main");
                             if (isNewUser) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
