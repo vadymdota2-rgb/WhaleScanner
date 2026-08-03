@@ -1007,6 +1007,112 @@ std::string resolveTokenArg(const std::string& argIn) {
     return result;
 }
 
+bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
+                    PriorBuy& out) {
+    const std::string wallet = toLower(walletArg);
+    const std::string token = toLower(tokenArg);
+    const long long now = static_cast<long long>(time(nullptr));
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+
+    // Берём последнюю ПОКУПКУ этого токена этим кошельком - не считая текущей,
+    // которая уже записана к моменту сборки алерта. Отсюда и смещение на одну
+    // строку: самая свежая покупка и есть та, о которой мы сейчас пишем.
+    if (!prepareOrLog(db, &s,
+        "SELECT usd_nanos, token_amount, timestamp FROM trades "
+        "WHERE wallet=? AND token=? AND is_buy=1 "
+        "ORDER BY timestamp DESC LIMIT 1 OFFSET 1")) return false;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+
+    long long usdNanos = 0, ts = 0;
+    std::string amountStr;
+    const bool found = sqlite3_step(s) == SQLITE_ROW;
+    if (found) {
+        usdNanos = sqlite3_column_int64(s, 0);
+        amountStr = safeColumnText(s, 1);
+        ts = sqlite3_column_int64(s, 2);
+    }
+    sqlite3_finalize(s);
+    if (!found || usdNanos <= 0 || ts <= 0) return false;
+
+    // Цена покупки восстанавливается из суммы и количества: отдельно её не
+    // храним, а так она получается ровно та, что была в момент сделки.
+    cpp_int amount = 0;
+    try { amount = cpp_int(amountStr); } catch (...) { return false; }
+    if (amount <= 0) return false;
+
+    const cpp_int thenPxBig = calcUnitPriceNanos(cpp_int(usdNanos), amount, 18);
+    if (thenPxBig <= 0) return false;
+    const long long thenPx = static_cast<long long>(thenPxBig);
+
+    // Цена сейчас - из кэша, он свежий по построению.
+    const uint64_t nowPx = getPriceNanos(token);
+    if (nowPx == 0) return false;
+
+    out.thenPriceNanos = thenPx;
+    out.nowPriceNanos = static_cast<long long>(nowPx);
+    out.ageSeconds = now - ts;
+    out.changePercent = 100.0 * (static_cast<double>(nowPx) - static_cast<double>(thenPx))
+                              / static_cast<double>(thenPx);
+    return true;
+}
+
+bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
+                 long long sellUsdNanos, const std::string& sellAmountStr, SellPnl& out) {
+    const std::string wallet = toLower(walletArg);
+    const std::string token = toLower(tokenArg);
+    if (sellUsdNanos <= 0) return false;
+
+    cpp_int sold = 0;
+    try { sold = cpp_int(sellAmountStr); } catch (...) { return false; }
+    if (sold <= 0) return false;
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+
+    // Все покупки этого токена этим кошельком. Средневзвешенная цена входа
+    // честнее последней покупки: кит обычно набирает позицию заходами, и
+    // сравнивать выход с одним из них значило бы выбрать удобный.
+    if (!prepareOrLog(db, &s,
+        "SELECT usd_nanos, token_amount FROM trades "
+        "WHERE wallet=? AND token=? AND is_buy=1")) return false;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+
+    cpp_int totalUsd = 0, totalAmount = 0;
+    int buys = 0;
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        const long long usd = sqlite3_column_int64(s, 0);
+        const std::string amt = safeColumnText(s, 1);
+        if (usd <= 0 || amt.empty()) continue;
+        try {
+            const cpp_int a(amt);
+            if (a <= 0) continue;
+            totalUsd += cpp_int(usd);
+            totalAmount += a;
+            buys++;
+        } catch (...) {}
+    }
+    sqlite3_finalize(s);
+    if (buys == 0 || totalAmount <= 0) return false;
+
+    // Себестоимость проданного объёма по средней цене входа.
+    const cpp_int costOfSold = totalUsd * sold / totalAmount;
+    if (costOfSold <= 0) return false;
+
+    const cpp_int proceeds(sellUsdNanos);
+    const cpp_int pnl = proceeds - costOfSold;
+
+    out.pnlNanos = static_cast<long long>(pnl);
+    out.costNanos = static_cast<long long>(costOfSold);
+    out.buyCount = buys;
+    out.pnlPercent = 100.0 * static_cast<double>(out.pnlNanos)
+                           / static_cast<double>(out.costNanos);
+    return true;
+}
+
 RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     std::string token = resolveTokenArg(tokenArg);
