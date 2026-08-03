@@ -30,7 +30,7 @@ struct HlMessage {
     std::string keyboard;
 };
 
-HlMessage buildPositionsPicker(const std::string& chatId);
+HlMessage buildPositionsPicker(const std::string& chatId, int page = 1);
 HlMessage buildWalletPositions(const std::string& chatId, const std::string& address);
 
 HlMessage buildVenueMenu(const std::string& chatId);
