@@ -1073,7 +1073,8 @@ uint64_t getPriceNanos(const std::string& token) {
     return n;
 }
 
-std::string buildAlertMessage(const std::string& label, const TxResult& res, const std::string& hash, Lang lang) {
+std::string buildAlertMessage(const std::string& label, const std::string& wallet,
+                              const TxResult& res, const std::string& hash, Lang lang) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
@@ -1103,7 +1104,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         // кита, набиравшего позицию заходами, учитываются все.
         if (!res.isBuy) {
             SellPnl pnl;
-            if (sellOutcome(mA, res.tokenAddr,
+            if (sellOutcome(wallet, res.tokenAddr,
                             static_cast<long long>(res.usdNanos),
                             res.rawAmount.convert_to<std::string>(), pnl)) {
                 msg += (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
@@ -1115,7 +1116,7 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
 
         if (res.isBuy) {
             PriorBuy prior;
-            if (lastBuyOutcome(mA, res.tokenAddr, prior) && prior.changePercent != 0.0) {
+            if (lastBuyOutcome(wallet, res.tokenAddr, prior) && prior.changePercent != 0.0) {
                 msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                      + tr(lang, "alert_prior_buy") + ": <b>"
                      + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
@@ -1186,7 +1187,7 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
 
     bool anySent = false;
     for (auto& [labelLang, chatIds] : byLabelLang) {
-        std::string msg = buildAlertMessage(labelLang.first, res, hash, labelLang.second);
+        std::string msg = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second);
         if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
     }
     if (anySent) {
