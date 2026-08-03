@@ -101,6 +101,19 @@ void initRankingDB() {
             block_number INTEGER,
             timestamp INTEGER
         );
+        CREATE TABLE IF NOT EXISTS wallet_history(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet TEXT NOT NULL,
+            token TEXT NOT NULL,
+            is_buy INTEGER NOT NULL,
+            usd_nanos INTEGER NOT NULL,
+            token_amount TEXT NOT NULL,
+            tx_hash TEXT,
+            timestamp INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_hash ON wallet_history(tx_hash, wallet, token, is_buy);
+        CREATE INDEX IF NOT EXISTS idx_wh_lookup ON wallet_history(wallet, token, timestamp);
+        CREATE INDEX IF NOT EXISTS idx_wh_time ON wallet_history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token);
         DROP INDEX IF EXISTS idx_trades_wallet;
         CREATE INDEX IF NOT EXISTS idx_trades_wallet_time ON trades(wallet, timestamp);
@@ -165,6 +178,14 @@ void closeRankingDB() {
 void cleanupOldTrades() {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
+    {
+        sqlite3_stmt* h;
+        if (prepareOrLog(db, &h, "DELETE FROM wallet_history WHERE timestamp < ?")) {
+            sqlite3_bind_int64(h, 1, static_cast<sqlite3_int64>(time(nullptr)) - WINDOW_SECONDS);
+            sqlite3_step(h);
+            sqlite3_finalize(h);
+        }
+    }
     if (!prepareOrLog(db, &s, "DELETE FROM trades WHERE timestamp < ?")) return;
     sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)) - WINDOW_SECONDS);
     int rc1 = sqlite3_step(s);
@@ -1007,8 +1028,37 @@ std::string resolveTokenArg(const std::string& argIn) {
     return result;
 }
 
+void saveWalletHistory(const std::string& walletArg, const TxResult& tx,
+                       const std::string& hash, long long blockTimestamp) {
+    if (!tx.isSwap || tx.tokenAddr.empty() || tx.usdNanos <= 0) return;
+
+    const std::string wallet = toLower(walletArg);
+    const std::string token = toLower(tx.tokenAddr);
+    const long long ts = blockTimestamp > 0 ? blockTimestamp
+                                            : static_cast<long long>(time(nullptr));
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    // OR IGNORE: одна транзакция может прийти дважды при переобработке блока,
+    // а дубль исказил бы и остаток, и среднюю цену входа.
+    if (!prepareOrLog(db, &s,
+        "INSERT OR IGNORE INTO wallet_history"
+        "(wallet,token,is_buy,usd_nanos,token_amount,tx_hash,timestamp) "
+        "VALUES(?,?,?,?,?,?,?)")) return;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 3, tx.isBuy ? 1 : 0);
+    sqlite3_bind_int64(s, 4, static_cast<sqlite3_int64>(tx.usdNanos));
+    const std::string amt = tx.rawAmount.convert_to<std::string>();
+    sqlite3_bind_text(s, 5, amt.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 6, hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 7, ts);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
 bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
-                    PriorBuy& out) {
+                    const std::string& currentHash, PriorBuy& out) {
     const std::string wallet = toLower(walletArg);
     const std::string token = toLower(tokenArg);
     const long long now = static_cast<long long>(time(nullptr));
@@ -1023,15 +1073,17 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
-    // Берём последнюю ПОКУПКУ этого токена этим кошельком - не считая текущей,
-    // которая уже записана к моменту сборки алерта. Отсюда и смещение на одну
-    // строку: самая свежая покупка и есть та, о которой мы сейчас пишем.
+    // Последняя ПОКУПКА этого токена этим кошельком, кроме текущей. Отсекаем
+    // её по хешу, а не смещением на строку: попадает ли текущая сделка в базу
+    // вообще, зависит от того, следит ли за кошельком сервисный аккаунт, и
+    // слепое смещение пропускало бы настоящую прошлую покупку.
     if (!prepareOrLog(db, &s,
-        "SELECT usd_nanos, token_amount, timestamp FROM trades "
-        "WHERE wallet=? AND token=? AND is_buy=1 "
-        "ORDER BY timestamp DESC LIMIT 1 OFFSET 1")) return false;
+        "SELECT usd_nanos, token_amount, timestamp FROM wallet_history "
+        "WHERE wallet=? AND token=? AND is_buy=1 AND (tx_hash IS NULL OR tx_hash<>?) "
+        "ORDER BY timestamp DESC LIMIT 1")) return false;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, currentHash.c_str(), -1, SQLITE_TRANSIENT);
 
     long long usdNanos = 0, ts = 0;
     std::string amountStr;
@@ -1080,7 +1132,7 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     // всем покупкам скопом нельзя: докупка после продажи меняет среднюю, и
     // покупки, сделанные позже, задним числом удорожали бы уже проданное.
     if (!prepareOrLog(db, &s,
-        "SELECT is_buy, usd_nanos, token_amount, tx_hash FROM trades "
+        "SELECT is_buy, usd_nanos, token_amount, tx_hash FROM wallet_history "
         "WHERE wallet=? AND token=? ORDER BY timestamp ASC, id ASC")) return false;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
