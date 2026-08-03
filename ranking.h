@@ -40,13 +40,17 @@ extern const std::string SERVICE_CHAT_ID;
 
 std::string formatHoldTime(long long seconds, Lang lang);
 
+void saveWalletHistory(const std::string& wallet, const TxResult& tx,
+                       const std::string& hash, long long blockTimestamp);
+
 struct PriorBuy {
     long long thenPriceNanos = 0;
     long long nowPriceNanos = 0;
     long long ageSeconds = 0;
     double changePercent = 0.0;
 };
-bool lastBuyOutcome(const std::string& wallet, const std::string& token, PriorBuy& out);
+bool lastBuyOutcome(const std::string& wallet, const std::string& token,
+                    const std::string& currentHash, PriorBuy& out);
 
 struct SellPnl {
     long long pnlNanos = 0;
