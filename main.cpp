@@ -1116,7 +1116,7 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
 
         if (res.isBuy) {
             PriorBuy prior;
-            if (lastBuyOutcome(wallet, res.tokenAddr, prior) && prior.changePercent != 0.0) {
+            if (lastBuyOutcome(wallet, res.tokenAddr, hash, prior) && prior.changePercent != 0.0) {
                 msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                      + tr(lang, "alert_prior_buy") + ": <b>"
                      + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
@@ -1237,6 +1237,10 @@ void flushPendingAlerts(bool force) {
                 for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
         }
         if (serviceWatched) saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
+        // История для расчёта прибыли пишется отдельно от рейтинговой: рейтинг
+        // читает всю таблицу trades целиком, и кошельки пользователей исказили
+        // бы его. Здесь же нужна история по каждому отслеживаемому кошельку.
+        saveWalletHistory(p.wallet, p.agg, p.hash, p.blockTs);
         dispatchAlert(p.wallet, p.agg, p.hash);
     }
 }
@@ -1328,7 +1332,7 @@ bool processBlock(long long bn) {
 
         rememberTokensFromReceipt(mA, receipt, blockTs);
         if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
-        else dispatchAlert(mA, res, hash);
+        else { saveWalletHistory(mA, res, hash, blockTs); dispatchAlert(mA, res, hash); }
         markTxProcessed(hash,bn);
     }
     saveLastBlockHash(block.is_object()?block.value("hash",""):""); return true;
