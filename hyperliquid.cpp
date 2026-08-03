@@ -69,6 +69,7 @@ constexpr long long NANOS_PER_UNIT = 1000000000LL;
 
 constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
+constexpr int HL_PICKER_PER_PAGE = 5;
 
 constexpr long long HL_RANK_WINDOW_SEC = 30LL * 86400LL;
 constexpr long long HL_FILL_TTL_SEC = HL_RANK_WINDOW_SEC;
@@ -1619,21 +1620,45 @@ HlMessage buildPositionsLocked(Lang lang) {
 
 // Выбор кошелька. Опрашивать все сразу незачем: человека интересует конкретный,
 // а каждый лишний запрос - это ожидание на его же экране.
-HlMessage buildPositionsPicker(const std::string& chatId) {
+HlMessage buildPositionsPicker(const std::string& chatId, int page) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
     if (!isPremium(chatId)) return buildPositionsLocked(lang);
 
     const char* const dm = dirMark(lang);
     const std::vector<HlUserWallet> wallets = hlUserWallets(chatId);
 
+    // Постраничность обязательна: у премиума до 50 кошельков, а у сервисного
+    // аккаунта - тысячи. Без неё экран превращался в простыню из кнопок.
+    const int total = static_cast<int>(wallets.size());
+    const int pages = total > 0 ? (total + HL_PICKER_PER_PAGE - 1) / HL_PICKER_PER_PAGE : 1;
+    if (page < 1) page = 1;
+    if (page > pages) page = pages;
+    const int from = (page - 1) * HL_PICKER_PER_PAGE;
+    const int to = std::min(from + HL_PICKER_PER_PAGE, total);
+
     json kb;
     kb["inline_keyboard"] = json::array();
-    for (const auto& w : wallets) {
+    for (int i = from; i < to; i++) {
+        const HlUserWallet& w = wallets[static_cast<size_t>(i)];
         const std::string label = w.label.empty() ? shortAddress(w.address) : safeString(w.label, 32);
         kb["inline_keyboard"].push_back(json::array({
             {{"text", "\U0001F4BC " + label}, {"callback_data", "hl_pos:" + w.address}}
         }));
     }
+
+    if (pages > 1) {
+        json nav = json::array();
+        if (page > 1)
+            nav.push_back({{"text", "\u2B05\uFE0F"},
+                           {"callback_data", "hl_pospage:" + std::to_string(page - 1)}});
+        nav.push_back({{"text", std::to_string(page) + "/" + std::to_string(pages)},
+                       {"callback_data", "hl_posnoop"}});
+        if (page < pages)
+            nav.push_back({{"text", "\u27A1\uFE0F"},
+                           {"callback_data", "hl_pospage:" + std::to_string(page + 1)}});
+        kb["inline_keyboard"].push_back(nav);
+    }
+
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
@@ -1725,7 +1750,14 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
         out = buildPerpLocked(chatId);
         return true;
     }
-    if (action == "hl_positions") { out = buildPositionsPicker(chatId); return true; }
+    if (action == "hl_positions") { out = buildPositionsPicker(chatId, 1); return true; }
+    if (action == "hl_pospage") {
+        int page = 1;
+        try { page = std::stoi(param); } catch (...) {}
+        out = buildPositionsPicker(chatId, page);
+        return true;
+    }
+    if (action == "hl_posnoop") { out = buildPositionsPicker(chatId, 1); return true; }
     if (action == "hl_pos") { out = buildWalletPositions(chatId, param); return true; }
     if (action == "hl_menu") { out = buildPerpTopMenu(chatId); return true; }
     if (action == "hl_open") {
