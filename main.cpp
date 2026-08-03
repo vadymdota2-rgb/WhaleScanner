@@ -1096,12 +1096,9 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
         std::string priceLabel = tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price");
         msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
 
-        // Чем кончилась прошлая покупка этого же токена. Без этой строки алерт
-        // сообщает только событие: "кит купил" - а стоило ли повторять, человек
-        // не знает. Показываем только у покупок: у продажи исход уже случился.
         // Прибыль по закрытой сделке: продал дороже средней цены входа или
-        // дешевле. Считается по всем покупкам этого токена в базе, поэтому у
-        // кита, набиравшего позицию заходами, учитываются все.
+        // дешевле. Считается по всей истории токена в базе, поэтому у кита,
+        // набиравшего позицию заходами, учитываются все покупки.
         if (!res.isBuy) {
             SellPnl pnl;
             if (sellOutcome(wallet, res.tokenAddr,
@@ -1119,9 +1116,15 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
             }
         }
 
+        // Чем кончилась прошлая покупка этого же токена и по какой средней он
+        // уже набрал позицию. Без этих строк алерт сообщает только событие:
+        // "кит купил" - а дорого или дёшево для него самого, человек не знает.
         if (res.isBuy) {
             PriorBuy prior;
-            if (lastBuyOutcome(wallet, res.tokenAddr, hash, prior)) {
+            // Передаём цену этой же сделки - она посчитана строкой выше и точна,
+                // в отличие от рыночной из кэша, которая отстаёт до двух минут.
+                if (lastBuyOutcome(wallet, res.tokenAddr, hash,
+                                   static_cast<long long>(unitPriceNanos), prior)) {
                 // Средняя по уже набранной позиции: докупает он выше своей
                 // средней или ниже - это и есть смысл строки.
                 if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
