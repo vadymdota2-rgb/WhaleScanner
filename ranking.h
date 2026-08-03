@@ -52,7 +52,8 @@ struct PriorBuy {
     int buyCount = 0;              // сколько покупок было до текущей
 };
 bool lastBuyOutcome(const std::string& wallet, const std::string& token,
-                    const std::string& currentHash, PriorBuy& out);
+                    const std::string& currentHash, long long currentPriceNanos,
+                    PriorBuy& out);
 
 struct SellPnl {
     long long pnlNanos = 0;
