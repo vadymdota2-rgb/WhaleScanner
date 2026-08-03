@@ -74,13 +74,12 @@ bool hexToLL(const std::string& hex, long long& out) {
 }
 
 namespace {
-// Длина пробельного символа, начинающегося в позиции i (0 - непробельный).
-// Важно обрабатывать неразрывный пробел U+00A0 как ЦЕЛЫЙ двухбайтовый символ:
-// побайтовое сравнение обрезало бы байт A0 и у обычных букв (например, у
-// кириллической "Р" = D0 A0), ломая UTF-8.
 size_t whitespaceLenAt(const std::string& s, size_t i) {
     unsigned char c = static_cast<unsigned char>(s[i]);
     if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') return 1;
+    // Неразрывный пробел U+00A0 в UTF-8 занимает ДВА байта: C2 A0. Проверять
+    // байты по отдельности нельзя - 0xA0 встречается внутри кириллицы, и такая
+    // проверка резала бы слова посередине.
     if (c == 0xC2 && i + 1 < s.size() && static_cast<unsigned char>(s[i + 1]) == 0xA0) return 2;
     return 0;
 }
@@ -105,8 +104,6 @@ std::string trim(const std::string& s) {
 }
 
 bool isValidAddress(const std::string& a) {
-    // Префикс принимаем в обоих регистрах: часть вызовов проверяет адрес до
-    // приведения к нижнему регистру, и вставленный "0X..." отвергался бы зря.
     if (a.length() != 42 || a[0] != '0' || (a[1] != 'x' && a[1] != 'X')) return false;
     for (size_t i = 2; i < a.length(); i++) {
         char c = a[i];
@@ -130,14 +127,16 @@ std::string formatThousands(uint64_t v) {
 
 std::string formatUsdNanosSigned(long long nanos, bool withPlus) {
     const bool neg = nanos < 0;
-    // Модуль берём через unsigned, чтобы корректно обработать LLONG_MIN,
-    // у которого нет положительного двойника в знаковом типе.
+    // Модуль берём через unsigned, а не через -nanos: у LLONG_MIN нет
+    // положительного двойника в знаковом типе, и обычное отрицание там -
+    // неопределённое поведение.
     unsigned long long mag = neg
         ? (~static_cast<unsigned long long>(nanos) + 1ULL)
         : static_cast<unsigned long long>(nanos);
 
     unsigned long long dollars = mag / 1000000000ULL;
-    int cents = static_cast<int>((mag % 1000000000ULL) / 10000000ULL);
+    int cents = static_cast<int>((mag % 1000000000ULL + 5000000ULL) / 10000000ULL);
+    if (cents == 100) { dollars++; cents = 0; }
 
     std::string s = formatThousands(dollars);
     if (cents != 0) {
@@ -153,8 +152,6 @@ std::string formatPercent(double pct, bool withPlus) {
     if (!std::isfinite(pct)) return "n/a";
     const bool neg = pct < 0;
     double a = neg ? -pct : pct;
-    // Точность по величине: меньше 1% - один знак (0.9%), 1..1000% - два
-    // знака (1.35%), выше - целое (12346%), где дробь была бы шумом.
     int decimals = a < 1.0 ? 1 : (a < 1000.0 ? 2 : 0);
     char buf[48];
     std::snprintf(buf, sizeof(buf), "%.*f", decimals, a);
@@ -168,9 +165,12 @@ std::string formatUsdSmall(long long nanos) {
     char buf[48];
     if (usd >= 0.01) {
         std::snprintf(buf, sizeof(buf), "%.2f", usd);
-    } else {
-        // Меньше цента: показываем четыре знака, иначе виден только ноль.
+    } else if (usd >= 0.0001) {
         std::snprintf(buf, sizeof(buf), "%.4f", usd);
+    } else if (usd >= 0.00000001) {
+        std::snprintf(buf, sizeof(buf), "%.8f", usd);
+    } else {
+        return "<$0.00000001";
     }
     return std::string("$") + buf;
 }
