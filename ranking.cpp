@@ -1043,7 +1043,8 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     try { amount = cpp_int(amountStr); } catch (...) { return false; }
     if (amount <= 0) return false;
 
-    const cpp_int thenPxBig = calcUnitPriceNanos(cpp_int(usdNanos), amount, 18);
+    const int dec = getDecimals(token);
+    const cpp_int thenPxBig = calcUnitPriceNanos(cpp_int(usdNanos), amount, dec);
     if (thenPxBig <= 0) return false;
     const long long thenPx = static_cast<long long>(thenPxBig);
 
