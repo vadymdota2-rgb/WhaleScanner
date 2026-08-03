@@ -55,7 +55,8 @@ struct SellPnl {
     int buyCount = 0;
 };
 bool sellOutcome(const std::string& wallet, const std::string& token,
-                 long long sellUsdNanos, const std::string& sellAmountStr, SellPnl& out);
+                 long long sellUsdNanos, const std::string& sellAmountStr,
+                 const std::string& currentHash, SellPnl& out);
 
 bool handleRankingCallback(const std::string& chatId, const std::string& action,
                            const std::string& param, const std::string& data,
