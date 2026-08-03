@@ -1094,6 +1094,43 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
         ts = sqlite3_column_int64(s, 2);
     }
     sqlite3_finalize(s);
+
+    // Средняя цена уже набранной позиции - не то же, что цена последней
+    // покупки. Кит мог войти пятью заходами, и сравнивать новую покупку с
+    // одной из них значило бы выбрать удобную. Обход тот же, что при продаже:
+    // покупка увеличивает остаток, продажа списывает долю.
+    {
+        sqlite3_stmt* h;
+        if (prepareOrLog(db, &h,
+            "SELECT is_buy, usd_nanos, token_amount, tx_hash FROM wallet_history "
+            "WHERE wallet=? AND token=? ORDER BY timestamp ASC, id ASC")) {
+            sqlite3_bind_text(h, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(h, 2, token.c_str(), -1, SQLITE_TRANSIENT);
+            cpp_int pos = 0, cost = 0;
+            int buys = 0;
+            while (sqlite3_step(h) == SQLITE_ROW) {
+                const bool isBuy = sqlite3_column_int(h, 0) != 0;
+                const long long u = sqlite3_column_int64(h, 1);
+                const std::string a = safeColumnText(h, 2);
+                const std::string rowHash = safeColumnText(h, 3);
+                if (!currentHash.empty() && rowHash == currentHash) continue;
+                cpp_int amt = 0;
+                try { amt = cpp_int(a); } catch (...) { continue; }
+                if (amt <= 0 || u < 0) continue;
+                if (isBuy) { pos += amt; cost += cpp_int(u); buys++; continue; }
+                if (pos <= 0) continue;
+                const cpp_int take = amt < pos ? amt : pos;
+                cost -= cost * take / pos;
+                pos -= take;
+            }
+            sqlite3_finalize(h);
+            if (pos > 0 && cost > 0) {
+                const cpp_int avgBig = calcUnitPriceNanos(cost, pos, dec);
+                if (avgBig > 0) out.avgEntryNanos = static_cast<long long>(avgBig);
+            }
+            out.buyCount = buys;
+        }
+    }
     if (!found || usdNanos <= 0 || ts <= 0) return false;
 
     // Цена покупки восстанавливается из суммы и количества: отдельно её не
@@ -1124,6 +1161,9 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     cpp_int selling = 0;
     try { selling = cpp_int(sellAmountStr); } catch (...) { return false; }
     if (selling <= 0) return false;
+
+    // ДО захвата: getDecimals при промахе кэша идёт в сеть и сама берёт dbMutex.
+    const int dec = getDecimals(token);
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
@@ -1173,6 +1213,11 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     const cpp_int take = selling < position ? selling : position;
     const cpp_int costOfSold = costBasis * take / position;
     if (costOfSold <= 0) return false;
+
+    // Средняя цена входа именно проданного объёма - та, с которой сравнивается
+    // цена продажи. Без неё процент нечем проверить.
+    const cpp_int avgBig = calcUnitPriceNanos(costOfSold, take, dec);
+    if (avgBig > 0) out.avgEntryNanos = static_cast<long long>(avgBig);
 
     const cpp_int pnl = cpp_int(sellUsdNanos) - costOfSold;
     out.pnlNanos = static_cast<long long>(pnl);
