@@ -1058,17 +1058,18 @@ void saveWalletHistory(const std::string& walletArg, const TxResult& tx,
 }
 
 bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
-                    const std::string& currentHash, PriorBuy& out) {
+                    const std::string& currentHash, long long currentPriceNanos,
+                    PriorBuy& out) {
     const std::string wallet = toLower(walletArg);
     const std::string token = toLower(tokenArg);
     const long long now = static_cast<long long>(time(nullptr));
 
-    // ДО захвата мьютекса: обе функции при промахе кэша идут в сеть и сами
-    // берут dbMutex через saveTokenMetadata. Вызов под замком вешает поток
+    if (currentPriceNanos <= 0) return false;
+
+    // ДО захвата мьютекса: getDecimals при промахе кэша идёт в сеть и сама
+    // берёт dbMutex через saveTokenMetadata. Вызов под замком вешает поток
     // намертво - бот запускается и молча перестаёт отвечать.
     const int dec = getDecimals(token);
-    const uint64_t nowPx = getPriceNanos(token);
-    if (nowPx == 0) return false;
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
@@ -1143,10 +1144,12 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     if (thenPxBig <= 0) return false;
     const long long thenPx = static_cast<long long>(thenPxBig);
 
+    // Сравниваем с ценой ЭТОЙ сделки, а не с рыночной из кэша: обе величины
+    // тогда из одного момента и проверяются друг через друга прямо в алерте.
     out.thenPriceNanos = thenPx;
-    out.nowPriceNanos = static_cast<long long>(nowPx);
+    out.nowPriceNanos = currentPriceNanos;
     out.ageSeconds = now - ts;
-    out.changePercent = 100.0 * (static_cast<double>(nowPx) - static_cast<double>(thenPx))
+    out.changePercent = 100.0 * (static_cast<double>(currentPriceNanos) - static_cast<double>(thenPx))
                               / static_cast<double>(thenPx);
     return true;
 }
