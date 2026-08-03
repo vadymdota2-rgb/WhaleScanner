@@ -40,6 +40,23 @@ extern const std::string SERVICE_CHAT_ID;
 
 std::string formatHoldTime(long long seconds, Lang lang);
 
+struct PriorBuy {
+    long long thenPriceNanos = 0;
+    long long nowPriceNanos = 0;
+    long long ageSeconds = 0;
+    double changePercent = 0.0;
+};
+bool lastBuyOutcome(const std::string& wallet, const std::string& token, PriorBuy& out);
+
+struct SellPnl {
+    long long pnlNanos = 0;
+    long long costNanos = 0;
+    double pnlPercent = 0.0;
+    int buyCount = 0;
+};
+bool sellOutcome(const std::string& wallet, const std::string& token,
+                 long long sellUsdNanos, const std::string& sellAmountStr, SellPnl& out);
+
 bool handleRankingCallback(const std::string& chatId, const std::string& action,
                            const std::string& param, const std::string& data,
                            long long messageId, const std::string& callbackQueryId);
