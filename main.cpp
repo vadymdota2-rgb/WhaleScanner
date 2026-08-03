@@ -1106,7 +1106,7 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
             SellPnl pnl;
             if (sellOutcome(wallet, res.tokenAddr,
                             static_cast<long long>(res.usdNanos),
-                            res.rawAmount.convert_to<std::string>(), pnl)) {
+                            res.rawAmount.convert_to<std::string>(), hash, pnl)) {
                 msg += (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                      + tr(lang, "alert_trade_pnl") + ": <b>"
                      + formatUsdNanosSigned(pnl.pnlNanos, true) + "</b> ("
