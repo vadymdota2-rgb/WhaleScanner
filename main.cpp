@@ -1107,6 +1107,11 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
             if (sellOutcome(wallet, res.tokenAddr,
                             static_cast<long long>(res.usdNanos),
                             res.rawAmount.convert_to<std::string>(), hash, pnl)) {
+                // Средняя цена входа идёт ПЕРЕД прибылью: сначала с чем
+                // сравниваем, потом результат. Без неё процент нечем проверить.
+                if (pnl.avgEntryNanos > 0)
+                    msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
+                         + formatPriceUsd(cpp_int(pnl.avgEntryNanos)) + "</b>\n";
                 msg += (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                      + tr(lang, "alert_trade_pnl") + ": <b>"
                      + formatUsdNanosSigned(pnl.pnlNanos, true) + "</b> ("
@@ -1116,13 +1121,20 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
 
         if (res.isBuy) {
             PriorBuy prior;
-            if (lastBuyOutcome(wallet, res.tokenAddr, hash, prior) && prior.changePercent != 0.0) {
-                msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
-                     + tr(lang, "alert_prior_buy") + ": <b>"
-                     + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
-                     + formatHoldTime(prior.ageSeconds, lang) + " "
-                     + tr(lang, "alert_prior_ago") + " \u2192 <b>"
-                     + formatPercent(prior.changePercent, true) + "</b>\n";
+            if (lastBuyOutcome(wallet, res.tokenAddr, hash, prior)) {
+                // Средняя по уже набранной позиции: докупает он выше своей
+                // средней или ниже - это и есть смысл строки.
+                if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
+                    msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
+                         + formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
+                if (prior.changePercent != 0.0) {
+                    msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+                         + tr(lang, "alert_prior_buy") + ": <b>"
+                         + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
+                         + formatHoldTime(prior.ageSeconds, lang) + " "
+                         + tr(lang, "alert_prior_ago") + " \u2192 <b>"
+                         + formatPercent(prior.changePercent, true) + "</b>\n";
+                }
             }
         }
     }
