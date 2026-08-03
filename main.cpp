@@ -1357,10 +1357,40 @@ thread_local bool g_navigatingBack = false;
 std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
 constexpr size_t VIEW_STACK_MAX = 12;
 
+// Листание страниц - не переход на новый экран, а перемещение внутри
+// текущего. Такие адреса ЗАМЕНЯЮТ вершину стека, а не ложатся поверх: иначе
+// "Назад" отматывало бы страницы по одной вместо выхода из раздела.
+// Возвращает "корень" списка для адреса листания: экран, с которого список
+// открыли. Страницы одного списка считаются одним экраном, поэтому и корень
+// у них общий.
+std::string pagingRoot(const std::string& data) {
+    if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
+    if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
+    if (data.rfind("gt_page:", 0) == 0)     return "menu:toptrader_spot";
+    if (data.rfind("hl_page:", 0) == 0)     return "hl_menu";
+    // Топ по токену открывается вводом символа, а не кнопкой: своего адреса у
+    // входа нет, поэтому корнем считаем сам список - страницы схлопнутся между
+    // собой, а "Назад" уведёт на экран, с которого запускали поиск.
+    if (data.rfind("tt_page:", 0) == 0)     return "tt_page:";
+    return "";
+}
+
 void rememberView(const std::string& chatId, const std::string& data) {
     if (g_navigatingBack) return;
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto& st = g_viewStack[chatId];
+    // Листание не создаёт новый шаг: страница подменяет либо предыдущую
+    // страницу того же списка, либо сам экран списка. Иначе "Назад" отматывало
+    // бы страницы по одной, а из первой уводило бы на неё же.
+    const std::string root = pagingRoot(data);
+    if (!root.empty()) {
+        if (!st.empty() && (st.back() == root || pagingRoot(st.back()) == root))
+            st.back() = data;
+        else
+            st.push_back(data);
+        if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
+        return;
+    }
     if (!st.empty() && st.back() == data) return;
     st.push_back(data);
     if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
