@@ -674,7 +674,12 @@ UIMessage buildMainMenu(const std::string& chatId) {
     // об этом, только когда переставали приходить перп-алерты. Замок у тех, у
     // кого её нет, - чтобы платное было видно до нажатия.
     std::string premiumLabel = tr(lang, "menu_premium");
-    if (isPremium(chatId)) {
+    if (chatId == SERVICE_CHAT_ID) {
+        // У сервисного аккаунта доступ постоянный и от подписки не зависит:
+        // isPremium возвращает true по идентификатору, ещё до чтения базы.
+        // Срок ему считать нечего, поэтому бесконечность вместо числа дней.
+        premiumLabel += " (\u221E)";
+    } else if (isPremium(chatId)) {
         const long long expire = premiumExpireTs(chatId);
         const long long now = static_cast<long long>(time(nullptr));
         if (expire > now) {
@@ -1089,6 +1094,36 @@ std::string buildAlertMessage(const std::string& label, const TxResult& res, con
         cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
         std::string priceLabel = tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price");
         msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+
+        // Чем кончилась прошлая покупка этого же токена. Без этой строки алерт
+        // сообщает только событие: "кит купил" - а стоило ли повторять, человек
+        // не знает. Показываем только у покупок: у продажи исход уже случился.
+        // Прибыль по закрытой сделке: продал дороже средней цены входа или
+        // дешевле. Считается по всем покупкам этого токена в базе, поэтому у
+        // кита, набиравшего позицию заходами, учитываются все.
+        if (!res.isBuy) {
+            SellPnl pnl;
+            if (sellOutcome(mA, res.tokenAddr,
+                            static_cast<long long>(res.usdNanos),
+                            res.rawAmount.convert_to<std::string>(), pnl)) {
+                msg += (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+                     + tr(lang, "alert_trade_pnl") + ": <b>"
+                     + formatUsdNanosSigned(pnl.pnlNanos, true) + "</b> ("
+                     + formatPercent(pnl.pnlPercent, true) + ")\n";
+            }
+        }
+
+        if (res.isBuy) {
+            PriorBuy prior;
+            if (lastBuyOutcome(mA, res.tokenAddr, prior) && prior.changePercent != 0.0) {
+                msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+                     + tr(lang, "alert_prior_buy") + ": <b>"
+                     + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
+                     + formatHoldTime(prior.ageSeconds, lang) + " "
+                     + tr(lang, "alert_prior_ago") + " \u2192 <b>"
+                     + formatPercent(prior.changePercent, true) + "</b>\n";
+            }
+        }
     }
     if (res.isSwap && !res.counterAddr.empty()) {
         std::string counterLabel = tr(lang, res.isBuy ? "alert_spent" : "alert_received");
@@ -1549,7 +1584,8 @@ void handleCallbackQuery(const json& callbackQuery) {
         handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
     else if (action == "hl_menu" || action == "hl_open" || action == "hl_page" ||
-             action == "hl_positions" || action == "hl_pos") {
+             action == "hl_positions" || action == "hl_pos" ||
+             action == "hl_pospage" || action == "hl_posnoop") {
         handleHyperliquidCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
 }
