@@ -1013,6 +1013,13 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     const std::string token = toLower(tokenArg);
     const long long now = static_cast<long long>(time(nullptr));
 
+    // ДО захвата мьютекса: обе функции при промахе кэша идут в сеть и сами
+    // берут dbMutex через saveTokenMetadata. Вызов под замком вешает поток
+    // намертво - бот запускается и молча перестаёт отвечать.
+    const int dec = getDecimals(token);
+    const uint64_t nowPx = getPriceNanos(token);
+    if (nowPx == 0) return false;
+
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
@@ -1043,14 +1050,9 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     try { amount = cpp_int(amountStr); } catch (...) { return false; }
     if (amount <= 0) return false;
 
-    const int dec = getDecimals(token);
     const cpp_int thenPxBig = calcUnitPriceNanos(cpp_int(usdNanos), amount, dec);
     if (thenPxBig <= 0) return false;
     const long long thenPx = static_cast<long long>(thenPxBig);
-
-    // Цена сейчас - из кэша, он свежий по построению.
-    const uint64_t nowPx = getPriceNanos(token);
-    if (nowPx == 0) return false;
 
     out.thenPriceNanos = thenPx;
     out.nowPriceNanos = static_cast<long long>(nowPx);
@@ -1061,51 +1063,66 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
 }
 
 bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
-                 long long sellUsdNanos, const std::string& sellAmountStr, SellPnl& out) {
+                 long long sellUsdNanos, const std::string& sellAmountStr,
+                 const std::string& currentHash, SellPnl& out) {
     const std::string wallet = toLower(walletArg);
     const std::string token = toLower(tokenArg);
     if (sellUsdNanos <= 0) return false;
 
-    cpp_int sold = 0;
-    try { sold = cpp_int(sellAmountStr); } catch (...) { return false; }
-    if (sold <= 0) return false;
+    cpp_int selling = 0;
+    try { selling = cpp_int(sellAmountStr); } catch (...) { return false; }
+    if (selling <= 0) return false;
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
-    // Все покупки этого токена этим кошельком. Средневзвешенная цена входа
-    // честнее последней покупки: кит обычно набирает позицию заходами, и
-    // сравнивать выход с одним из них значило бы выбрать удобный.
+    // Всю историю по паре кошелёк-токен читаем ПО ПОРЯДКУ. Считать среднюю по
+    // всем покупкам скопом нельзя: докупка после продажи меняет среднюю, и
+    // покупки, сделанные позже, задним числом удорожали бы уже проданное.
     if (!prepareOrLog(db, &s,
-        "SELECT usd_nanos, token_amount FROM trades "
-        "WHERE wallet=? AND token=? AND is_buy=1")) return false;
+        "SELECT is_buy, usd_nanos, token_amount, tx_hash FROM trades "
+        "WHERE wallet=? AND token=? ORDER BY timestamp ASC, id ASC")) return false;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
 
-    cpp_int totalUsd = 0, totalAmount = 0;
+    cpp_int position = 0;   // остаток монет
+    cpp_int costBasis = 0;  // сколько вложено именно в этот остаток
     int buys = 0;
+
     while (sqlite3_step(s) == SQLITE_ROW) {
-        const long long usd = sqlite3_column_int64(s, 0);
-        const std::string amt = safeColumnText(s, 1);
-        if (usd <= 0 || amt.empty()) continue;
-        try {
-            const cpp_int a(amt);
-            if (a <= 0) continue;
-            totalUsd += cpp_int(usd);
-            totalAmount += a;
+        const bool isBuy = sqlite3_column_int(s, 0) != 0;
+        const long long usd = sqlite3_column_int64(s, 1);
+        const std::string amtStr = safeColumnText(s, 2);
+        const std::string rowHash = safeColumnText(s, 3);
+        cpp_int amt = 0;
+        try { amt = cpp_int(amtStr); } catch (...) { continue; }
+        if (amt <= 0 || usd < 0) continue;
+
+        if (isBuy) {
+            position += amt;
+            costBasis += cpp_int(usd);
             buys++;
-        } catch (...) {}
+            continue;
+        }
+
+        // Текущая продажа к этому моменту уже в базе. Пропускаем её по хешу -
+        // сравнение по количеству ошиблось бы, продай кит дважды столько же.
+        if (!currentHash.empty() && rowHash == currentHash) continue;
+
+        if (position <= 0) continue;
+        const cpp_int take = amt < position ? amt : position;
+        costBasis -= costBasis * take / position;
+        position -= take;
     }
     sqlite3_finalize(s);
-    if (buys == 0 || totalAmount <= 0) return false;
 
-    // Себестоимость проданного объёма по средней цене входа.
-    const cpp_int costOfSold = totalUsd * sold / totalAmount;
+    if (buys == 0 || position <= 0 || costBasis <= 0) return false;
+
+    const cpp_int take = selling < position ? selling : position;
+    const cpp_int costOfSold = costBasis * take / position;
     if (costOfSold <= 0) return false;
 
-    const cpp_int proceeds(sellUsdNanos);
-    const cpp_int pnl = proceeds - costOfSold;
-
+    const cpp_int pnl = cpp_int(sellUsdNanos) - costOfSold;
     out.pnlNanos = static_cast<long long>(pnl);
     out.costNanos = static_cast<long long>(costOfSold);
     out.buyCount = buys;
