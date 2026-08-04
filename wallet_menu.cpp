@@ -26,9 +26,6 @@ std::mutex g_walletPageMutex;
 std::map<std::string, int> g_lastWalletPage;
 }
 
-namespace {
-}
-
 void rememberWalletPage(const std::string& chatId, int page) {
     std::lock_guard<std::mutex> l(g_walletPageMutex);
     g_lastWalletPage[chatId] = page < 1 ? 1 : page;
@@ -156,7 +153,8 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     return AddWhaleResult::OK;
 }
 
-bool removeUserWhale(const std::string& chatId, const std::string& address) {
+bool removeUserWhale(const std::string& chatId, const std::string& addressArg) {
+    const std::string address = toLower(addressArg);
     std::lock_guard<std::mutex> l(dbMutex);
     if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[DB] removeUserWhale BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
@@ -465,7 +463,6 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             sqlite3_finalize(s);
 
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
-            rememberView(chatId, data);
             replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
                     "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
         } else {
@@ -494,7 +491,6 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             }
         }
         auto msg = TelegramUI::buildRemoveConfirm(chatId, address, label, langFromCode(getUserLanguage(chatId)));
-        rememberView(chatId, data);
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "remove") {
