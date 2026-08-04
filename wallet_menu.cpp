@@ -432,6 +432,7 @@ void startAddWalletFlow(const std::string& chatId, long long messageId) {
 bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
                           const std::string& data, long long messageId, const std::string& callbackQueryId) {
     if (action == "mw_page") {
+        g_sessionManager.clearSession(chatId);
         rememberView(chatId, data);
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
@@ -463,8 +464,19 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             sqlite3_finalize(s);
 
             g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
-            replyInPlace(chatId, messageId, tr(lang, "rename_title") + "\n\n" + tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) +
-                    "</b>\n\n" + tr(lang, "rename_enter_new"), TelegramUI::buildCancelButton(lang));
+
+            json cancelKb;
+            cancelKb["inline_keyboard"] = json::array({
+                json::array({
+                    {{"text", tr(lang, "cancel_button")}, {"callback_data", backToWalletsData(chatId)}}
+                })
+            });
+
+            replyInPlace(chatId, messageId,
+                tr(lang, "rename_title") + "\n\n" +
+                tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) + "</b>\n\n" +
+                tr(lang, "rename_enter_new"),
+                cancelKb.dump());
         } else {
             sqlite3_finalize(s);
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
