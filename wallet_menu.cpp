@@ -27,7 +27,6 @@ std::map<std::string, int> g_lastWalletPage;
 }
 
 namespace {
-std::mutex g_holdPageMutex;
 }
 
 void rememberWalletPage(const std::string& chatId, int page) {
@@ -101,7 +100,8 @@ void untrackWalletFromService(const std::string& wallet) {
     }
 }
 
-AddWhaleResult addUserWhale(const std::string& chatId, const std::string& address, const std::string& label) {
+AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addressArg, const std::string& label) {
+    const std::string address = toLower(addressArg);
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
@@ -272,7 +272,7 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         bool illiquid = false;
         double liq = chainCtx().stablecoins.count(t) ? 0.0 : getPoolLiquidityUsd(t);
         if (liq > 0.0) {
-            cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5 * 1e9));
+            const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
             if (usd > poolCap) illiquid = true;
         }
 
@@ -433,8 +433,7 @@ void startAddWalletFlow(const std::string& chatId, long long messageId) {
 
 bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
                           const std::string& data, long long messageId, const std::string& callbackQueryId) {
-    if (false) {}
-    else if (action == "mw_page") {
+    if (action == "mw_page") {
         rememberView(chatId, data);
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
@@ -659,6 +658,7 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
             return true;
         }
 
+        bool renamed = false;
         {
             std::lock_guard<std::mutex> l(dbMutex);
             sqlite3_stmt* s;
@@ -668,9 +668,16 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
                 sqlite3_bind_text(s, 1, newLabel.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 3, session.pendingAddress.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(s);
+                if (sqlite3_step(s) == SQLITE_DONE) renamed = sqlite3_changes(db) > 0;
                 sqlite3_finalize(s);
             }
+        }
+
+        if (!renamed) {
+            g_sessionManager.clearSession(chatId);
+            replyInPlace(chatId, session.promptMessageId, tr(lang, "err_wallet_not_found"),
+                    errorBackKeyboard(chatId, lang));
+            return true;
         }
 
         refreshWatchers();
