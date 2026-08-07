@@ -2006,6 +2006,8 @@ int main() {
     loadTokenCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
+    checkTranslations();
+
     if (!initHyperliquid()) {
         std::cerr << "[STARTUP] Hyperliquid init failed - perps DISABLED for this run" << std::endl;
     } else {
