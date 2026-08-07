@@ -689,10 +689,15 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
         }
 
         refreshWatchers();
-        std::string back = getLastView(chatId);
         g_sessionManager.clearSession(chatId);
-        auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
-        replyInPlace(chatId, session.promptMessageId, tr(lang, "rename_success") + "\n\n" + tr(lang, "rename_new_name") + " <b>" + safeString(newLabel, 32) + "</b>.\n\n" + msg.text,
+        // Прямо в список кошельков, как и отмена: полагаться на историю здесь
+        // ненадёжно - при пустом стеке человека выбрасывало в главное меню,
+        // хотя переименовывал он кошелёк и ждёт увидеть список.
+        auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
+        replyInPlace(chatId, session.promptMessageId,
+                tr(lang, "rename_success") + "\n\n" +
+                tr(lang, "rename_new_name") + " <b>" + safeString(newLabel, 32) + "</b>.\n\n" +
+                msg.text,
                 msg.keyboard);
         return true;
     }
