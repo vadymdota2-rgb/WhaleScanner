@@ -377,12 +377,34 @@ void fetchAccountState(const std::string& wallet) {
 
     if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) return;
 
+    // Закрытые позиции в ответе не приходят вовсе, поэтому старые записи о них
+    // остались бы в кэше навсегда. Собираем монеты, которые сейчас открыты, и
+    // всё остальное по этому кошельку удаляем.
+    std::set<std::string> openNow;
+    for (const auto& ap : j["assetPositions"]) {
+        if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
+        const std::string c = ap["position"].value("coin", std::string());
+        if (!c.empty()) openNow.insert(c);
+    }
+
     std::lock_guard<std::mutex> l(g_posMutex);
+
+    const std::string prefix = posKey(wallet, "");
+    for (auto it = g_lastPositions.begin(); it != g_lastPositions.end(); ) {
+        if (it->first.rfind(prefix, 0) == 0 &&
+            openNow.find(it->first.substr(prefix.size())) == openNow.end())
+            it = g_lastPositions.erase(it);
+        else
+            ++it;
+    }
+
+    // Предохранитель на случай, если кошельков станет очень много. Депозиты
+    // счетов НЕ трогаем: они нужны для ROI и заново придут не скоро.
     if (g_lastPositions.size() > HL_POSITION_CACHE_CAP) {
         g_lastPositions.clear();
-        g_accountValue.clear();
         std::cout << "[HL] кэш позиций сброшен по достижении предела" << std::endl;
     }
+
     for (const auto& ap : j["assetPositions"]) {
         if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
         const json& p = ap["position"];
