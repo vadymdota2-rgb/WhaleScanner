@@ -354,6 +354,17 @@ std::mutex g_posMutex;
 std::unordered_map<std::string, PositionInfo> g_lastPositions;
 std::unordered_map<std::string, long long> g_accountValue;
 
+// Безопасное чтение строкового поля. json::value() бросает исключение, если
+// ключ ЕСТЬ, но лежит в нём null - а площадка присылает null в liquidationPx у
+// позиций без цены ликвидации и в некоторых других полях. Исключение из потока
+// телеграма никто не ловит, и процесс падал целиком.
+std::string jstr(const json& j, const char* key, const char* def = "") {
+    if (!j.is_object()) return def;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return def;
+    return it->get<std::string>();
+}
+
 std::string posKey(const std::string& wallet, const std::string& coin) {
     return wallet + "|" + coin;
 }
@@ -368,7 +379,7 @@ void fetchAccountState(const std::string& wallet) {
 
     long long accountValue = 0;
     if (j.contains("marginSummary") && j["marginSummary"].is_object())
-        parseDecimalToNanos(j["marginSummary"].value("accountValue", std::string("0")), accountValue);
+        parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), accountValue);
 
     {
         std::lock_guard<std::mutex> l(g_posMutex);
@@ -383,7 +394,7 @@ void fetchAccountState(const std::string& wallet) {
     std::set<std::string> openNow;
     for (const auto& ap : j["assetPositions"]) {
         if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
-        const std::string c = ap["position"].value("coin", std::string());
+        const std::string c = jstr(ap["position"], "coin");
         if (!c.empty()) openNow.insert(c);
     }
 
@@ -408,7 +419,7 @@ void fetchAccountState(const std::string& wallet) {
     for (const auto& ap : j["assetPositions"]) {
         if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
         const json& p = ap["position"];
-        std::string coin = p.value("coin", std::string());
+        std::string coin = jstr(p, "coin");
         if (coin.empty()) continue;
 
         PositionInfo info;
@@ -418,11 +429,11 @@ void fetchAccountState(const std::string& wallet) {
             const json& lev = p["leverage"];
             if (lev.contains("value") && lev["value"].is_number())
                 info.leverage = lev["value"].get<int>();
-            info.isolated = lev.value("type", std::string()) == "isolated";
+            info.isolated = jstr(lev, "type") == "isolated";
         }
-        parseDecimalToNanos(p.value("marginUsed", std::string("0")), info.marginUsedNanos);
-        parseDecimalToNanos(p.value("positionValue", std::string("0")), info.positionValueNanos);
-        parseDecimalToNanos(p.value("liquidationPx", std::string("0")), info.liquidationPxNanos);
+        parseDecimalToNanos(jstr(p, "marginUsed", "0"), info.marginUsedNanos);
+        parseDecimalToNanos(jstr(p, "positionValue", "0"), info.positionValueNanos);
+        parseDecimalToNanos(jstr(p, "liquidationPx", "0"), info.liquidationPxNanos);
 
         g_lastPositions[posKey(wallet, coin)] = info;
     }
@@ -609,12 +620,12 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
-    std::string coin = f.value("coin", std::string());
-    std::string dir  = f.value("dir", std::string());
-    std::string side = f.value("side", std::string());
-    std::string px   = f.value("px", std::string());
-    std::string sz   = f.value("sz", std::string());
-    std::string hash = f.value("hash", std::string());
+    std::string coin = jstr(f, "coin");
+    std::string dir  = jstr(f, "dir");
+    std::string side = jstr(f, "side");
+    std::string px   = jstr(f, "px");
+    std::string sz   = jstr(f, "sz");
+    std::string hash = jstr(f, "hash");
     sqlite3_bind_text(s, 3, coin.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 4, dir.c_str(),  -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 5, side.c_str(), -1, SQLITE_TRANSIENT);
@@ -813,17 +824,17 @@ void enrichWallet(const std::string& wallet) {
         const long long ts = f.value("time", 0LL);
         if (ts > maxTs) maxTs = ts;
 
-        if (!isPerpCoin(f.value("coin", std::string()))) { skippedNonPerp++; continue; }
+        if (!isPerpCoin(jstr(f, "coin"))) { skippedNonPerp++; continue; }
 
         Prepared p;
         p.fill = &f;
         p.closedPnl = 0;
         p.fee = 0;
-        parseDecimalToNanos(f.value("closedPnl", std::string("0")), p.closedPnl);
-        parseDecimalToNanos(f.value("fee", std::string("0")), p.fee);
+        parseDecimalToNanos(jstr(f, "closedPnl", "0"), p.closedPnl);
+        parseDecimalToNanos(jstr(f, "fee", "0"), p.fee);
         p.notional = 0;
-        notionalNanos(f.value("px", std::string("0")), f.value("sz", std::string("0")), p.notional);
-        p.pos = lastKnownPosition(wallet, f.value("coin", std::string()));
+        notionalNanos(jstr(f, "px", "0"), jstr(f, "sz", "0"), p.notional);
+        p.pos = lastKnownPosition(wallet, jstr(f, "coin"));
         p.pos.stillOpen = p.pos.known && p.pos.snapshotAt >= stateAt;
         prepared.push_back(std::move(p));
     }
@@ -853,8 +864,8 @@ void enrichWallet(const std::string& wallet) {
         std::map<std::string, HlAlertData> series;
         for (size_t i : freshRows) {
             const Prepared& p = prepared[i];
-            const std::string coin = p.fill->value("coin", std::string());
-            const std::string dk = dirKey(p.fill->value("dir", std::string()));
+            const std::string coin = jstr(*p.fill, "coin");
+            const std::string dk = dirKey(jstr(*p.fill, "dir"));
 
             HlAlertData& a = series[coin + "|" + dk];
             if (a.fillCount == 0) {
@@ -865,7 +876,7 @@ void enrichWallet(const std::string& wallet) {
             a.notionalNanos += p.notional;
             a.closedPnlNanos += p.closedPnl;
             long long sz = 0;
-            if (parseDecimalToNanos(p.fill->value("sz", std::string("0")), sz)) {
+            if (parseDecimalToNanos(jstr(*p.fill, "sz", "0"), sz)) {
                 if (sz < 0) sz = -sz;
                 a.qtyNanos += sz;
             }
@@ -886,7 +897,7 @@ void enrichWallet(const std::string& wallet) {
     if (!fills.empty() && skippedNonPerp == fills.size()) {
         std::cerr << "[HL] ВНИМАНИЕ: у " << wallet << " отсеяны ВСЕ " << fills.size()
                   << " сделок как нефьючерсные. Первая монета: "
-                  << fills[0].value("coin", std::string("?"))
+                  << jstr(fills[0], "coin", "?")
                   << " - сверь с именами рынков из meta." << std::endl;
     } else if (stored > 0 && !wasSeeded) {
         std::cout << "[HL] первичное наполнение " << wallet << ": " << stored
@@ -1007,8 +1018,8 @@ void handleTrades(const json& data) {
             g_hits.fetch_add(1, std::memory_order_relaxed);
 
             long long notional = 0;
-            if (!notionalNanos(t.value("px", std::string("0")),
-                               t.value("sz", std::string("0")), notional)) continue;
+            if (!notionalNanos(jstr(t, "px", "0"),
+                               jstr(t, "sz", "0"), notional)) continue;
 
             bool serviceWatched = false;
             uint64_t minThreshold = 0;
@@ -1035,7 +1046,7 @@ void handleWsMessage(const std::string& raw) {
     json j = json::parse(raw, nullptr, false);
     if (j.is_discarded() || !j.is_object()) return;
 
-    const std::string channel = j.value("channel", std::string());
+    const std::string channel = jstr(j, "channel");
     if (channel == "trades") {
         try {
             if (j.contains("data")) handleTrades(j["data"]);
@@ -1592,31 +1603,31 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
 
         OpenPosition op;
         op.wallet = wallet;
-        op.coin = p.value("coin", std::string());
+        op.coin = jstr(p, "coin");
         if (op.coin.empty()) continue;
 
         // szi отрицателен у шорта - знак и есть сторона позиции.
         long long szi = 0;
-        parseDecimalToNanos(p.value("szi", std::string("0")), szi);
+        parseDecimalToNanos(jstr(p, "szi", "0"), szi);
         if (szi == 0) continue;
         op.isLong = szi > 0;
         op.sizeNanos = szi < 0 ? -szi : szi;
 
-        parseDecimalToNanos(p.value("entryPx", std::string("0")), op.entryPxNanos);
-        parseDecimalToNanos(p.value("liquidationPx", std::string("0")), op.liqPxNanos);
-        parseDecimalToNanos(p.value("marginUsed", std::string("0")), op.marginNanos);
-        parseDecimalToNanos(p.value("unrealizedPnl", std::string("0")), op.unrealizedNanos);
+        parseDecimalToNanos(jstr(p, "entryPx", "0"), op.entryPxNanos);
+        parseDecimalToNanos(jstr(p, "liquidationPx", "0"), op.liqPxNanos);
+        parseDecimalToNanos(jstr(p, "marginUsed", "0"), op.marginNanos);
+        parseDecimalToNanos(jstr(p, "unrealizedPnl", "0"), op.unrealizedNanos);
 
         // returnOnEquity приходит долей, а не процентом.
         long long roe = 0;
-        if (parseDecimalToNanos(p.value("returnOnEquity", std::string("0")), roe))
+        if (parseDecimalToNanos(jstr(p, "returnOnEquity", "0"), roe))
             op.roePercent = 100.0 * static_cast<double>(roe) / static_cast<double>(NANOS_PER_UNIT);
 
         if (p.contains("leverage") && p["leverage"].is_object()) {
             const json& lev = p["leverage"];
             if (lev.contains("value") && lev["value"].is_number())
                 op.leverage = lev["value"].get<int>();
-            op.isolated = lev.value("type", std::string()) == "isolated";
+            op.isolated = jstr(lev, "type") == "isolated";
         }
         out.push_back(std::move(op));
     }
@@ -1805,7 +1816,22 @@ bool handleHyperliquidCallback(const std::string& chatId, const std::string& act
                                const std::string& param, const std::string& data,
                                long long messageId, const std::string& callbackQueryId) {
     HlMessage msg;
-    if (!renderHyperliquidView(chatId, action, param, msg)) return false;
+    // Ответ площадки разбирается прямо здесь, в потоке телеграма. Любое
+    // неожиданное поле - и исключение уронило бы весь процесс, а не один экран.
+    // Ловим его: человек увидит ошибку и сможет нажать ещё раз.
+    try {
+        if (!renderHyperliquidView(chatId, action, param, msg)) return false;
+    } catch (const std::exception& e) {
+        std::cerr << "[HL] ошибка при построении экрана " << action << ": " << e.what() << std::endl;
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        msg.text = tr(lang, "generic_error_retry");
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+        }));
+        msg.keyboard = kb.dump();
+    }
     rememberView(chatId, data);
     replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     return true;
