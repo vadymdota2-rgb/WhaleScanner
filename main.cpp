@@ -245,6 +245,9 @@ const std::string TG_TOKEN = []{
 }();
 
 constexpr int TRIAL_DAYS = 7;
+// Вдвое больше окна сделок: токен мог не торговаться месяц, но всё ещё лежать
+// в кошельке, и удалять его из списка рано.
+constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
@@ -969,6 +972,42 @@ void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& 
     }
 }
 
+// Уборка таблицы монет. Растёт она монотонно: строку добавляет каждая новая
+// пара кошелёк-токен, а удаляется она только когда баланс обнулился при
+// просмотре портфеля. Без этой уборки записи отписанных кошельков лежали бы
+// в базе вечно.
+void cleanupWalletTokens() {
+    const long long now = static_cast<long long>(time(nullptr));
+    const long long cutoff = now - WALLET_TOKEN_TTL_SEC;
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+
+    // Осиротевшие: кошелёк больше никто не отслеживает. Такие записи не станут
+    // нужными снова - при повторном добавлении токены найдутся заново.
+    if (prepareOrLog(db, &s,
+        "DELETE FROM wallet_tokens WHERE wallet NOT IN "
+        "(SELECT wa.address FROM whale_addresses wa "
+        " JOIN user_whales uw ON uw.whale_id = wa.id)")) {
+        if (sqlite3_step(s) == SQLITE_DONE) {
+            const int n = sqlite3_changes(db);
+            if (n > 0) std::cout << "[CLEANUP] wallet_tokens: удалено осиротевших " << n << std::endl;
+        }
+        sqlite3_finalize(s);
+    }
+
+    // Давно не встречавшиеся: токен, не появлявшийся в сделках дольше срока,
+    // в портфеле почти наверняка мёртвый.
+    if (prepareOrLog(db, &s, "DELETE FROM wallet_tokens WHERE last_seen < ?")) {
+        sqlite3_bind_int64(s, 1, cutoff);
+        if (sqlite3_step(s) == SQLITE_DONE) {
+            const int n = sqlite3_changes(db);
+            if (n > 0) std::cout << "[CLEANUP] wallet_tokens: удалено старых " << n << std::endl;
+        }
+        sqlite3_finalize(s);
+    }
+}
+
 std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
     std::vector<std::string> out;
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -1572,11 +1611,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             auto msg = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
-        else if (param == "settings") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
         else if (param == "languages") {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildLanguagesMenu(chatId);
@@ -1620,6 +1654,11 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId,
                 tr(lang, "err_invoice_failed") + "\n\n" + page.text, page.keyboard);
         }
+    }
+    else if (action == "mw_noop") {
+        // Счётчик страниц - кнопка без действия. Без ответа Telegram крутит
+        // часики на ней до таймаута, будто бот завис.
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
     else if (action == "mw_page" || action == "rename" ||
              action == "askremove" || action == "remove") {
@@ -2009,7 +2048,7 @@ int main() {
                 g_msgQueue.syncSize();
                 lsq=std::chrono::steady_clock::now();
             }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); cleanupWalletTokens(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
