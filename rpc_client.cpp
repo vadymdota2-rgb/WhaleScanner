@@ -8,14 +8,9 @@
 #include <ctime>
 #include <curl/curl.h>
 
-// ======================== Пул эндпоинтов по сетям ========================
-
-
-std::vector<std::string> RPC_ENDPOINTS;   // задаётся через setRpcEndpoints()
+std::vector<std::string> RPC_ENDPOINTS;
 std::atomic<size_t> rpcIndex{0};
 
-// Обработчик, которым слой сообщает наружу о сбое запроса. По умолчанию пуст:
-// модуль ничего не знает про структуру статистики бота.
 namespace { std::function<void()> g_failureHandler; }
 
 void setRpcFailureHandler(std::function<void()> handler) {
@@ -30,18 +25,10 @@ void setRpcEndpoints(const std::vector<std::string>& endpoints) {
     initEndpointHealth();
 }
 
-// ============================== Транспорт ==============================
-
 size_t WriteCB(void* c, size_t s, size_t n, std::string* d) {
     d->append((char*)c, s * n); return s * n;
 }
 
-// Постоянное соединение на каждый поток. Раньше здесь были curl_easy_init/cleanup
-// на КАЖДЫЙ запрос - это заново открывало TCP-соединение и проводило полное
-// TLS-рукопожатие (~100-300мс) при каждом вызове RPC. curl_easy_reset сбрасывает
-// параметры запроса, но сохраняет живое соединение, DNS-кэш и TLS-сессии, поэтому
-// повторные обращения к тому же узлу переиспользуют уже открытый канал.
-// thread_local обязателен: easy-хэндл нельзя разделять между потоками.
 struct CurlHandleHolder {
     CURL* h = nullptr;
     CurlHandleHolder() : h(curl_easy_init()) {}
@@ -78,15 +65,8 @@ std::string http(const std::string& url, const std::string& post, int timeout) {
     return res;
 }
 
-
-// ---- Здоровье эндпоинтов ----
-// Список публичных узлов быстро устаревает: одни закрываются, другие меняют
-// адрес. Вместо того чтобы гадать, какие живы, бот определяет это сам:
-// узел, подряд не ответивший несколько раз, временно исключается из ротации,
-// а через паузу проверяется снова - вдруг ожил. Так можно смело держать
-// длинный список, не боясь, что мёртвые адреса будут тормозить работу.
-constexpr int ENDPOINT_FAIL_LIMIT = 5;        // подряд неудач до отключения
-constexpr long long ENDPOINT_COOLDOWN_SEC = 600;  // на сколько отключаем
+constexpr int ENDPOINT_FAIL_LIMIT = 5;
+constexpr long long ENDPOINT_COOLDOWN_SEC = 600;
 
 std::mutex g_healthMutex;
 std::vector<int> g_consecFails;
@@ -116,10 +96,9 @@ void reportEndpoint(size_t idx, bool ok) {
     }
 }
 
-// Ближайший рабочий узел начиная с idx. Если живых нет вообще - вернём
-// исходный, чтобы бот всё равно попытался, а не встал намертво.
 size_t usableEndpointFrom(size_t idx) {
     const size_t n = RPC_ENDPOINTS.size();
+    if (n == 0) return 0;
     for (size_t k = 0; k < n; ++k) {
         size_t cand = (idx + k) % n;
         if (endpointUsable(cand)) return cand;
@@ -128,17 +107,13 @@ size_t usableEndpointFrom(size_t idx) {
 }
 
 json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
+    if (RPC_ENDPOINTS.empty()) return nullptr;
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     auto res = http(RPC_ENDPOINTS[idx % RPC_ENDPOINTS.size()], r.dump());
     try { auto p = json::parse(res); if (p.contains("result") && !p["result"].is_null()) return p["result"]; } catch (...) {}
     return nullptr;
 }
 
-// Запрос с РАСПРЕДЕЛЕНИЕМ по узлам. Нужен для параллельной загрузки чеков:
-// если все потоки бьют в один эндпоинт, мы упираемся в его лимит (~33 запроса
-// в секунду) задолго до нехватки времени. Раскладывая запросы по 12 узлам,
-// поднимаем суммарную ёмкость примерно до 400/сек. При неудаче пробуем
-// следующие узлы, поэтому отказ одного не роняет загрузку блока.
 json rpcSpread(size_t seed, const std::string& method, json params) {
     for (size_t attempt = 0; attempt < 3 && running.load(std::memory_order_relaxed); ++attempt) {
         size_t idx = usableEndpointFrom(seed + attempt);
@@ -150,18 +125,16 @@ json rpcSpread(size_t seed, const std::string& method, json params) {
     return nullptr;
 }
 
-// Диагностика: если конкретный публичный RPC периодически "подвисает" на секунды
-// без явного сбоя (timeout/ошибка), rpc_failures это не заметит - а лаг растёт
-// точно так же. Порог и накопление по каждому эндпоинту отдельно, чтобы увидеть
-// именно КАКОЙ узел тормозит, а не гадать.
 const long long RPC_SLOW_THRESHOLD_MS = 1000;
 const int RPC_SLOW_STREAK_LIMIT = 3;
 std::mutex g_rpcLatencyMutex;
 std::map<std::string, uint64_t> g_rpcSlowCount;
 std::map<std::string, int64_t> g_rpcSlowMaxMs;
-std::atomic<int> g_rpcSlowStreak{0};
+std::mutex g_rpcStreakMutex;
+std::map<std::string, int> g_rpcSlowStreakByEp;
 
 json rpc(const std::string& method, json params, int maxRetries) {
+    if (RPC_ENDPOINTS.empty()) { reportFailure(); return nullptr; }
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     std::string body = r.dump();
     for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
@@ -177,17 +150,20 @@ json rpc(const std::string& method, json params, int maxRetries) {
                 if (elapsedMs > mx) mx = elapsedMs;
             }
             std::cerr << "[RPC-SLOW] " << method << " on " << RPC_ENDPOINTS[idx] << " took " << elapsedMs << "ms" << std::endl;
-            // Уходим с узла, который стабильно тормозит, а не только с упавшего.
-            // Порог в несколько подряд - чтобы не скакать из-за одиночной заминки:
-            // при постоянных соединениях смена узла стоит нового TLS-рукопожатия.
-            if (g_rpcSlowStreak.fetch_add(1, std::memory_order_relaxed) + 1 >= RPC_SLOW_STREAK_LIMIT) {
-                g_rpcSlowStreak.store(0, std::memory_order_relaxed);
+            int streak = 0;
+            {
+                std::lock_guard<std::mutex> sl(g_rpcStreakMutex);
+                streak = ++g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]];
+                if (streak >= RPC_SLOW_STREAK_LIMIT) g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
+            }
+            if (streak >= RPC_SLOW_STREAK_LIMIT) {
                 size_t cur = rpcIndex.load(std::memory_order_relaxed);
                 rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
                 std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur] << std::endl;
             }
         } else {
-            g_rpcSlowStreak.store(0, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> sl(g_rpcStreakMutex);
+            g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
         }
         bool valid = false;
         try {
@@ -209,7 +185,6 @@ json rpc(const std::string& method, json params, int maxRetries) {
     return nullptr;
 }
 
-// Сводка по медленным узлам для /stats.
 std::string rpcSlowSummary() {
     std::lock_guard<std::mutex> ll(g_rpcLatencyMutex);
     if (g_rpcSlowCount.empty()) return "";
