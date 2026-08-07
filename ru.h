@@ -6,6 +6,8 @@ enum class Lang { EN, RU, ES, PT, FR, TR, AR };
 Lang langFromCode(const std::string& code);
 std::string tr(Lang lang, const std::string& key);
 
+void checkTranslations();
+
 const char* trEs(const std::string& key);
 const char* trPt(const std::string& key);
 const char* trFr(const std::string& key);
