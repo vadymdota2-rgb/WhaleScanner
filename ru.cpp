@@ -1,7 +1,15 @@
 #include "ru.h"
+#include <iostream>
+#include <cctype>
+#include <vector>
 #include <unordered_map>
 
-Lang langFromCode(const std::string& code) {
+Lang langFromCode(const std::string& codeArg) {
+    std::string code;
+    for (char c : codeArg) {
+        if (c == '-' || c == '_') break;
+        code += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
     if (code == "ru") return Lang::RU;
     if (code == "es") return Lang::ES;
     if (code == "pt") return Lang::PT;
@@ -342,6 +350,24 @@ const char* external(Lang lang, const std::string& key) {
         default:       return nullptr;
     }
 }
+}
+
+void checkTranslations() {
+    struct { Lang lang; const char* name; } langs[] = {
+        {Lang::ES, "ES"}, {Lang::PT, "PT"}, {Lang::FR, "FR"},
+        {Lang::TR, "TR"}, {Lang::AR, "AR"}
+    };
+    for (const auto& L : langs) {
+        std::vector<std::string> missing;
+        for (const auto& kv : table())
+            if (!external(L.lang, kv.first)) missing.push_back(kv.first);
+        if (missing.empty()) continue;
+        std::cerr << "[I18N] " << L.name << ": без перевода " << missing.size()
+                  << " из " << table().size() << ", откат на английский:";
+        for (size_t i = 0; i < missing.size() && i < 5; i++) std::cerr << " " << missing[i];
+        if (missing.size() > 5) std::cerr << " ...";
+        std::cerr << std::endl;
+    }
 }
 
 std::string tr(Lang lang, const std::string& key) {
