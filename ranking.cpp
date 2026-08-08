@@ -31,13 +31,10 @@ extern std::atomic<bool> running;
 
 namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
-constexpr int MIN_COMPLETED_TRADES = 5;
-constexpr int MAX_RANKED_WALLETS = 20;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 1000;
-constexpr int PER_PAGE = 5;
 constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
@@ -215,7 +212,6 @@ int64_t cppIntToClampedI64(const cpp_int& v) {
 }
 
 std::string formatUsdSigned(int64_t usdNanos) { return formatUsdNanosSigned(usdNanos); }
-std::string formatPercentSigned(double pct)   { return formatPercent(pct, true); }
 
 const char* dirMark(Lang lang) {
     return lang == Lang::AR ? "\u200F" : "";
@@ -241,120 +237,6 @@ struct PnlRow {
     long long avgHoldSeconds = 0;
 };
 
-std::vector<PnlRow> computeTopPnl(const std::string& token, bool& ok) {
-    ok = false;
-    std::vector<PnlRow> results;
-    long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
-
-    std::string curWallet;
-    cpp_int heldQty = 0;
-    cpp_int heldCost = 0;
-    cpp_int realizedPnl = 0;
-    cpp_int totalCostDeployed = 0;
-    int completedTrades = 0;
-    int winningTrades = 0;
-    cpp_int heldTimeWeighted = 0;
-    long long totalHoldSeconds = 0;
-
-    auto flush = [&]() {
-        if (!curWallet.empty() && completedTrades >= MIN_COMPLETED_TRADES &&
-            completedTrades <= MAX_BOT_FILTER_TRADES) {
-            PnlRow row;
-            row.wallet = curWallet;
-            row.pnlNanos = cppIntToClampedI64(realizedPnl);
-            double costD = totalCostDeployed > 0 ? totalCostDeployed.convert_to<double>() : 0.0;
-            double pnlD = realizedPnl.convert_to<double>();
-            row.roiPercent = costD > 0.0 ? (100.0 * pnlD / costD) : 0.0;
-            row.winRatePercent = completedTrades > 0
-                ? static_cast<int>(100.0 * winningTrades / completedTrades + 0.5)
-                : 0;
-            row.avgHoldSeconds = completedTrades > 0 ? totalHoldSeconds / completedTrades : 0;
-            row.completedTrades = completedTrades;
-            results.push_back(row);
-        }
-    };
-
-    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
-    std::unique_lock<std::mutex> readLock, writeLock;
-    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
-    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
-
-    sqlite3_stmt* s;
-    if (!prepareOrLog(rdb, &s,
-        "SELECT t.wallet, t.is_buy, t.usd_nanos, t.token_amount, t.timestamp FROM trades t "
-        "WHERE t.token=? AND t.timestamp>=? "
-        "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw WHERE iw.wallet=t.wallet AND iw.permanent=1) "
-        "ORDER BY t.wallet ASC, t.timestamp ASC, t.id ASC")) return results;
-    sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, since);
-
-    int stepRc;
-    while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
-        std::string wallet = safeColumnText(s, 0);
-        bool isBuy = sqlite3_column_int(s, 1) != 0;
-        int64_t usdNanos = sqlite3_column_int64(s, 2);
-        std::string amountStr = safeColumnText(s, 3);
-        long long tradeTs = sqlite3_column_int64(s, 4);
-        cpp_int amount;
-        if (!safeParseAmount(amountStr, "wallet=" + wallet + " token=" + token, amount)) {
-            sqlite3_finalize(s);
-            std::cerr << "[RANKING] computeTopPnl(" << token << ") aborted: corrupted token_amount" << std::endl;
-            return results;
-        }
-
-        if (wallet != curWallet) {
-            flush();
-            curWallet = wallet;
-            heldQty = 0; heldCost = 0; realizedPnl = 0; totalCostDeployed = 0;
-            completedTrades = 0; winningTrades = 0;
-            heldTimeWeighted = 0; totalHoldSeconds = 0;
-        }
-
-        if (isBuy) {
-            heldQty += amount;
-            heldCost += cpp_int(usdNanos);
-            heldTimeWeighted += amount * cpp_int(tradeTs);
-        } else if (heldQty > 0 && amount > 0) {
-            cpp_int matchedQty = amount < heldQty ? amount : heldQty;
-            cpp_int costOfMatched = (heldCost * matchedQty) / heldQty;
-            cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
-            cpp_int timeOfMatched = (heldTimeWeighted * matchedQty) / heldQty;
-
-            realizedPnl += (proceedsMatched - costOfMatched);
-            totalCostDeployed += costOfMatched;
-            completedTrades++;
-            if (proceedsMatched > costOfMatched) winningTrades++;
-
-            cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
-            long long held = tradeTs - avgBuyTs.convert_to<long long>();
-            if (held > 0) totalHoldSeconds += held;
-
-            heldQty -= matchedQty;
-            heldCost -= costOfMatched;
-            heldTimeWeighted -= timeOfMatched;
-        }
-
-    }
-    sqlite3_finalize(s);
-    if (stepRc != SQLITE_DONE) {
-        std::cerr << "[RANKING] computeTopPnl(" << token << ") interrupted mid-read: "
-                  << sqlite3_errmsg(rdb) << std::endl;
-        return results;
-    }
-    ok = true;
-    flush();
-
-    std::sort(results.begin(), results.end(), [](const PnlRow& a, const PnlRow& b) {
-        if (a.pnlNanos != b.pnlNanos) return a.pnlNanos > b.pnlNanos;
-        if (a.roiPercent != b.roiPercent) return a.roiPercent > b.roiPercent;
-        return a.completedTrades > b.completedTrades;
-    });
-    if (results.size() > static_cast<size_t>(MAX_RANKED_WALLETS)) results.resize(MAX_RANKED_WALLETS);
-    return results;
-}
-
-std::mutex g_cacheMutex;
-std::map<std::string, std::string> g_lastTokenByChat;
 std::atomic<bool> g_forceRebuild{false};
 
 std::string rowsToJson(const std::vector<PnlRow>& rows) {
@@ -402,72 +284,6 @@ bool loadCachedPayload(const std::string& key, std::string& out) {
     }
     sqlite3_finalize(s);
     return found;
-}
-
-bool cacheReady() {
-    std::string tmp;
-    return loadCachedPayload("global_pnl", tmp);
-}
-
-RankingMessage buildGeneratingMessage(Lang lang) {
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-    return {tr(lang, "rk_generating"), keyboard.dump()};
-}
-
-RankingMessage renderPage(const std::string& token, const std::vector<PnlRow>& rows, int page, Lang lang) {
-    int totalPages = std::max(1, static_cast<int>((rows.size() + PER_PAGE - 1) / PER_PAGE));
-    page = std::max(1, std::min(page, totalPages));
-    int startIdx = (page - 1) * PER_PAGE;
-    int endIdx = std::min(static_cast<int>(rows.size()), startIdx + PER_PAGE);
-
-    std::stringstream text;
-
-    const char* const dm = dirMark(lang);
-
-    text << dm << "🟡 <b>BSC \u2014 " << tr(lang, "rk_top_pnl_30d") << "</b>\n\n";
-    text << dm << "📄 <b>" << tr(lang, "rk_smart_contract") << "</b>\n";
-    text << dm << "<code>" << safeString(token, 42) << "</code>\n\n";
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-
-    if (rows.empty()) {
-        text << dm << "📊 " << tr(lang, "rk_no_wallets_min_trades1") << " " << MIN_COMPLETED_TRADES
-             << " " << tr(lang, "rk_no_wallets_min_trades2");
-    } else {
-        for (int i = startIdx; i < endIdx; i++) {
-            const PnlRow& r = rows[i];
-            int rank = i + 1;
-            text << dm << rankLabel(rank) << "\n";
-            text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
-            text << dm << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << dm << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentSigned(r.roiPercent) << "\n";
-            text << dm << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
-            text << dm << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
-            text << dm << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
-            if (i + 1 < endIdx) text << "\n" << dm << CARD_SEPARATOR << "\n\n";
-
-            json row;
-            row.push_back({{"text", tr(lang, "rk_track") + " #" + std::to_string(rank)}, {"callback_data", "tt_track:" + r.wallet}});
-            row.push_back({{"text", "🔍 " + chainCtx().explorerName}, {"url", chainCtx().explorerUrl + "/address/" + r.wallet}});
-            keyboard["inline_keyboard"].push_back(row);
-        }
-    }
-
-    json navRow = json::array();
-    if (page > 1) navRow.push_back({{"text", tr(lang, "rk_prev")}, {"callback_data", "tt_page:" + std::to_string(page - 1)}});
-    navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
-    if (page < totalPages) navRow.push_back({{"text", tr(lang, "rk_next")}, {"callback_data", "tt_page:" + std::to_string(page + 1)}});
-    keyboard["inline_keyboard"].push_back(navRow);
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-
-    return {text.str(), keyboard.dump()};
 }
 
 struct GlobalRankings {
@@ -683,15 +499,8 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     return {text.str(), keyboard.dump()};
 }
 
-RankingMessage buildTokenRankingFromCache(const std::string& token, int page, Lang lang) {
-    std::string payload;
-    if (!loadCachedPayload("token_" + token, payload)) {
-        if (!cacheReady()) return buildGeneratingMessage(lang);
-        return renderPage(token, std::vector<PnlRow>{}, page, lang);
-    }
-    std::vector<PnlRow> rows;
-    if (!rowsFromJson(payload, rows)) return buildGeneratingMessage(lang);
-    return renderPage(token, rows, page, lang);
+RankingMessage buildGeneratingMessage(Lang lang) {
+    return {tr(lang, "rk_generating"), ""};
 }
 
 RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade, Lang lang) {
@@ -702,30 +511,6 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
     std::vector<PnlRow> rows;
     if (!rowsFromJson(payload, rows)) return buildGeneratingMessage(lang);
     return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang);
-}
-
-std::vector<std::string> listActiveTokens(bool& ok) {
-    ok = false;
-    std::vector<std::string> tokens;
-    long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
-
-    sqlite3* rdb = g_rankingReadDb ? g_rankingReadDb : db;
-    std::unique_lock<std::mutex> readLock, writeLock;
-    if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
-    else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
-
-    sqlite3_stmt* s;
-    if (!prepareOrLog(rdb, &s, "SELECT DISTINCT token FROM trades WHERE timestamp>=?")) return tokens;
-    sqlite3_bind_int64(s, 1, since);
-    int stepRc;
-    while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) tokens.push_back(safeColumnText(s, 0));
-    sqlite3_finalize(s);
-    if (stepRc != SQLITE_DONE) {
-        std::cerr << "[RANKING] listActiveTokens() interrupted mid-read: " << sqlite3_errmsg(rdb) << std::endl;
-        return tokens;
-    }
-    ok = true;
-    return tokens;
 }
 
 void rebuildAllRankings() {
@@ -744,22 +529,6 @@ void rebuildAllRankings() {
     entries.emplace_back("global_roi", rowsToJson(g.byRoi));
     entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
     entries.emplace_back("global_active", rowsToJson(g.byActive));
-
-    std::vector<std::string> tokens = listActiveTokens(ok);
-    if (!ok) {
-        std::cerr << "[RANKING] cache rebuild aborted: active-token list read was interrupted, keeping previous cache" << std::endl;
-        return;
-    }
-    for (const std::string& tok : tokens) {
-        if (!running.load(std::memory_order_relaxed)) return;
-        bool tokOk = false;
-        auto rows = computeTopPnl(tok, tokOk);
-        if (!tokOk) {
-            std::cerr << "[RANKING] cache rebuild aborted: token '" << tok << "' ranking read was interrupted, keeping previous cache" << std::endl;
-            return;
-        }
-        entries.emplace_back("token_" + tok, rowsToJson(rows));
-    }
 
     long long now = static_cast<long long>(time(nullptr));
     {
@@ -1015,21 +784,6 @@ void saveTrade(const std::string& walletArg, const TxResult& tx,
     }
 }
 
-std::string resolveTokenArg(const std::string& argIn) {
-    std::string arg = trim(argIn);
-    if (arg.empty()) return "";
-    if (isValidAddress(arg)) return toLower(arg);
-
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, "SELECT address FROM token_cache WHERE symbol = ? COLLATE NOCASE LIMIT 1")) return "";
-    sqlite3_bind_text(s, 1, arg.c_str(), -1, SQLITE_TRANSIENT);
-    std::string result;
-    if (sqlite3_step(s) == SQLITE_ROW) result = safeColumnText(s, 0);
-    sqlite3_finalize(s);
-    return result;
-}
-
 void saveWalletHistory(const std::string& walletArg, const TxResult& tx,
                        const std::string& hash, long long blockTimestamp) {
     if (!tx.isSwap || tx.tokenAddr.empty() || tx.usdNanos <= 0) return;
@@ -1208,36 +962,6 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     return true;
 }
 
-RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    std::string token = resolveTokenArg(tokenArg);
-    if (token.empty()) {
-        return {tr(lang, "rk_unknown_token1") + " " + safeString(tokenArg, 32) +
-                "\n\n" + tr(lang, "rk_unknown_token2"), ""};
-    }
-
-    {
-        std::lock_guard<std::mutex> l(g_cacheMutex);
-        g_lastTokenByChat[chatId] = token;
-    }
-
-    return buildTokenRankingFromCache(token, page, lang);
-}
-
-RankingMessage buildTopPnlPage(const std::string& chatId, int page) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    std::string token;
-    {
-        std::lock_guard<std::mutex> l(g_cacheMutex);
-        auto it = g_lastTokenByChat.find(chatId);
-        if (it == g_lastTokenByChat.end()) {
-            return {tr(lang, "rk_expired"), ""};
-        }
-        token = it->second;
-    }
-    return buildTokenRankingFromCache(token, page, lang);
-}
-
 RankingMessage buildGlobalTopMenu(const std::string& chatId) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     json keyboard;
@@ -1255,9 +979,6 @@ RankingMessage buildGlobalTopMenu(const std::string& chatId) {
         {{"text", tr(lang, "rk_btn_most_active")}, {"callback_data", "gt_open:active"}}
     }));
 
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "rk_btn_top_pnl_by_token")}, {"callback_data", "gt_token"}}
-    }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
@@ -1300,14 +1021,7 @@ void rankingCacheLoop() {
 bool handleRankingCallback(const std::string& chatId, const std::string& action,
                            const std::string& param, const std::string& data,
                            long long messageId, const std::string& callbackQueryId) {
-    if (action == "tt_page") {
-        rememberView(chatId, data);
-        int page = 1;
-        try { page = std::stoi(param); } catch (...) {}
-        auto msg = buildTopPnlPage(chatId, page);
-        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "tt_track") {
+    if (action == "tt_track") {
         std::string address = toLower(param);
         Lang trackLang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
@@ -1356,18 +1070,6 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
                 replyInPlace(chatId, messageId, msg.text, msg.keyboard);
             }
         }
-    }
-    else if (action == "gt_token") {
-        Lang lang = langFromCode(getUserLanguage(chatId));
-        g_sessionManager.setState(chatId, UserState::AWAITING_TOPTRADER_TOKEN);
-        rememberView(chatId, data);
-
-        replyInPlace(
-            chatId,
-            messageId,
-            tr(lang, "token_search_prompt"),
-            TelegramUI::buildCancelButton(lang)
-        );
     }
     else return false;
     return true;
