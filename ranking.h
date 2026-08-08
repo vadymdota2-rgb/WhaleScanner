@@ -25,10 +25,6 @@ struct RankingMessage {
     std::string keyboard;
 };
 
-RankingMessage buildTopPnlMessage(const std::string& chatId, const std::string& tokenArg, int page = 1);
-
-RankingMessage buildTopPnlPage(const std::string& chatId, int page);
-
 enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
 
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out);
