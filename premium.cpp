@@ -206,12 +206,11 @@ bool grantPremiumDays(const std::string& chatId, int days) {
 
     ensureUser(chatId);
     const long long now = static_cast<long long>(time(nullptr));
-    std::lock_guard<std::mutex> l(dbMutex);
+    std::unique_lock<std::mutex> lock(dbMutex);
 
     int flag = 0; long long start = 0, expire = 0;
     if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
 
-    // Действующую подписку продлеваем от её конца, истёкшую - от сегодня.
     const bool active = (flag != 0 && expire > now);
     const long long newExpire = (active ? expire : now) + static_cast<long long>(days) * 86400LL;
     const long long newStart  = active ? (start > 0 ? start : now) : now;
@@ -225,8 +224,14 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
     const int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    return rc == SQLITE_DONE;
+    if (rc != SQLITE_DONE) return false;
+
+    lock.unlock();
+    refreshWatchers();
+    return true;
 }
+
+enum class PaymentApplyResult { Activated, Extended, Duplicate, Rejected, Error };
 
 PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp) {
     if (!sp.is_object()) return PaymentApplyResult::Rejected;
@@ -519,7 +524,13 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     PaymentApplyResult result = applySuccessfulPayment(chatId, sp);
 
     if (result == PaymentApplyResult::Rejected) return false;
-    if (result == PaymentApplyResult::Error) return false;
+    if (result == PaymentApplyResult::Error) {
+        std::cerr << "[PREMIUM] ВЫДАЧА НЕ УДАЛАСЬ ПОСЛЕ ОПЛАТЫ: chat=" << chatId
+                  << " charge=" << (sp.is_object() ? sp.value("telegram_payment_charge_id", std::string("?")) : std::string("?"))
+                  << " amount=" << (sp.is_object() ? sp.value("total_amount", 0LL) : 0LL)
+                  << " — выдать вручную" << std::endl;
+        return false;
+    }
     if (result == PaymentApplyResult::Duplicate) return true;
 
     refreshWatchers();
