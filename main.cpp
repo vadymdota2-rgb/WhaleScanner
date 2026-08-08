@@ -1420,8 +1420,22 @@ constexpr size_t VIEW_STACK_MAX = 12;
 std::string pagingRoot(const std::string& data) {
     if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
-    if (data.rfind("gt_page:", 0) == 0)     return "menu:toptrader_spot";
-    if (data.rfind("hl_page:", 0) == 0)     return "hl_menu";
+    // Рейтинги открываются по виду (pnl, roi, winrate...), и корень у страницы
+    // - именно этот открытый рейтинг, а не меню выбора. Иначе страница ложилась
+    // бы поверх экрана открытия, и "Назад" со второй страницы возвращал бы на
+    // первую вместо выхода в меню.
+    if (data.rfind("gt_page:", 0) == 0) {
+        const size_t k1 = data.find(':');
+        const size_t k2 = data.find(':', k1 + 1);
+        if (k2 != std::string::npos) return "gt_open:" + data.substr(k1 + 1, k2 - k1 - 1);
+        return "menu:toptrader_spot";
+    }
+    if (data.rfind("hl_page:", 0) == 0) {
+        const size_t k1 = data.find(':');
+        const size_t k2 = data.find(':', k1 + 1);
+        if (k2 != std::string::npos) return "hl_open:" + data.substr(k1 + 1, k2 - k1 - 1);
+        return "hl_menu";
+    }
     // Топ по токену открывается вводом символа, а не кнопкой: своего адреса у
     // входа нет, поэтому корнем считаем сам список - страницы схлопнутся между
     // собой, а "Назад" уведёт на экран, с которого запускали поиск.
