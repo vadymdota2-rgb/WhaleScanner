@@ -1439,7 +1439,6 @@ std::string pagingRoot(const std::string& data) {
     // Топ по токену открывается вводом символа, а не кнопкой: своего адреса у
     // входа нет, поэтому корнем считаем сам список - страницы схлопнутся между
     // собой, а "Назад" уведёт на экран, с которого запускали поиск.
-    if (data.rfind("tt_page:", 0) == 0)     return "tt_page:";
     return "";
 }
 
@@ -1510,12 +1509,6 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         int page = 1;
         try { page = std::stoi(param); } catch (...) {}
         return TelegramUI::buildWalletsList(chatId, page);
-    }
-    if (action == "tt_page") {
-        int page = 1;
-        try { page = std::stoi(param); } catch (...) {}
-        auto r = buildTopPnlPage(chatId, page);
-        return {r.text, r.keyboard};
     }
     if (action == "gt_open") {
         GlobalRankKind kind;
@@ -1682,8 +1675,8 @@ void handleCallbackQuery(const json& callbackQuery) {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
-    else if (action == "tt_page" || action == "tt_track" || action == "tt_noop" ||
-             action == "gt_open" || action == "gt_page" || action == "gt_token") {
+    else if (action == "tt_track" || action == "tt_noop" ||
+             action == "gt_open" || action == "gt_page") {
         handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
     else if (action == "hl_menu" || action == "hl_open" || action == "hl_page" ||
@@ -1705,23 +1698,7 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
     if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD)
         return handleThresholdText(chatId, text);
 
-    if (session.state == UserState::AWAITING_TOPTRADER_TOKEN) {
-        std::string tokenArg = trim(text);
-        Lang lang = langFromCode(getUserLanguage(chatId));
-
-        if (tokenArg.empty()) {
-            sendMsg(chatId, tr(lang, "token_search_empty"),
-                    TelegramUI::buildCancelButton(lang));
-            return true;
-        }
-
-        RankingMessage result = buildTopPnlMessage(chatId, tokenArg, 1);
-        g_sessionManager.clearSession(chatId);
-        sendMsg(chatId, result.text, result.keyboard);
-        return true;
-    }
-
-    if (session.state == UserState::AWAITING_HOLD_ADDRESS) {
+        if (session.state == UserState::AWAITING_HOLD_ADDRESS) {
         const std::string addr = toLower(trim(text));
         Lang lang = langFromCode(getUserLanguage(chatId));
 
