@@ -33,7 +33,7 @@ namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
 constexpr int MIN_COMPLETED_TRADES = 5;
 constexpr int MAX_RANKED_WALLETS = 20;
-constexpr int MIN_GLOBAL_COMPLETED_TRADES = 1;
+constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 1000;
@@ -484,7 +484,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
 
     std::string curWallet, curToken;
     cpp_int heldQty = 0, heldCost = 0;
-    cpp_int outerPnl = 0, outerBuyVol = 0;
+    cpp_int outerPnl = 0, outerCostDeployed = 0;
     int outerCompleted = 0, outerWinning = 0;
     cpp_int heldTimeWeighted = 0;
     long long outerHoldSeconds = 0;
@@ -495,7 +495,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             PnlRow row;
             row.wallet = curWallet;
             row.pnlNanos = cppIntToClampedI64(outerPnl);
-            double volD = outerBuyVol > 0 ? outerBuyVol.convert_to<double>() : 0.0;
+            double volD = outerCostDeployed > 0 ? outerCostDeployed.convert_to<double>() : 0.0;
             double pnlD = outerPnl.convert_to<double>();
 
             row.roiPercent = volD > 0.0 ? (100.0 * pnlD / volD) : 0.0;
@@ -540,7 +540,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             flush();
             curWallet = wallet;
             curToken.clear();
-            outerPnl = 0; outerBuyVol = 0; outerCompleted = 0; outerWinning = 0;
+            outerPnl = 0; outerCostDeployed = 0; outerCompleted = 0; outerWinning = 0;
             outerHoldSeconds = 0;
         }
         if (token != curToken) {
@@ -552,7 +552,6 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             heldQty += amount;
             heldCost += cpp_int(usdNanos);
             heldTimeWeighted += amount * cpp_int(tradeTs);
-            outerBuyVol += cpp_int(usdNanos);
         } else if (heldQty > 0 && amount > 0) {
             cpp_int matchedQty = amount < heldQty ? amount : heldQty;
             cpp_int costOfMatched = (heldCost * matchedQty) / heldQty;
@@ -560,6 +559,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
             cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
 
             outerPnl += (proceedsMatched - costOfMatched);
+            outerCostDeployed += costOfMatched;
             outerCompleted++;
             if (proceedsMatched > costOfMatched) outerWinning++;
 
@@ -914,7 +914,7 @@ int countCompletedTrades30DLocked(const std::string& wallet, long long since, in
 
 }
 
-void saveTrade(const std::string& wallet, const TxResult& tx,
+void saveTrade(const std::string& walletArg, const TxResult& tx,
                const std::string& hash, long long block, long long blockTimestamp) {
 
     if (!tx.valid || !tx.isSwap) return;
@@ -925,6 +925,7 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
     long long now = static_cast<long long>(time(nullptr));
     long long ts = blockTimestamp > 0 ? blockTimestamp : now;
 
+    const std::string wallet = toLower(walletArg);
     std::string token = toLower(tx.tokenAddr);
     std::string amountStr = tx.rawAmount.convert_to<std::string>();
     int64_t usdNanos64 = cppIntToClampedI64(tx.usdNanos);
@@ -998,7 +999,8 @@ void saveTrade(const std::string& wallet, const TxResult& tx,
                 if (blockSaved) {
                     blockedNow = true;
                     std::cout << "[RANKING] Bot detected: " << wallet
-                              << " — permanently excluded from ranking (>500 trades/30d)" << std::endl;
+                              << " — permanently excluded from ranking (>"
+                              << MAX_BOT_FILTER_TRADES << " trades/30d)" << std::endl;
                 } else {
                     std::cerr << "[RANKING] Bot detected: " << wallet
                               << " but permanent block was NOT saved - will re-evaluate on next trade" << std::endl;
@@ -1039,8 +1041,6 @@ void saveWalletHistory(const std::string& walletArg, const TxResult& tx,
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
-    // OR IGNORE: одна транзакция может прийти дважды при переобработке блока,
-    // а дубль исказил бы и остаток, и среднюю цену входа.
     if (!prepareOrLog(db, &s,
         "INSERT OR IGNORE INTO wallet_history"
         "(wallet,token,is_buy,usd_nanos,token_amount,tx_hash,timestamp) "
@@ -1066,18 +1066,11 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
 
     if (currentPriceNanos <= 0) return false;
 
-    // ДО захвата мьютекса: getDecimals при промахе кэша идёт в сеть и сама
-    // берёт dbMutex через saveTokenMetadata. Вызов под замком вешает поток
-    // намертво - бот запускается и молча перестаёт отвечать.
     const int dec = getDecimals(token);
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
-    // Последняя ПОКУПКА этого токена этим кошельком, кроме текущей. Отсекаем
-    // её по хешу, а не смещением на строку: попадает ли текущая сделка в базу
-    // вообще, зависит от того, следит ли за кошельком сервисный аккаунт, и
-    // слепое смещение пропускало бы настоящую прошлую покупку.
     if (!prepareOrLog(db, &s,
         "SELECT usd_nanos, token_amount, timestamp FROM wallet_history "
         "WHERE wallet=? AND token=? AND is_buy=1 AND (tx_hash IS NULL OR tx_hash<>?) "
@@ -1096,10 +1089,6 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     }
     sqlite3_finalize(s);
 
-    // Средняя цена уже набранной позиции - не то же, что цена последней
-    // покупки. Кит мог войти пятью заходами, и сравнивать новую покупку с
-    // одной из них значило бы выбрать удобную. Обход тот же, что при продаже:
-    // покупка увеличивает остаток, продажа списывает долю.
     {
         sqlite3_stmt* h;
         if (prepareOrLog(db, &h,
@@ -1134,8 +1123,6 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     }
     if (!found || usdNanos <= 0 || ts <= 0) return false;
 
-    // Цена покупки восстанавливается из суммы и количества: отдельно её не
-    // храним, а так она получается ровно та, что была в момент сделки.
     cpp_int amount = 0;
     try { amount = cpp_int(amountStr); } catch (...) { return false; }
     if (amount <= 0) return false;
@@ -1144,8 +1131,6 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
     if (thenPxBig <= 0) return false;
     const long long thenPx = static_cast<long long>(thenPxBig);
 
-    // Сравниваем с ценой ЭТОЙ сделки, а не с рыночной из кэша: обе величины
-    // тогда из одного момента и проверяются друг через друга прямо в алерте.
     out.thenPriceNanos = thenPx;
     out.nowPriceNanos = currentPriceNanos;
     out.ageSeconds = now - ts;
@@ -1165,23 +1150,19 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     try { selling = cpp_int(sellAmountStr); } catch (...) { return false; }
     if (selling <= 0) return false;
 
-    // ДО захвата: getDecimals при промахе кэша идёт в сеть и сама берёт dbMutex.
     const int dec = getDecimals(token);
 
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
-    // Всю историю по паре кошелёк-токен читаем ПО ПОРЯДКУ. Считать среднюю по
-    // всем покупкам скопом нельзя: докупка после продажи меняет среднюю, и
-    // покупки, сделанные позже, задним числом удорожали бы уже проданное.
     if (!prepareOrLog(db, &s,
         "SELECT is_buy, usd_nanos, token_amount, tx_hash FROM wallet_history "
         "WHERE wallet=? AND token=? ORDER BY timestamp ASC, id ASC")) return false;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 2, token.c_str(), -1, SQLITE_TRANSIENT);
 
-    cpp_int position = 0;   // остаток монет
-    cpp_int costBasis = 0;  // сколько вложено именно в этот остаток
+    cpp_int position = 0;
+    cpp_int costBasis = 0;
     int buys = 0;
 
     while (sqlite3_step(s) == SQLITE_ROW) {
@@ -1200,8 +1181,6 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
             continue;
         }
 
-        // Текущая продажа к этому моменту уже в базе. Пропускаем её по хешу -
-        // сравнение по количеству ошиблось бы, продай кит дважды столько же.
         if (!currentHash.empty() && rowHash == currentHash) continue;
 
         if (position <= 0) continue;
@@ -1217,8 +1196,6 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     const cpp_int costOfSold = costBasis * take / position;
     if (costOfSold <= 0) return false;
 
-    // Средняя цена входа именно проданного объёма - та, с которой сравнивается
-    // цена продажи. Без неё процент нечем проверить.
     const cpp_int avgBig = calcUnitPriceNanos(costOfSold, take, dec);
     if (avgBig > 0) out.avgEntryNanos = static_cast<long long>(avgBig);
 
@@ -1352,6 +1329,7 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
         }
     }
     else if (action == "tt_noop") {
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
     else if (action == "gt_open") {
         GlobalRankKind kind;
