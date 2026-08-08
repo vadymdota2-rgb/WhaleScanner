@@ -12,10 +12,6 @@ void cleanupExpiredPremium();
 
 long long premiumExpireTs(const std::string& chatId);
 
-
-enum class PaymentApplyResult { Activated, Extended, Duplicate, Rejected, Error };
-PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohmann::json& sp);
-
 bool grantPremiumDays(const std::string& chatId, int days);
 
 size_t premiumMaxWallets(const std::string& chatId);
