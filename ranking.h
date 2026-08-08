@@ -48,8 +48,8 @@ struct PriorBuy {
     long long nowPriceNanos = 0;
     long long ageSeconds = 0;
     double changePercent = 0.0;
-    long long avgEntryNanos = 0;   // средняя цена уже набранной позиции
-    int buyCount = 0;              // сколько покупок было до текущей
+    long long avgEntryNanos = 0;
+    int buyCount = 0;
 };
 bool lastBuyOutcome(const std::string& wallet, const std::string& token,
                     const std::string& currentHash, long long currentPriceNanos,
@@ -60,7 +60,7 @@ struct SellPnl {
     long long costNanos = 0;
     double pnlPercent = 0.0;
     int buyCount = 0;
-    long long avgEntryNanos = 0;   // средняя цена входа проданного объёма
+    long long avgEntryNanos = 0;
 };
 bool sellOutcome(const std::string& wallet, const std::string& token,
                  long long sellUsdNanos, const std::string& sellAmountStr,
