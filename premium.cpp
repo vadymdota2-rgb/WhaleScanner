@@ -132,6 +132,31 @@ bool initPremium(const std::string& botToken, const std::string& serviceChatId) 
     return ok;
 }
 
+std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds) {
+    std::set<std::string> out;
+    if (chatIds.empty() || !g_premiumSchemaOk) return out;
+
+    const long long now = static_cast<long long>(time(nullptr));
+
+    for (const auto& c : chatIds)
+        if (!g_serviceChatId.empty() && c == g_serviceChatId) out.insert(c);
+
+    std::string sql =
+        "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire>? AND chat_id IN (";
+    for (size_t i = 0; i < chatIds.size(); i++) sql += (i ? ",?" : "?");
+    sql += ")";
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, sql.c_str())) return out;
+    sqlite3_bind_int64(s, 1, now);
+    for (size_t i = 0; i < chatIds.size(); i++)
+        sqlite3_bind_text(s, static_cast<int>(i + 2), chatIds[i].c_str(), -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(s) == SQLITE_ROW) out.insert(safeColumnText(s, 0));
+    sqlite3_finalize(s);
+    return out;
+}
+
 bool isPremium(const std::string& chatId) {
 
     if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return true;
@@ -214,9 +239,6 @@ bool grantPremiumDays(const std::string& chatId, int days) {
 
     const bool active = (flag != 0 && expire > now);
     const long long base = active ? expire : now;
-    // Испорченное значение в базе (например, после ручной правки) дало бы при
-    // сложении переполнение и отрицательный срок - подписка обнулилась бы
-    // молча. Честным путём такое недостижимо: нужно 400 тысяч продлений.
     const long long addSec = static_cast<long long>(days) * 86400LL;
     if (base > LLONG_MAX - addSec) {
         std::cerr << "[PREMIUM] grant: expire overflow for " << chatId
