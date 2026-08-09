@@ -1,5 +1,6 @@
 #include "message_queue.h"
-#include "premium.h"   // isPremium: приоритет доставки подписчикам
+#include <set>
+#include "premium.h"
 
 #include <sqlite3.h>
 #include <mutex>
@@ -80,7 +81,7 @@ RetryResult SafeMessageQueue::scheduleRetry(int64_t id) {
 void SafeMessageQueue::senderLoop() {
     initCounters(); auto rec=queueSize.load();
     if (rec>0) std::cout << "[QUEUE] Recovered " << rec << " pending deliveries" << std::endl;
-    while (qRunning.load(std::memory_order_relaxed)) {
+    while (qRunning.load(std::memory_order_acquire)) {
         time_t ra=globalRetryAfter.load(std::memory_order_relaxed);
         if (ra>0&&time(nullptr)<ra) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
         if (queueSize.load(std::memory_order_relaxed)==0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
@@ -140,7 +141,7 @@ void SafeMessageQueue::start() {
 
 SafeMessageQueue::~SafeMessageQueue() { stop(); }
 
-void SafeMessageQueue::stop() { qRunning.store(false); if (senderThread.joinable()) senderThread.join(); }
+void SafeMessageQueue::stop() { qRunning.store(false, std::memory_order_release); if (senderThread.joinable()) senderThread.join(); }
 
 size_t SafeMessageQueue::size() { return queueSize.load(std::memory_order_relaxed); }
 
@@ -153,13 +154,17 @@ void SafeMessageQueue::syncSize() {
 
 bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
     if (recipients.empty()) return true;
+    if (text.empty()) {
+        std::cerr << "[QUEUE] empty message rejected for " << recipients.size()
+                  << " recipient(s)" << std::endl;
+        return false;
+    }
     size_t batchSize = recipients.size();
 
-    // Приоритет считаем ДО захвата мьютекса: isPremium читает ту же базу и
-    // берёт тот же замок, вызов внутри дал бы взаимоблокировку.
+    const std::set<std::string> premium = premiumSubsetOf(recipients);
     std::vector<int> prio;
     prio.reserve(recipients.size());
-    for (const auto& c : recipients) prio.push_back(isPremium(c) ? 1 : 0);
+    for (const auto& c : recipients) prio.push_back(premium.count(c) ? 1 : 0);
 
     auto txStart=std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> l(dbMutex);
