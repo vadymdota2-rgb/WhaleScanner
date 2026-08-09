@@ -6,25 +6,17 @@
 #include <algorithm>
 #include <mutex>
 
-#include "utils.h"  // toLower
+#include "utils.h"
 
 using json = nlohmann::json;
 
-// Диагностический модуль: копит частоту адресов, на которые чаще всего
-// натыкается анализатор в ветке "DEX interaction" (swap виден, но flow
-// кошелька не подтверждён) - чтобы находить кандидатов для таблицы роутеров.
-// Полностью самодостаточен: main.cpp вызывает только recordBeneficiarySignal
-// в точке классификации и handleBeneficiaryCommand в диспетчере команд.
-// Для удаления фичи достаточно убрать эти два вызова, #include и сами файлы.
 namespace {
 
-// Ограничение размера — защита от неограниченного роста памяти на случай
-// патологически большого числа уникальных адресов (например, CREATE2-контракты).
 constexpr size_t BENEFICIARY_TALLY_CAP = 20000;
 
 std::mutex g_benefTallyMutex;
-std::unordered_map<std::string, uint64_t> g_benefToTally;   // tx.to (вызываемый контракт) -> счётчик
-std::unordered_map<std::string, uint64_t> g_benefAddrTally; // адрес-бенефициар -> счётчик
+std::unordered_map<std::string, uint64_t> g_benefToTally;
+std::unordered_map<std::string, uint64_t> g_benefAddrTally;
 
 std::string buildTopAddrList(const std::unordered_map<std::string, uint64_t>& m, size_t topN, bool labelRouters) {
     std::vector<std::pair<std::string, uint64_t>> v(m.begin(), m.end());
@@ -43,7 +35,7 @@ std::string buildTopAddrList(const std::unordered_map<std::string, uint64_t>& m,
     return ss.str();
 }
 
-} // namespace
+}
 
 void recordBeneficiarySignal(const nlohmann::json& tx, const TxResult& res) {
     if (res.flowBeneficiaries.empty()) return;
@@ -53,7 +45,6 @@ void recordBeneficiarySignal(const nlohmann::json& tx, const TxResult& res) {
     if (!to.empty() && (g_benefToTally.count(to) || g_benefToTally.size() < BENEFICIARY_TALLY_CAP))
         g_benefToTally[to]++;
 
-    // Формат res.flowBeneficiaries: "token:addr:amount;token:addr:amount;..."
     const std::string& s = res.flowBeneficiaries;
     size_t pos = 0;
     while (pos <= s.size()) {
