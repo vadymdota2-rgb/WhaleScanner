@@ -1,12 +1,16 @@
 #pragma once
 
 #include <string>
+#include <vector>
+#include <set>
 #include "json.hpp"
 #include "ru.h"
 
 bool initPremium(const std::string& botToken, const std::string& serviceChatId = "");
 
 bool isPremium(const std::string& chatId);
+
+std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds);
 
 void cleanupExpiredPremium();
 
