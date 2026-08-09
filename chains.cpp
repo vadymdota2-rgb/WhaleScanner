@@ -1,9 +1,6 @@
 #include "chains.h"
 #include "utils.h"
 
-// Реализации конфигураций сетей. Каждая функция - полное описание одной сети
-// в одном месте: торговые параметры и её узлы вместе.
-
 const std::string WBNB_ADDR = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
 const std::string NATIVE_BNB_MARKER = "native:bnb";
 
@@ -16,11 +13,11 @@ ChainContext makeBscContext() {
     c.nativeMarker = NATIVE_BNB_MARKER;
     c.wrappedNative = WBNB_ADDR;
     c.stablecoins = {
-        "0x55d398326f99059ff775485246999027b3197955",  // USDT
-        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  // USDC
-        "0xe9e7cea3dedca5984780bafc599bd69add087d56",  // BUSD
-        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",  // FDUSD
-        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d"   // USD1
+        "0x55d398326f99059ff775485246999027b3197955",
+        "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
+        "0xe9e7cea3dedca5984780bafc599bd69add087d56",
+        "0xc5f0f7b66764f6ec8c8dff7ba683102295e16409",
+        "0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d"
     };
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WBNB_ADDR);
@@ -55,20 +52,13 @@ ChainContext makeBscContext() {
         "0x78bc5ee9f11d133a08b331c2e18fe81be0ed02dc",
         "0xdd90e5e87a2081dcf0391920868ebc2ffb81a1af",
     };
-    // PancakeSwap Infinity - единая инфраструктура-синглтон на ВСЕ пары (в отличие
-    // от V2/V3, где у каждой пары свой pool-контракт, распознаваемый по Swap-топику).
-    // Vault - это "accounting layer", которая физически двигает токены между сторонами
-    // свопа, поэтому именно он чаще всего встречается как контрагент в Transfer-логах.
     c.knownPoolInfra = {
-        // Uniswap V4 тоже работает на BSC - его Pool Manager всплывал в
-        // диагностике как один из самых частых нераспознанных адресов.
-        "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df", // Uniswap V4: Pool Manager
-        "0x238a358808379702088667322f80ac48bad5e6c4", // PancakeSwap Infinity: Vault
-        "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b",  // PancakeSwap Infinity: CLPoolManager
-        "0xc697d2898e0d09264376196696c51d7abbbaa4a9",  // PancakeSwap Infinity: BinPoolManager
+        "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
+        "0x238a358808379702088667322f80ac48bad5e6c4",
+        "0xa0ffb9c1ce1fe56963b0321b32e7a0302114058b",
+        "0xc697d2898e0d09264376196696c51d7abbbaa4a9",
     };
     c.rpcEndpoints = {
-    // Официальные dataseed-узлы BNB Chain
     "https://bsc-dataseed.bnbchain.org",
     "https://bsc-dataseed1.bnbchain.org",
     "https://bsc-dataseed2.bnbchain.org",
@@ -77,7 +67,6 @@ ChainContext makeBscContext() {
     "https://bsc-dataseed2.ninicoin.io",
     "https://bsc-dataseed3.ninicoin.io",
     "https://bsc-dataseed4.ninicoin.io",
-    // Публичные провайдеры
     "https://bsc.publicnode.com",
     "https://binance.llamarpc.com",
     "https://rpc.ankr.com/bsc",
@@ -90,14 +79,11 @@ ChainContext makeBscContext() {
     "https://bsc-dataseed.nariox.org",
     "https://rpc.coinsdo.net/bsc",
     "https://bsc.nodereal.io",
-    // Добавлено: официальные dataseed на устаревшем домене binance.org и
-    // базовые адреса семейств, которых не хватало (были только пронумерованные).
     "https://bsc-dataseed.binance.org",
     "https://bsc-dataseed1.binance.org",
     "https://bsc-dataseed2.binance.org",
     "https://bsc-dataseed.defibit.io",
     "https://bsc-dataseed.ninicoin.io",
-    // Прочие публичные провайдеры
     "https://binance.nodereal.io",
     "https://bnb.rpc.subquery.network/public",
     "https://bsc-rpc.publicnode.com",
@@ -126,11 +112,8 @@ ChainContext makeEthereumContext() {
     };
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WETH_ADDR);
-    // Singleton-архитектура V4: один контракт на все пары, поэтому он часто
-    // оказывается контрагентом в переводах и не должен приниматься за
-    // "личный вольт" кошелька.
     c.knownPoolInfra = {
-        "0x000000000004444c5dc75cb358380d2e3de08a90", // Uniswap V4: Pool Manager
+        "0x000000000004444c5dc75cb358380d2e3de08a90",
     };
     c.routers = {
         {"0x7a250d5630b4cf539739df2c5dacb4c659f2488d", "Uniswap V2"},
@@ -168,7 +151,7 @@ ChainContext makeBaseContext() {
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WETH_ADDR);
     c.knownPoolInfra = {
-        "0x498581ff718922c3f8e6a244956af099b2652b2b", // Uniswap V4: Pool Manager
+        "0x498581ff718922c3f8e6a244956af099b2652b2b",
     };
     c.routers = {
         {"0x198ef79f1f515f02dfe9e3115ed9fc07183f02fc", "Uniswap (Universal Router)"},
@@ -201,9 +184,6 @@ ChainContext makeArbitrumContext() {
     };
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WETH_ADDR);
-    // ВНИМАНИЕ: адрес Uniswap V4 Pool Manager для Arbitrum не подтверждён.
-    // Uniswap прямо предупреждает, что адреса V4 в разных сетях РАЗНЫЕ, поэтому
-    // угадывать нельзя - вписать после проверки в обозревателе сети.
     c.routers = {
         {"0x4c60051384bd2d3c01bfc845cf5f4b44bcbe9de5", "Uniswap (Universal Router)"},
         {"0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", "Uniswap (Universal Router)"},
@@ -220,16 +200,11 @@ ChainContext makeArbitrumContext() {
     return c;
 }
 
-namespace {
-}
-
-
 bool chainConfigByName(const std::string& name, ChainContext& out) {
     std::string n = toLower(name);
-    if (n == "bsc")                        { out = makeBscContext();      return true; }
+    if (n == "bsc" || n == "bnb")          { out = makeBscContext();      return true; }
     if (n == "ethereum" || n == "eth")     { out = makeEthereumContext(); return true; }
     if (n == "base")                       { out = makeBaseContext();     return true; }
     if (n == "arbitrum" || n == "arb")     { out = makeArbitrumContext(); return true; }
     return false;
 }
-
