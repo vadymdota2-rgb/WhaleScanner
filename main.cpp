@@ -1394,12 +1394,24 @@ bool processBlock(long long bn) {
 
 void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
-        if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
+    const long long now = static_cast<long long>(time(nullptr));
+
+    // ПОРЯДОК ВАЖЕН: сначала доставки, потом алерты. При обратном порядке
+    // алерт удалялся первым, и его доставки переставали находиться по
+    // соединению с alerts - оставались в базе навсегда.
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
-        sqlite3_bind_int64(s,1,time(nullptr)-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
+        sqlite3_bind_int64(s,1,now-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
+
+    if (prepareOrLog(db,&s,"DELETE FROM alerts WHERE id IN (SELECT a.id FROM alerts a WHERE a.created_at<? AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.alert_id=a.id AND d.status IN (0,3)))")) {
+        sqlite3_bind_int64(s,1,now-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
+        if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
+
+    // Подбираем осиротевшее, накопленное прежним порядком: доставки, чей алерт
+    // уже удалён. Без этого прошлые утечки остались бы в базе навсегда.
+    if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.id=deliveries.alert_id)")) {
+        sqlite3_step(s); int orp=sqlite3_changes(db); sqlite3_finalize(s);
+        if (orp>0) std::cout << "[CLEANUP] Removed " << orp << " orphaned deliveries" << std::endl; }
 }
 
 std::mutex g_lastViewMutex;
