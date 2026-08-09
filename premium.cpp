@@ -1,4 +1,5 @@
 #include "premium.h"
+#include <climits>
 
 #include <sqlite3.h>
 #include <mutex>
@@ -212,7 +213,17 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
 
     const bool active = (flag != 0 && expire > now);
-    const long long newExpire = (active ? expire : now) + static_cast<long long>(days) * 86400LL;
+    const long long base = active ? expire : now;
+    // Испорченное значение в базе (например, после ручной правки) дало бы при
+    // сложении переполнение и отрицательный срок - подписка обнулилась бы
+    // молча. Честным путём такое недостижимо: нужно 400 тысяч продлений.
+    const long long addSec = static_cast<long long>(days) * 86400LL;
+    if (base > LLONG_MAX - addSec) {
+        std::cerr << "[PREMIUM] grant: expire overflow for " << chatId
+                  << " (base=" << base << "), rejected" << std::endl;
+        return false;
+    }
+    const long long newExpire = base + addSec;
     const long long newStart  = active ? (start > 0 ? start : now) : now;
 
     sqlite3_stmt* s;
