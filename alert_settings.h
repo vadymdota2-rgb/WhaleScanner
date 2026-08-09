@@ -15,14 +15,12 @@ struct UIMessage {
 
 UIMessage buildMainMenu(const std::string& chatId);
 std::string buildCancelButton(Lang lang = Lang::EN);
-// Вариант с быстрым переходом в Топ трейдеров - для экрана ввода адреса.
 std::string buildCancelWithTopTraders(Lang lang = Lang::EN);
 std::string buildCancelWithSpotTop(Lang lang = Lang::EN);
 UIMessage buildAlertThresholdMenu(uint64_t currentThresholdNanos, Lang lang = Lang::EN);
 
 }
 
-// Порог алертов по умолчанию - домен этого модуля.
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
@@ -50,8 +48,6 @@ enum class UserState {
 struct UserSession {
     UserState state = UserState::IDLE;
     std::string pendingAddress;
-    // id сообщения-приглашения ("введите адрес..."), чтобы удалить его после
-    // завершения диалога и не оставлять в чате второе висящее меню.
     long long promptMessageId = 0;
 };
 
