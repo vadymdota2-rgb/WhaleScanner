@@ -12,8 +12,6 @@
 std::string getUserLanguage(const std::string& chatId);
 void ensureUser(const std::string& chatId);
 
-// База данных и её мьютекс живут в main.cpp - модуль пользуется ими,
-// как и остальные (ranking, premium, wallet_menu).
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
@@ -28,8 +26,6 @@ constexpr uint64_t NANOS_PER_USD = 1000000000ULL;
 constexpr uint64_t NANOS_PER_CENT = NANOS_PER_USD / 100;
 constexpr uint64_t MAX_THRESHOLD_USD = 1000000000ULL;
 constexpr uint64_t MAX_THRESHOLD_CENTS = MAX_THRESHOLD_USD * 100;
-// Нижняя граница порога. Ниже неё алерты превращаются в поток мусора
-// (мелкие сделки идут постоянно), поэтому запрещено ставить меньше.
 constexpr uint64_t MIN_THRESHOLD_USD = 50ULL;
 constexpr uint64_t MIN_THRESHOLD_CENTS = MIN_THRESHOLD_USD * 100;
 
@@ -158,8 +154,6 @@ TelegramUI::UIMessage TelegramUI::buildAlertThresholdMenu(uint64_t currentThresh
     return {text.str(), keyboard.dump()};
 }
 
-// Хранение порога - домен этого модуля, поэтому реализация живёт здесь,
-// а не в main.cpp (он лишь пользуется ими через заголовок).
 uint64_t getUserThresholdNanos(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT threshold_nanos FROM users WHERE chat_id=?")) return DEFAULT_THRESHOLD_NANOS;
@@ -203,10 +197,6 @@ bool handleThresholdCallback(const std::string& chatId, const std::string& param
         replyInPlace(chatId, messageId, tr(lang, "threshold_save_failed") + "\n\n" + menu.text, menu.keyboard);
         return true;
     }
-    // Сбрасываем возможный незакрытый диалог "своя сумма": иначе, если
-    // пользователь открыл ввод суммы, а затем нажал пресет в другом сообщении,
-    // состояние осталось бы висеть и следующий обычный текст в чате был бы
-    // молча принят за сумму порога.
     g_sessionManager.clearSession(chatId);
     auto menu = TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), lang);
     replyInPlace(chatId, messageId, buildStatusText(ar, nanos, lang) + "\n\n" + menu.text, menu.keyboard);
@@ -215,8 +205,6 @@ bool handleThresholdCallback(const std::string& chatId, const std::string& param
 
 bool handleThresholdText(const std::string& chatId, const std::string& text) {
     Lang lang = langFromCode(getUserLanguage(chatId));
-    // Правим то же сообщение, в котором шёл диалог, иначе в чате остаётся
-    // висеть старое приглашение и получается два меню порога сразу.
     const long long promptId = g_sessionManager.getSession(chatId).promptMessageId;
     uint64_t nanos = 0;
     ParseResult pr = parseThresholdNanos(text, nanos);
