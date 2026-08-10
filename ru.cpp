@@ -299,6 +299,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_side_long",   {"Long",  "Лонг"}},
         {"hl_side_short",  {"Short", "Шорт"}},
         {"hl_entry_price", {"Entry", "Вход"}},
+        {"hl_mark_price",  {"Current price", "Текущая цена"}},
         {"hl_unrealized",  {"Unrealized PnL", "Незакрытая прибыль"}},
 
         {"hl_venue_title",  {"Top traders", "Топ трейдеров"}},
