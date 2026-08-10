@@ -14,26 +14,37 @@ uint64_t getPriceNanos(const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
 
-cpp_int parseUint256(const std::string& h) {
-    if (h.length()<66) return 0; cpp_int r=0;
-    for (char c:h.substr(2,64)) { r<<=4; if (c>='0'&&c<='9') r|=(c-'0'); else if (c>='a'&&c<='f') r|=(c-'a'+10); else if (c>='A'&&c<='F') r|=(c-'A'+10); } return r;
-}
-cpp_int hexToCppInt(const std::string& h) {
-    if (h.size() < 2 || h[0] != '0' || h[1] != 'x') return 0;
+cpp_int hexNibbles(const std::string& h, size_t from, size_t count) {
     cpp_int r = 0;
-    for (size_t i = 2; i < h.size(); i++) {
-        char c = h[i]; r <<= 4;
-        if (c >= '0' && c <= '9') r |= (c - '0');
+    const size_t end = std::min(h.size(), from + count);
+    for (size_t i = from; i < end; i++) {
+        const char c = h[i];
+        r <<= 4;
+        if      (c >= '0' && c <= '9') r |= (c - '0');
         else if (c >= 'a' && c <= 'f') r |= (c - 'a' + 10);
         else if (c >= 'A' && c <= 'F') r |= (c - 'A' + 10);
     }
     return r;
 }
+
+cpp_int parseUint256(const std::string& h) {
+    if (h.length() < 66) return 0;
+    return hexNibbles(h, 2, 64);
+}
+cpp_int hexToCppInt(const std::string& h) {
+    if (h.size() < 2 || h[0] != '0' || h[1] != 'x') return 0;
+    return hexNibbles(h, 2, h.size() - 2);
+}
 std::string formatAmount(const cpp_int& raw, int dec) {
     if (dec < 0 || dec > 36) dec = 18;
-    if (raw==0) return "0.00"; cpp_int d=1; for (int i=0;i<dec;i++) d*=10;
-    std::string ip=(raw/d).convert_to<std::string>(), fp=(raw%d).convert_to<std::string>();
-    while ((int)fp.length()<dec) fp="0"+fp; if (fp.length()>2) fp=fp.substr(0,2); while (fp.length()<2) fp+="0";
+    if (raw == 0) return "0.00";
+    cpp_int d = 1;
+    for (int i = 0; i < dec; i++) d *= 10;
+    std::string ip = (raw / d).convert_to<std::string>();
+    std::string fp = (raw % d).convert_to<std::string>();
+    while (static_cast<int>(fp.length()) < dec) fp = "0" + fp;
+    if (fp.length() > 2) fp = fp.substr(0, 2);
+    while (fp.length() < 2) fp += "0";
     std::string grouped; int cnt=0;
     for (auto it=ip.rbegin(); it!=ip.rend(); ++it) {
         if (cnt && cnt%3==0 && *it>='0' && *it<='9') grouped.push_back(',');
@@ -263,39 +274,6 @@ int walletFlowsWithCounterparty(
     return count;
 }
 
-int maxCommonWalletCounterpartyTokenCount(
-    const std::map<std::string, std::vector<FlowEdge>>& graph,
-    const std::vector<std::string>& tokenOrder,
-    const std::map<std::string, cpp_int>& netFlow,
-    const std::string& wallet,
-    bool incoming
-) {
-    std::map<std::string, std::set<std::string>> tokensByCounterparty;
-
-    for (const auto& token : tokenOrder) {
-        auto netIt = netFlow.find(token);
-        if (netIt == netFlow.end()) continue;
-        if (incoming && netIt->second <= 0) continue;
-        if (!incoming && netIt->second >= 0) continue;
-
-        auto graphIt = graph.find(token);
-        if (graphIt == graph.end()) continue;
-
-        for (const auto& edge : graphIt->second) {
-            if (edge.amount <= 0) continue;
-            if (incoming && edge.to == wallet && edge.from != wallet)
-                tokensByCounterparty[edge.from].insert(token);
-            if (!incoming && edge.from == wallet && edge.to != wallet)
-                tokensByCounterparty[edge.to].insert(token);
-        }
-    }
-
-    int best = 0;
-    for (const auto& item : tokensByCounterparty)
-        best = std::max(best, static_cast<int>(item.second.size()));
-    return best;
-}
-
 bool reachesAny(
     const std::map<std::string, std::vector<FlowEdge>>& graph,
     const std::string& token,
@@ -386,7 +364,6 @@ cpp_int gasCostUsdNanos(const json& receipt) {
 }
 
 bool isBaseAsset(const std::string& a) { return g_chain.baseAssets.count(toLower(a)) > 0; }
-bool isStablecoin(const std::string& a) { return g_chain.stablecoins.count(toLower(a)) > 0; }
 std::string lookupRouterLabel(const std::string& addr) {
     auto it = g_chain.routers.find(toLower(addr));
     return it != g_chain.routers.end() ? it->second : std::string();
