@@ -102,9 +102,6 @@ std::vector<PerpRow> computeRanking(bool& ok) {
         }
         rows.push_back(r);
     }
-    // Прерванное чтение даёт частичные данные. Без этой проверки они легли бы
-    // в кэш как полные и держались бы там пять минут - рейтинг молча показывал
-    // бы половину трейдеров.
     const bool complete = stepRc == SQLITE_DONE;
     sqlite3_finalize(s);
     if (!complete) {
@@ -127,8 +124,6 @@ void rankingSnapshot(std::vector<PerpRow>& localCopy) {
         bool ok = false;
         std::vector<PerpRow> fresh = computeRanking(ok);
         std::lock_guard<std::mutex> l(g_rankMutex);
-        // Неудачный пересчёт не затирает прежний рейтинг и не считается
-        // свежим: время сбрасываем, чтобы следующий заход попробовал снова.
         if (ok) g_rankCache.swap(fresh);
         else    g_rankBuiltAt = 0;
         localCopy = g_rankCache;
@@ -272,7 +267,6 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     return {text.str(), keyboard.dump()};
 }
 
-
 }
 
 std::string hyperliquidStatsLine() {
@@ -281,25 +275,49 @@ std::string hyperliquidStatsLine() {
     size_t queued;
     { std::lock_guard<std::mutex> l(g_queueMutex); queued = g_enrichQueue.size(); }
 
+    long long bannedTotal = 0;
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (g_hlDb) {
+            sqlite3_stmt* s;
+            if (prepareOrLog(g_hlDb, &s, "SELECT COUNT(*) FROM hl_banned")) {
+                if (sqlite3_step(s) == SQLITE_ROW) bannedTotal = sqlite3_column_int64(s, 0);
+                sqlite3_finalize(s);
+            }
+        }
+    }
+
+    const unsigned long long seen  = g_tradesSeen.load(std::memory_order_relaxed);
+    const unsigned long long hits  = g_hits.load(std::memory_order_relaxed);
+    const unsigned long long enr   = g_enriched.load(std::memory_order_relaxed);
+    const unsigned long long alerts= g_alertsSent.load(std::memory_order_relaxed);
+    const unsigned long long skips = g_budgetSkips.load(std::memory_order_relaxed);
+    const unsigned long long recon = g_reconnects.load(std::memory_order_relaxed);
+
     ss << "\n\n\U0001F535 <b>Hyperliquid</b>\n"
-       << (g_connected.load(std::memory_order_relaxed) ? "\u2705 на связи" : "\u274C нет связи")
-       << ", рынков: " << g_subscribedCoins.load(std::memory_order_relaxed)
-       << "\n\U0001F440 кошельков: " << watchedCount()
-       << "\n\U0001F4CA сделок в фиде: " << formatThousands(g_tradesSeen.load(std::memory_order_relaxed))
-       << "\n\U0001F3AF попаданий: " << g_hits.load(std::memory_order_relaxed)
-       << "\n\U0001F504 дозагрузок: " << g_enriched.load(std::memory_order_relaxed)
-       << " (в очереди " << queued << ")"
-       << "\n\U0001F4E8 алертов: " << g_alertsSent.load(std::memory_order_relaxed)
-       << "\n\U0001F6D1 пропусков по бюджету: " << g_budgetSkips.load(std::memory_order_relaxed)
-       << "\n\U0001F916 ботов исключено: " << g_botsBanned.load(std::memory_order_relaxed)
-       << "\n\u267B\uFE0F переподключений: " << g_reconnects.load(std::memory_order_relaxed);
-    if (last > 0) ss << "\n\u23F1 тишина: " << (nowSec() - last) << "с";
+       << (g_connected.load(std::memory_order_relaxed) ? "\u2705 подключён" : "\u274C нет связи")
+       << " \u00B7 слежу за " << formatThousands(watchedCount()) << " кошельками"
+       << " на " << g_subscribedCoins.load(std::memory_order_relaxed) << " монетах";
+
+    if (last > 0) ss << "\n\u23F1 последняя сделка: " << (nowSec() - last) << "с назад";
+
+    ss << "\n\n\U0001F4CA <b>Поток</b>"
+       << "\n\u2022 сделок на бирже: " << formatThousands(seen)
+       << "\n\u2022 у наших кошельков: " << formatThousands(hits);
+
+    ss << "\n\n\U0001F4E8 <b>Алерты</b>"
+       << "\n\u2022 отправлено: " << formatThousands(alerts)
+       << "\n\u2022 запросов истории: " << formatThousands(enr);
+    if (queued > 0) ss << "\n\u2022 ждут проверки: " << queued << " кошельков";
+
+    ss << "\n\n\U0001F916 <b>Фильтры</b>"
+       << "\n\u2022 ботов исключено всего: " << formatThousands(static_cast<uint64_t>(bannedTotal));
+    ss << "\n\u2022 пропущено по лимиту API: " << formatThousands(skips);
+    if (recon > 0) ss << "\n\u2022 обрывов связи: " << recon;
+
     return ss.str();
 }
 
-// Забыть построенный рейтинг: зовётся из core при бане бота, чтобы тот исчез
-// из топа немедленно, а не через пять минут. Само состояние рейтинга живёт
-// здесь целиком - core о его устройстве не знает.
 namespace hl {
 void invalidateRankCache() {
     std::lock_guard<std::mutex> l(g_rankMutex);
@@ -406,9 +424,6 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
 
         parseDecimalToNanos(jstr(p, "entryPx", "0"), op.entryPxNanos);
 
-        // Текущую цену площадка отдельным полем не присылает, но её даёт
-        // стоимость позиции, делённая на её размер. Отдельный запрос не нужен -
-        // всё в том же ответе.
         long long posValue = 0;
         if (parseDecimalToNanos(jstr(p, "positionValue", "0"), posValue) &&
             posValue > 0 && op.sizeNanos > 0) {
@@ -556,8 +571,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.markPxNanos > 0) {
             t << dm << "\U0001F4B9 " << tr(lang, "hl_mark_price") << ": <b>"
               << formatPriceNanos(p.markPxNanos) << "</b>";
-            // Насколько цена ушла от входа. Для шорта знак обратный: падение
-            // цены - прибыль, и показывать минус там было бы враньём.
             if (p.entryPxNanos > 0) {
                 double move = 100.0 * (static_cast<double>(p.markPxNanos) -
                                        static_cast<double>(p.entryPxNanos))
