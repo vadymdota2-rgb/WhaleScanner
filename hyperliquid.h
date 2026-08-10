@@ -19,6 +19,8 @@ struct HlUserWallet {
 };
 std::vector<HlUserWallet> hlUserWallets(const std::string& chatId);
 
+size_t hlAlertRecipientCount();
+
 bool initHyperliquid();
 
 void startHyperliquidLoop();
