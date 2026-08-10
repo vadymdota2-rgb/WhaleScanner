@@ -31,6 +31,7 @@ constexpr long long HL_RANK_WINDOW_SEC = 30LL * 86400LL;
 extern const char* const HL_CARD_SEPARATOR;
 
 void invalidateRankCache();
+void rebuildRankCache();
 
 long long nowSec();
 const char* dirMark(Lang lang);
