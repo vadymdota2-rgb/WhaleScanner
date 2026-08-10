@@ -42,7 +42,6 @@ std::string shortAddress(const std::string& a);
 
 namespace hl {
 
-
 const char* const HL_WS_URL   = "wss://api.hyperliquid.xyz/ws";
 const char* const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
 
@@ -68,14 +67,13 @@ constexpr long long HL_SEED_LOOKBACK_MS = 3600LL * 1000LL;
 constexpr int HL_HYPERACTIVE_FILLS = 200;
 constexpr long long HL_HYPERACTIVE_DEBOUNCE_SEC = 600;
 
-
 constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
+constexpr long long HL_RANK_REBUILD_SEC = 300;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
 constexpr long long HL_FILL_TTL_SEC = HL_RANK_WINDOW_SEC;
 
 constexpr int HL_MAX_BOT_TRADES = 1000;
-
 
 const char* const HL_CARD_SEPARATOR = "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501";
 
@@ -552,6 +550,20 @@ void cleanupOldFills() {
     }
 }
 
+void forgetUnwatchedAccounts() {
+    auto watched = watchedSnapshot();
+    if (!watched || watched->empty()) return;
+    std::lock_guard<std::mutex> l(g_posMutex);
+    size_t before = g_accountValue.size();
+    for (auto it = g_accountValue.begin(); it != g_accountValue.end(); ) {
+        if (watched->count(it->first)) ++it;
+        else it = g_accountValue.erase(it);
+    }
+    const size_t removed = before - g_accountValue.size();
+    if (removed > 0)
+        std::cout << "[HL] забыто депозитов неотслеживаемых кошельков: " << removed << std::endl;
+}
+
 int countFillsInWindow(const std::string& wallet) {
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return 0;
@@ -917,6 +929,7 @@ void enrichWallet(const std::string& wallet) {
 
 void enricherLoop() {
     long long lastCleanup = 0;
+    long long lastRank = 0;
     while (keepGoing()) {
         std::set<std::string> batch;
         {
@@ -940,7 +953,16 @@ void enricherLoop() {
             (lastCleanup == 0 || nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC)) {
             purgeNonPerpFills();
             cleanupOldFills();
+            forgetUnwatchedAccounts();
             lastCleanup = nowSec();
+        }
+
+        if (lastRank == 0 || nowSec() - lastRank >= HL_RANK_REBUILD_SEC) {
+            try { rebuildRankCache(); }
+            catch (const std::exception& e) {
+                std::cerr << "[HL] сбой пересборки рейтинга: " << e.what() << std::endl;
+            }
+            lastRank = nowSec();
         }
 
         for (int i = 0; i < 20 && keepGoing(); i++)
@@ -1164,11 +1186,9 @@ void feedLoop() {
     std::cout << "[HL] поток фида остановлен" << std::endl;
 }
 
-
 }
 
 using namespace hl;
-
 
 bool initHyperliquid() {
     std::lock_guard<std::mutex> l(g_hlDbMutex);
