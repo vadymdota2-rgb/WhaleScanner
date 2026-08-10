@@ -112,6 +112,8 @@ std::vector<PerpRow> computeRanking(bool& ok) {
     return rows;
 }
 
+
+
 void rankingSnapshot(std::vector<PerpRow>& localCopy) {
     std::lock_guard<std::mutex> l(g_rankMutex);
     localCopy = g_rankCache;
@@ -251,27 +253,7 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     return {text.str(), keyboard.dump()};
 }
 
-}  // namespace
-
-namespace hl {
-
-void rebuildRankCache() {
-    bool ok = false;
-    std::vector<PerpRow> fresh = computeRanking(ok);
-    std::lock_guard<std::mutex> l(g_rankMutex);
-    if (ok) {
-        g_rankCache.swap(fresh);
-        g_rankBuiltAt = nowSec();
-    }
 }
-
-void invalidateRankCache() {
-    std::lock_guard<std::mutex> l(g_rankMutex);
-    g_rankBuiltAt = 0;
-    g_rankCache.clear();
-}
-
-}  // namespace hl
 
 std::string hyperliquidStatsLine() {
     std::stringstream ss;
@@ -320,6 +302,24 @@ std::string hyperliquidStatsLine() {
     if (recon > 0) ss << "\n\u2022 обрывов связи: " << recon;
 
     return ss.str();
+}
+
+namespace hl {
+void rebuildRankCache() {
+    bool ok = false;
+    std::vector<PerpRow> fresh = computeRanking(ok);
+    std::lock_guard<std::mutex> l(g_rankMutex);
+    if (ok) {
+        g_rankCache.swap(fresh);
+        g_rankBuiltAt = nowSec();
+    }
+}
+
+void invalidateRankCache() {
+    std::lock_guard<std::mutex> l(g_rankMutex);
+    g_rankBuiltAt = 0;
+    g_rankCache.clear();
+}
 }
 
 HlMessage buildVenueMenu(const std::string& chatId) {
