@@ -112,23 +112,17 @@ std::vector<PerpRow> computeRanking(bool& ok) {
     return rows;
 }
 
-void rankingSnapshot(std::vector<PerpRow>& localCopy) {
-    bool needRebuild;
-    {
-        std::lock_guard<std::mutex> l(g_rankMutex);
-        needRebuild = g_rankCache.empty() || nowSec() - g_rankBuiltAt >= HL_RANK_CACHE_SEC;
-        if (needRebuild) g_rankBuiltAt = nowSec();
+void rebuildRankCache() {
+    bool ok = false;
+    std::vector<PerpRow> fresh = computeRanking(ok);
+    std::lock_guard<std::mutex> l(g_rankMutex);
+    if (ok) {
+        g_rankCache.swap(fresh);
+        g_rankBuiltAt = nowSec();
     }
+}
 
-    if (needRebuild) {
-        bool ok = false;
-        std::vector<PerpRow> fresh = computeRanking(ok);
-        std::lock_guard<std::mutex> l(g_rankMutex);
-        if (ok) g_rankCache.swap(fresh);
-        else    g_rankBuiltAt = 0;
-        localCopy = g_rankCache;
-        return;
-    }
+void rankingSnapshot(std::vector<PerpRow>& localCopy) {
     std::lock_guard<std::mutex> l(g_rankMutex);
     localCopy = g_rankCache;
 }
