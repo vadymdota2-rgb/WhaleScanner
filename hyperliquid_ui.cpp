@@ -292,6 +292,7 @@ std::string hyperliquidStatsLine() {
        << "\n\u2022 у наших кошельков: " << formatThousands(hits);
 
     ss << "\n\n\U0001F4E8 <b>Алерты</b>"
+       << "\n\u2022 получателей: " << hlAlertRecipientCount()
        << "\n\u2022 отправлено: " << formatThousands(alerts)
        << "\n\u2022 запросов истории: " << formatThousands(enr);
     if (queued > 0) ss << "\n\u2022 ждут проверки: " << queued << " кошельков";
