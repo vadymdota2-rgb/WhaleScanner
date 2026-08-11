@@ -581,6 +581,26 @@ std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
     return out;
 }
 
+size_t hlAlertRecipientCount() {
+    // Уникальные люди, которым реально может прийти перп-алерт: премиум,
+    // не сервисный аккаунт, и хотя бы один отслеживаемый кошелёк торгует
+    // на площадке. Считаем по тем же условиям, что и рассылка.
+    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
+    { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
+    if (!snapshot) return 0;
+
+    std::set<std::string> uniq;
+    for (const auto& kv : *snapshot)
+        for (const Watcher& w : kv.second)
+            if (w.chatId != SERVICE_CHAT_ID) uniq.insert(w.chatId);
+
+    // isPremium ходит в базу, поэтому проверяем ПОСЛЕ обхода снимка -
+    // держать оба замка разом незачем.
+    size_t n = 0;
+    for (const std::string& c : uniq) if (isPremium(c)) n++;
+    return n;
+}
+
 std::string getUserLanguage(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT language FROM users WHERE chat_id=?")) return "en";
