@@ -75,7 +75,8 @@ struct CoverageSet {
 };
 CoverageSet g_covUser, g_covSvc;
 
-void recordCoverageBucket(const TxResult& r, CoverageSet& c) {
+void recordCoverage(const TxResult& r, bool serviceOnly) {
+    CoverageSet& c = serviceOnly ? g_covSvc : g_covUser;
     if (r.venue == "Add Liquidity") c.lp_add.fetch_add(1, std::memory_order_relaxed);
     else if (r.venue == "Remove Liquidity") c.lp_remove.fetch_add(1, std::memory_order_relaxed);
     else if (r.venue == "Wrap") c.wrap.fetch_add(1, std::memory_order_relaxed);
@@ -85,9 +86,6 @@ void recordCoverageBucket(const TxResult& r, CoverageSet& c) {
     else if (r.venue == "Arbitrage") c.arbitrage.fetch_add(1, std::memory_order_relaxed);
     else if (!r.unknownReason.empty()) c.unknown.fetch_add(1, std::memory_order_relaxed);
     else c.transfer.fetch_add(1, std::memory_order_relaxed);
-}
-
-void recordCoverageSignals(const TxResult& r) {
     if (r.hasSwapEvent) g_stats.sig_swap_event.fetch_add(1, std::memory_order_relaxed);
     if (r.isUniversalRouter) g_stats.sig_universal_router.fetch_add(1, std::memory_order_relaxed);
     if (r.isGenericMulticall) g_stats.sig_multicall.fetch_add(1, std::memory_order_relaxed);
@@ -581,26 +579,6 @@ std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
     for (const Watcher& w : it->second)
         out.push_back(HlRecipient{w.chatId, w.label, w.thresholdNanos});
     return out;
-}
-
-size_t hlAlertRecipientCount() {
-    // Уникальные люди, которым реально может прийти перп-алерт: премиум,
-    // не сервисный аккаунт, и хотя бы один отслеживаемый кошелёк торгует
-    // на площадке. Считаем по тем же условиям, что и рассылка.
-    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
-    { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
-    if (!snapshot) return 0;
-
-    std::set<std::string> uniq;
-    for (const auto& kv : *snapshot)
-        for (const Watcher& w : kv.second)
-            if (w.chatId != SERVICE_CHAT_ID) uniq.insert(w.chatId);
-
-    // isPremium ходит в базу, поэтому проверяем ПОСЛЕ обхода снимка -
-    // держать оба замка разом незачем.
-    size_t n = 0;
-    for (const std::string& c : uniq) if (isPremium(c)) n++;
-    return n;
 }
 
 std::string getUserLanguage(const std::string& chatId) {
@@ -1388,16 +1366,13 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
-        bool hasService = false, hasUser = false;
-        if (auto cw = watchers->find(mA); cw != watchers->end()) {
-            for (const auto& w : cw->second) {
-                if (w.chatId == SERVICE_CHAT_ID) hasService = true;
-                else hasUser = true;
-            }
-        }
-        if (hasService) recordCoverageBucket(res, g_covSvc);
-        if (hasUser) recordCoverageBucket(res, g_covUser);
-        if (hasService || hasUser) recordCoverageSignals(res);
+        bool svcOnly = false;
+        { auto cw = watchers->find(mA);
+          if (cw != watchers->end() && !cw->second.empty()) {
+              svcOnly = true;
+              for (const auto& w : cw->second) if (w.chatId != SERVICE_CHAT_ID) { svcOnly = false; break; }
+          } }
+        recordCoverage(res, svcOnly);
         checkInvariants(hash, res);
         if (!res.isSwap && !res.unknownReason.empty()) logUnknownTx(hash, bn, tx, receipt, res);
         if (res.venue == "DEX interaction") { logBeneficiaries(hash, tx, res); recordBeneficiarySignal(tx, res); }
