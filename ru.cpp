@@ -242,6 +242,8 @@ const std::unordered_map<std::string, Entry>& table() {
                                     "⚠️ Вы уже отслеживаете этот кошелёк.\n\nВведите другой адрес или нажмите Отмена."}},
         {"wallet_bot_banned", {"🤖 This wallet was flagged as a bot and permanently excluded from the ranking. The service account cannot track it.\n\nEnter a different address or press Cancel.",
                                "🤖 Этот кошелёк помечен как бот и навсегда исключён из рейтинга. Сервисный аккаунт не может его отслеживать.\n\nВведите другой адрес или нажмите Отмена."}},
+        {"wallet_bot_removed", {"🤖 This wallet was removed from your list: it looks like a trading bot (too many trades). Tracking it would flood your alerts.",
+                                "🤖 Кошелёк удалён из вашего списка: похож на торгового бота (слишком много сделок). Отслеживание засорило бы алерты."}},
         {"toast_invalid_address", {"❌ Invalid address.", "❌ Неверный адрес."}},
         {"track_now_tracked", {"✅ Wallet", "✅ Кошелёк"}},
         {"track_now_tracked_suffix", {"is now being tracked.", "теперь отслеживается."}},
