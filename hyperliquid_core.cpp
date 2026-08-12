@@ -1,5 +1,6 @@
 #include "hyperliquid.h"
 #include "wallet_menu.h"
+#include "ranking.h"
 
 #include <algorithm>
 #include <atomic>
@@ -32,6 +33,8 @@ using json = nlohmann::json;
 
 extern std::atomic<bool> running;
 extern const std::string SERVICE_CHAT_ID;
+extern sqlite3* db;
+extern std::mutex dbMutex;
 std::string http(const std::string& url, const std::string& post, int timeout);
 void logCritical(const std::string& msg);
 std::string getUserLanguage(const std::string& chatId);
@@ -219,15 +222,34 @@ bool isBanned(const std::string& addr) {
 
 std::set<std::string> loadBannedWallets() {
     std::set<std::string> out;
-    std::lock_guard<std::mutex> l(g_hlDbMutex);
-    if (!g_hlDb) return out;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(g_hlDb, &s, "SELECT wallet FROM hl_banned")) return out;
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        std::string w = safeColumnText(s, 0);
-        if (!w.empty()) out.insert(w);
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (g_hlDb) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(g_hlDb, &s, "SELECT wallet FROM hl_banned")) {
+                while (sqlite3_step(s) == SQLITE_ROW) {
+                    std::string w = safeColumnText(s, 0);
+                    if (!w.empty()) out.insert(toLower(w));
+                }
+                sqlite3_finalize(s);
+            }
+        }
     }
-    sqlite3_finalize(s);
+    // Спотовый permanent ban (ignored_wallets) — тот же стоп-лист для перпов.
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        if (db) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(db, &s,
+                    "SELECT wallet FROM ignored_wallets WHERE permanent=1")) {
+                while (sqlite3_step(s) == SQLITE_ROW) {
+                    std::string w = safeColumnText(s, 0);
+                    if (!w.empty()) out.insert(toLower(w));
+                }
+                sqlite3_finalize(s);
+            }
+        }
+    }
     return out;
 }
 
@@ -580,6 +602,7 @@ int countFillsInWindow(const std::string& wallet) {
 }
 
 bool banWallet(const std::string& wallet, int trades) {
+    const std::string addr = toLower(wallet);
     bool saved = false;
     {
         std::lock_guard<std::mutex> l(g_hlDbMutex);
@@ -588,7 +611,7 @@ bool banWallet(const std::string& wallet, int trades) {
         if (!prepareOrLog(g_hlDb, &s,
                 "INSERT OR IGNORE INTO hl_banned(wallet,banned_at,trades) VALUES(?,?,?)"))
             return false;
-        sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 2, nowSec());
         sqlite3_bind_int(s, 3, trades);
         if (sqlite3_step(s) == SQLITE_DONE) saved = sqlite3_changes(g_hlDb) > 0;
@@ -599,10 +622,29 @@ bool banWallet(const std::string& wallet, int trades) {
     {
         std::lock_guard<std::mutex> l(g_walletsMutex);
         auto updated = std::make_shared<AddressSet>(*g_banned);
-        updated->insert(wallet);
+        updated->insert(addr);
         g_banned = updated;
     }
     invalidateRankCache();
+
+    // Зеркало на спот: permanent ban + снять со всех user/service watchlist.
+    if (!isPermanentlyBanned(addr)) {
+        std::lock_guard<std::mutex> l(dbMutex);
+        if (db) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(db, &s,
+                    "INSERT OR REPLACE INTO ignored_wallets(wallet, ignored_until, permanent) "
+                    "VALUES(?, ?, 1)")) {
+                sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(nowSec()));
+                if (sqlite3_step(s) != SQLITE_DONE)
+                    std::cerr << "[HL] mirror spot ban failed: " << sqlite3_errmsg(db) << std::endl;
+                sqlite3_finalize(s);
+            }
+        }
+    }
+    untrackWalletFromService(addr);
+    std::cout << "[HL] bot banned on perps+spot: " << addr << " (" << trades << " fills/30d)" << std::endl;
     return true;
 }
 
