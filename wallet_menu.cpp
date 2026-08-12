@@ -15,6 +15,7 @@
 #include "premium.h"
 #include "ranking.h"
 #include "tx_analyzer.h"
+#include "alert_settings.h"
 
 using json = nlohmann::json;
 
@@ -78,22 +79,47 @@ size_t countUserWhales(const std::string& chatId) {
 }
 
 void untrackWalletFromService(const std::string& wallet) {
-    bool removed = false;
+    const std::string addr = toLower(wallet);
+    std::vector<std::pair<std::string, std::string>> recipients; // chatId, label
+    int removed = 0;
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "SELECT uw.user_id, uw.label FROM user_whales uw "
+                "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+                "WHERE wa.address = ?")) {
+            sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                std::string cid = safeColumnText(s, 0);
+                std::string lab = safeColumnText(s, 1);
+                if (!cid.empty()) recipients.emplace_back(std::move(cid), std::move(lab));
+            }
+            sqlite3_finalize(s);
+        }
         if (!prepareOrLog(db, &s,
-            "DELETE FROM user_whales WHERE user_id=? AND whale_id=("
+            "DELETE FROM user_whales WHERE whale_id=("
             "SELECT id FROM whale_addresses WHERE address=?)")) return;
-        sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, toLower(wallet).c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db) > 0;
-        else std::cerr << "[WATCHERS] service untrack failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db);
+        else std::cerr << "[WATCHERS] bot untrack failed: " << sqlite3_errmsg(db) << std::endl;
         sqlite3_finalize(s);
     }
-    if (removed) {
-        std::cout << "[WATCHERS] Bot wallet untracked from service account: " << toLower(wallet) << std::endl;
-        refreshWatchers();
+    if (removed <= 0) return;
+
+    std::cout << "[WATCHERS] Bot wallet untracked from " << removed
+              << " watchlist(s): " << addr << std::endl;
+    refreshWatchers();
+
+    for (const auto& [cid, label] : recipients) {
+        if (cid == SERVICE_CHAT_ID) continue;
+        Lang lang = langFromCode(getUserLanguage(cid));
+        std::string shown = label.empty() || toLower(label) == addr
+            ? shortAddress(addr)
+            : safeString(label, 32);
+        std::string msg = tr(lang, "wallet_bot_removed");
+        msg += "\n\n💼 <b>" + shown + "</b>\n<code>" + safeString(addr, 42) + "</code>";
+        sendMsg(cid, msg);
     }
 }
 
@@ -102,7 +128,8 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
-    if (chatId == SERVICE_CHAT_ID && isPermanentlyBanned(address)) {
+    // Бан бота общий: и service, и обычные users не могут добавить.
+    if (isPermanentlyBanned(address)) {
         return AddWhaleResult::PERMANENTLY_BANNED;
     }
 
@@ -633,7 +660,14 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
             replyInPlace(chatId, session.promptMessageId, tr(lang, "already_tracking") + "\n\n" + msg.text, msg.keyboard);
         }
-        else if (result == AddWhaleResult::LIMIT_REACHED) {
+                else if (result == AddWhaleResult::PERMANENTLY_BANNED) {
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            std::string back = getLastView(chatId);
+            g_sessionManager.clearSession(chatId);
+            auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
+            replyInPlace(chatId, session.promptMessageId, tr(lang, "wallet_bot_banned") + "\n\n" + msg.text, msg.keyboard);
+        }
+else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
             Lang lang = langFromCode(getUserLanguage(chatId));
             if (isPremium(chatId)) {
