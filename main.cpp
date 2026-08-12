@@ -1319,10 +1319,11 @@ void flushPendingAlerts(bool force) {
             if (wit != watchers->end())
                 for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
         }
-        if (serviceWatched) saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
-        // История для расчёта прибыли пишется отдельно от рейтинговой: рейтинг
-        // читает всю таблицу trades целиком, и кошельки пользователей исказили
-        // бы его. Здесь же нужна история по каждому отслеживаемому кошельку.
+        // Пишем trades по любому watched-кошельку: иначе user-only бот
+        // никогда не наберёт счётчик и не попадёт под permanent ban.
+        // В рейтинг боты не зайдут — отсекаются ignored_wallets + порог.
+        saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
+        (void)serviceWatched;
         saveWalletHistory(p.wallet, p.agg, p.hash, p.blockTs);
         dispatchAlert(p.wallet, p.agg, p.hash);
     }
