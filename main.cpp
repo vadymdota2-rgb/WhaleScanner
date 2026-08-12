@@ -1120,7 +1120,7 @@ uint64_t getPriceNanos(const std::string& token) {
             double cg = j2[a]["usd"].get<double>();
             if (std::isfinite(cg) && cg > 0.0) p = cg;
         } } catch (...) {} }
-    constexpr double MAX_SANE_PRICE_USD = 1e9;
+    constexpr double MAX_SANE_PRICE_USD = 1e6;
     uint64_t n = (std::isfinite(p) && p > 0.0 && p < MAX_SANE_PRICE_USD)
                ? static_cast<uint64_t>(p * 1000000000.0) : 0;
     if (n>0) {
@@ -1189,7 +1189,8 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
                 if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
                     msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
                          + formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
-                if (prior.changePercent != 0.0) {
+                if (prior.changePercent != 0.0 &&
+                    prior.changePercent < 1000000.0 && prior.changePercent > -1000000.0) {
                     msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                          + tr(lang, "alert_prior_buy") + ": <b>"
                          + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
@@ -1242,7 +1243,15 @@ std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
 std::mutex g_pendingMutex;
 }
 
+// Notional above $50M → bad price×amount (scam token / wrong decimals / bad oracle).
+bool isSaneAlertNotional(const TxResult& res) {
+    if (res.usdNanos <= 0) return true;
+    static const cpp_int kMaxUsdNanos = cpp_int("50000000000000000"); // $50,000,000
+    return res.usdNanos <= kMaxUsdNanos;
+}
+
 void dispatchAlert(const std::string& mA, const TxResult& res, const std::string& hash) {
+    if (!isSaneAlertNotional(res)) return;
     std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
     {
         std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
@@ -1405,6 +1414,13 @@ bool processBlock(long long bn) {
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
         rememberTokensFromReceipt(mA, receipt, blockTs);
+        if (!isSaneAlertNotional(res)) {
+            std::cerr << "[ALERT] skip insane notional " << hash
+                      << " usdNanos=" << res.usdNanos.convert_to<std::string>()
+                      << " token=" << res.tokenAddr << std::endl;
+            markTxProcessed(hash,bn);
+            continue;
+        }
         if (res.isSwap) bufferSwap(mA, res, hash, bn, blockTs);
         else { saveWalletHistory(mA, res, hash, blockTs); dispatchAlert(mA, res, hash); }
         markTxProcessed(hash,bn);
