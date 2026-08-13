@@ -1418,6 +1418,9 @@ const Table& tablePl() {
         {"hl_rk_leverage", "Śr. dźwignia"},
         {"hl_rk_roi_account", "ROI do depozytu"},
         {"hl_rk_empty", "Brak danych — ranking wymaga min. 5 zamkniętych transakcji na portfel w 30 dni."}
+,
+        {"help_disclaimer", "⚠️ <b>Zastrzeżenie</b>\nBot pokazuje transakcje on-chain, które już się wydarzyły. To usługa informacyjna, nie porada inwestycyjna ani rekomendacja handlu. Wyniki portfela z przeszłości nie przewidują przyszłości. Handel z dźwignią może kosztować cały depozyt. Decyzje i ryzyko są Twoje."},
+        {"hl_locked_body", "Wieczne kontrakty są dostępne z Premium.\n\nDostajesz dźwignię, depozyt i cenę likwidacji przy każdej transakcji, zrealizowany PnL z giełdy, otwarte pozycje portfeli i ranking traderów z 30 dni."}
     };
     return t;
 }
@@ -1645,6 +1648,9 @@ const Table& tableDe() {
         {"hl_rk_leverage", "Ø Hebel"},
         {"hl_rk_roi_account", "ROI auf Einlage"},
         {"hl_rk_empty", "Noch keine Daten — Ranking braucht mind. 5 geschlossene Trades pro Wallet in 30 Tagen."}
+,
+        {"help_disclaimer", "⚠️ <b>Haftungsausschluss</b>\nDer Bot zeigt On-Chain-Transaktionen, die bereits stattgefunden haben. Dies ist ein Informationsdienst, keine Anlageberatung und keine Handelsempfehlung. Vergangene Ergebnisse einer Wallet sagen nichts über die Zukunft aus. Hebelhandel kann deinen gesamten Einsatz kosten. Entscheidungen und Risiko liegen bei dir."},
+        {"hl_locked_body", "Perpetuals sind mit Premium verfügbar.\n\nDu erhältst Hebel, Margin und Liquidationspreis bei jedem Trade, realisierten PnL von der Börse, offene Positionen deiner Wallets und das 30-Tage-Trader-Ranking."}
     };
     return t;
 }
@@ -1872,6 +1878,9 @@ const Table& tableUk() {
         {"hl_rk_leverage", "Середнє плече"},
         {"hl_rk_roi_account", "ROI до депозиту"},
         {"hl_rk_empty", "Поки немає даних — у рейтинг потрапляють гаманці мінімум із 5 закритими угодами за 30 днів."}
+,
+        {"help_disclaimer", "⚠️ <b>Відмова від відповідальності</b>\nБот показує вже здійснені транзакції з блокчейну. Це інформаційний сервіс, а не інвестиційна рекомендація і не заклик до угод. Минулі результати гаманця не передбачають майбутніх. Торгівля з плечем може коштувати вам усього депозиту. Рішення приймаєте ви, ризик несете ви."},
+        {"hl_locked_body", "Ф’ючерси доступні за підпискою.\n\nВи отримуєте плече, заставу й ціну ліквідації по кожній угоді, готовий прибуток від біржі, відкриті позиції ваших гаманців і рейтинг трейдерів за 30 днів."}
     };
     return t;
 }
@@ -2099,6 +2108,9 @@ const Table& tableHi() {
         {"hl_rk_leverage", "औसत लीवरेज"},
         {"hl_rk_roi_account", "जमा पर ROI"},
         {"hl_rk_empty", "अभी डेटा नहीं — रैंकिंग के लिए प्रति वॉलेट 30 दिन में कम से कम 5 बंद ट्रेड चाहिए।"}
+,
+        {"help_disclaimer", "⚠️ <b>अस्वीकरण</b>\nबॉट ऑन-चेन ट्रांज़ैक्शन दिखाता है जो पहले हो चुके हैं। यह सूचना सेवा है, निवेश सलाह या ट्रेड सिफ़ारिश नहीं। किसी वॉलेट के पुराने नतीजे भविष्य नहीं बताते। लीवरेज ट्रेडिंग से पूरा डिपॉज़िट जा सकता है। फ़ैसले और जोखिम आपके हैं।"},
+        {"hl_locked_body", "परपेचुअल प्रीमियम के साथ उपलब्ध।\n\nहर ट्रेड पर लीवरेज, कोलैटरल, लिक्विडेशन प्राइस, एक्सचेंज से रियलाइज़्ड PnL, वॉलेट की खुली पोज़िशन और 30-दिन ट्रेडर रैंकिंग मिलती है।"}
     };
     return t;
 }
@@ -2326,6 +2338,9 @@ const Table& tableId() {
         {"hl_rk_leverage", "Rata leverage"},
         {"hl_rk_roi_account", "ROI terhadap deposit"},
         {"hl_rk_empty", "Belum ada data — peringkat butuh min. 5 trade tertutup per dompet dalam 30 hari."}
+,
+        {"help_disclaimer", "⚠️ <b>Penafian</b>\nBot menampilkan transaksi on-chain yang sudah terjadi. Ini layanan informasi, bukan saran investasi atau rekomendasi trading. Hasil masa lalu suatu dompet tidak memprediksi masa depan. Trading leverage bisa menghabiskan seluruh deposit. Keputusan dan risiko ada pada Anda."},
+        {"hl_locked_body", "Perpetual tersedia dengan Premium.\n\nAnda mendapat leverage, jaminan, dan harga likuidasi tiap trade, PnL terealisasi dari bursa, posisi terbuka dompet, dan peringkat trader 30 hari."}
     };
     return t;
 }
@@ -2553,6 +2568,9 @@ const Table& tableVi() {
         {"hl_rk_leverage", "Đòn bẩy TB"},
         {"hl_rk_roi_account", "ROI trên ký quỹ"},
         {"hl_rk_empty", "Chưa có dữ liệu — xếp hạng cần ít nhất 5 lệnh đóng mỗi ví trong 30 ngày."}
+,
+        {"help_disclaimer", "⚠️ <b>Tuyên bố miễn trừ</b>\nBot hiển thị giao dịch on-chain đã xảy ra. Đây là dịch vụ thông tin, không phải tư vấn đầu tư hay khuyến nghị giao dịch. Kết quả quá khứ không dự báo tương lai. Giao dịch đòn bẩy có thể mất toàn bộ ký quỹ. Quyết định và rủi ro thuộc về bạn."},
+        {"hl_locked_body", "Perpetual có với Premium.\n\nBạn nhận đòn bẩy, ký quỹ, giá thanh lý mỗi lệnh, PnL đã chốt từ sàn, vị thế mở của ví và xếp hạng trader 30 ngày."}
     };
     return t;
 }
@@ -2780,6 +2798,9 @@ const Table& tableKo() {
         {"hl_rk_leverage", "평균 레버리지"},
         {"hl_rk_roi_account", "예치금 대비 ROI"},
         {"hl_rk_empty", "데이터 없음 — 순위에는 지갑당 30일 최소 5건 청산 거래가 필요합니다."}
+,
+        {"help_disclaimer", "⚠️ <b>면책</b>\n봇은 이미 발생한 온체인 거래를 보여 줍니다. 정보 서비스이며 투자 자문이나 매매 권유가 아닙니다. 과거 성과는 미래를 보장하지 않습니다. 레버리지 거래는 전액 손실 가능합니다. 결정과 위험은 본인에게 있습니다."},
+        {"hl_locked_body", "퍼페츄얼은 프리미엄에서 이용 가능합니다.\n\n거래마다 레버리지·담보·청산가, 거래소 실현 PnL, 지갑 미결제 포지션, 30일 트레이더 순위를 받습니다."}
     };
     return t;
 }
@@ -3007,6 +3028,9 @@ const Table& tableZh() {
         {"hl_rk_leverage", "平均杠杆"},
         {"hl_rk_roi_account", "相对本金 ROI"},
         {"hl_rk_empty", "暂无数据 — 排名需每钱包 30 天内至少 5 笔已平仓交易。"}
+,
+        {"help_disclaimer", "⚠️ <b>免责声明</b>\n机器人展示已发生的链上交易。仅为信息服务，不构成投资建议或交易推荐。过往表现不代表未来。杠杆交易可能导致本金全部损失。决策与风险由您自行承担。"},
+        {"hl_locked_body", "永续合约需开通高级版。\n\n每笔交易可看杠杆、保证金与强平价，交易所已实现盈亏，钱包未平仓位，以及 30 天交易者排名。"}
     };
     return t;
 }
@@ -3234,6 +3258,9 @@ const Table& tableJa() {
         {"hl_rk_leverage", "平均レバレッジ"},
         {"hl_rk_roi_account", "預入比ROI"},
         {"hl_rk_empty", "データなし — ランキングにはウォレットあたり30日で最低5件の決済取引が必要です。"}
+,
+        {"help_disclaimer", "⚠️ <b>免責事項</b>\nボットは既に発生したオンチェーン取引を表示します。情報サービスであり、投資助言や取引推奨ではありません。過去の実績は将来を保証しません。レバレッジ取引は証拠金全損の可能性があります。判断とリスクはご自身にあります。"},
+        {"hl_locked_body", "無期限先物はプレミアムで利用できます。\n\n取引ごとのレバレッジ・証拠金・清算価格、取引所の実現PnL、ウォレットの建玉、30日トレーダーランキングが利用可能です。"}
     };
     return t;
 }
