@@ -795,6 +795,14 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         {"tr", "🇹🇷 Türkçe"},
         {"ar", "🇸🇦 العربية"},
         {"pl", "🇵🇱 Polski"},
+        {"de", "🇩🇪 Deutsch"},
+        {"uk", "🇺🇦 Українська"},
+        {"hi", "🇮🇳 हिन्दी"},
+        {"id", "🇮🇩 Indonesia"},
+        {"vi", "🇻🇳 Tiếng Việt"},
+        {"ko", "🇰🇷 한국어"},
+        {"zh", "🇨🇳 中文"},
+        {"ja", "🇯🇵 日本語"},
     };
     std::string current = getUserLanguage(chatId);
     Lang lang = langFromCode(current);
@@ -1695,7 +1703,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "lang") {
-        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar", "pl"};
+        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar", "pl", "de", "uk", "hi", "id", "vi", "ko", "zh", "ja"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
             rememberView(chatId, "menu:languages");
