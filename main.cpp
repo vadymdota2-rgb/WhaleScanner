@@ -1695,7 +1695,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "lang") {
-        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar"};
+        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar", "pl"};
         if (SUPPORTED_LANGS.count(param)) {
             setUserLanguage(chatId, param);
             rememberView(chatId, "menu:languages");
