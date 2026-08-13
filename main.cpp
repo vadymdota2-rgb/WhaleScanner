@@ -809,11 +809,16 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
-    for (const auto& l : LANGUAGES) {
+    // Две кнопки в ряд — иначе список из 16 языков слишком длинный.
+    json row = json::array();
+    for (size_t i = 0; i < LANGUAGES.size(); ++i) {
+        const auto& l = LANGUAGES[i];
         std::string labelText = l.second + (l.first == current ? " ✅" : "");
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", labelText}, {"callback_data", "lang:" + l.first}}
-        }));
+        row.push_back({{"text", labelText}, {"callback_data", "lang:" + l.first}});
+        if (row.size() == 2 || i + 1 == LANGUAGES.size()) {
+            keyboard["inline_keyboard"].push_back(row);
+            row = json::array();
+        }
     }
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
