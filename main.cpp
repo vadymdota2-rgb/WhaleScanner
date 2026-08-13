@@ -1909,7 +1909,38 @@ void telegramLoop() {
                         } else {
                             size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
                             { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
-                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>\n\n"
+                            std::string langStats;
+                            {
+                                std::lock_guard<std::mutex> l(dbMutex);
+                                sqlite3_stmt* s;
+                                if (prepareOrLog(db, &s,
+                                    "SELECT COALESCE(NULLIF(TRIM(language), ''), 'en') AS lang, COUNT(*) "
+                                    "FROM users GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC")) {
+                                    std::vector<std::pair<std::string, long long>> rows;
+                                    long long total = 0;
+                                    while (sqlite3_step(s) == SQLITE_ROW) {
+                                        std::string lg = safeColumnText(s, 0);
+                                        long long n = sqlite3_column_int64(s, 1);
+                                        rows.push_back({std::move(lg), n});
+                                        total += n;
+                                    }
+                                    sqlite3_finalize(s);
+                                    if (!rows.empty()) {
+                                        std::ostringstream ls;
+                                        ls << "🌐 Languages:";
+                                        for (const auto& r : rows) {
+                                            ls << "\n· " << r.first << ": <b>" << r.second << "</b>";
+                                            if (total > 0)
+                                                ls << " (" << (r.second * 100 / total) << "%)";
+                                        }
+                                        langStats = ls.str();
+                                    }
+                                }
+                            }
+
+                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>";
+                            if (!langStats.empty()) ss2 << "\n" << langStats;
+                            ss2 << "\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             ss2 << rpcSlowSummary();
