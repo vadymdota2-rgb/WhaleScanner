@@ -794,6 +794,7 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
         {"fr", "🇫🇷 Français"},
         {"tr", "🇹🇷 Türkçe"},
         {"ar", "🇸🇦 العربية"},
+        {"pl", "🇵🇱 Polski"},
     };
     std::string current = getUserLanguage(chatId);
     Lang lang = langFromCode(current);
