@@ -16,6 +16,7 @@ Lang langFromCode(const std::string& codeArg) {
     if (code == "fr") return Lang::FR;
     if (code == "tr") return Lang::TR;
     if (code == "ar") return Lang::AR;
+    if (code == "pl") return Lang::PL;
     return Lang::EN;
 }
 
@@ -335,6 +336,7 @@ const char* external(Lang lang, const std::string& key) {
         case Lang::FR: return trFr(key);
         case Lang::TR: return trTr(key);
         case Lang::AR: return trAr(key);
+        case Lang::PL: return trPl(key);
         default:       return nullptr;
     }
 }
@@ -343,7 +345,7 @@ const char* external(Lang lang, const std::string& key) {
 void checkTranslations() {
     struct { Lang lang; const char* name; } langs[] = {
         {Lang::ES, "ES"}, {Lang::PT, "PT"}, {Lang::FR, "FR"},
-        {Lang::TR, "TR"}, {Lang::AR, "AR"}
+        {Lang::TR, "TR"}, {Lang::AR, "AR"}, {Lang::PL, "PL"}
     };
     for (const auto& L : langs) {
         std::vector<std::string> missing;
