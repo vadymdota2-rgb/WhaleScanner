@@ -115,6 +115,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"remove_confirm_notice", {"You'll stop receiving alerts for this wallet.",
                                    "Вы перестанете получать алерты по этому кошельку."}},
         {"remove_yes", {"🗑️ Yes, remove", "🗑️ Да, удалить"}},
+        {"toast_main_wallet_set", {"Main wallet updated", "Основной кошелёк выбран"}},
         {"toast_wallet_removed", {"✅ Wallet removed", "✅ Кошелёк удалён"}},
 
         {"err_invalid_number", {"❌ Invalid number.", "❌ Неверное число."}},
@@ -212,6 +213,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_footer", {"Use the main menu for quick access to all features.",
                          "Используйте главное меню для быстрого доступа ко всем функциям."}},
 
+        {"premium_expired_notice", {"⭐ Your Premium has ended.\n\nAlerts now come from your main wallet only — the rest are saved and switch back on when you renew. You can pick which one is main in My wallets.\nHyperliquid futures and the full Top-100 need a subscription.",
+                                    "⭐ Премиум закончился.\n\nАлерты приходят только с основного кошелька — остальные сохранены и включатся после продления. Выбрать основной можно в разделе Мои кошельки.\nФьючерсы Hyperliquid и полный Топ-100 доступны по подписке."}},
         {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures with ranking, alerts and open positions, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
                            "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid с рейтингом, алертами и открытыми позициями, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
         {"pr_active_title", {"⭐ <b>Premium Active</b>", "⭐ <b>Премиум активен</b>"}},
