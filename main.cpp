@@ -356,6 +356,16 @@ void initDB() {
             std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
         if (mErr) sqlite3_free(mErr);
     }
+    {
+        // Какой кошелёк остаётся рабочим после окончания премиума. Раньше это
+        // был первый по дате добавления - человек его не выбирал и часто
+        // оставался с тем, который ему не нужен.
+        char* mErr = nullptr;
+        if (sqlite3_exec(db, "ALTER TABLE user_whales ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0",
+                         nullptr, nullptr, &mErr) == SQLITE_OK)
+            std::cout << "[STARTUP] user_whales: added is_primary column" << std::endl;
+        if (mErr) sqlite3_free(mErr);
+    }
 
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -510,7 +520,7 @@ void refreshWatchers() {
             "FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "JOIN users u ON u.chat_id = uw.user_id "
-            "ORDER BY uw.user_id ASC, uw.created_at ASC, uw.rowid ASC")) {
+            "ORDER BY uw.user_id ASC, uw.is_primary DESC, uw.created_at ASC, uw.rowid ASC")) {
             sqlite3_bind_int64(s,1,now);
             std::string prevUser;
             size_t loadedForUser = 0;
@@ -1730,7 +1740,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         // часики на ней до таймаута, будто бот завис.
         if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
-    else if (action == "mw_page" || action == "rename" ||
+    else if (action == "mw_page" || action == "rename" || action == "setmain" ||
              action == "askremove" || action == "remove") {
         handleWalletCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
