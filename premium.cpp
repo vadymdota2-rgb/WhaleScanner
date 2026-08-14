@@ -1,4 +1,5 @@
 #include "premium.h"
+#include "alert_settings.h"
 #include <climits>
 
 #include <sqlite3.h>
@@ -172,9 +173,23 @@ bool isPremium(const std::string& chatId) {
 void cleanupExpiredPremium() {
     long long now = static_cast<long long>(time(nullptr));
     int changed = 0;
+    std::vector<std::string> expired;
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
+
+        // Собираем список ДО обновления: после него не отличить тех, у кого
+        // подписка кончилась сейчас, от тех, у кого её не было никогда.
+        if (prepareOrLog(db, &s,
+            "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire<=?")) {
+            sqlite3_bind_int64(s, 1, now);
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                std::string cid = safeColumnText(s, 0);
+                if (!cid.empty()) expired.push_back(std::move(cid));
+            }
+            sqlite3_finalize(s);
+        }
+
         if (!prepareOrLog(db, &s,
             "UPDATE users SET is_premium=0 WHERE is_premium=1 AND premium_expire<=?"))
             return;
@@ -190,8 +205,21 @@ void cleanupExpiredPremium() {
     }
     if (changed > 0) {
         std::cout << "[PREMIUM] Expired -> Free: " << changed << " user(s)" << std::endl;
-
         refreshWatchers();
+
+        // Сообщаем каждому: молча урезать доступ - это выглядит как поломка.
+        // Замок к этому моменту отпущен, sendMsg и getUserLanguage сами ходят
+        // в базу.
+        for (const std::string& cid : expired) {
+            if (cid == g_serviceChatId) continue;
+            Lang lang = langFromCode(getUserLanguage(cid));
+            json kb;
+            kb["inline_keyboard"] = json::array();
+            kb["inline_keyboard"].push_back(json::array({
+                {{"text", tr(lang, "menu_premium")}, {"callback_data", "menu:premium"}}
+            }));
+            sendMsg(cid, tr(lang, "premium_expired_notice"), kb.dump());
+        }
     }
 }
 
