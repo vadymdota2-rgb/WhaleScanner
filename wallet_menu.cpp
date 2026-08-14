@@ -354,7 +354,8 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         if (!prepareOrLog(db, &s,
             "SELECT wa.address, uw.label FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "WHERE uw.user_id = ? ORDER BY uw.created_at")) {
+            "WHERE uw.user_id = ? "
+            "ORDER BY uw.is_primary DESC, uw.created_at")) {
             return {tr(lang, "err_loading_wallets"), ""};
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
@@ -394,6 +395,10 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
 
         json row;
         row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
+        // Выбор рабочего кошелька нужен только бесплатным: у премиума работают
+        // все, и кнопка была бы бессмысленной.
+        if (!premium && walletRows.size() > 1 && idx != 0)
+            row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
     }
@@ -508,6 +513,41 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             sqlite3_finalize(s);
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
         }
+    }
+    else if (action == "setmain") {
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        const std::string address = toLower(param);
+        if (!isValidAddress(address)) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_invalid_address"), true);
+            return true;
+        }
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            // Сначала снимаем отметку со всех: основной кошелёк ровно один.
+            if (prepareOrLog(db, &s, "UPDATE user_whales SET is_primary=0 WHERE user_id=?")) {
+                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
+            if (prepareOrLog(db, &s,
+                "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
+                "SELECT id FROM whale_addresses WHERE address=?)")) {
+                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_DONE) changed = sqlite3_changes(db) > 0;
+                sqlite3_finalize(s);
+            }
+        }
+        if (!changed) {
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
+            return true;
+        }
+        refreshWatchers();
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "toast_main_wallet_set"), false);
+        auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "askremove") {
         std::string address = toLower(param);
