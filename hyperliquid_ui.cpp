@@ -570,7 +570,7 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
     // сразу видит, чего этот кит стоит в обоих рейтингах.
     SpotRankInfo sr;
     t << dm << "\n\U0001F7E1 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
-    if (spotRankOf(addr, sr)) {
+    if (spotRankOf(addr, sr) && sr.rank <= 100) {
         t << " — #" << sr.rank << "\n"
           << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
           << dm << "\U0001F4C8 " << tr(lang, "rk_roi_per_trade") << ": "
@@ -583,7 +583,7 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
 
     PerpRankInfo pr;
     t << dm << "\n\U0001F535 <b>Hyperliquid " << tr(lang, "wl_perp_rank") << "</b>";
-    if (perpRankOf(addr, pr)) {
+    if (perpRankOf(addr, pr) && pr.rank <= 100) {
         t << " — #" << pr.rank << "\n"
           << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pr.pnlNanos, true) << "\n";
         if (pr.roiKnown)
