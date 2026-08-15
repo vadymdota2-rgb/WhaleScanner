@@ -24,6 +24,7 @@ struct TonInvoice {
 };
 
 bool tonPaymentsAvailable();
+void warmGramRate();
 bool createTonInvoice(const std::string& chatId, TonInvoice& out);
 void pollTonPayments();
 
