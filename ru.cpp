@@ -115,6 +115,10 @@ const std::unordered_map<std::string, Entry>& table() {
         {"remove_confirm_notice", {"You'll stop receiving alerts for this wallet.",
                                    "Вы перестанете получать алерты по этому кошельку."}},
         {"remove_yes", {"🗑️ Yes, remove", "🗑️ Да, удалить"}},
+        {"wl_spot_rank",  {"Spot", "Спот"}},
+        {"wl_perp_rank",  {"Futures", "Фьючерсы"}},
+        {"wl_not_ranked", {"not in ranking", "нет в рейтинге"}},
+        {"wl_trades_short", {"trades", "сделок"}},
         {"toast_main_wallet_set", {"Main wallet updated", "Основной кошелёк выбран"}},
         {"toast_wallet_removed", {"✅ Wallet removed", "✅ Кошелёк удалён"}},
 
@@ -293,6 +297,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"hl_position_size", {"Position size",  "Размер позиции"}},
         {"hl_collateral",    {"Collateral",     "Залог позиции"}},
         {"hl_of_account",    {"of account",     "счёта"}},
+        {"hl_in_position",   {"in position",    "в позиции"}},
         {"hl_position_closed", {"Position fully closed", "Позиция закрыта полностью"}},
         {"hl_fills_in_series", {"Trades in this series", "Сделок в серии"}},
         {"hl_leverage",    {"Leverage",      "Плечо"}},
