@@ -35,17 +35,12 @@ constexpr long long PREMIUM_DURATION_SECONDS = 30LL * 86400LL;
 constexpr int       PREMIUM_PRICE_STARS      = 250;
 const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 
-// Оплата в GRAM переводом на наш кошелёк. Никаких посредников: человек шлёт
-// из своего кошелька в Telegram, бот находит платёж по метке в комментарии.
 constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
-// Порог считаем в долларах, а не в монетах: при росте курса подписка станет
-// стоить меньше GRAM, и фиксированный порог начал бы отсекать настоящие
-// платежи. Три доллара - заведомо ниже цены подписки и выше любого спама.
 constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
 const char* const TON_RATE_URL =
-    "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd";
+    "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network,gram-2&vs_currencies=usd";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
@@ -207,8 +202,6 @@ void cleanupExpiredPremium() {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
 
-        // Собираем список ДО обновления: после него не отличить тех, у кого
-        // подписка кончилась сейчас, от тех, у кого её не было никогда.
         if (prepareOrLog(db, &s,
             "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire<=?")) {
             sqlite3_bind_int64(s, 1, now);
@@ -236,9 +229,6 @@ void cleanupExpiredPremium() {
         std::cout << "[PREMIUM] Expired -> Free: " << changed << " user(s)" << std::endl;
         refreshWatchers();
 
-        // Сообщаем каждому: молча урезать доступ - это выглядит как поломка.
-        // Замок к этому моменту отпущен, sendMsg и getUserLanguage сами ходят
-        // в базу.
         for (const std::string& cid : expired) {
             if (cid == g_serviceChatId) continue;
             Lang lang = langFromCode(getUserLanguage(cid));
@@ -285,8 +275,6 @@ bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlre
 
 namespace {
 
-// Адрес публичный - по нему только принимают, распоряжаться средствами
-// нельзя. Держим в коде: одной настройкой меньше.
 std::string tonWallet() {
     const char* a = std::getenv("TON_WALLET_ADDRESS");
     if (a && *a) return a;
@@ -300,8 +288,6 @@ std::string jstrField(const json& j, const char* key, const char* def = "") {
     return it->get<std::string>();
 }
 
-// Курс держим в памяти и обновляем раз в 10 минут: у CoinGecko есть лимит,
-// а между двумя платежами курс всё равно почти не меняется.
 std::mutex g_rateMutex;
 double g_gramUsd = 0.0;
 long long g_rateAt = 0;
@@ -319,9 +305,15 @@ double gramUsdRate() {
     }
     json j = json::parse(resp, nullptr, false);
     double rate = 0.0;
-    if (j.is_object() && j.contains("the-open-network"))
-        rate = j["the-open-network"].value("usd", 0.0);
+    if (j.is_object()) {
+        for (const char* id : {"the-open-network", "gram-2"}) {
+            if (!j.contains(id) || !j[id].is_object()) continue;
+            const double v = j[id].value("usd", 0.0);
+            if (v > 0.0) { rate = v; break; }
+        }
+    }
     if (rate <= 0.0) {
+        std::cerr << "[TON] курс не получен, ответ: " << resp.substr(0, 200) << std::endl;
         std::lock_guard<std::mutex> l(g_rateMutex);
         return g_gramUsd;
     }
@@ -331,8 +323,6 @@ double gramUsdRate() {
     return rate;
 }
 
-// Метка вида WB-7K3M. Короткая, чтобы человек не ошибся при вводе вручную,
-// и без похожих символов: 0/O и 1/I/L перепутать проще всего.
 std::string makeMemo() {
     static const char* ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
     static std::mt19937_64 rng(std::random_device{}());
@@ -347,15 +337,22 @@ std::string makeMemo() {
 bool tonPaymentsAvailable() { return !tonWallet().empty(); }
 
 bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
-    if (!g_premiumSchemaOk) return false;
+    if (!g_premiumSchemaOk) {
+        std::cerr << "[TON] счёт не создан: схема базы не готова" << std::endl;
+        return false;
+    }
     out.wallet = tonWallet();
-    if (out.wallet.empty()) return false;
+    if (out.wallet.empty()) {
+        std::cerr << "[TON] счёт не создан: адрес кошелька пуст" << std::endl;
+        return false;
+    }
 
     const double rate = gramUsdRate();
-    if (rate <= 0.0) return false;
+    if (rate <= 0.0) {
+        std::cerr << "[TON] счёт не создан: нет курса GRAM" << std::endl;
+        return false;
+    }
 
-    // Округляем вверх до сотых: просить 1.23456789 GRAM бессмысленно, человек
-    // всё равно введёт округлённое, и платёж не сойдётся по сумме.
     const double gram = std::ceil(TON_PRICE_USD / rate * 100.0) / 100.0;
     out.nanoAmount = static_cast<long long>(gram * 1e9 + 0.5);
     out.gramAmount = gram;
@@ -363,7 +360,6 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
     const long long now = static_cast<long long>(time(nullptr));
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
-    // Метка уникальна: если такая уже есть, пробуем другую.
     for (int attempt = 0; attempt < 5; attempt++) {
         out.memo = makeMemo();
         if (!prepareOrLog(db, &s,
@@ -380,9 +376,6 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
     return false;
 }
 
-// Читаем входящие переводы на наш кошелёк и ищем среди них наши метки.
-// Уведомлений блокчейн не шлёт - опрашиваем сами, но только пока есть
-// неоплаченные счета.
 void pollTonPayments() {
     if (!g_premiumSchemaOk) return;
     const std::string wallet = tonWallet();
@@ -390,7 +383,6 @@ void pollTonPayments() {
 
     const long long now = static_cast<long long>(time(nullptr));
 
-    // Есть ли вообще кого ждать? Нет - и в сеть не ходим.
     bool anyActive = false;
     {
         std::lock_guard<std::mutex> l(dbMutex);
@@ -410,13 +402,9 @@ void pollTonPayments() {
     }
     if (!anyActive) return;
 
-    // Окно расширяем, если в прошлый раз оно пришло полным: значит переводов
-    // больше, чем мы забираем, и часть могла остаться невидимой.
     static std::atomic<int> s_limit{30};
     const int limit = s_limit.load(std::memory_order_relaxed);
 
-    // Курс берём один раз на весь заход. Не получили - порог не применяем:
-    // лучше проверить лишний перевод, чем пропустить оплату.
     const double rate = gramUsdRate();
     const long long minNano = rate > 0.0
         ? static_cast<long long>(TON_MIN_USD / rate * 1e9)
@@ -452,7 +440,6 @@ void pollTonPayments() {
         if (tx.contains("transaction_id") && tx["transaction_id"].is_object())
             hash = jstrField(tx["transaction_id"], "hash");
 
-        // Метка могла прийти с лишними пробелами или в другом регистре.
         std::string clean;
         for (char c : memo) {
             if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
@@ -476,8 +463,6 @@ void pollTonPayments() {
         }
         if (chatId.empty()) continue;
 
-        // Допускаем недоплату до 2%: курс мог сдвинуться, пока человек платил,
-        // а отказывать из-за пары центов - злить того, кто уже заплатил.
         if (got * 100 < need * 98) {
             std::cerr << "[TON] недоплата по " << clean << ": пришло " << got
                       << " нанo, ждали " << need << std::endl;
@@ -703,7 +688,7 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
             {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
         }));
         if (tonPaymentsAvailable()) keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "pr_buy_ton")}, {"callback_data", "premium_ton"}}
+            {{"text", tr(lang, "pr_renew_ton")}, {"callback_data", "premium_ton"}}
         }));
     } else {
         text << tr(lang, "pr_title") << "\n\n"
