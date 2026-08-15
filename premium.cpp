@@ -39,12 +39,12 @@ constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
 constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
-// Курс берём с Binance: у CoinGecko жёсткий лимит на бесплатные запросы, и
-// он молча отказывает. Здесь простой запрос без ключа и без ограничений.
+// Курс берём с DexScreener - тем же источником, что и цены токенов: он на
+// сервере точно доступен, в отличие от Binance и CoinGecko.
 const char* const TON_RATE_URL =
-    "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT";
+    "https://api.dexscreener.com/latest/dex/search?q=TON%20USDT";
 const char* const TON_RATE_URL_FALLBACK =
-    "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network,gram-2&vs_currencies=usd";
+    "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
@@ -304,32 +304,50 @@ double gramUsdRate() {
     }
     double rate = 0.0;
 
-    // Binance отдаёт {"symbol":"TONUSDT","price":"2.8134"}
+    // Из всех пар берём самую ликвидную в сети TON: на мелких пулах цена
+    // пляшет, и подписка стоила бы то дороже, то дешевле.
     const std::string resp = http(TON_RATE_URL, "", 10);
     if (!resp.empty()) {
         json j = json::parse(resp, nullptr, false);
-        if (j.is_object() && j.contains("price") && j["price"].is_string()) {
-            try { rate = std::stod(j["price"].get<std::string>()); } catch (...) { rate = 0.0; }
+        if (j.is_object() && j.contains("pairs") && j["pairs"].is_array()) {
+            double bestLiq = -1.0;
+            for (const auto& pair : j["pairs"]) {
+                if (!pair.is_object()) continue;
+                if (jstrField(pair, "chainId") != "ton") continue;
+
+                // Нужна именно пара, где GRAM продаётся за доллар, а не наоборот.
+                std::string base;
+                if (pair.contains("baseToken") && pair["baseToken"].is_object())
+                    base = jstrField(pair["baseToken"], "symbol");
+                if (base != "TON" && base != "GRAM" && base != "WTON") continue;
+
+                const std::string priceStr = jstrField(pair, "priceUsd");
+                if (priceStr.empty()) continue;
+                double price = 0.0;
+                try { price = std::stod(priceStr); } catch (...) { continue; }
+                if (!std::isfinite(price) || price <= 0.0) continue;
+
+                double liq = 0.0;
+                if (pair.contains("liquidity") && pair["liquidity"].is_object() &&
+                    pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
+                    liq = pair["liquidity"]["usd"].get<double>();
+                if (liq > bestLiq) { bestLiq = liq; rate = price; }
+            }
         }
     }
 
-    // Если биржа недоступна - пробуем CoinGecko. Монету переименовали из
-    // Toncoin в GRAM, поэтому спрашиваем оба идентификатора.
+    // Запасной путь, если DexScreener не ответил.
     if (rate <= 0.0) {
         const std::string r2 = http(TON_RATE_URL_FALLBACK, "", 10);
         if (!r2.empty()) {
             json j2 = json::parse(r2, nullptr, false);
-            if (j2.is_object()) {
-                for (const char* id : {"the-open-network", "gram-2"}) {
-                    if (!j2.contains(id) || !j2[id].is_object()) continue;
-                    const double v = j2[id].value("usd", 0.0);
-                    if (v > 0.0) { rate = v; break; }
-                }
+            if (j2.is_object() && j2.contains("price") && j2["price"].is_string()) {
+                try { rate = std::stod(j2["price"].get<std::string>()); } catch (...) { rate = 0.0; }
             }
         }
     }
     if (rate <= 0.0) {
-        std::cerr << "[TON] курс не получен ни от Binance, ни от CoinGecko" << std::endl;
+        std::cerr << "[TON] курс не получен ни от DexScreener, ни от Binance" << std::endl;
         std::lock_guard<std::mutex> l(g_rateMutex);
         return g_gramUsd;
     }
