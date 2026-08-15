@@ -1000,6 +1000,28 @@ RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind
     return buildGlobalFromCache(kind, page, maxRank, showUpgrade, lang);
 }
 
+bool spotRankOf(const std::string& wallet, SpotRankInfo& out) {
+    // Читаем готовый кэш рейтинга: он перестраивается фоновым потоком, и
+    // список кошельков не должен запускать тяжёлый расчёт по 30 дням.
+    std::string payload;
+    if (!loadCachedPayload("global_pnl", payload)) return false;
+    std::vector<PnlRow> rows;
+    if (!rowsFromJson(payload, rows) || rows.empty()) return false;
+
+    const std::string w = toLower(wallet);
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (toLower(rows[i].wallet) != w) continue;
+        out.rank = static_cast<int>(i) + 1;
+        out.total = static_cast<int>(rows.size());
+        out.pnlNanos = rows[i].pnlNanos;
+        out.roiPercent = rows[i].roiPercent;
+        out.winRatePercent = rows[i].winRatePercent;
+        out.completedTrades = rows[i].completedTrades;
+        return true;
+    }
+    return false;
+}
+
 void rankingCacheLoop() {
     while (running.load(std::memory_order_relaxed)) {
         try {
