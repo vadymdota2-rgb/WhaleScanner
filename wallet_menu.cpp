@@ -1,4 +1,5 @@
 #include "wallet_menu.h"
+#include "hyperliquid.h"
 
 #include <sstream>
 #include <iostream>
@@ -388,16 +389,53 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         size_t idx = static_cast<size_t>(i);
 
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        std::string status = premium ? "" : (idx == 0 ? " 🔔" : " ⏸");
+        // У премиума работают все кошельки, но основной всё равно помечаем:
+        // человек должен видеть, какой останется после окончания подписки.
+        std::string status;
+        if (idx == 0) status = premium ? " ⭐" : " 🔔";
+        else if (!premium) status = " ⏸";
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
-        text << "<code>" << safeString(address, 42) << "</code>\n\n";
+        text << "<code>" << safeString(address, 42) << "</code>\n";
+
+        // Места в обоих рейтингах. Читаются из готовых кэшей, тяжёлых запросов
+        // здесь нет: иначе список из пятидесяти кошельков открывался бы минуту.
+        // Показатели в том же виде, что и в карточках рейтинга: человек уже
+        // знает эти строки и читает их не задумываясь.
+        SpotRankInfo sr;
+        text << "\n🟡 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
+        if (spotRankOf(address, sr)) {
+            text << " — #" << sr.rank << "\n"
+                 << "💵 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
+                 << "📈 " << tr(lang, "rk_roi_per_trade") << ": "
+                 << formatPercent(sr.roiPercent, true) << "\n"
+                 << "🎯 " << tr(lang, "ws_winrate") << ": " << sr.winRatePercent << "%\n"
+                 << "🔄 " << tr(lang, "rk_trades") << ": " << sr.completedTrades << "\n";
+        } else {
+            text << ": " << tr(lang, "wl_not_ranked") << "\n";
+        }
+
+        PerpRankInfo pr;
+        text << "\n🔵 <b>Hyperliquid " << tr(lang, "wl_perp_rank") << "</b>";
+        if (perpRankOf(address, pr)) {
+            text << " — #" << pr.rank << "\n"
+                 << "💵 PnL: " << formatUsdNanosSigned(pr.pnlNanos, true) << "\n";
+            if (pr.roiKnown)
+                text << "📈 " << tr(lang, "hl_rk_roi_account") << ": "
+                     << formatPercent(pr.roiPercent, true) << "\n";
+            text << "🎯 " << tr(lang, "ws_winrate") << ": " << pr.winRatePercent << "%\n"
+                 << "🔄 " << tr(lang, "rk_trades") << ": " << pr.closedTrades << "\n";
+        } else {
+            text << ": " << tr(lang, "wl_not_ranked") << "\n";
+        }
+        text << "\n";
 
         json row;
         row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
-        // Выбор рабочего кошелька нужен только бесплатным: у премиума работают
-        // все, и кнопка была бы бессмысленной.
-        if (!premium && walletRows.size() > 1 && idx != 0)
+        // Кнопка видна и премиуму: выбрать основной кошелёк надо ЗАРАНЕЕ,
+        // пока подписка действует. Иначе человек узнает про этот выбор только
+        // когда премиум кончился и алерты уже урезаны.
+        if (walletRows.size() > 1 && idx != 0)
             row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
