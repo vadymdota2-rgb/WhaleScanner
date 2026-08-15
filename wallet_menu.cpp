@@ -391,8 +391,10 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         // У премиума работают все кошельки, но основной всё равно помечаем:
         // человек должен видеть, какой останется после окончания подписки.
+        // Основной кошелёк помечаем колокольчиком и подписью - у премиума
+        // тоже, чтобы он заранее видел, какой останется после подписки.
         std::string status;
-        if (idx == 0) status = premium ? " ⭐" : " 🔔";
+        if (idx == 0) status = " 🔔 <i>" + tr(lang, "wl_main_wallet") + "</i>";
         else if (!premium) status = " ⏸";
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
