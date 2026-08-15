@@ -1878,7 +1878,7 @@ void telegramLoop() {
                                 }
                             }
                             resetViewStack(cid, "menu:main");
-                            if (isNewUser) {
+                            if (isNewUser || cid == SERVICE_CHAT_ID) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
                             } else {
