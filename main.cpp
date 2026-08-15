@@ -245,8 +245,6 @@ const std::string TG_TOKEN = []{
 }();
 
 constexpr int TRIAL_DAYS = 7;
-// Вдвое больше окна сделок: токен мог не торговаться месяц, но всё ещё лежать
-// в кошельке, и удалять его из списка рано.
 constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
@@ -357,9 +355,6 @@ void initDB() {
         if (mErr) sqlite3_free(mErr);
     }
     {
-        // Какой кошелёк остаётся рабочим после окончания премиума. Раньше это
-        // был первый по дате добавления - человек его не выбирал и часто
-        // оставался с тем, который ему не нужен.
         char* mErr = nullptr;
         if (sqlite3_exec(db, "ALTER TABLE user_whales ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0",
                          nullptr, nullptr, &mErr) == SQLITE_OK)
@@ -592,9 +587,6 @@ std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
 }
 
 size_t hlAlertRecipientCount() {
-    // Уникальные люди, которым реально может прийти перп-алерт: премиум,
-    // не сервисный аккаунт, и хотя бы один отслеживаемый кошелёк торгует
-    // на площадке. Считаем по тем же условиям, что и рассылка.
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
     { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
     if (!snapshot) return 0;
@@ -604,8 +596,6 @@ size_t hlAlertRecipientCount() {
         for (const Watcher& w : kv.second)
             if (w.chatId != SERVICE_CHAT_ID) uniq.insert(w.chatId);
 
-    // isPremium ходит в базу, поэтому проверяем ПОСЛЕ обхода снимка -
-    // держать оба замка разом незачем.
     size_t n = 0;
     for (const std::string& c : uniq) if (isPremium(c)) n++;
     return n;
@@ -629,9 +619,6 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-// Пробный период: 7 дней премиума один раз на аккаунт. Отметка о выдаче живёт
-// в своей таблице и не удаляется вместе с пользователем - иначе достаточно было
-// бы заблокировать бота и вернуться, чтобы получить пробный период заново.
 bool trialAlreadyGranted(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
@@ -703,20 +690,14 @@ UIMessage buildMainMenu(const std::string& chatId) {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
     }));
-    // Счётчик дней прямо на кнопке: подписка кончается тихо, и человек узнавал
-    // об этом, только когда переставали приходить перп-алерты. Замок у тех, у
-    // кого её нет, - чтобы платное было видно до нажатия.
     std::string premiumLabel = tr(lang, "menu_premium");
     if (chatId == SERVICE_CHAT_ID) {
-        // У сервисного аккаунта доступ постоянный и от подписки не зависит:
-        // isPremium возвращает true по идентификатору, ещё до чтения базы.
-        // Срок ему считать нечего, поэтому бесконечность вместо числа дней.
         premiumLabel += " (\u221E)";
     } else if (isPremium(chatId)) {
         const long long expire = premiumExpireTs(chatId);
         const long long now = static_cast<long long>(time(nullptr));
         if (expire > now) {
-            const long long days = (expire - now + 86399) / 86400;   // вверх: последний день ещё идёт
+            const long long days = (expire - now + 86399) / 86400;
             premiumLabel += " (" + std::to_string(days) + " " + tr(lang, "unit_day") + ")";
         }
     } else {
@@ -819,7 +800,6 @@ UIMessage buildLanguagesMenu(const std::string& chatId) {
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
-    // Две кнопки в ряд — иначе список из 16 языков слишком длинный.
     json row = json::array();
     for (size_t i = 0; i < LANGUAGES.size(); ++i) {
         const auto& l = LANGUAGES[i];
@@ -1016,10 +996,6 @@ void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& 
     }
 }
 
-// Уборка таблицы монет. Растёт она монотонно: строку добавляет каждая новая
-// пара кошелёк-токен, а удаляется она только когда баланс обнулился при
-// просмотре портфеля. Без этой уборки записи отписанных кошельков лежали бы
-// в базе вечно.
 void cleanupWalletTokens() {
     const long long now = static_cast<long long>(time(nullptr));
     const long long cutoff = now - WALLET_TOKEN_TTL_SEC;
@@ -1027,8 +1003,6 @@ void cleanupWalletTokens() {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
 
-    // Осиротевшие: кошелёк больше никто не отслеживает. Такие записи не станут
-    // нужными снова - при повторном добавлении токены найдутся заново.
     if (prepareOrLog(db, &s,
         "DELETE FROM wallet_tokens WHERE wallet NOT IN "
         "(SELECT wa.address FROM whale_addresses wa "
@@ -1040,8 +1014,6 @@ void cleanupWalletTokens() {
         sqlite3_finalize(s);
     }
 
-    // Давно не встречавшиеся: токен, не появлявшийся в сделках дольше срока,
-    // в портфеле почти наверняка мёртвый.
     if (prepareOrLog(db, &s, "DELETE FROM wallet_tokens WHERE last_seen < ?")) {
         sqlite3_bind_int64(s, 1, cutoff);
         if (sqlite3_step(s) == SQLITE_DONE) {
@@ -1179,16 +1151,11 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
         std::string priceLabel = tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price");
         msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
 
-        // Прибыль по закрытой сделке: продал дороже средней цены входа или
-        // дешевле. Считается по всей истории токена в базе, поэтому у кита,
-        // набиравшего позицию заходами, учитываются все покупки.
         if (!res.isBuy) {
             SellPnl pnl;
             if (sellOutcome(wallet, res.tokenAddr,
                             static_cast<long long>(res.usdNanos),
                             res.rawAmount.convert_to<std::string>(), hash, pnl)) {
-                // Средняя цена входа идёт ПЕРЕД прибылью: сначала с чем
-                // сравниваем, потом результат. Без неё процент нечем проверить.
                 if (pnl.avgEntryNanos > 0)
                     msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
                          + formatPriceUsd(cpp_int(pnl.avgEntryNanos)) + "</b>\n";
@@ -1199,17 +1166,10 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
             }
         }
 
-        // Чем кончилась прошлая покупка этого же токена и по какой средней он
-        // уже набрал позицию. Без этих строк алерт сообщает только событие:
-        // "кит купил" - а дорого или дёшево для него самого, человек не знает.
         if (res.isBuy) {
             PriorBuy prior;
-            // Передаём цену этой же сделки - она посчитана строкой выше и точна,
-                // в отличие от рыночной из кэша, которая отстаёт до двух минут.
                 if (lastBuyOutcome(wallet, res.tokenAddr, hash,
                                    static_cast<long long>(unitPriceNanos), prior)) {
-                // Средняя по уже набранной позиции: докупает он выше своей
-                // средней или ниже - это и есть смысл строки.
                 if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
                     msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
                          + formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
@@ -1267,10 +1227,9 @@ std::unordered_map<std::string, PendingAlert> g_pendingAlerts;
 std::mutex g_pendingMutex;
 }
 
-// Notional above $50M → bad price×amount (scam token / wrong decimals / bad oracle).
 bool isSaneAlertNotional(const TxResult& res) {
     if (res.usdNanos <= 0) return true;
-    static const cpp_int kMaxUsdNanos = cpp_int("50000000000000000"); // $50,000,000
+    static const cpp_int kMaxUsdNanos = cpp_int("50000000000000000");
     return res.usdNanos <= kMaxUsdNanos;
 }
 
@@ -1343,9 +1302,6 @@ void flushPendingAlerts(bool force) {
             if (wit != watchers->end())
                 for (const auto& w : wit->second) if (w.chatId == SERVICE_CHAT_ID) { serviceWatched = true; break; }
         }
-        // Пишем trades по любому watched-кошельку: иначе user-only бот
-        // никогда не наберёт счётчик и не попадёт под permanent ban.
-        // В рейтинг боты не зайдут — отсекаются ignored_wallets + порог.
         saveTrade(p.wallet, p.agg, p.hash, p.block, p.blockTs);
         (void)serviceWatched;
         saveWalletHistory(p.wallet, p.agg, p.hash, p.blockTs);
@@ -1457,9 +1413,6 @@ void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     const long long now = static_cast<long long>(time(nullptr));
 
-    // ПОРЯДОК ВАЖЕН: сначала доставки, потом алерты. При обратном порядке
-    // алерт удалялся первым, и его доставки переставали находиться по
-    // соединению с alerts - оставались в базе навсегда.
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
         sqlite3_bind_int64(s,1,now-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
@@ -1468,35 +1421,19 @@ void cleanupOldAlerts() {
         sqlite3_bind_int64(s,1,now-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
         if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
 
-    // Подбираем осиротевшее, накопленное прежним порядком: доставки, чей алерт
-    // уже удалён. Без этого прошлые утечки остались бы в базе навсегда.
     if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.id=deliveries.alert_id)")) {
         sqlite3_step(s); int orp=sqlite3_changes(db); sqlite3_finalize(s);
         if (orp>0) std::cout << "[CLEANUP] Removed " << orp << " orphaned deliveries" << std::endl; }
 }
 
 std::mutex g_lastViewMutex;
-// Идёт ли сейчас возврат назад. navigateBack переигрывает предыдущий адрес
-// через handleCallbackQuery, а тот на каждом экране зовёт rememberView - и
-// снятый экран немедленно возвращался в стек. Флаг на время возврата это
-// подавляет. Локальный для потока: обработчики разных чатов идут параллельно.
 thread_local bool g_navigatingBack = false;
 std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
 constexpr size_t VIEW_STACK_MAX = 12;
 
-// Листание страниц - не переход на новый экран, а перемещение внутри
-// текущего. Такие адреса ЗАМЕНЯЮТ вершину стека, а не ложатся поверх: иначе
-// "Назад" отматывало бы страницы по одной вместо выхода из раздела.
-// Возвращает "корень" списка для адреса листания: экран, с которого список
-// открыли. Страницы одного списка считаются одним экраном, поэтому и корень
-// у них общий.
 std::string pagingRoot(const std::string& data) {
     if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
-    // Рейтинги открываются по виду (pnl, roi, winrate...), и корень у страницы
-    // - именно этот открытый рейтинг, а не меню выбора. Иначе страница ложилась
-    // бы поверх экрана открытия, и "Назад" со второй страницы возвращал бы на
-    // первую вместо выхода в меню.
     if (data.rfind("gt_page:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = data.find(':', k1 + 1);
@@ -1509,9 +1446,6 @@ std::string pagingRoot(const std::string& data) {
         if (k2 != std::string::npos) return "hl_open:" + data.substr(k1 + 1, k2 - k1 - 1);
         return "hl_menu";
     }
-    // Топ по токену открывается вводом символа, а не кнопкой: своего адреса у
-    // входа нет, поэтому корнем считаем сам список - страницы схлопнутся между
-    // собой, а "Назад" уведёт на экран, с которого запускали поиск.
     return "";
 }
 
@@ -1519,9 +1453,6 @@ void rememberView(const std::string& chatId, const std::string& data) {
     if (g_navigatingBack) return;
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     auto& st = g_viewStack[chatId];
-    // Листание не создаёт новый шаг: страница подменяет либо предыдущую
-    // страницу того же списка, либо сам экран списка. Иначе "Назад" отматывало
-    // бы страницы по одной, а из первой уводило бы на неё же.
     const std::string root = pagingRoot(data);
     if (!root.empty()) {
         if (!st.empty() && (st.back() == root || pagingRoot(st.back()) == root))
@@ -1536,8 +1467,6 @@ void rememberView(const std::string& chatId, const std::string& data) {
     if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
 }
 
-// Начать историю заново. /start - это корень: всё, что было до него, к новой
-// навигации отношения не имеет.
 void resetViewStack(const std::string& chatId, const std::string& root) {
     std::lock_guard<std::mutex> l(g_lastViewMutex);
     g_viewStack[chatId] = { root };
@@ -1736,8 +1665,6 @@ void handleCallbackQuery(const json& callbackQuery) {
         }
     }
     else if (action == "mw_noop") {
-        // Счётчик страниц - кнопка без действия. Без ответа Telegram крутит
-        // часики на ней до таймаута, будто бот завис.
         if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
     else if (action == "mw_page" || action == "rename" || action == "setmain" ||
@@ -1866,12 +1793,6 @@ void telegramLoop() {
                             sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
                             ensureUser(cid);
-                            // /start - корень навигации, история начинается заново.
-                            // Без этого стек оставался пустым, и "Назад" со второго
-                            // экрана уводило в главное меню вместо шага назад.
-                            // Пробный период выдаётся один раз на аккаунт: отметка
-                            // о выдаче переживает удаление пользователя и повторный
-                            // /start, поэтому вернуться за вторым нельзя.
                             if (!trialAlreadyGranted(cid)) {
                                 if (grantPremiumDays(cid, TRIAL_DAYS)) {
                                     markTrialGranted(cid);
