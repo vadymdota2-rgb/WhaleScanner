@@ -16,6 +16,17 @@ void cleanupExpiredPremium();
 
 long long premiumExpireTs(const std::string& chatId);
 
+struct TonInvoice {
+    std::string memo;
+    std::string wallet;
+    long long nanoAmount = 0;
+    double gramAmount = 0.0;
+};
+
+bool tonPaymentsAvailable();
+bool createTonInvoice(const std::string& chatId, TonInvoice& out);
+void pollTonPayments();
+
 bool grantPremiumDays(const std::string& chatId, int days);
 
 size_t premiumMaxWallets(const std::string& chatId);
