@@ -219,8 +219,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_footer", {"Use the main menu for quick access to all features.",
                          "Используйте главное меню для быстрого доступа ко всем функциям."}},
 
-        {"premium_expired_notice", {"⭐ Your Premium has ended.\n\nAlerts now come from your main wallet only — the rest are saved and switch back on when you renew. You can pick which one is main in My wallets.\nHyperliquid futures and the full Top-100 need a subscription.",
-                                    "⭐ Премиум закончился.\n\nАлерты приходят только с основного кошелька — остальные сохранены и включатся после продления. Выбрать основной можно в разделе Мои кошельки.\nФьючерсы Hyperliquid и полный Топ-100 доступны по подписке."}},
+        {"premium_expired_notice", {"⭐ Your Premium has ended. Here is what changed:\n\n🔔 Alerts — main wallet only\nThe others are saved and paused. Pick which one is main in 💼 My wallets.\n\n🔵 Hyperliquid futures — off\nRanking, alerts and open positions are unavailable.\n\n🏆 Top traders — 30 instead of 100\n\nRenewing brings everything back: all 50 wallets, futures and the full Top-100.",
+                                    "⭐ Премиум закончился. Что изменилось:\n\n🔔 Алерты — только с основного кошелька\nОстальные сохранены и стоят на паузе. Выбрать основной — в разделе 💼 Мои кошельки.\n\n🔵 Фьючерсы Hyperliquid — отключены\nРейтинг, алерты и открытые позиции недоступны.\n\n🏆 Топ трейдеров — 30 вместо 100\n\nПродление вернёт всё: 50 кошельков, фьючерсы и полный Топ-100."}},
         {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures with ranking, alerts and open positions, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
                            "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid с рейтингом, алертами и открытыми позициями, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
         {"pr_active_title", {"⭐ <b>Premium Active</b>", "⭐ <b>Премиум активен</b>"}},
