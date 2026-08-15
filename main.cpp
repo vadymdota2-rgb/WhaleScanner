@@ -1655,6 +1655,31 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
+    else if (action == "premium_ton") {
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        TonInvoice inv;
+        if (!createTonInvoice(chatId, inv)) {
+            if (!callbackQueryId.empty())
+                answerCallbackQuery(callbackQueryId, tr(lang, "generic_error_retry"), true);
+            return;
+        }
+        char amt[32];
+        std::snprintf(amt, sizeof(amt), "%.2f", inv.gramAmount);
+
+        std::string text = tr(lang, "ton_invoice_header") + "\n\n";
+        text += "1️⃣ " + tr(lang, "ton_step_amount") + "\n<code>" + amt + "</code> GRAM\n\n";
+        text += "2️⃣ " + tr(lang, "ton_step_address") + "\n<code>" + inv.wallet + "</code>\n\n";
+        text += "3️⃣ " + tr(lang, "ton_step_memo") + "\n<code>" + inv.memo + "</code>\n\n";
+        text += tr(lang, "ton_memo_warning") + "\n\n" + tr(lang, "ton_invoice_footer");
+
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+        }));
+        replyInPlace(chatId, messageId, text, kb.dump());
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
+    }
     else if (action == "premium_buy") {
 
         if (!sendPremiumInvoice(chatId)) {
@@ -2042,6 +2067,7 @@ int main() {
     });
     g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
     auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
+    auto ltp=std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
         try {
             auto lj=rpc("eth_blockNumber",{}); long long lat;
@@ -2065,6 +2091,11 @@ int main() {
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lsq).count()>=5) {
                 g_msgQueue.syncSize();
                 lsq=std::chrono::steady_clock::now();
+            }
+            // Платежи проверяем часто: человек перевёл и ждёт.
+            if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-ltp).count()>=20) {
+                pollTonPayments();
+                ltp=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); cleanupWalletTokens(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
