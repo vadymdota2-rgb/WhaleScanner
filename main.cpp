@@ -1659,8 +1659,10 @@ void handleCallbackQuery(const json& callbackQuery) {
         const Lang lang = langFromCode(getUserLanguage(chatId));
         TonInvoice inv;
         if (!createTonInvoice(chatId, inv)) {
-            if (!callbackQueryId.empty())
-                answerCallbackQuery(callbackQueryId, tr(lang, "generic_error_retry"), true);
+            auto page = buildPremiumPage(chatId);
+            replyInPlace(chatId, messageId,
+                tr(lang, "ton_rate_unavailable") + "\n\n" + page.text, page.keyboard);
+            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
             return;
         }
         char amt[32];
@@ -2092,7 +2094,6 @@ int main() {
                 g_msgQueue.syncSize();
                 lsq=std::chrono::steady_clock::now();
             }
-            // Платежи проверяем часто: человек перевёл и ждёт.
             if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-ltp).count()>=20) {
                 pollTonPayments();
                 ltp=std::chrono::steady_clock::now();
