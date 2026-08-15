@@ -2070,6 +2070,7 @@ int main() {
     g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
     auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     auto ltp=std::chrono::steady_clock::now();
+    auto lrt=std::chrono::steady_clock::now()-std::chrono::minutes(10);
     while (running.load(std::memory_order_relaxed)) {
         try {
             auto lj=rpc("eth_blockNumber",{}); long long lat;
@@ -2097,6 +2098,10 @@ int main() {
             if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-ltp).count()>=20) {
                 pollTonPayments();
                 ltp=std::chrono::steady_clock::now();
+            }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
+                warmGramRate();
+                lrt=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); cleanupWalletTokens(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
