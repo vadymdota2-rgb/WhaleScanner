@@ -1872,31 +1872,47 @@ void telegramLoop() {
                                 std::lock_guard<std::mutex> l(dbMutex);
                                 sqlite3_stmt* s;
                                 if (prepareOrLog(db, &s,
-                                    "SELECT COALESCE(NULLIF(TRIM(language), ''), 'en') AS lang, COUNT(*) "
-                                    "FROM users GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC")) {
-                                    std::vector<std::pair<std::string, long long>> rows;
-                                    long long total = 0;
+                                    "SELECT COALESCE(NULLIF(TRIM(u.language), ''), 'en') AS lang, "
+                                    "COUNT(*), "
+                                    "SUM(CASE WHEN EXISTS(SELECT 1 FROM user_whales uw WHERE uw.user_id=u.chat_id) "
+                                    "THEN 1 ELSE 0 END) "
+                                    "FROM users u GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC")) {
+                                    struct LangRow { std::string lang; long long users, active; };
+                                    std::vector<LangRow> rows;
+                                    long long total = 0, totalActive = 0;
                                     while (sqlite3_step(s) == SQLITE_ROW) {
-                                        std::string lg = safeColumnText(s, 0);
-                                        long long n = sqlite3_column_int64(s, 1);
-                                        rows.push_back({std::move(lg), n});
-                                        total += n;
+                                        LangRow r;
+                                        r.lang = safeColumnText(s, 0);
+                                        r.users = sqlite3_column_int64(s, 1);
+                                        r.active = sqlite3_column_int64(s, 2);
+                                        total += r.users;
+                                        totalActive += r.active;
+                                        rows.push_back(std::move(r));
                                     }
                                     sqlite3_finalize(s);
                                     if (!rows.empty()) {
                                         std::ostringstream ls;
-                                        ls << "🌐 Languages:";
+                                        ls << "🌐 Languages (с кошельком):";
                                         for (const auto& r : rows) {
-                                            ls << "\n· " << r.first << ": <b>" << r.second << "</b>";
-                                            if (total > 0)
-                                                ls << " (" << (r.second * 100 / total) << "%)";
+                                            ls << "\n· " << r.lang << ": <b>" << r.users << "</b>";
+                                            if (total > 0) ls << " (" << (r.users * 100 / total) << "%)";
+                                            ls << " → <b>" << r.active << "</b>";
+                                            if (r.users > 0) ls << " (" << (r.active * 100 / r.users) << "%)";
                                         }
+                                        if (total > 0)
+                                            ls << "\n· всего с кошельком: <b>" << totalActive
+                                               << "</b> из " << total
+                                               << " (" << (totalActive * 100 / total) << "%)";
                                         langStats = ls.str();
                                     }
                                 }
                             }
 
-                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>\n⏱ Uptime: <b>" << getUptime() << "</b>";
+                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>"
+                                  << "\n🧵 Потоки: <b>" << g_msgQueue.busy() << "/"
+                                  << g_msgQueue.threads() << "</b> заняты · отправлено <b>"
+                                  << g_msgQueue.sent() << "</b>"
+                                  << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
                                 << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
