@@ -10,6 +10,10 @@
 #include <sstream>
 #include <unordered_map>
 #include <atomic>
+#include <random>
+#include <cmath>
+#include <cctype>
+#include "rpc_client.h"
 #include "utils.h"
 #include "ru.h"
 
@@ -29,6 +33,14 @@ namespace {
 constexpr long long PREMIUM_DURATION_SECONDS = 30LL * 86400LL;
 constexpr int       PREMIUM_PRICE_STARS      = 250;
 const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
+
+// Оплата в GRAM переводом на наш кошелёк. Никаких посредников: человек шлёт
+// из своего кошелька в Telegram, бот находит платёж по метке в комментарии.
+constexpr double TON_PRICE_USD = 3.99;
+constexpr long long TON_INVOICE_TTL_SEC = 3600;
+const char* const TON_API_URL = "https://toncenter.com/api/v2/";
+const char* const TON_RATE_URL =
+    "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
@@ -114,6 +126,18 @@ bool initPremium(const std::string& botToken, const std::string& serviceChatId) 
         );
         CREATE INDEX IF NOT EXISTS idx_premium_chat ON premium_payments(chat_id);
         CREATE INDEX IF NOT EXISTS idx_premium_paid ON premium_payments(paid_at);
+
+        CREATE TABLE IF NOT EXISTS ton_invoices (
+            memo TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            nano_amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at INTEGER NOT NULL,
+            paid_at INTEGER NOT NULL DEFAULT 0,
+            tx_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_ton_active ON ton_invoices(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_ton_chat ON ton_invoices(chat_id);
     )";
     char* perr = nullptr;
     if (sqlite3_exec(db, paymentsSql, nullptr, nullptr, &perr) != SQLITE_OK) {
@@ -252,6 +276,216 @@ bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlre
     return rc == SQLITE_DONE;
 }
 
+}
+
+namespace {
+
+// Адрес публичный - по нему только принимают, распоряжаться средствами
+// нельзя. Держим в коде: одной настройкой меньше.
+std::string tonWallet() {
+    const char* a = std::getenv("TON_WALLET_ADDRESS");
+    if (a && *a) return a;
+    return "UQDAiNYvy2KUIwjEcgD1ZxPVw-CPwdk4WbBQwpVsQQ5jsO6o";
+}
+
+std::string jstrField(const json& j, const char* key, const char* def = "") {
+    if (!j.is_object()) return def;
+    auto it = j.find(key);
+    if (it == j.end() || !it->is_string()) return def;
+    return it->get<std::string>();
+}
+
+// Курс держим в памяти и обновляем раз в 10 минут: у CoinGecko есть лимит,
+// а между двумя платежами курс всё равно почти не меняется.
+std::mutex g_rateMutex;
+double g_gramUsd = 0.0;
+long long g_rateAt = 0;
+
+double gramUsdRate() {
+    const long long now = static_cast<long long>(time(nullptr));
+    {
+        std::lock_guard<std::mutex> l(g_rateMutex);
+        if (g_gramUsd > 0.0 && now - g_rateAt < 600) return g_gramUsd;
+    }
+    const std::string resp = http(TON_RATE_URL, "", 10);
+    if (resp.empty()) {
+        std::lock_guard<std::mutex> l(g_rateMutex);
+        return g_gramUsd;   // отдаём прошлый курс, лучше старый чем никакой
+    }
+    json j = json::parse(resp, nullptr, false);
+    double rate = 0.0;
+    if (j.is_object() && j.contains("the-open-network"))
+        rate = j["the-open-network"].value("usd", 0.0);
+    if (rate <= 0.0) {
+        std::lock_guard<std::mutex> l(g_rateMutex);
+        return g_gramUsd;
+    }
+    std::lock_guard<std::mutex> l(g_rateMutex);
+    g_gramUsd = rate;
+    g_rateAt = now;
+    return rate;
+}
+
+// Метка вида WB-7K3M. Короткая, чтобы человек не ошибся при вводе вручную,
+// и без похожих символов: 0/O и 1/I/L перепутать проще всего.
+std::string makeMemo() {
+    static const char* ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
+    static std::mt19937_64 rng(std::random_device{}());
+    std::uniform_int_distribution<size_t> pick(0, 30);
+    std::string m = "WB-";
+    for (int i = 0; i < 4; i++) m += ALPHABET[pick(rng)];
+    return m;
+}
+
+}
+
+bool tonPaymentsAvailable() { return !tonWallet().empty(); }
+
+bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
+    if (!g_premiumSchemaOk) return false;
+    out.wallet = tonWallet();
+    if (out.wallet.empty()) return false;
+
+    const double rate = gramUsdRate();
+    if (rate <= 0.0) return false;
+
+    // Округляем вверх до сотых: просить 1.23456789 GRAM бессмысленно, человек
+    // всё равно введёт округлённое, и платёж не сойдётся по сумме.
+    const double gram = std::ceil(TON_PRICE_USD / rate * 100.0) / 100.0;
+    out.nanoAmount = static_cast<long long>(gram * 1e9 + 0.5);
+    out.gramAmount = gram;
+
+    const long long now = static_cast<long long>(time(nullptr));
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    // Метка уникальна: если такая уже есть, пробуем другую.
+    for (int attempt = 0; attempt < 5; attempt++) {
+        out.memo = makeMemo();
+        if (!prepareOrLog(db, &s,
+            "INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at) "
+            "VALUES(?,?,?,'active',?)")) return false;
+        sqlite3_bind_text(s, 1, out.memo.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 3, out.nanoAmount);
+        sqlite3_bind_int64(s, 4, now);
+        const bool ok = sqlite3_step(s) == SQLITE_DONE;
+        sqlite3_finalize(s);
+        if (ok) return true;
+    }
+    return false;
+}
+
+// Читаем входящие переводы на наш кошелёк и ищем среди них наши метки.
+// Уведомлений блокчейн не шлёт - опрашиваем сами, но только пока есть
+// неоплаченные счета.
+void pollTonPayments() {
+    if (!g_premiumSchemaOk) return;
+    const std::string wallet = tonWallet();
+    if (wallet.empty()) return;
+
+    const long long now = static_cast<long long>(time(nullptr));
+
+    // Есть ли вообще кого ждать? Нет - и в сеть не ходим.
+    bool anyActive = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+            "SELECT 1 FROM ton_invoices WHERE status='active' AND created_at > ? LIMIT 1")) {
+            sqlite3_bind_int64(s, 1, now - TON_INVOICE_TTL_SEC);
+            anyActive = sqlite3_step(s) == SQLITE_ROW;
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s,
+            "UPDATE ton_invoices SET status='expired' WHERE status='active' AND created_at <= ?")) {
+            sqlite3_bind_int64(s, 1, now - TON_INVOICE_TTL_SEC);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+    if (!anyActive) return;
+
+    const std::string url = std::string(TON_API_URL) + "getTransactions?address=" + wallet + "&limit=30";
+    const std::string resp = http(url, "", 15);
+    if (resp.empty()) return;
+    json j = json::parse(resp, nullptr, false);
+    if (!j.is_object() || !j.value("ok", false) || !j.contains("result") || !j["result"].is_array())
+        return;
+
+    for (const auto& tx : j["result"]) {
+        if (!tx.is_object() || !tx.contains("in_msg") || !tx["in_msg"].is_object()) continue;
+        const json& in = tx["in_msg"];
+
+        const std::string memo = jstrField(in, "message");
+        if (memo.empty()) continue;
+
+        long long got = 0;
+        try { got = std::stoll(jstrField(in, "value", "0")); } catch (...) { continue; }
+        if (got <= 0) continue;
+
+        std::string hash;
+        if (tx.contains("transaction_id") && tx["transaction_id"].is_object())
+            hash = jstrField(tx["transaction_id"], "hash");
+
+        // Метка могла прийти с лишними пробелами или в другом регистре.
+        std::string clean;
+        for (char c : memo) {
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+            clean += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+
+        std::string chatId;
+        long long need = 0;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (!prepareOrLog(db, &s,
+                "SELECT chat_id, nano_amount FROM ton_invoices "
+                "WHERE memo=? AND status='active'")) continue;
+            sqlite3_bind_text(s, 1, clean.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                chatId = safeColumnText(s, 0);
+                need = sqlite3_column_int64(s, 1);
+            }
+            sqlite3_finalize(s);
+        }
+        if (chatId.empty()) continue;
+
+        // Допускаем недоплату до 2%: курс мог сдвинуться, пока человек платил,
+        // а отказывать из-за пары центов - злить того, кто уже заплатил.
+        if (got * 100 < need * 98) {
+            std::cerr << "[TON] недоплата по " << clean << ": пришло " << got
+                      << " нанo, ждали " << need << std::endl;
+            continue;
+        }
+
+        bool claimed = false;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s,
+                "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
+                "WHERE memo=? AND status='active'")) {
+                sqlite3_bind_int64(s, 1, now);
+                sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 3, clean.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_DONE) claimed = sqlite3_changes(db) > 0;
+                sqlite3_finalize(s);
+            }
+        }
+        if (!claimed) continue;
+
+        if (!grantPremiumDays(chatId, 30)) {
+            std::cerr << "[TON] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << chatId
+                      << " memo=" << clean << " — выдать вручную" << std::endl;
+            continue;
+        }
+        std::cout << "[TON] premium 30d выдан: chat=" << chatId
+                  << " memo=" << clean << " " << (got / 1e9) << " GRAM" << std::endl;
+
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        sendMsg(chatId, tr(lang, "ton_paid_ok"));
+    }
 }
 
 bool grantPremiumDays(const std::string& chatId, int days) {
@@ -443,6 +677,9 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
         }));
+        if (tonPaymentsAvailable()) keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "pr_buy_ton")}, {"callback_data", "premium_ton"}}
+        }));
     } else {
         text << tr(lang, "pr_title") << "\n\n"
              << tr(lang, "pr_unlock") << "\n\n"
@@ -456,6 +693,9 @@ PremiumMessage buildPremiumPage(const std::string& chatId) {
 
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "pr_buy")}, {"callback_data", "premium_buy"}}
+        }));
+        if (tonPaymentsAvailable()) keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "pr_buy_ton")}, {"callback_data", "premium_ton"}}
         }));
     }
 
