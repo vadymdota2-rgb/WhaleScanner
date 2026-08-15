@@ -39,7 +39,11 @@ constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
 constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
+// Курс берём с Binance: у CoinGecko жёсткий лимит на бесплатные запросы, и
+// он молча отказывает. Здесь простой запрос без ключа и без ограничений.
 const char* const TON_RATE_URL =
+    "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT";
+const char* const TON_RATE_URL_FALLBACK =
     "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network,gram-2&vs_currencies=usd";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
@@ -298,22 +302,34 @@ double gramUsdRate() {
         std::lock_guard<std::mutex> l(g_rateMutex);
         if (g_gramUsd > 0.0 && now - g_rateAt < 600) return g_gramUsd;
     }
-    const std::string resp = http(TON_RATE_URL, "", 10);
-    if (resp.empty()) {
-        std::lock_guard<std::mutex> l(g_rateMutex);
-        return g_gramUsd;   // отдаём прошлый курс, лучше старый чем никакой
-    }
-    json j = json::parse(resp, nullptr, false);
     double rate = 0.0;
-    if (j.is_object()) {
-        for (const char* id : {"the-open-network", "gram-2"}) {
-            if (!j.contains(id) || !j[id].is_object()) continue;
-            const double v = j[id].value("usd", 0.0);
-            if (v > 0.0) { rate = v; break; }
+
+    // Binance отдаёт {"symbol":"TONUSDT","price":"2.8134"}
+    const std::string resp = http(TON_RATE_URL, "", 10);
+    if (!resp.empty()) {
+        json j = json::parse(resp, nullptr, false);
+        if (j.is_object() && j.contains("price") && j["price"].is_string()) {
+            try { rate = std::stod(j["price"].get<std::string>()); } catch (...) { rate = 0.0; }
+        }
+    }
+
+    // Если биржа недоступна - пробуем CoinGecko. Монету переименовали из
+    // Toncoin в GRAM, поэтому спрашиваем оба идентификатора.
+    if (rate <= 0.0) {
+        const std::string r2 = http(TON_RATE_URL_FALLBACK, "", 10);
+        if (!r2.empty()) {
+            json j2 = json::parse(r2, nullptr, false);
+            if (j2.is_object()) {
+                for (const char* id : {"the-open-network", "gram-2"}) {
+                    if (!j2.contains(id) || !j2[id].is_object()) continue;
+                    const double v = j2[id].value("usd", 0.0);
+                    if (v > 0.0) { rate = v; break; }
+                }
+            }
         }
     }
     if (rate <= 0.0) {
-        std::cerr << "[TON] курс не получен, ответ: " << resp.substr(0, 200) << std::endl;
+        std::cerr << "[TON] курс не получен ни от Binance, ни от CoinGecko" << std::endl;
         std::lock_guard<std::mutex> l(g_rateMutex);
         return g_gramUsd;
     }
@@ -335,6 +351,10 @@ std::string makeMemo() {
 }
 
 bool tonPaymentsAvailable() { return !tonWallet().empty(); }
+
+// Тянем курс заранее, чтобы первое нажатие кнопки не ждало сети и не
+// упиралось в пустой кэш.
+void warmGramRate() { gramUsdRate(); }
 
 bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
     if (!g_premiumSchemaOk) {
