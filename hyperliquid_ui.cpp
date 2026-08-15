@@ -309,6 +309,32 @@ std::string hyperliquidStatsLine() {
 // Место кошелька в перп-рейтинге по PnL и его показатели. Читаем готовый
 // снимок - тяжёлый запрос по 30 дням уже сделан в фоне, список кошельков
 // открывается мгновенно.
+// Трое лучших по PnL - для приветственного экрана. Читаем готовый снимок,
+// тяжёлого запроса здесь нет.
+std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree() {
+    std::vector<PerpRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        rows = g_rankCache;
+    }
+    std::sort(rows.begin(), rows.end(),
+              [](const PerpRow& a, const PerpRow& b) { return a.pnlNanos > b.pnlNanos; });
+
+    std::vector<std::pair<std::string, PerpRankInfo>> out;
+    for (size_t i = 0; i < rows.size() && out.size() < 3; i++) {
+        PerpRankInfo info;
+        info.rank = static_cast<int>(i) + 1;
+        info.total = static_cast<int>(rows.size());
+        info.pnlNanos = rows[i].pnlNanos;
+        info.roiPercent = rows[i].roiPercent;
+        info.roiKnown = rows[i].roiKnown;
+        info.winRatePercent = rows[i].winRatePercent;
+        info.closedTrades = rows[i].closedTrades;
+        out.emplace_back(rows[i].wallet, info);
+    }
+    return out;
+}
+
 bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
     std::vector<PerpRow> rows;
     {
