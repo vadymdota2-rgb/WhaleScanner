@@ -729,18 +729,41 @@ UIMessage buildMainMenu(const std::string& chatId) {
 }
 
 UIMessage buildWelcomeMessage(const std::string& chatId) {
-    auto msg = buildMainMenu(chatId);
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    if (lang == Lang::RU) {
-        msg.text = "🚨 <b>Добро пожаловать в Wallet Tracker!</b>\n\n"
-                 "Отслеживайте кошельки китов в сети " + chainCtx().displayName + " и получайте мгновенные уведомления о покупках, продажах и переводах.\n\n"
-                 "Нажмите кнопку ниже, чтобы начать:";
-    } else {
-        msg.text = "🚨 <b>Welcome to Wallet Tracker!</b>\n\n"
-                 "Monitor whale wallets on " + chainCtx().displayName + " and get instant notifications for buys, sells and transfers.\n\n"
-                 "Tap a button below to get started:";
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    std::ostringstream t;
+
+    t << tr(lang, "wc_title") << "\n\n"
+      << tr(lang, "wc_how") << "\n\n";
+
+    std::vector<std::pair<std::string, PerpRankInfo>> top3 = perpTopThree();
+
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+
+    auto addWhale = [&](int n, const std::string& addr, long long pnl, int winRate) {
+        const char* medal = n == 0 ? "\U0001F947" : (n == 1 ? "\U0001F948" : "\U0001F949");
+        t << medal << " <code>" << shortAddress(addr) << "</code>\n"
+          << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pnl, true)
+          << " \u00B7 \U0001F3AF " << winRate << "%\n\n";
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", std::string(medal) + " " + tr(lang, "wc_track_btn") + " " + shortAddress(addr)},
+             {"callback_data", "wc_track:" + addr}}
+        }));
+    };
+
+    if (!top3.empty()) {
+        t << tr(lang, "wc_top_intro") << "\n\n";
+        int n = 0;
+        for (const auto& [addr, info] : top3) { addWhale(n, addr, info.pnlNanos, info.winRatePercent); if (++n >= 3) break; }
     }
-    return msg;
+
+    t << tr(lang, "wc_free_note");
+
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "wc_next_btn")}, {"callback_data", "menu:main"}}
+    }));
+
+    return {t.str(), keyboard.dump()};
 }
 
 std::string buildCancelButton(Lang lang) {
@@ -1566,7 +1589,7 @@ void handleCallbackQuery(const json& callbackQuery) {
     std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
     std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
 
-    if (action != "tt_track" && action != "remove" && !callbackQueryId.empty()) {
+    if (action != "tt_track" && action != "wc_track" && action != "remove" && !callbackQueryId.empty()) {
         answerCallbackQuery(callbackQueryId);
     }
 
@@ -1654,6 +1677,27 @@ void handleCallbackQuery(const json& callbackQuery) {
             auto msg = TelegramUI::buildLanguagesMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
+    }
+    else if (action == "wc_track") {
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        const std::string address = toLower(param);
+        std::string toast;
+        if (!isValidAddress(address)) {
+            toast = tr(lang, "toast_invalid_address");
+        } else if (isTrackingWallet(chatId, address)) {
+            toast = tr(lang, "toast_already_tracking");
+        } else {
+            switch (addUserWhale(chatId, address, shortAddress(address))) {
+                case AddWhaleResult::OK:            toast = tr(lang, "wc_track_done"); break;
+                case AddWhaleResult::ALREADY_EXISTS:toast = tr(lang, "toast_already_tracking"); break;
+                case AddWhaleResult::LIMIT_REACHED: toast = tr(lang, "free_plan_1_wallet"); break;
+                case AddWhaleResult::PERMANENTLY_BANNED: toast = tr(lang, "wallet_bot_banned"); break;
+                default:                            toast = tr(lang, "generic_error_retry"); break;
+            }
+        }
+        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, toast, true);
+        auto msg = TelegramUI::buildWelcomeMessage(chatId);
+        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "premium_ton") {
         const Lang lang = langFromCode(getUserLanguage(chatId));
@@ -1805,7 +1849,13 @@ void telegramLoop() {
                 if (!txt.empty() && txt[0] == '/') {
                     g_sessionManager.clearSession(cid);
 
-                    if (txt=="/start") {
+                    if (txt=="/menu") {
+                        ensureUser(cid);
+                        resetViewStack(cid, "menu:main");
+                        auto msg = TelegramUI::buildMainMenu(cid);
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
+                    else if (txt=="/start") {
                         bool isNewUser = false;
                         {
                             std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
