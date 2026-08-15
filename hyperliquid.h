@@ -21,6 +21,18 @@ std::vector<HlUserWallet> hlUserWallets(const std::string& chatId);
 
 size_t hlAlertRecipientCount();
 
+struct PerpRankInfo {
+    int rank = 0;
+    int total = 0;
+    long long pnlNanos = 0;
+    double roiPercent = 0.0;
+    bool roiKnown = false;
+    int winRatePercent = 0;
+    int closedTrades = 0;
+};
+
+bool perpRankOf(const std::string& wallet, PerpRankInfo& out);
+
 bool initHyperliquid();
 
 void startHyperliquidLoop();
