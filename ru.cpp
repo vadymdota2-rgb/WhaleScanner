@@ -117,6 +117,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"remove_yes", {"🗑️ Yes, remove", "🗑️ Да, удалить"}},
         {"wl_spot_rank",  {"Spot", "Спот"}},
         {"wl_perp_rank",  {"Futures", "Фьючерсы"}},
+        {"wl_main_wallet", {"main", "основной"}},
         {"wl_not_ranked", {"not in ranking", "нет в рейтинге"}},
         {"wl_trades_short", {"trades", "сделок"}},
         {"toast_main_wallet_set", {"Main wallet updated", "Основной кошелёк выбран"}},
