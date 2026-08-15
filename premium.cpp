@@ -12,6 +12,7 @@
 #include <atomic>
 #include <random>
 #include <cmath>
+#include <algorithm>
 #include <cctype>
 #include "rpc_client.h"
 #include "utils.h"
@@ -38,6 +39,10 @@ const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
 // из своего кошелька в Telegram, бот находит платёж по метке в комментарии.
 constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
+// Порог считаем в долларах, а не в монетах: при росте курса подписка станет
+// стоить меньше GRAM, и фиксированный порог начал бы отсекать настоящие
+// платежи. Три доллара - заведомо ниже цены подписки и выше любого спама.
+constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
 const char* const TON_RATE_URL =
     "https://api.coingecko.com/api/v3/simple/price?ids=the-open-network&vs_currencies=usd";
@@ -405,12 +410,31 @@ void pollTonPayments() {
     }
     if (!anyActive) return;
 
-    const std::string url = std::string(TON_API_URL) + "getTransactions?address=" + wallet + "&limit=30";
+    // Окно расширяем, если в прошлый раз оно пришло полным: значит переводов
+    // больше, чем мы забираем, и часть могла остаться невидимой.
+    static std::atomic<int> s_limit{30};
+    const int limit = s_limit.load(std::memory_order_relaxed);
+
+    // Курс берём один раз на весь заход. Не получили - порог не применяем:
+    // лучше проверить лишний перевод, чем пропустить оплату.
+    const double rate = gramUsdRate();
+    const long long minNano = rate > 0.0
+        ? static_cast<long long>(TON_MIN_USD / rate * 1e9)
+        : 0;
+
+    const std::string url = std::string(TON_API_URL) + "getTransactions?address=" + wallet +
+                            "&limit=" + std::to_string(limit);
     const std::string resp = http(url, "", 15);
     if (resp.empty()) return;
     json j = json::parse(resp, nullptr, false);
     if (!j.is_object() || !j.value("ok", false) || !j.contains("result") || !j["result"].is_array())
         return;
+
+    const int got_count = static_cast<int>(j["result"].size());
+    if (got_count >= limit && limit < 200)
+        s_limit.store(std::min(limit * 2, 200), std::memory_order_relaxed);
+    else if (got_count * 3 < limit && limit > 30)
+        s_limit.store(std::max(limit / 2, 30), std::memory_order_relaxed);
 
     for (const auto& tx : j["result"]) {
         if (!tx.is_object() || !tx.contains("in_msg") || !tx["in_msg"].is_object()) continue;
@@ -422,6 +446,7 @@ void pollTonPayments() {
         long long got = 0;
         try { got = std::stoll(jstrField(in, "value", "0")); } catch (...) { continue; }
         if (got <= 0) continue;
+        if (minNano > 0 && got < minNano) continue;
 
         std::string hash;
         if (tx.contains("transaction_id") && tx["transaction_id"].is_object())
