@@ -39,10 +39,9 @@ constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
 constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
-// Курс берём с DexScreener - тем же источником, что и цены токенов: он на
-// сервере точно доступен, в отличие от Binance и CoinGecko.
 const char* const TON_RATE_URL =
-    "https://api.dexscreener.com/latest/dex/search?q=TON%20USDT";
+    "https://api.dexscreener.com/latest/dex/tokens/"
+    "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT";
 const char* const TON_RATE_URL_FALLBACK =
     "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT";
 
@@ -304,8 +303,6 @@ double gramUsdRate() {
     }
     double rate = 0.0;
 
-    // Из всех пар берём самую ликвидную в сети TON: на мелких пулах цена
-    // пляшет, и подписка стоила бы то дороже, то дешевле.
     const std::string resp = http(TON_RATE_URL, "", 10);
     if (!resp.empty()) {
         json j = json::parse(resp, nullptr, false);
@@ -315,28 +312,26 @@ double gramUsdRate() {
                 if (!pair.is_object()) continue;
                 if (jstrField(pair, "chainId") != "ton") continue;
 
-                // Нужна именно пара, где GRAM продаётся за доллар, а не наоборот.
-                std::string base;
-                if (pair.contains("baseToken") && pair["baseToken"].is_object())
-                    base = jstrField(pair["baseToken"], "symbol");
-                if (base != "TON" && base != "GRAM" && base != "WTON") continue;
+                double usd = 0.0, native = 0.0;
+                try {
+                    usd = std::stod(jstrField(pair, "priceUsd", "0"));
+                    native = std::stod(jstrField(pair, "priceNative", "0"));
+                } catch (...) { continue; }
+                if (!std::isfinite(usd) || !std::isfinite(native) ||
+                    usd <= 0.0 || native <= 0.0) continue;
 
-                const std::string priceStr = jstrField(pair, "priceUsd");
-                if (priceStr.empty()) continue;
-                double price = 0.0;
-                try { price = std::stod(priceStr); } catch (...) { continue; }
-                if (!std::isfinite(price) || price <= 0.0) continue;
+                const double gram = usd / native;
+                if (gram < 0.01 || gram > 1000.0) continue;
 
                 double liq = 0.0;
                 if (pair.contains("liquidity") && pair["liquidity"].is_object() &&
                     pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
                     liq = pair["liquidity"]["usd"].get<double>();
-                if (liq > bestLiq) { bestLiq = liq; rate = price; }
+                if (liq > bestLiq) { bestLiq = liq; rate = gram; }
             }
         }
     }
 
-    // Запасной путь, если DexScreener не ответил.
     if (rate <= 0.0) {
         const std::string r2 = http(TON_RATE_URL_FALLBACK, "", 10);
         if (!r2.empty()) {
@@ -370,8 +365,6 @@ std::string makeMemo() {
 
 bool tonPaymentsAvailable() { return !tonWallet().empty(); }
 
-// Тянем курс заранее, чтобы первое нажатие кнопки не ждало сети и не
-// упиралось в пустой кэш.
 void warmGramRate() { gramUsdRate(); }
 
 bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
