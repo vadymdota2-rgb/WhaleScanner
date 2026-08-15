@@ -32,6 +32,7 @@ struct PerpRankInfo {
 };
 
 bool perpRankOf(const std::string& wallet, PerpRankInfo& out);
+std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree();
 
 bool initHyperliquid();
 
