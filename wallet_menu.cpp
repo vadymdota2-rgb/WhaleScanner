@@ -394,8 +394,8 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         // Основной кошелёк помечаем колокольчиком и подписью - у премиума
         // тоже, чтобы он заранее видел, какой останется после подписки.
         std::string status;
-        if (idx == 0) status = " 🔔 <i>" + tr(lang, "wl_main_wallet") + "</i>";
-        else if (!premium) status = " ⏸";
+        if (idx == 0) status = " 🔔 " + tr(lang, "wl_main_wallet");
+        else if (!premium) status = " ⏸ " + tr(lang, "wl_paused");
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
         text << "<code>" << safeString(address, 42) << "</code>\n";
@@ -404,9 +404,11 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         // здесь нет: иначе список из пятидесяти кошельков открывался бы минуту.
         // Показатели в том же виде, что и в карточках рейтинга: человек уже
         // знает эти строки и читает их не задумываясь.
+        // Место ниже сотого ничего не говорит: в топ его всё равно не увидеть,
+        // а строка создаёт впечатление, будто кошелёк в рейтинге.
         SpotRankInfo sr;
         text << "\n🟡 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
-        if (spotRankOf(address, sr)) {
+        if (spotRankOf(address, sr) && sr.rank <= 100) {
             text << " — #" << sr.rank << "\n"
                  << "💵 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
                  << "📈 " << tr(lang, "rk_roi_per_trade") << ": "
@@ -419,7 +421,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
 
         PerpRankInfo pr;
         text << "\n🔵 <b>Hyperliquid " << tr(lang, "wl_perp_rank") << "</b>";
-        if (perpRankOf(address, pr)) {
+        if (perpRankOf(address, pr) && pr.rank <= 100) {
             text << " — #" << pr.rank << "\n"
                  << "💵 PnL: " << formatUsdNanosSigned(pr.pnlNanos, true) << "\n";
             if (pr.roiKnown)
