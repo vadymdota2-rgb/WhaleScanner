@@ -18,6 +18,17 @@ void cleanupOldTrades();
 bool isPermanentlyBanned(const std::string& wallet);
 bool liftPermanentBan(const std::string& wallet);
 
+struct SpotRankInfo {
+    int rank = 0;
+    int total = 0;
+    long long pnlNanos = 0;
+    double roiPercent = 0.0;
+    int winRatePercent = 0;
+    int completedTrades = 0;
+};
+
+bool spotRankOf(const std::string& wallet, SpotRankInfo& out);
+
 void rankingCacheLoop();
 
 struct RankingMessage {
