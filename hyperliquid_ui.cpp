@@ -1,4 +1,5 @@
 #include "hyperliquid.h"
+#include "ranking.h"
 #include "wallet_menu.h"
 
 #include <algorithm>
@@ -564,7 +565,37 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
     std::stringstream t;
     t << dm << "\U0001F4BC <b>" << label << "</b>\n";
     t << dm << "<code>" << safeString(addr, 42) << "</code>\n";
-    t << HL_CARD_SEPARATOR << "\n\n";
+
+    // Те же показатели, что в списке кошельков: человек открыл позиции кита и
+    // сразу видит, чего этот кит стоит в обоих рейтингах.
+    SpotRankInfo sr;
+    t << dm << "\n\U0001F7E1 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
+    if (spotRankOf(addr, sr)) {
+        t << " — #" << sr.rank << "\n"
+          << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
+          << dm << "\U0001F4C8 " << tr(lang, "rk_roi_per_trade") << ": "
+          << formatPercent(sr.roiPercent, true) << "\n"
+          << dm << "\U0001F3AF " << tr(lang, "ws_winrate") << ": " << sr.winRatePercent << "%\n"
+          << dm << "\U0001F504 " << tr(lang, "rk_trades") << ": " << sr.completedTrades << "\n";
+    } else {
+        t << ": " << tr(lang, "wl_not_ranked") << "\n";
+    }
+
+    PerpRankInfo pr;
+    t << dm << "\n\U0001F535 <b>Hyperliquid " << tr(lang, "wl_perp_rank") << "</b>";
+    if (perpRankOf(addr, pr)) {
+        t << " — #" << pr.rank << "\n"
+          << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pr.pnlNanos, true) << "\n";
+        if (pr.roiKnown)
+            t << dm << "\U0001F4C8 " << tr(lang, "hl_rk_roi_account") << ": "
+              << formatPercent(pr.roiPercent, true) << "\n";
+        t << dm << "\U0001F3AF " << tr(lang, "ws_winrate") << ": " << pr.winRatePercent << "%\n"
+          << dm << "\U0001F504 " << tr(lang, "rk_trades") << ": " << pr.closedTrades << "\n";
+    } else {
+        t << ": " << tr(lang, "wl_not_ranked") << "\n";
+    }
+
+    t << "\n" << HL_CARD_SEPARATOR << "\n\n";
 
     std::vector<OpenPosition> pos;
     long long accountValue = 0;
@@ -599,15 +630,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
             // Какая доля счёта заведена в эту позицию: 5% и 60% - это разный
             // риск при одинаковой сумме.
             t << "\n";
-            // Депозит и доля под каждой позицией: по одной сумме залога не
-            // понять, рискует кит четвертью счёта или сотой долей.
-            if (accountValue > 0) {
-                const double share = 100.0 * static_cast<double>(p.marginNanos)
-                                            / static_cast<double>(accountValue);
-                t << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
-                  << fmtUsd(accountValue) << "</b> — "
-                  << formatPercent(share, false) << " " << tr(lang, "hl_in_position") << "\n";
-            }
         }
         if (p.entryPxNanos > 0)
             t << dm << "\U0001F4CD " << tr(lang, "hl_entry_price") << ": <b>"
@@ -632,6 +654,15 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.liqPxNanos > 0)
             t << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
               << formatPriceNanos(p.liqPxNanos) << "</b>\n";
+        // Депозит - последней строкой карточки: сначала сама позиция, потом
+        // масштаб риска относительно всего счёта.
+        if (accountValue > 0 && p.marginNanos > 0) {
+            const double share = 100.0 * static_cast<double>(p.marginNanos)
+                                        / static_cast<double>(accountValue);
+            t << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
+              << fmtUsd(accountValue) << "</b> — "
+              << formatPercent(share, false) << " " << tr(lang, "hl_in_position") << "\n";
+        }
     }
     return {t.str(), kb.dump()};
 }
