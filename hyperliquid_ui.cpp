@@ -305,6 +305,33 @@ std::string hyperliquidStatsLine() {
     return ss.str();
 }
 
+// Место кошелька в перп-рейтинге по PnL и его показатели. Читаем готовый
+// снимок - тяжёлый запрос по 30 дням уже сделан в фоне, список кошельков
+// открывается мгновенно.
+bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
+    std::vector<PerpRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        rows = g_rankCache;
+    }
+    if (rows.empty()) return false;
+    std::sort(rows.begin(), rows.end(),
+              [](const PerpRow& a, const PerpRow& b) { return a.pnlNanos > b.pnlNanos; });
+    const std::string w = toLower(wallet);
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (toLower(rows[i].wallet) != w) continue;
+        out.rank = static_cast<int>(i) + 1;
+        out.total = static_cast<int>(rows.size());
+        out.pnlNanos = rows[i].pnlNanos;
+        out.roiPercent = rows[i].roiPercent;
+        out.roiKnown = rows[i].roiKnown;
+        out.winRatePercent = rows[i].winRatePercent;
+        out.closedTrades = rows[i].closedTrades;
+        return true;
+    }
+    return false;
+}
+
 namespace hl {
 void rebuildRankCache() {
     bool ok = false;
@@ -395,7 +422,9 @@ struct OpenPosition {
     bool isolated = false;
 };
 
-bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out) {
+bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out,
+                       long long& accountValueNanos) {
+    accountValueNanos = 0;
     json body;
     body["type"] = "clearinghouseState";
     body["user"] = wallet;
@@ -403,6 +432,10 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
     json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
     if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
         return false;
+
+    // Депозит счёта приходит в этом же ответе - отдельный запрос не нужен.
+    if (j.contains("marginSummary") && j["marginSummary"].is_object())
+        parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), accountValueNanos);
 
     for (const auto& ap : j["assetPositions"]) {
         if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
@@ -534,7 +567,8 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
     t << HL_CARD_SEPARATOR << "\n\n";
 
     std::vector<OpenPosition> pos;
-    if (!fetchOpenPositions(addr, pos)) {
+    long long accountValue = 0;
+    if (!fetchOpenPositions(addr, pos, accountValue)) {
         t << dm << tr(lang, "generic_error_retry");
         return {t.str(), kb.dump()};
     }
@@ -559,9 +593,22 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
             t << " \u00B7 " << p.leverage << "\u00D7 "
               << tr(lang, p.isolated ? "hl_isolated" : "hl_cross");
         t << "\n";
-        if (p.marginNanos > 0)
+        if (p.marginNanos > 0) {
             t << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
-              << fmtUsd(p.marginNanos) << "</b>\n";
+              << fmtUsd(p.marginNanos) << "</b>";
+            // Какая доля счёта заведена в эту позицию: 5% и 60% - это разный
+            // риск при одинаковой сумме.
+            t << "\n";
+            // Депозит и доля под каждой позицией: по одной сумме залога не
+            // понять, рискует кит четвертью счёта или сотой долей.
+            if (accountValue > 0) {
+                const double share = 100.0 * static_cast<double>(p.marginNanos)
+                                            / static_cast<double>(accountValue);
+                t << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
+                  << fmtUsd(accountValue) << "</b> — "
+                  << formatPercent(share, false) << " " << tr(lang, "hl_in_position") << "\n";
+            }
+        }
         if (p.entryPxNanos > 0)
             t << dm << "\U0001F4CD " << tr(lang, "hl_entry_price") << ": <b>"
               << formatPriceNanos(p.entryPxNanos) << "</b>\n";
