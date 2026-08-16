@@ -10,7 +10,7 @@
 #include "utils.h"
 
 std::string getUserLanguage(const std::string& chatId);
-void ensureUser(const std::string& chatId);
+void ensureUser(const std::string& chatId, const std::string& tgLangCode = "");
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
