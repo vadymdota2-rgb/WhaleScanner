@@ -123,15 +123,22 @@ void SafeMessageQueue::senderLoop() {
               while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
               sqlite3_finalize(s);
           }
-          if (!prepFailed && !batch.empty() &&
-              prepareOrLog(db,&s,"UPDATE deliveries SET status=5 WHERE id=? AND status IN (0,3)")) {
-              for (auto& t : batch) {
-                  sqlite3_bind_int64(s,1,std::get<0>(t));
-                  sqlite3_step(s);
-                  sqlite3_reset(s);
-                  sqlite3_clear_bindings(s);
+          if (!prepFailed && !batch.empty()) {
+              if (prepareOrLog(db,&s,"UPDATE deliveries SET status=5 WHERE id=? AND status IN (0,3)")) {
+                  std::vector<std::tuple<int64_t,std::string,std::string>> claimed;
+                  claimed.reserve(batch.size());
+                  for (auto& t : batch) {
+                      sqlite3_bind_int64(s,1,std::get<0>(t));
+                      const bool ok = sqlite3_step(s)==SQLITE_DONE && sqlite3_changes(db)==1;
+                      sqlite3_reset(s);
+                      sqlite3_clear_bindings(s);
+                      if (ok) claimed.push_back(std::move(t));
+                  }
+                  sqlite3_finalize(s);
+                  batch.swap(claimed);
+              } else {
+                  batch.clear();
               }
-              sqlite3_finalize(s);
           }
         }
         if (prepFailed) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
