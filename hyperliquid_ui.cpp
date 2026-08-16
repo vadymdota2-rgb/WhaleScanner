@@ -113,8 +113,6 @@ std::vector<PerpRow> computeRanking(bool& ok) {
     return rows;
 }
 
-
-
 void rankingSnapshot(std::vector<PerpRow>& localCopy) {
     std::lock_guard<std::mutex> l(g_rankMutex);
     localCopy = g_rankCache;
@@ -306,11 +304,6 @@ std::string hyperliquidStatsLine() {
     return ss.str();
 }
 
-// Место кошелька в перп-рейтинге по PnL и его показатели. Читаем готовый
-// снимок - тяжёлый запрос по 30 дням уже сделан в фоне, список кошельков
-// открывается мгновенно.
-// Трое лучших по PnL - для приветственного экрана. Читаем готовый снимок,
-// тяжёлого запроса здесь нет.
 std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree() {
     std::vector<PerpRow> rows;
     {
@@ -460,7 +453,6 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
     if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
         return false;
 
-    // Депозит счёта приходит в этом же ответе - отдельный запрос не нужен.
     if (j.contains("marginSummary") && j["marginSummary"].is_object())
         parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), accountValueNanos);
 
@@ -592,8 +584,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
     t << dm << "\U0001F4BC <b>" << label << "</b>\n";
     t << dm << "<code>" << safeString(addr, 42) << "</code>\n";
 
-    // Те же показатели, что в списке кошельков: человек открыл позиции кита и
-    // сразу видит, чего этот кит стоит в обоих рейтингах.
     SpotRankInfo sr;
     t << dm << "\n\U0001F7E1 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
     if (spotRankOf(addr, sr) && sr.rank <= 100) {
@@ -653,8 +643,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.marginNanos > 0) {
             t << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
               << fmtUsd(p.marginNanos) << "</b>";
-            // Какая доля счёта заведена в эту позицию: 5% и 60% - это разный
-            // риск при одинаковой сумме.
             t << "\n";
         }
         if (p.entryPxNanos > 0)
@@ -680,8 +668,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.liqPxNanos > 0)
             t << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
               << formatPriceNanos(p.liqPxNanos) << "</b>\n";
-        // Депозит - последней строкой карточки: сначала сама позиция, потом
-        // масштаб риска относительно всего счёта.
         if (accountValue > 0 && p.marginNanos > 0) {
             const double share = 100.0 * static_cast<double>(p.marginNanos)
                                         / static_cast<double>(accountValue);
