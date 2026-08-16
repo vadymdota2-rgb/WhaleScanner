@@ -742,12 +742,16 @@ UIMessage buildWelcomeMessage(const std::string& chatId) {
 
     auto addWhale = [&](int n, const std::string& addr, long long pnl, int winRate) {
         const char* medal = n == 0 ? "\U0001F947" : (n == 1 ? "\U0001F948" : "\U0001F949");
-        t << medal << " <code>" << shortAddress(addr) << "</code>\n"
+        const bool tracked = isTrackingWallet(chatId, addr);
+        t << medal << " <code>" << shortAddress(addr) << "</code>"
+          << (tracked ? "  \u2705" : "") << "\n"
           << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pnl, true)
           << " \u00B7 \U0001F3AF " << winRate << "%\n\n";
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", std::string(medal) + " " + tr(lang, "wc_track_btn") + " " + shortAddress(addr)},
-             {"callback_data", "wc_track:" + addr}}
+            {{"text", tracked
+                        ? "\u2705 " + tr(lang, "wc_tracked_btn") + " " + shortAddress(addr)
+                        : std::string(medal) + " " + tr(lang, "wc_track_btn") + " " + shortAddress(addr)},
+             {"callback_data", tracked ? "wc_noop" : "wc_track:" + addr}}
         }));
     };
 
@@ -1678,6 +1682,11 @@ void handleCallbackQuery(const json& callbackQuery) {
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
+    else if (action == "wc_noop") {
+        if (!callbackQueryId.empty())
+            answerCallbackQuery(callbackQueryId,
+                tr(langFromCode(getUserLanguage(chatId)), "toast_already_tracking"), false);
+    }
     else if (action == "wc_track") {
         const Lang lang = langFromCode(getUserLanguage(chatId));
         const std::string address = toLower(param);
@@ -1870,18 +1879,22 @@ void telegramLoop() {
                             sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
                             ensureUser(cid);
+                            bool trialJustGranted = false;
                             if (!trialAlreadyGranted(cid)) {
                                 if (grantPremiumDays(cid, TRIAL_DAYS)) {
                                     markTrialGranted(cid);
-                                    Lang tl = langFromCode(getUserLanguage(cid));
-                                    sendMsg(cid, tr(tl, "trial_granted"));
+                                    trialJustGranted = true;
                                 }
                             }
                             resetViewStack(cid, "menu:main");
                             if (isNewUser || cid == SERVICE_CHAT_ID) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
+                                if (trialJustGranted)
+                                    sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "trial_granted"));
                             } else {
+                                if (trialJustGranted)
+                                    sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "trial_granted"));
                                 auto msg = TelegramUI::buildMainMenu(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
                             }
