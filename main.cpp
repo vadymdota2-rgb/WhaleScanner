@@ -487,11 +487,14 @@ void saveLastBlockHash(const std::string& h) {
     sqlite3_bind_text(s,1,h.c_str(),-1,SQLITE_TRANSIENT); sqlite3_step(s); sqlite3_finalize(s);
 }
 
-void ensureUser(const std::string& chatId) {
+void ensureUser(const std::string& chatId, const std::string& tgLangCode) {
+    std::string lang = "en";
+    if (!tgLangCode.empty()) lang = langCodeOf(langFromCode(tgLangCode));
+
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO users(chat_id,language,threshold_nanos,created_at) VALUES(?,?,?,?)")) return;
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(s,2,"en",-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,lang.c_str(),-1,SQLITE_TRANSIENT);
     sqlite3_bind_int64(s,3,static_cast<sqlite3_int64>(DEFAULT_THRESHOLD_NANOS));
     sqlite3_bind_int64(s,4,time(nullptr));
     sqlite3_step(s); sqlite3_finalize(s);
@@ -1853,13 +1856,18 @@ void telegramLoop() {
                 }
                 if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
                 std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
+                std::string tgLang;
+                if (u["message"].contains("from") && u["message"]["from"].is_object() &&
+                    u["message"]["from"].contains("language_code") &&
+                    u["message"]["from"]["language_code"].is_string())
+                    tgLang = u["message"]["from"]["language_code"].get<std::string>();
                 if (!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
 
                 if (!txt.empty() && txt[0] == '/') {
                     g_sessionManager.clearSession(cid);
 
                     if (txt=="/menu") {
-                        ensureUser(cid);
+                        ensureUser(cid, tgLang);
                         resetViewStack(cid, "menu:main");
                         auto msg = TelegramUI::buildMainMenu(cid);
                         sendMsg(cid, msg.text, msg.keyboard);
@@ -1878,23 +1886,19 @@ void telegramLoop() {
                         if (countUsers() >= MAX_USERS && isNewUser) {
                             sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
-                            ensureUser(cid);
-                            bool trialJustGranted = false;
+                            ensureUser(cid, tgLang);
                             if (!trialAlreadyGranted(cid)) {
                                 if (grantPremiumDays(cid, TRIAL_DAYS)) {
                                     markTrialGranted(cid);
-                                    trialJustGranted = true;
+                                    Lang tl = langFromCode(getUserLanguage(cid));
+                                    sendMsg(cid, tr(tl, "trial_granted"));
                                 }
                             }
                             resetViewStack(cid, "menu:main");
                             if (isNewUser || cid == SERVICE_CHAT_ID) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
-                                if (trialJustGranted)
-                                    sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "trial_granted"));
                             } else {
-                                if (trialJustGranted)
-                                    sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "trial_granted"));
                                 auto msg = TelegramUI::buildMainMenu(cid);
                                 sendMsg(cid, msg.text, msg.keyboard);
                             }
