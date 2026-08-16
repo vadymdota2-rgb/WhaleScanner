@@ -9,7 +9,7 @@ using boost::multiprecision::cpp_int;
 #include "ru.h"
 
 std::string getUserLanguage(const std::string& chatId);
-void ensureUser(const std::string& chatId);
+void ensureUser(const std::string& chatId, const std::string& tgLangCode = "");
 void rememberView(const std::string& chatId, const std::string& data);
 std::string getLastView(const std::string& chatId);
 bool navigateBack(const std::string& chatId, long long messageId);
