@@ -42,8 +42,6 @@ const char* const TON_API_URL = "https://toncenter.com/api/v2/";
 const char* const TON_RATE_URL =
     "https://api.dexscreener.com/latest/dex/tokens/"
     "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT";
-const char* const TON_RATE_URL_FALLBACK =
-    "https://api.binance.com/api/v3/ticker/price?symbol=TONUSDT";
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
@@ -333,16 +331,7 @@ double gramUsdRate() {
     }
 
     if (rate <= 0.0) {
-        const std::string r2 = http(TON_RATE_URL_FALLBACK, "", 10);
-        if (!r2.empty()) {
-            json j2 = json::parse(r2, nullptr, false);
-            if (j2.is_object() && j2.contains("price") && j2["price"].is_string()) {
-                try { rate = std::stod(j2["price"].get<std::string>()); } catch (...) { rate = 0.0; }
-            }
-        }
-    }
-    if (rate <= 0.0) {
-        std::cerr << "[TON] курс не получен ни от DexScreener, ни от Binance" << std::endl;
+        std::cerr << "[TON] курс GRAM не получен от DexScreener" << std::endl;
         std::lock_guard<std::mutex> l(g_rateMutex);
         return g_gramUsd;
     }
