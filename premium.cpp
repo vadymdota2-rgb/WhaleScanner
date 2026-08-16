@@ -26,7 +26,7 @@ extern sqlite3* db;
 extern std::mutex dbMutex;
 
 std::string http(const std::string& url, const std::string& post, int timeout);
-void ensureUser(const std::string& chatId);
+void ensureUser(const std::string& chatId, const std::string& tgLangCode = "");
 void refreshWatchers();
 
 namespace {
