@@ -1001,8 +1001,6 @@ RankingMessage buildGlobalTopPage(const std::string& chatId, GlobalRankKind kind
 }
 
 bool spotRankOf(const std::string& wallet, SpotRankInfo& out) {
-    // Читаем готовый кэш рейтинга: он перестраивается фоновым потоком, и
-    // список кошельков не должен запускать тяжёлый расчёт по 30 дням.
     std::string payload;
     if (!loadCachedPayload("global_pnl", payload)) return false;
     std::vector<PnlRow> rows;
