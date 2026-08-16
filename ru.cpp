@@ -4,6 +4,27 @@
 #include <vector>
 #include <unordered_map>
 
+std::string langCodeOf(Lang l) {
+    switch (l) {
+        case Lang::RU: return "ru";
+        case Lang::ES: return "es";
+        case Lang::PT: return "pt";
+        case Lang::FR: return "fr";
+        case Lang::TR: return "tr";
+        case Lang::AR: return "ar";
+        case Lang::PL: return "pl";
+        case Lang::DE: return "de";
+        case Lang::UK: return "uk";
+        case Lang::HI: return "hi";
+        case Lang::ID: return "id";
+        case Lang::VI: return "vi";
+        case Lang::KO: return "ko";
+        case Lang::ZH: return "zh";
+        case Lang::JA: return "ja";
+        default:       return "en";
+    }
+}
+
 Lang langFromCode(const std::string& codeArg) {
     std::string code;
     for (char c : codeArg) {
@@ -230,6 +251,7 @@ const std::unordered_map<std::string, Entry>& table() {
                           "Можно добавить любой кошелёк самому — отправьте его адрес в разделе 💼 Мои кошельки."}},
         {"wc_next_btn", {"➡️ Go to menu", "➡️ Перейти в меню"}},
         {"wc_track_done", {"✅ Added — you will get alerts from this wallet", "✅ Добавлен — алерты с этого кошелька будут приходить"}},
+        {"wc_tracked_btn", {"Tracking", "Отслеживается"}},
         {"trial_granted", {"🎁 <b>7 days of Premium — on us</b>\n\nYou now have: Hyperliquid futures with ranking, alerts and open positions, up to 50 wallets, the full Top 100 and priority alerts.\n\nGiven once per account.",
                            "🎁 <b>7 дней Премиума — в подарок</b>\n\nВам доступны: фьючерсы Hyperliquid с рейтингом, алертами и открытыми позициями, до 50 кошельков, полный Топ-100 и приоритетные алерты.\n\nВыдаётся один раз на аккаунт."}},
         {"pr_active_title", {"⭐ <b>Premium Active</b>", "⭐ <b>Премиум активен</b>"}},
