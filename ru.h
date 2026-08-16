@@ -4,6 +4,7 @@
 enum class Lang { EN, RU, ES, PT, FR, TR, AR, PL, DE, UK, HI, ID, VI, KO, ZH, JA };
 
 Lang langFromCode(const std::string& code);
+std::string langCodeOf(Lang l);
 std::string tr(Lang lang, const std::string& key);
 
 void checkTranslations();
