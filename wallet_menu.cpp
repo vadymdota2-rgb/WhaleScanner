@@ -129,7 +129,6 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
-    // Бан бота общий: и service, и обычные users не могут добавить.
     if (isPermanentlyBanned(address)) {
         return AddWhaleResult::PERMANENTLY_BANNED;
     }
@@ -165,9 +164,19 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     bool exists = sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s);
     if (exists) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ALREADY_EXISTS; }
 
-    if (!prepareOrLog(db,&s,"INSERT INTO user_whales(user_id,whale_id,label,created_at) VALUES(?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
+    bool firstWallet = false;
+    {
+        sqlite3_stmt* c;
+        if (prepareOrLog(db,&c,"SELECT 1 FROM user_whales WHERE user_id=? LIMIT 1")) {
+            sqlite3_bind_text(c,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+            firstWallet = sqlite3_step(c) != SQLITE_ROW;
+            sqlite3_finalize(c);
+        }
+    }
+    if (!prepareOrLog(db,&s,"INSERT INTO user_whales(user_id,whale_id,label,created_at,is_primary) VALUES(?,?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
     sqlite3_bind_text(s,3,label.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,4,time(nullptr));
+    sqlite3_bind_int(s,5,firstWallet ? 1 : 0);
     if (sqlite3_step(s)!=SQLITE_DONE) {
         std::cerr << "[DB] user_whales INSERT failed: " << sqlite3_errmsg(db) << std::endl;
         sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR;
@@ -214,6 +223,18 @@ bool removeUserWhale(const std::string& chatId, const std::string& addressArg) {
         sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false;
     }
     sqlite3_finalize(s);
+
+    if (removed && prepareOrLog(db,&s,
+        "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
+        "SELECT whale_id FROM user_whales WHERE user_id=? ORDER BY created_at ASC, rowid ASC LIMIT 1) "
+        "AND NOT EXISTS (SELECT 1 FROM user_whales WHERE user_id=? AND is_primary=1)")) {
+        sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_bind_text(s,3,chatId.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+
     if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[DB] removeUserWhale COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
         sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
@@ -389,10 +410,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         size_t idx = static_cast<size_t>(i);
 
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
-        // У премиума работают все кошельки, но основной всё равно помечаем:
-        // человек должен видеть, какой останется после окончания подписки.
-        // Основной кошелёк помечаем колокольчиком и подписью - у премиума
-        // тоже, чтобы он заранее видел, какой останется после подписки.
         std::string status;
         if (idx == 0) status = " 🔔 " + tr(lang, "wl_main_wallet");
         else if (!premium) status = " ⏸ " + tr(lang, "wl_paused");
@@ -400,12 +417,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
         text << "<code>" << safeString(address, 42) << "</code>\n";
 
-        // Места в обоих рейтингах. Читаются из готовых кэшей, тяжёлых запросов
-        // здесь нет: иначе список из пятидесяти кошельков открывался бы минуту.
-        // Показатели в том же виде, что и в карточках рейтинга: человек уже
-        // знает эти строки и читает их не задумываясь.
-        // Место ниже сотого ничего не говорит: в топ его всё равно не увидеть,
-        // а строка создаёт впечатление, будто кошелёк в рейтинге.
         SpotRankInfo sr;
         text << "\n🟡 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
         if (spotRankOf(address, sr) && sr.rank <= 100) {
@@ -436,9 +447,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
 
         json row;
         row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
-        // Кнопка видна и премиуму: выбрать основной кошелёк надо ЗАРАНЕЕ,
-        // пока подписка действует. Иначе человек узнает про этот выбор только
-        // когда премиум кончился и алерты уже урезаны.
         if (walletRows.size() > 1 && idx != 0)
             row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
@@ -521,40 +529,50 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             return true;
         }
 
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (!prepareOrLog(db, &s,
-            "SELECT uw.label FROM user_whales uw "
-            "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-            "WHERE uw.user_id = ? AND wa.address = ?")) {
+        bool prepFailed = false, found = false;
+        std::string currentLabel;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (!prepareOrLog(db, &s,
+                "SELECT uw.label FROM user_whales uw "
+                "JOIN whale_addresses wa ON wa.id = uw.whale_id "
+                "WHERE uw.user_id = ? AND wa.address = ?")) {
+                prepFailed = true;
+            } else {
+                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_ROW) {
+                    found = true;
+                    currentLabel = safeColumnText(s, 0);
+                }
+                sqlite3_finalize(s);
+            }
+        }
+
+        if (prepFailed) {
             replyInPlace(chatId, messageId, tr(lang, "err_loading_wallet"), errorBackKeyboard(chatId, lang));
             return true;
         }
-        sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
-
-        if (sqlite3_step(s) == SQLITE_ROW) {
-            std::string currentLabel = safeColumnText(s, 0);
-            sqlite3_finalize(s);
-
-            g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
-
-            json cancelKb;
-            cancelKb["inline_keyboard"] = json::array({
-                json::array({
-                    {{"text", tr(lang, "cancel_button")}, {"callback_data", backToWalletsData(chatId)}}
-                })
-            });
-
-            replyInPlace(chatId, messageId,
-                tr(lang, "rename_title") + "\n\n" +
-                tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) + "</b>\n\n" +
-                tr(lang, "rename_enter_new"),
-                cancelKb.dump());
-        } else {
-            sqlite3_finalize(s);
+        if (!found) {
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
+            return true;
         }
+
+        g_sessionManager.setState(chatId, UserState::AWAITING_RENAME, address, messageId);
+
+        json cancelKb;
+        cancelKb["inline_keyboard"] = json::array({
+            json::array({
+                {{"text", tr(lang, "cancel_button")}, {"callback_data", backToWalletsData(chatId)}}
+            })
+        });
+
+        replyInPlace(chatId, messageId,
+            tr(lang, "rename_title") + "\n\n" +
+            tr(lang, "rename_current_name") + " <b>" + safeString(currentLabel, 32) + "</b>\n\n" +
+            tr(lang, "rename_enter_new"),
+            cancelKb.dump());
     }
     else if (action == "setmain") {
         const Lang lang = langFromCode(getUserLanguage(chatId));
@@ -567,19 +585,29 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         {
             std::lock_guard<std::mutex> l(dbMutex);
             sqlite3_stmt* s;
-            // Сначала снимаем отметку со всех: основной кошелёк ровно один.
-            if (prepareOrLog(db, &s, "UPDATE user_whales SET is_primary=0 WHERE user_id=?")) {
-                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_step(s);
-                sqlite3_finalize(s);
-            }
-            if (prepareOrLog(db, &s,
-                "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
-                "SELECT id FROM whale_addresses WHERE address=?)")) {
-                sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(s) == SQLITE_DONE) changed = sqlite3_changes(db) > 0;
-                sqlite3_finalize(s);
+            if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                std::cerr << "[WALLET] setmain: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+            } else {
+                bool ok = false;
+                if (prepareOrLog(db, &s, "UPDATE user_whales SET is_primary=0 WHERE user_id=?")) {
+                    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                    ok = sqlite3_step(s) == SQLITE_DONE;
+                    sqlite3_finalize(s);
+                }
+                if (ok && prepareOrLog(db, &s,
+                    "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
+                    "SELECT id FROM whale_addresses WHERE address=?)")) {
+                    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(s, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+                    if (sqlite3_step(s) == SQLITE_DONE) changed = sqlite3_changes(db) > 0;
+                    else ok = false;
+                    sqlite3_finalize(s);
+                } else ok = false;
+                if (ok && changed) sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+                else {
+                    sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                    changed = false;
+                }
             }
         }
         if (!changed) {
@@ -806,9 +834,6 @@ else if (result == AddWhaleResult::LIMIT_REACHED) {
 
         refreshWatchers();
         g_sessionManager.clearSession(chatId);
-        // Прямо в список кошельков, как и отмена: полагаться на историю здесь
-        // ненадёжно - при пустом стеке человека выбрасывало в главное меню,
-        // хотя переименовывал он кошелёк и ждёт увидеть список.
         auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
         replyInPlace(chatId, session.promptMessageId,
                 tr(lang, "rename_success") + "\n\n" +
