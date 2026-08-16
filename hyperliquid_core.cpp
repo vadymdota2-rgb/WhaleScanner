@@ -235,7 +235,6 @@ std::set<std::string> loadBannedWallets() {
             }
         }
     }
-    // Спотовый permanent ban (ignored_wallets) — тот же стоп-лист для перпов.
     {
         std::lock_guard<std::mutex> l(dbMutex);
         if (db) {
@@ -627,7 +626,6 @@ bool banWallet(const std::string& wallet, int trades) {
     }
     invalidateRankCache();
 
-    // Зеркало на спот: permanent ban + снять со всех user/service watchlist.
     if (!isPermanentlyBanned(addr)) {
         std::lock_guard<std::mutex> l(dbMutex);
         if (db) {
