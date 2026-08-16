@@ -65,10 +65,11 @@ std::string fmtUsdNanos(const cpp_int& nanos) {
 }
 
 bool isTrackingWallet(const std::string& chatId, const std::string& address) {
+    const std::string addr = toLower(address);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT 1 FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=? AND wa.address=?")) return false;
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(s,2,address.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,addr.c_str(),-1,SQLITE_TRANSIENT);
     bool e=sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s); return e;
 }
 
