@@ -65,8 +65,22 @@ cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) {
     if (usd > MAX_TRADE_USD_NANOS) return 0;
     return usd;
 }
-std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
-    std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
+std::string formatUsd(const cpp_int& n) {
+    std::string s = n.convert_to<std::string>();
+    while (s.length() < 10) s = "0" + s;
+    std::string dl = s.substr(0, s.length() - 9);
+    std::string ct = s.substr(s.length() - 9, 2);
+    if (dl.empty()) dl = "0";
+    std::string grouped;
+    int cnt = 0;
+    for (auto it = dl.rbegin(); it != dl.rend(); ++it) {
+        if (cnt && cnt % 3 == 0 && *it >= '0' && *it <= '9') grouped.push_back(',');
+        grouped.push_back(*it);
+        cnt++;
+    }
+    std::reverse(grouped.begin(), grouped.end());
+    return "$" + grouped + "." + ct;
+}
 
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec) {
     if (rawAmount <= 0 || usdNanos <= 0) return 0;
@@ -89,8 +103,17 @@ std::string formatPriceUsd(const cpp_int& n) {
     size_t keep = (lastNonZero == std::string::npos) ? 0 : (lastNonZero + 1);
     if (keep < 2) keep = 2;
     fracPart = fracPart.substr(0, keep);
-    return std::string(neg ? "-$" : "$") + dollarPart + "." + fracPart;
+    std::string grouped;
+    int cnt = 0;
+    for (auto it = dollarPart.rbegin(); it != dollarPart.rend(); ++it) {
+        if (cnt && cnt % 3 == 0 && *it >= '0' && *it <= '9') grouped.push_back(',');
+        grouped.push_back(*it);
+        cnt++;
+    }
+    std::reverse(grouped.begin(), grouped.end());
+    return std::string(neg ? "-$" : "$") + grouped + "." + fracPart;
 }
+
 
 namespace {
 
