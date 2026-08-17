@@ -214,7 +214,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                     t << (r.closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
                       << tr(lang, "hl_pnl") << ": <b>"
                       << formatUsdNanosSigned(r.closedPnlNanos, true) << "</b>\n";
-                t << "\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
+                t << "\U0001F4BC <code>" << r.wallet << "</code>\n\n";
 
                 const std::string btn = std::to_string(i + 1) + ". " + coin + " \u00B7 "
                                       + tr(lang, "big_track_btn");
@@ -251,7 +251,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                       << safeString(r.asset) << "</code>\n";
                 if (!r.txHash.empty())
                     t << "\U0001F194 TX: <code>" << safeString(r.txHash) << "</code>\n";
-                t << "\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
+                t << "\U0001F4BC <code>" << r.wallet << "</code>\n\n";
 
                 const std::string btn = std::to_string(i + 1) + ". " + sym + " \u00B7 "
                                       + tr(lang, "big_track_btn");
