@@ -82,6 +82,7 @@ std::vector<BigRow> spotRows(long long sinceSec, int limit) {
     if (!prepareOrLog(db, &s,
         "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.timestamp FROM trades t "
         "WHERE t.timestamp >= ? AND t.usd_nanos > 0 "
+        "AND t.usd_nanos <= 10000000000000000 "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw "
         "                WHERE iw.wallet = t.wallet AND iw.permanent = 1) "
         "ORDER BY t.usd_nanos DESC LIMIT ?")) return out;
@@ -155,22 +156,23 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
             const BigRow& r = rows[i];
             const bool up = r.side.find("Long") != std::string::npos ||
                             r.side.find("Buy")  != std::string::npos;
+            std::string assetLabel = perp ? r.asset : getSymbol(r.asset);
+            if (assetLabel.empty()) assetLabel = shortAddress(r.asset);
+            assetLabel = safeString(assetLabel, 16);
+
             t << "<b>" << (i + 1) << ".</b> " << (up ? "\U0001F7E2" : "\U0001F534")
-              << " <b>" << safeString(r.asset, 16) << "</b>\n"
+              << " <b>" << assetLabel << "</b>\n"
               << "\U0001F4B0 " << formatUsd(static_cast<cpp_int>(r.usdNanos));
             if (perp && r.leverage > 0) t << " \u00B7 " << r.leverage << "\u00D7";
-            t << "\n<code>" << shortAddress(r.wallet) << "</code>\n\n";
+            t << "\n\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
 
+            json row = json::array();
+            row.push_back({{"text", std::to_string(i + 1) + ". " + assetLabel + " · " + tr(lang, "big_track_btn")},
+                           {"callback_data", "tt_track:" + r.wallet}});
             if (perp)
-                kb["inline_keyboard"].push_back(json::array({
-                    {{"text", std::to_string(i + 1) + ". " + tr(lang, "big_positions_btn")},
-                     {"callback_data", "hl_pos:" + r.wallet}}
-                }));
-            else
-                kb["inline_keyboard"].push_back(json::array({
-                    {{"text", std::to_string(i + 1) + ". " + tr(lang, "big_track_btn")},
-                     {"callback_data", "tt_track:" + r.wallet}}
-                }));
+                row.push_back({{"text", tr(lang, "big_positions_btn")},
+                               {"callback_data", "hl_pos:" + r.wallet}});
+            kb["inline_keyboard"].push_back(row);
         }
 
         if (!premium) t << "<i>" << tr(lang, "big_free_note") << "</i>\n\n";
