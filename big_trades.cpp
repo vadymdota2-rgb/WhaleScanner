@@ -262,9 +262,6 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                 if (!r.amountStr.empty())
                     t << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
                       << safeString(r.amountStr, 24) << " " << coin << "</b>\n";
-                if (r.feeNanos != 0)
-                    t << "\u26FD " << tr(lang, "alert_gas") << ": <b>"
-                      << formatUsd(cpp_int(std::llabs(r.feeNanos))) << "</b>\n";
                 if (r.accountValueNanos > 0)
                     t << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
                       << formatUsd(cpp_int(r.accountValueNanos)) << "</b>\n";
