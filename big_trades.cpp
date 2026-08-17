@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <sqlite3.h>
 
 #include "json.hpp"
@@ -70,6 +71,19 @@ struct BigRow {
     int leverage = 0;
     bool isBuy = false;
 };
+
+
+std::vector<BigRow> uniqueByWallet(std::vector<BigRow> rows) {
+    std::unordered_set<std::string> seen;
+    std::vector<BigRow> out;
+    out.reserve(rows.size());
+    for (auto& r : rows) {
+        const std::string key = toLower(r.wallet);
+        if (!seen.insert(key).second) continue;
+        out.push_back(std::move(r));
+    }
+    return out;
+}
 
 std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     std::vector<BigRow> out;
@@ -175,7 +189,10 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const int maxRows = premium ? MAX_ROWS : FREE_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
-    std::vector<BigRow> rows = perp ? perpRows(since, maxRows) : spotRows(since, maxRows);
+    std::vector<BigRow> rows = perp ? perpRows(since, maxRows * 5) : spotRows(since, maxRows * 5);
+    rows = uniqueByWallet(std::move(rows));
+    if (static_cast<int>(rows.size()) > maxRows)
+        rows.resize(static_cast<size_t>(maxRows));
 
     std::ostringstream t;
     t << "\U0001F525 <b>" << tr(lang, perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
