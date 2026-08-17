@@ -174,9 +174,13 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "big_btn_spot")}, {"callback_data", "bg_open:spot:24h"}}
     }));
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "big_btn_perp")}, {"callback_data", "bg_open:perp:24h"}}
-    }));
+    {
+        std::string perpBtn = tr(lang, "big_btn_perp");
+        if (!isPremium(chatId)) perpBtn += " 🔒";
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", perpBtn}, {"callback_data", "bg_open:perp:24h"}}
+        }));
+    }
     kb["inline_keyboard"].push_back(backRow(lang, "menu:main"));
     return {t.str(), kb.dump()};
 }
@@ -186,6 +190,22 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const Lang lang = langFromCode(getUserLanguage(chatId));
     const bool perp = venue == "perp";
     const bool premium = isPremium(chatId);
+
+    if (perp && !premium) {
+        std::ostringstream t;
+        t << "🔥 <b>" << tr(lang, "big_perp_title") << "</b>
+
+"
+          << "🔒 " << tr(lang, "hl_locked_body");
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
+        }));
+        kb["inline_keyboard"].push_back(backRow(lang, "menu:big"));
+        return {t.str(), kb.dump()};
+    }
+
     const int maxRows = premium ? MAX_ROWS : FREE_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
