@@ -688,6 +688,10 @@ void saveTrade(const std::string& walletArg, const TxResult& tx,
 
     if (!tx.valid || !tx.isSwap) return;
     if (tx.usdNanos <= 0) return;
+    if (tx.usdNanos > cpp_int("10000000000000000")) {
+        std::cerr << "[RANKING] сделка с нереальной суммой отброшена: " << hash << std::endl;
+        return;
+    }
     if (tx.tokenAddr.empty()) return;
     if (tx.rawAmount <= 0) return;
 
@@ -786,6 +790,7 @@ void saveTrade(const std::string& walletArg, const TxResult& tx,
 
 void saveWalletHistory(const std::string& walletArg, const TxResult& tx,
                        const std::string& hash, long long blockTimestamp) {
+    if (tx.usdNanos > cpp_int("10000000000000000")) return;
     if (!tx.isSwap || tx.tokenAddr.empty() || tx.usdNanos <= 0) return;
 
     const std::string wallet = toLower(walletArg);
@@ -870,7 +875,8 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
             sqlite3_finalize(h);
             if (pos > 0 && cost > 0) {
                 const cpp_int avgBig = calcUnitPriceNanos(cost, pos, dec);
-                if (avgBig > 0) out.avgEntryNanos = static_cast<long long>(avgBig);
+                if (avgBig > 0 && avgBig <= cpp_int("1000000000000000"))
+                    out.avgEntryNanos = static_cast<long long>(avgBig);
             }
             out.buyCount = buys;
         }
@@ -951,7 +957,8 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     if (costOfSold <= 0) return false;
 
     const cpp_int avgBig = calcUnitPriceNanos(costOfSold, take, dec);
-    if (avgBig > 0) out.avgEntryNanos = static_cast<long long>(avgBig);
+    if (avgBig > 0 && avgBig <= cpp_int("1000000000000000"))
+        out.avgEntryNanos = static_cast<long long>(avgBig);
 
     const cpp_int pnl = cpp_int(sellUsdNanos) - costOfSold;
     out.pnlNanos = static_cast<long long>(pnl);
