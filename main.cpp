@@ -26,6 +26,7 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ranking.h"
+#include "big_trades.h"
 #include "alert_settings.h"
 #include "rpc_client.h"
 #include "chains.h"
@@ -710,6 +711,9 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", premiumLabel}, {"callback_data", "menu:premium"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_languages")}, {"callback_data", "menu:languages"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
@@ -1101,6 +1105,7 @@ std::string getSymbol(const std::string& addr) {
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
+constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
 std::map<std::string, double> POOL_LIQUIDITY_CACHE;
 
 double getPoolLiquidityUsd(const std::string& token) {
@@ -1130,6 +1135,7 @@ uint64_t getPriceNanos(const std::string& token) {
                 double price = 0.0;
                 try { price = std::stod(pair["priceUsd"].get<std::string>()); } catch (...) { continue; }
                 if (!std::isfinite(price) || price <= 0.0) continue;
+                if (liq < MIN_POOL_LIQUIDITY_USD) continue;
                 if (liq > bestLiquidity) { bestLiquidity = liq; p = price; }
             }
             if (bestLiquidity >= 0.0) {
@@ -1138,6 +1144,10 @@ uint64_t getPriceNanos(const std::string& token) {
             }
         }
     } catch (...) {}
+    if (p > 1e12) {
+        std::cerr << "[PRICE] отброшена бессмысленная цена " << p << " для " << a << std::endl;
+        p = 0;
+    }
     if (p==0) {
         const std::string platform = chainCtx().coingeckoPlatform.empty()
                                    ? std::string("binance-smart-chain") : chainCtx().coingeckoPlatform;
@@ -1464,6 +1474,12 @@ constexpr size_t VIEW_STACK_MAX = 12;
 std::string pagingRoot(const std::string& data) {
     if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
+    if (data.rfind("bg_page:", 0) == 0) {
+        const size_t a = data.find(':'), b = data.find(':', a + 1);
+        const size_t c = b == std::string::npos ? std::string::npos : data.find(':', b + 1);
+        if (c != std::string::npos) return "bg_open:" + data.substr(a + 1, c - a - 1);
+        return "menu:big";
+    }
     if (data.rfind("gt_page:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = data.find(':', k1 + 1);
@@ -1529,6 +1545,7 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         if (param == "toptrader") { auto r = buildVenueMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "toptrader_spot") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
+        if (param == "big") { auto r = buildBigMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
         if (param == "help") return TelegramUI::buildHelpMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
@@ -1761,6 +1778,9 @@ void handleCallbackQuery(const json& callbackQuery) {
     else if (action == "threshold") {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
+    }
+    else if (action == "bg_open" || action == "bg_page" || action == "bg_noop") {
+        handleBigTradesCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
     else if (action == "tt_track" || action == "tt_noop" ||
              action == "gt_open" || action == "gt_page") {
