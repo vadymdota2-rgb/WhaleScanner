@@ -79,6 +79,7 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
         "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, closed_pnl_nanos "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
+        "AND (dir LIKE '%Open Long%' OR dir LIKE '%Open Short%') "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "ORDER BY notional_nanos DESC LIMIT ?")) return out;
     sqlite3_bind_int64(s, 1, sinceSec * 1000LL);
