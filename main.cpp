@@ -1238,12 +1238,6 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
         msg += (res.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ") + counterLabel + ": <b>" +
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
-    if (res.gasUsdNanos > 0) {
-        long long gasLL = 0;
-        try { gasLL = std::stoll(res.gasUsdNanos.convert_to<std::string>()); } catch (...) {}
-        msg += "\u26FD " + tr(lang, "alert_gas") + ": <b>" +
-               formatUsdSmall(gasLL) + "</b>\n";
-    }
     if (!tokenIsNative) msg+="\U0001F4DC " + tr(lang, "alert_contract") + ": <code>"+safeString(res.tokenAddr)+"</code>\n";
     msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
     msg+="\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>"+safeString(label)+"</b>\n\n";
