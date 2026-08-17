@@ -14,6 +14,9 @@ uint64_t getPriceNanos(const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
 
+const cpp_int MAX_TRADE_USD_NANOS        = cpp_int("10000000000000000");   // $10 млн
+const cpp_int MAX_SANE_UNIT_PRICE_NANOS  = cpp_int("1000000000000000");    // $1 млн за токен
+
 cpp_int hexNibbles(const std::string& h, size_t from, size_t count) {
     cpp_int r = 0;
     const size_t end = std::min(h.size(), from + count);
@@ -53,14 +56,25 @@ std::string formatAmount(const cpp_int& raw, int dec) {
     std::reverse(grouped.begin(), grouped.end());
     return grouped+"."+fp;
 }
-cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) { if (!pn) return 0; cpp_int d=1; for (int i=0;i<dec;i++) d*=10; return (raw*pn)/d; }
+cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) {
+    if (!pn || raw <= 0) return 0;
+    if (dec < 0 || dec > 36) dec = 18;
+    cpp_int d = 1;
+    for (int i = 0; i < dec; i++) d *= 10;
+    const cpp_int usd = (raw * pn) / d;
+    if (usd > MAX_TRADE_USD_NANOS) return 0;
+    return usd;
+}
 std::string formatUsd(const cpp_int& n) { std::string s=n.convert_to<std::string>(); while (s.length()<10) s="0"+s;
     std::string dl=s.substr(0,s.length()-9), ct=s.substr(s.length()-9,2); if (dl.empty()) dl="0"; return "$"+dl+"."+ct; }
 
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec) {
-    if (rawAmount <= 0) return 0;
+    if (rawAmount <= 0 || usdNanos <= 0) return 0;
+    if (dec < 0 || dec > 36) dec = 18;
     cpp_int d = 1; for (int i = 0; i < dec; i++) d *= 10;
-    return (usdNanos * d) / rawAmount;
+    const cpp_int unit = (usdNanos * d) / rawAmount;
+    if (unit > MAX_SANE_UNIT_PRICE_NANOS) return 0;
+    return unit;
 }
 
 std::string formatPriceUsd(const cpp_int& n) {
