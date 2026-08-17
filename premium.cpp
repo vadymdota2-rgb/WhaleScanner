@@ -361,6 +361,30 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
         std::cerr << "[TON] счёт не создан: схема базы не готова" << std::endl;
         return false;
     }
+
+    // Если у человека уже есть живой счёт - отдаём его же. Иначе он вышел,
+    // зашёл, увидел другую метку, а перевёл по старой - и платёж повис бы.
+    {
+        const long long now = static_cast<long long>(time(nullptr));
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+            "SELECT memo, nano_amount FROM ton_invoices "
+            "WHERE chat_id=? AND status='active' AND created_at > ? "
+            "ORDER BY created_at DESC LIMIT 1")) {
+            sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, now - TON_INVOICE_TTL_SEC);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                out.memo = safeColumnText(s, 0);
+                out.nanoAmount = sqlite3_column_int64(s, 1);
+                out.gramAmount = static_cast<double>(out.nanoAmount) / 1e9;
+                out.wallet = tonWallet();
+                sqlite3_finalize(s);
+                return !out.wallet.empty();
+            }
+            sqlite3_finalize(s);
+        }
+    }
     out.wallet = tonWallet();
     if (out.wallet.empty()) {
         std::cerr << "[TON] счёт не создан: адрес кошелька пуст" << std::endl;
