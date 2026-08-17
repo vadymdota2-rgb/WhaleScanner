@@ -274,6 +274,7 @@ UIMessage buildAccountMenu(const std::string& chatId) {
 UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
     Lang lang = langFromCode(getUserLanguage(chatId));
     constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;
+    constexpr double MIN_POOL_LIQUIDITY_USD = 5000.0;
     constexpr int MAX_TOKENS_TO_CHECK = 40;
 
     std::vector<PortfolioItem> held;
@@ -318,16 +319,22 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         if (usd < cpp_int(DUST_USD_NANOS)) continue;
 
         bool illiquid = false;
-        double liq = chainCtx().stablecoins.count(t) ? 0.0 : getPoolLiquidityUsd(t);
-        if (liq > 0.0) {
-            const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
-            if (usd > poolCap) illiquid = true;
+        const bool stable = chainCtx().stablecoins.count(t) > 0;
+        const double liq = stable ? 0.0 : getPoolLiquidityUsd(t);
+
+        if (!stable) {
+            if (liq < MIN_POOL_LIQUIDITY_USD) {
+                illiquid = true;
+            } else {
+                const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
+                if (usd > poolCap) { illiquid = true; usd = poolCap; }
+            }
         }
 
         std::string sym = safeString(getSymbol(t), 12);
         if (illiquid) sym += " \u26A0";
         held.push_back({sym, formatAmount(raw, dec), usd});
-        totalUsdNanos += usd;
+        if (!illiquid) totalUsdNanos += usd;
         if (illiquid) ++illiquidCount;
     }
 
