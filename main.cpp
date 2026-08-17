@@ -1667,6 +1667,11 @@ void handleCallbackQuery(const json& callbackQuery) {
             auto msg = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
+        else if (param == "big") {
+            rememberView(chatId, data);
+            auto msg = buildBigMenu(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
         else if (param == "languages") {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildLanguagesMenu(chatId);
