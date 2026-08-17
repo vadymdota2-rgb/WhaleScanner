@@ -689,10 +689,13 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_account") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:account"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
+        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
     std::string premiumLabel = tr(lang, "menu_premium");
     if (chatId == SERVICE_CHAT_ID) {
@@ -709,9 +712,6 @@ UIMessage buildMainMenu(const std::string& chatId) {
     }
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", premiumLabel}, {"callback_data", "menu:premium"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_languages")}, {"callback_data", "menu:languages"}}
