@@ -25,9 +25,10 @@ void rememberView(const std::string& chatId, const std::string& data);
 
 namespace {
 
-constexpr int PER_PAGE   = 5;
-constexpr int MAX_ROWS   = 30;
-constexpr int FREE_ROWS  = 10;
+constexpr int PER_PAGE  = 5;
+constexpr int MAX_ROWS  = 30;
+constexpr int FREE_ROWS = 10;
+constexpr long long MAX_SPOT_USD_NANOS = 10000000000000000LL;
 
 long long windowSeconds(const std::string& w) {
     if (w == "1h") return 3600LL;
@@ -41,11 +42,32 @@ const char* windowKey(const std::string& w) {
     return "big_win_24h";
 }
 
+const char* hlDirKey(const std::string& dir) {
+    if (dir.find("Close Long")  != std::string::npos) return "hl_close_long";
+    if (dir.find("Close Short") != std::string::npos) return "hl_close_short";
+    if (dir.find("Open Long")   != std::string::npos) return "hl_open_long";
+    if (dir.find("Open Short")  != std::string::npos) return "hl_open_short";
+    if (dir.find("Long")  != std::string::npos) return "hl_open_long";
+    if (dir.find("Short") != std::string::npos) return "hl_open_short";
+    return "hl_open_long";
+}
+
+bool hlSideUp(const std::string& dir) {
+    const char* k = hlDirKey(dir);
+    return std::string(k) == "hl_open_long" || std::string(k) == "hl_close_short";
+}
+
 struct BigRow {
-    std::string wallet, asset, side;
+    std::string wallet;
+    std::string asset;
+    std::string side;
+    std::string amountStr;
+    std::string pxStr;
+    std::string txHash;
     long long usdNanos = 0;
-    long long ts = 0;
+    long long closedPnlNanos = 0;
     int leverage = 0;
+    bool isBuy = false;
 };
 
 std::vector<BigRow> perpRows(long long sinceSec, int limit) {
@@ -54,7 +76,8 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     if (!hl::g_hlDb) return out;
     sqlite3_stmt* s;
     if (!prepareOrLog(hl::g_hlDb, &s,
-        "SELECT wallet, coin, dir, notional_nanos, leverage, ts FROM hl_fills "
+        "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, closed_pnl_nanos "
+        "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "ORDER BY notional_nanos DESC LIMIT ?")) return out;
@@ -62,12 +85,15 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     sqlite3_bind_int(s, 2, limit);
     while (sqlite3_step(s) == SQLITE_ROW) {
         BigRow r;
-        r.wallet   = safeColumnText(s, 0);
-        r.asset    = safeColumnText(s, 1);
-        r.side     = safeColumnText(s, 2);
-        r.usdNanos = sqlite3_column_int64(s, 3);
-        r.leverage = sqlite3_column_int(s, 4);
-        r.ts       = sqlite3_column_int64(s, 5) / 1000;
+        r.wallet         = safeColumnText(s, 0);
+        r.asset          = safeColumnText(s, 1);
+        r.side           = safeColumnText(s, 2);
+        r.usdNanos       = sqlite3_column_int64(s, 3);
+        r.leverage       = sqlite3_column_int(s, 4);
+        r.pxStr          = safeColumnText(s, 5);
+        r.amountStr      = safeColumnText(s, 6);
+        r.closedPnlNanos = sqlite3_column_int64(s, 7);
+        r.isBuy          = hlSideUp(r.side);
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
@@ -80,21 +106,25 @@ std::vector<BigRow> spotRows(long long sinceSec, int limit) {
     if (!db) return out;
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
-        "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.timestamp FROM trades t "
+        "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.token_amount, t.tx_hash "
+        "FROM trades t "
         "WHERE t.timestamp >= ? AND t.usd_nanos > 0 "
-        "AND t.usd_nanos <= 10000000000000000 "
+        "AND t.usd_nanos <= ? "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw "
         "                WHERE iw.wallet = t.wallet AND iw.permanent = 1) "
         "ORDER BY t.usd_nanos DESC LIMIT ?")) return out;
     sqlite3_bind_int64(s, 1, sinceSec);
-    sqlite3_bind_int(s, 2, limit);
+    sqlite3_bind_int64(s, 2, MAX_SPOT_USD_NANOS);
+    sqlite3_bind_int(s, 3, limit);
     while (sqlite3_step(s) == SQLITE_ROW) {
         BigRow r;
-        r.wallet   = safeColumnText(s, 0);
-        r.asset    = safeColumnText(s, 1);
-        r.side     = sqlite3_column_int(s, 2) ? "Buy" : "Sell";
-        r.usdNanos = sqlite3_column_int64(s, 3);
-        r.ts       = sqlite3_column_int64(s, 4);
+        r.wallet    = safeColumnText(s, 0);
+        r.asset     = safeColumnText(s, 1);
+        r.isBuy     = sqlite3_column_int(s, 2) != 0;
+        r.side      = r.isBuy ? "Buy" : "Sell";
+        r.usdNanos  = sqlite3_column_int64(s, 3);
+        r.amountStr = safeColumnText(s, 4);
+        r.txHash    = safeColumnText(s, 5);
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
@@ -103,6 +133,12 @@ std::vector<BigRow> spotRows(long long sinceSec, int limit) {
 
 json backRow(Lang lang, const std::string& data) {
     return json::array({ {{"text", tr(lang, "back_button")}, {"callback_data", data}} });
+}
+
+std::string spotAssetLabel(const std::string& tokenAddr) {
+    std::string sym = getSymbol(tokenAddr);
+    if (sym.empty()) return shortAddress(tokenAddr);
+    return safeString(sym, 16);
 }
 
 }
@@ -154,25 +190,75 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
 
         for (int i = from; i < to; i++) {
             const BigRow& r = rows[i];
-            const bool up = r.side.find("Long") != std::string::npos ||
-                            r.side.find("Buy")  != std::string::npos;
-            std::string assetLabel = perp ? r.asset : getSymbol(r.asset);
-            if (assetLabel.empty()) assetLabel = shortAddress(r.asset);
-            assetLabel = safeString(assetLabel, 16);
 
-            t << "<b>" << (i + 1) << ".</b> " << (up ? "\U0001F7E2" : "\U0001F534")
-              << " <b>" << assetLabel << "</b>\n"
-              << "\U0001F4B0 " << formatUsd(static_cast<cpp_int>(r.usdNanos));
-            if (perp && r.leverage > 0) t << " \u00B7 " << r.leverage << "\u00D7";
-            t << "\n\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
+            if (perp) {
+                const char* dk = hlDirKey(r.side);
+                const bool up = hlSideUp(r.side);
+                const std::string coin = safeString(r.asset.empty() ? "?" : r.asset, 16);
 
-            json row = json::array();
-            row.push_back({{"text", std::to_string(i + 1) + ". " + assetLabel + " · " + tr(lang, "big_track_btn")},
-                           {"callback_data", "tt_track:" + r.wallet}});
-            if (perp)
-                row.push_back({{"text", tr(lang, "big_positions_btn")},
-                               {"callback_data", "hl_pos:" + r.wallet}});
-            kb["inline_keyboard"].push_back(row);
+                t << "<b>" << (i + 1) << ".</b> "
+                  << (up ? "\U0001F7E2" : "\U0001F534") << " <b>"
+                  << tr(lang, dk) << " " << coin << "</b>\n";
+                t << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>"
+                  << formatUsd(cpp_int(r.usdNanos)) << "</b>";
+                if (r.leverage > 0)
+                    t << " \u00B7 " << r.leverage << "\u00D7";
+                t << "\n";
+                if (!r.pxStr.empty())
+                    t << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
+                      << safeString(r.pxStr, 24) << "</b>\n";
+                if (!r.amountStr.empty())
+                    t << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
+                      << safeString(r.amountStr, 24) << " " << coin << "</b>\n";
+                if (r.closedPnlNanos != 0)
+                    t << (r.closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+                      << tr(lang, "hl_pnl") << ": <b>"
+                      << formatUsdNanosSigned(r.closedPnlNanos, true) << "</b>\n";
+                t << "\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
+
+                const std::string btn = std::to_string(i + 1) + ". " + coin + " \u00B7 "
+                                      + tr(lang, "big_track_btn");
+                kb["inline_keyboard"].push_back(json::array({
+                    {{"text", btn}, {"callback_data", "tt_track:" + r.wallet}}
+                }));
+            } else {
+                const std::string sym = spotAssetLabel(r.asset);
+                const int dec = getDecimals(r.asset);
+                cpp_int raw = 0;
+                try {
+                    if (!r.amountStr.empty()) raw = cpp_int(r.amountStr);
+                } catch (...) { raw = 0; }
+
+                t << "<b>" << (i + 1) << ".</b> "
+                  << (r.isBuy ? "\U0001F7E2" : "\U0001F534") << " <b>"
+                  << tr(lang, r.isBuy ? "alert_buy" : "alert_sell") << "</b>\n";
+                t << "\U0001F4B0 " << tr(lang, "alert_amount") << ": <b>"
+                  << formatUsd(cpp_int(r.usdNanos)) << "</b>\n";
+                t << "\U0001FA99 " << tr(lang, "alert_token") << ": <b>"
+                  << sym << "</b>\n";
+                if (raw > 0)
+                    t << "\U0001F4E6 " << tr(lang, "alert_qty") << ": <b>"
+                      << formatAmount(raw, dec) << "</b>\n";
+                if (raw > 0 && r.usdNanos > 0) {
+                    const cpp_int unit = calcUnitPriceNanos(cpp_int(r.usdNanos), raw, dec);
+                    if (unit > 0)
+                        t << "\U0001F4B5 "
+                          << tr(lang, r.isBuy ? "alert_buy_price" : "alert_sell_price")
+                          << ": <b>" << formatPriceUsd(unit) << "</b>\n";
+                }
+                if (!r.asset.empty())
+                    t << "\U0001F4DC " << tr(lang, "alert_contract") << ": <code>"
+                      << safeString(r.asset) << "</code>\n";
+                if (!r.txHash.empty())
+                    t << "\U0001F194 TX: <code>" << safeString(r.txHash) << "</code>\n";
+                t << "\U0001F4BC <code>" << shortAddress(r.wallet) << "</code>\n\n";
+
+                const std::string btn = std::to_string(i + 1) + ". " + sym + " \u00B7 "
+                                      + tr(lang, "big_track_btn");
+                kb["inline_keyboard"].push_back(json::array({
+                    {{"text", btn}, {"callback_data", "tt_track:" + r.wallet}}
+                }));
+            }
         }
 
         if (!premium) t << "<i>" << tr(lang, "big_free_note") << "</i>\n\n";
