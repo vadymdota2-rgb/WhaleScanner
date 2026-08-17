@@ -176,7 +176,7 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
     }));
     {
         std::string perpBtn = tr(lang, "big_btn_perp");
-        if (!isPremium(chatId)) perpBtn += " 🔒";
+        if (!isPremium(chatId)) perpBtn += " \U0001F512";
         kb["inline_keyboard"].push_back(json::array({
             {{"text", perpBtn}, {"callback_data", "bg_open:perp:24h"}}
         }));
@@ -193,10 +193,8 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
 
     if (perp && !premium) {
         std::ostringstream t;
-        t << "🔥 <b>" << tr(lang, "big_perp_title") << "</b>
-
-"
-          << "🔒 " << tr(lang, "hl_locked_body");
+        t << "\U0001F525 <b>" << tr(lang, "big_perp_title") << "</b>\n\n"
+          << "\U0001F512 " << tr(lang, "hl_locked_body");
         json kb;
         kb["inline_keyboard"] = json::array();
         kb["inline_keyboard"].push_back(json::array({
