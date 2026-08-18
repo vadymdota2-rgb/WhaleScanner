@@ -43,6 +43,7 @@ using boost::multiprecision::cpp_int;
 
 struct Stats {
     std::atomic<uint64_t> rpc_failures{0};
+    std::atomic<uint64_t> rpc_giveups{0};
     std::atomic<uint64_t> price_fallbacks{0};
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
@@ -2005,7 +2006,7 @@ void telegramLoop() {
                                   << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
-                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load() << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
+                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · " << g_stats.rpc_giveups.load() << " отказов" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             ss2 << rpcSlowSummary();
                             {
@@ -2147,6 +2148,9 @@ int main() {
     setRpcFailureHandler([]{
         g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
         g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
+    });
+    setRpcGiveUpHandler([]{
+        g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
     initDB(); initRankingDB(); seedWalletTokensFromTrades();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
