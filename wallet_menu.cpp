@@ -80,6 +80,19 @@ size_t countUserWhales(const std::string& chatId) {
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
 
+namespace {
+void reassignPrimaryLocked(const std::string& chatId) {
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
+        "SELECT whale_id FROM user_whales WHERE user_id=? ORDER BY created_at ASC, rowid ASC LIMIT 1) "
+        "AND NOT EXISTS (SELECT 1 FROM user_whales WHERE user_id=? AND is_primary=1)")) return;
+    for (int i = 1; i <= 3; i++) sqlite3_bind_text(s, i, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+}
+
 void untrackWalletFromService(const std::string& wallet) {
     const std::string addr = toLower(wallet);
     std::vector<std::pair<std::string, std::string>> recipients; // chatId, label
@@ -106,6 +119,9 @@ void untrackWalletFromService(const std::string& wallet) {
         if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db);
         else std::cerr << "[WATCHERS] bot untrack failed: " << sqlite3_errmsg(db) << std::endl;
         sqlite3_finalize(s);
+
+        if (removed > 0)
+            for (const auto& r : recipients) reassignPrimaryLocked(r.first);
     }
     if (removed <= 0) return;
 
@@ -225,16 +241,7 @@ bool removeUserWhale(const std::string& chatId, const std::string& addressArg) {
     }
     sqlite3_finalize(s);
 
-    if (removed && prepareOrLog(db,&s,
-        "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
-        "SELECT whale_id FROM user_whales WHERE user_id=? ORDER BY created_at ASC, rowid ASC LIMIT 1) "
-        "AND NOT EXISTS (SELECT 1 FROM user_whales WHERE user_id=? AND is_primary=1)")) {
-        sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-        sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-        sqlite3_bind_text(s,3,chatId.c_str(),-1,SQLITE_TRANSIENT);
-        sqlite3_step(s);
-        sqlite3_finalize(s);
-    }
+    if (removed) reassignPrimaryLocked(chatId);
 
     if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[DB] removeUserWhale COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
@@ -322,17 +329,19 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         const bool stable = chainCtx().stablecoins.count(t) > 0;
         const double liq = stable ? 0.0 : getPoolLiquidityUsd(t);
 
+        bool capped = false;
         if (!stable) {
             if (liq < MIN_POOL_LIQUIDITY_USD) {
                 illiquid = true;
             } else {
                 const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
-                if (usd > poolCap) { illiquid = true; usd = poolCap; }
+                if (usd > poolCap) { capped = true; usd = poolCap; }
             }
         }
 
         std::string sym = safeString(getSymbol(t), 12);
         if (illiquid) sym += " \u26A0";
+        else if (capped) sym += " \u2248";
         held.push_back({sym, formatAmount(raw, dec), usd});
         if (!illiquid) totalUsdNanos += usd;
         if (illiquid) ++illiquidCount;
@@ -377,12 +386,13 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
     bool premium = isPremium(chatId);
     Lang lang = langFromCode(getUserLanguage(chatId));
 
-    std::vector<std::pair<std::string, std::string>> walletRows;
+    struct WalletRow { std::string address, label; bool primary; };
+    std::vector<WalletRow> walletRows;
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (!prepareOrLog(db, &s,
-            "SELECT wa.address, uw.label FROM user_whales uw "
+            "SELECT wa.address, uw.label, uw.is_primary FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "WHERE uw.user_id = ? "
             "ORDER BY uw.is_primary DESC, uw.created_at")) {
@@ -390,7 +400,8 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         }
         sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
         while (sqlite3_step(s) == SQLITE_ROW)
-            walletRows.emplace_back(safeColumnText(s, 0), safeColumnText(s, 1));
+            walletRows.push_back({safeColumnText(s, 0), safeColumnText(s, 1),
+                                  sqlite3_column_int(s, 2) != 0});
         sqlite3_finalize(s);
     }
 
@@ -413,13 +424,14 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
 
     bool any = total > 0;
     for (int i = startIdx; i < endIdx; i++) {
-        const std::string& address = walletRows[i].first;
-        const std::string& label = walletRows[i].second;
+        const std::string& address = walletRows[i].address;
+        const std::string& label = walletRows[i].label;
         size_t idx = static_cast<size_t>(i);
 
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
+        const bool isPrimary = walletRows[i].primary;
         std::string status;
-        if (idx == 0) status = " 🔔 " + tr(lang, "wl_main_wallet");
+        if (isPrimary) status = " 🔔 " + tr(lang, "wl_main_wallet");
         else if (!premium) status = " ⏸ " + tr(lang, "wl_paused");
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
@@ -455,7 +467,7 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
 
         json row;
         row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
-        if (walletRows.size() > 1 && idx != 0)
+        if (walletRows.size() > 1 && !isPrimary)
             row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
         keyboard["inline_keyboard"].push_back(row);
