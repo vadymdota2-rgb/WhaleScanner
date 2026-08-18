@@ -11,13 +11,20 @@
 std::vector<std::string> RPC_ENDPOINTS;
 std::atomic<size_t> rpcIndex{0};
 
-namespace { std::function<void()> g_failureHandler; }
+namespace { std::function<void()> g_failureHandler; std::function<void()> g_giveUpHandler; }
+
+void setRpcGiveUpHandler(std::function<void()> handler) {
+    g_giveUpHandler = std::move(handler);
+}
 
 void setRpcFailureHandler(std::function<void()> handler) {
     g_failureHandler = std::move(handler);
 }
 
-namespace { inline void reportFailure() { if (g_failureHandler) g_failureHandler(); } }
+namespace {
+inline void reportFailure() { if (g_failureHandler) g_failureHandler(); }
+inline void reportGiveUp()  { if (g_giveUpHandler) g_giveUpHandler(); }
+}
 
 void setRpcEndpoints(const std::vector<std::string>& endpoints) {
     RPC_ENDPOINTS = endpoints;
@@ -46,6 +53,7 @@ std::string http(const std::string& url, const std::string& post, int timeout) {
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &res);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeout));
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION,
         +[](void*, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
             return running.load(std::memory_order_relaxed) ? 0 : 1; });
@@ -122,6 +130,7 @@ json rpcSpread(size_t seed, const std::string& method, json params) {
         if (!r.is_null()) return r;
         reportFailure();
     }
+    reportGiveUp();
     return nullptr;
 }
 
@@ -134,7 +143,7 @@ std::mutex g_rpcStreakMutex;
 std::map<std::string, int> g_rpcSlowStreakByEp;
 
 json rpc(const std::string& method, json params, int maxRetries) {
-    if (RPC_ENDPOINTS.empty()) { reportFailure(); return nullptr; }
+    if (RPC_ENDPOINTS.empty()) { reportFailure(); reportGiveUp(); return nullptr; }
     json r; r["jsonrpc"]="2.0"; r["method"]=method; r["params"]=params; r["id"]=1;
     std::string body = r.dump();
     for (int a = 0; a < maxRetries && running.load(std::memory_order_relaxed); a++) {
@@ -157,15 +166,13 @@ json rpc(const std::string& method, json params, int maxRetries) {
                 if (streak >= RPC_SLOW_STREAK_LIMIT) g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
             }
             if (streak >= RPC_SLOW_STREAK_LIMIT) {
-                size_t cur = rpcIndex.load(std::memory_order_relaxed);
-                rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[cur] << std::endl;
+                rpcIndex.store((idx + 1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[idx] << std::endl;
             }
         } else {
             std::lock_guard<std::mutex> sl(g_rpcStreakMutex);
             g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
         }
-        bool valid = false;
         try {
             auto p = json::parse(res);
             if (p.contains("result") && !p["result"].is_null()) {
@@ -173,15 +180,16 @@ json rpc(const std::string& method, json params, int maxRetries) {
                 return p["result"];
             }
         } catch (...) {}
-        if (!valid) {
+        {
             reportEndpoint(idx, false);
             reportFailure();
-            size_t cur = rpcIndex.load(std::memory_order_relaxed);
-            rpcIndex.store((cur+1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
-            std::cerr << "[RPC] Switching to " << ((cur+1)%RPC_ENDPOINTS.size()) << " after failure on " << RPC_ENDPOINTS[cur] << std::endl;
+            rpcIndex.store((idx + 1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+            std::cerr << "[RPC] Switching to " << ((idx + 1) % RPC_ENDPOINTS.size())
+                      << " after failure on " << RPC_ENDPOINTS[idx] << std::endl;
         }
         if (a < maxRetries-1) std::this_thread::sleep_for(std::chrono::milliseconds((1<<a)*500));
     }
+    reportGiveUp();
     return nullptr;
 }
 
