@@ -114,7 +114,6 @@ std::string formatPriceUsd(const cpp_int& n) {
     return std::string(neg ? "-$" : "$") + grouped + "." + fracPart;
 }
 
-
 namespace {
 
 struct UniversalRouterCommands {
@@ -377,9 +376,7 @@ cpp_int usdFromCounterAsset(const std::string& counterAddr, const cpp_int& count
     }
 
     if (g_chain.stablecoins.count(counterAddr)) {
-        const int dec = getDecimals(counterAddr);
-        cpp_int d = 1; for (int k = 0; k < dec; ++k) d *= 10;
-        return (counterAmount * cpp_int(1000000000)) / d;
+        return calcUsdNanos(counterAmount, getDecimals(counterAddr), 1000000000ULL);
     }
     return 0;
 }
@@ -449,8 +446,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     const std::string dead = "0x000000000000000000000000000000000000dead";
 
     std::map<std::string, cpp_int> netFlow;
-    std::map<std::string, cpp_int> grossIn;
-    std::map<std::string, cpp_int> grossOut;
     std::map<std::string, std::vector<FlowEdge>> graph;
     std::vector<std::string> tokenOrder;
     std::set<std::string> swapPools;
@@ -464,8 +459,6 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
     auto touch = [&](const std::string& token) {
         if (!netFlow.count(token)) {
             netFlow[token] = 0;
-            grossIn[token] = 0;
-            grossOut[token] = 0;
             tokenOrder.push_back(token);
         }
     };
@@ -580,12 +573,10 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         touch(logAddr);
         if (to == wallet) {
             netFlow[logAddr] += amount;
-            grossIn[logAddr] += amount;
             if (from == zero) mintedToWallet.insert(logAddr);
         }
         if (from == wallet) {
             netFlow[logAddr] -= amount;
-            grossOut[logAddr] += amount;
             if (to == zero || to == dead) burnedFromWallet.insert(logAddr);
         }
     }
