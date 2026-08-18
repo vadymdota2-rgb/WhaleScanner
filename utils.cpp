@@ -159,18 +159,3 @@ std::string formatPercent(double pct, bool withPlus) {
     return std::string(sign) + buf + "%";
 }
 
-std::string formatUsdSmall(long long nanos) {
-    if (nanos <= 0) return "$0";
-    const double usd = static_cast<double>(nanos) / 1e9;
-    char buf[48];
-    if (usd >= 0.01) {
-        std::snprintf(buf, sizeof(buf), "%.2f", usd);
-    } else if (usd >= 0.0001) {
-        std::snprintf(buf, sizeof(buf), "%.4f", usd);
-    } else if (usd >= 0.00000001) {
-        std::snprintf(buf, sizeof(buf), "%.8f", usd);
-    } else {
-        return "<$0.00000001";
-    }
-    return std::string("$") + buf;
-}
