@@ -13,7 +13,6 @@ std::string safeString(const std::string& s, size_t maxLen = 64);
 std::string formatThousands(uint64_t v);
 std::string formatUsdNanosSigned(long long nanos, bool withPlus = true);
 std::string formatPercent(double pct, bool withPlus = true);
-std::string formatUsdSmall(long long nanos);
 bool hexToLL(const std::string& hex, long long& out);
 bool isValidAddress(const std::string& a);
 std::string safeColumnText(sqlite3_stmt* stmt, int col);
