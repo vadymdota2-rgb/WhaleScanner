@@ -32,5 +32,6 @@ void reportEndpoint(size_t idx, bool ok);
 size_t usableEndpointFrom(size_t idx);
 
 void setRpcFailureHandler(std::function<void()> handler);
+void setRpcGiveUpHandler(std::function<void()> handler);
 
 std::string rpcSlowSummary();
