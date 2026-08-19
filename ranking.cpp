@@ -111,10 +111,10 @@ void initRankingDB() {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_wh_hash ON wallet_history(tx_hash, wallet, token, is_buy);
         CREATE INDEX IF NOT EXISTS idx_wh_lookup ON wallet_history(wallet, token, timestamp);
         CREATE INDEX IF NOT EXISTS idx_wh_time ON wallet_history(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_trades_token ON trades(token);
         DROP INDEX IF EXISTS idx_trades_wallet;
         CREATE INDEX IF NOT EXISTS idx_trades_wallet_time ON trades(wallet, timestamp);
         CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
+        DROP INDEX IF EXISTS idx_trades_token;
         CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp);
         CREATE TABLE IF NOT EXISTS ignored_wallets(
             wallet TEXT PRIMARY KEY,
