@@ -7,6 +7,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <sqlite3.h>
 
@@ -39,11 +40,31 @@ std::map<std::string, std::string> TOKEN_SYMBOLS;
 std::map<std::string, int> TOKEN_DECIMALS;
 std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 std::map<std::string, double> POOL_LIQUIDITY_CACHE;
+std::map<std::string, time_t> POOL_LIQUIDITY_TS;
 
 std::mutex g_pairCacheMutex;
 std::map<std::string, std::string> PAIR_CACHE;
-constexpr time_t NEGATIVE_PAIR_TTL = 1800;
+std::map<std::string, time_t> PAIR_CACHE_TS;
+constexpr time_t PAIR_CACHE_TTL = 6 * 3600;      // пары: 6 ч
+constexpr time_t NEGATIVE_PAIR_TTL = 1800;        // «пары нет»: 30 мин
+constexpr time_t LIQ_CACHE_TTL = 20 * 60;         // оценка liq в RAM: 20 мин
+constexpr time_t PRICE_RAM_SWEEP = 15 * 60;       // выкинуть протухшие цены из RAM
+constexpr time_t CLEAN_NEG_EVERY = 10 * 60;
+constexpr time_t CLEAN_PRICE_RAM_EVERY = 15 * 60;
+constexpr time_t CLEAN_LIQ_EVERY = 20 * 60;
+constexpr time_t CLEAN_PAIR_EVERY = 30 * 60;
+constexpr time_t CLEAN_HIST_EVERY = 6 * 3600;
+
 std::map<std::string, time_t> NEGATIVE_PAIR_UNTIL;
+
+static void ensurePairCacheSchema() {
+    static bool done = false;
+    if (done) return;
+    char* err = nullptr;
+    sqlite3_exec(db, "ALTER TABLE pair_cache ADD COLUMN ts INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, &err);
+    if (err) sqlite3_free(err);
+    done = true;
+}
 
 }
 
@@ -68,29 +89,158 @@ void loadTokenCache() {
 
 void savePairCache(const std::string& token, const std::string& val) {
     if (val.empty()) return;
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT INTO pair_cache(token,val) VALUES(?,?) ON CONFLICT(token) DO UPDATE SET val=excluded.val")) return;
-    sqlite3_bind_text(s,1,token.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(s,2,val.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
+    const time_t now = time(nullptr);
+    {
+        std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+        PAIR_CACHE[token] = val;
+        PAIR_CACHE_TS[token] = now;
+    }
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        ensurePairCacheSchema();
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db,&s,
+            "INSERT INTO pair_cache(token,val,ts) VALUES(?,?,?) "
+            "ON CONFLICT(token) DO UPDATE SET val=excluded.val, ts=excluded.ts")) return;
+        sqlite3_bind_text(s,1,token.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_bind_text(s,2,val.c_str(),-1,SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s,3,static_cast<sqlite3_int64>(now));
+        sqlite3_step(s); sqlite3_finalize(s);
+    }
 }
 
 void loadPairCache() {
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"SELECT token,val FROM pair_cache")) return;
-    int n = 0;
+    const time_t now = time(nullptr);
+    const time_t cutoff = now - PAIR_CACHE_TTL;
+    std::vector<std::tuple<std::string,std::string,time_t>> rows;
+    int skipped = 0;
     {
-        std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+        std::lock_guard<std::mutex> l(dbMutex);
+        ensurePairCacheSchema();
+        sqlite3_stmt* d;
+        if (prepareOrLog(db,&d,"DELETE FROM pair_cache WHERE ts>0 AND ts<?")) {
+            sqlite3_bind_int64(d,1,static_cast<sqlite3_int64>(cutoff));
+            sqlite3_step(d);
+            sqlite3_finalize(d);
+        }
+        sqlite3_stmt* s;
+        // ts=0 — старые записи: берём, возраст = now, протухнут через TTL
+        if (!prepareOrLog(db,&s,"SELECT token,val,ts FROM pair_cache")) return;
         while (sqlite3_step(s)==SQLITE_ROW) {
             std::string t = toLower(safeColumnText(s,0));
             std::string v = safeColumnText(s,1);
-            if (t.size()==42 && !v.empty()) { PAIR_CACHE[t]=v; ++n; }
+            time_t ts = static_cast<time_t>(sqlite3_column_int64(s,2));
+            if (t.size()!=42 || v.empty()) continue;
+            if (ts > 0 && ts < cutoff) { ++skipped; continue; }
+            rows.emplace_back(std::move(t), std::move(v), ts > 0 ? ts : now);
+        }
+        sqlite3_finalize(s);
+    }
+    {
+        std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+        for (auto& [t,v,ts] : rows) {
+            PAIR_CACHE[t] = std::move(v);
+            PAIR_CACHE_TS[t] = ts;
         }
     }
-    sqlite3_finalize(s);
-    if (n>0) std::cout << "[STARTUP] Loaded " << n << " cached pairs" << std::endl;
+    if (!rows.empty() || skipped > 0)
+        std::cout << "[STARTUP] Loaded " << rows.size() << " cached pairs"
+                  << (skipped ? (", skipped expired " + std::to_string(skipped)) : "")
+                  << std::endl;
+}
+
+void cleanupPairCache() {
+    const time_t cutoff = time(nullptr) - PAIR_CACHE_TTL;
+    int ram = 0, dbn = 0;
+    {
+        std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+        for (auto it = PAIR_CACHE_TS.begin(); it != PAIR_CACHE_TS.end(); ) {
+            if (it->second < cutoff) {
+                PAIR_CACHE.erase(it->first);
+                it = PAIR_CACHE_TS.erase(it);
+                ++ram;
+            } else ++it;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        ensurePairCacheSchema();
+        sqlite3_stmt* s;
+        if (prepareOrLog(db,&s,"DELETE FROM pair_cache WHERE ts>0 AND ts<?")) {
+            sqlite3_bind_int64(s,1,static_cast<sqlite3_int64>(cutoff));
+            if (sqlite3_step(s)==SQLITE_DONE) dbn = sqlite3_changes(db);
+            sqlite3_finalize(s);
+        }
+    }
+    if (ram > 0 || dbn > 0)
+        std::cout << "[PAIR-CACHE] expired: ram=" << ram << " db=" << dbn << std::endl;
+}
+
+static void cleanupNegativePairs() {
+    const time_t now = time(nullptr);
+    int n = 0;
+    std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+    for (auto it = NEGATIVE_PAIR_UNTIL.begin(); it != NEGATIVE_PAIR_UNTIL.end(); ) {
+        if (it->second <= now) { it = NEGATIVE_PAIR_UNTIL.erase(it); ++n; }
+        else ++it;
+    }
+    if (n > 0) std::cout << "[PAIR-CACHE] negative expired: " << n << std::endl;
+}
+
+static void cleanupPriceRam() {
+    const time_t now = time(nullptr);
+    int n = 0;
+    std::lock_guard<std::mutex> l(cacheMutex);
+    for (auto it = PRICE_NANOS_CACHE.begin(); it != PRICE_NANOS_CACHE.end(); ) {
+        // native держим дольше — свой TTL
+        const std::string& w = chainCtx().wrappedNative;
+        const time_t ttl = (!w.empty() && it->first == toLower(w)) ? NATIVE_PRICE_TTL : PRICE_TTL;
+        if (now - it->second.second > ttl) {
+            it = PRICE_NANOS_CACHE.erase(it);
+            ++n;
+        } else ++it;
+    }
+    if (n > 0) std::cout << "[PRICE] ram expired: " << n << std::endl;
+}
+
+static void cleanupLiqCache() {
+    const time_t now = time(nullptr);
+    int n = 0;
+    std::lock_guard<std::mutex> l(cacheMutex);
+    for (auto it = POOL_LIQUIDITY_TS.begin(); it != POOL_LIQUIDITY_TS.end(); ) {
+        if (now - it->second > LIQ_CACHE_TTL) {
+            POOL_LIQUIDITY_CACHE.erase(it->first);
+            it = POOL_LIQUIDITY_TS.erase(it);
+            ++n;
+        } else ++it;
+    }
+    if (n > 0) std::cout << "[PRICE] liq cache expired: " << n << std::endl;
+}
+
+void cleanupTokenPricesPeriodic() {
+    static time_t lastNeg = 0, lastPriceRam = 0, lastLiq = 0, lastPair = 0, lastHist = 0;
+    const time_t now = time(nullptr);
+
+    if (now - lastNeg >= CLEAN_NEG_EVERY) {
+        cleanupNegativePairs();
+        lastNeg = now;
+    }
+    if (now - lastPriceRam >= CLEAN_PRICE_RAM_EVERY) {
+        cleanupPriceRam();
+        lastPriceRam = now;
+    }
+    if (now - lastLiq >= CLEAN_LIQ_EVERY) {
+        cleanupLiqCache();
+        lastLiq = now;
+    }
+    if (now - lastPair >= CLEAN_PAIR_EVERY) {
+        cleanupPairCache();
+        lastPair = now;
+    }
+    if (now - lastHist >= CLEAN_HIST_EVERY) {
+        cleanupPriceHistory();
+        lastHist = now;
+    }
 }
 
 void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
@@ -227,9 +377,17 @@ std::string getSymbol(const std::string& addr) {
 }
 
 double getPoolLiquidityUsd(const std::string& token) {
+    const std::string a = toLower(token);
     std::lock_guard<std::mutex> l(cacheMutex);
-    auto it = POOL_LIQUIDITY_CACHE.find(toLower(token));
-    return it != POOL_LIQUIDITY_CACHE.end() ? it->second : 0.0;
+    auto it = POOL_LIQUIDITY_CACHE.find(a);
+    if (it == POOL_LIQUIDITY_CACHE.end()) return 0.0;
+    auto ts = POOL_LIQUIDITY_TS.find(a);
+    if (ts != POOL_LIQUIDITY_TS.end() && time(nullptr) - ts->second > LIQ_CACHE_TTL) {
+        POOL_LIQUIDITY_CACHE.erase(it);
+        POOL_LIQUIDITY_TS.erase(ts);
+        return 0.0;
+    }
+    return it->second;
 }
 
 static uint64_t cachedNativePriceNanos() {
@@ -260,13 +418,20 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         }
         auto it = PAIR_CACHE.find(t);
         if (it != PAIR_CACHE.end()) {
-            const size_t b1 = it->second.find('|');
-            const size_t b2 = it->second.rfind('|');
-            if (b1 != std::string::npos && b2 > b1) {
-                cachedPair = it->second.substr(0, b1);
-                cachedBase = it->second.substr(b1 + 1, b2 - b1 - 1);
-                if (b2 + 1 < it->second.size())
-                    cachedSide = (it->second[b2 + 1] == '0') ? 0 : 1;
+            auto tsIt = PAIR_CACHE_TS.find(t);
+            const time_t ts = (tsIt != PAIR_CACHE_TS.end()) ? tsIt->second : 0;
+            if (ts > 0 && time(nullptr) - ts > PAIR_CACHE_TTL) {
+                PAIR_CACHE.erase(it);
+                if (tsIt != PAIR_CACHE_TS.end()) PAIR_CACHE_TS.erase(tsIt);
+            } else {
+                const size_t b1 = it->second.find('|');
+                const size_t b2 = it->second.rfind('|');
+                if (b1 != std::string::npos && b2 > b1) {
+                    cachedPair = it->second.substr(0, b1);
+                    cachedBase = it->second.substr(b1 + 1, b2 - b1 - 1);
+                    if (b2 + 1 < it->second.size())
+                        cachedSide = (it->second[b2 + 1] == '0') ? 0 : 1;
+                }
             }
         }
     }
@@ -283,10 +448,7 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         }
     }
 
-    uint64_t bestPrice = 0;
-    double bestLiq = -1.0;
-    std::string bestStored;
-
+    // Первая валидная пара (WBNB → стейблы). Max-liq давал завышенные цены на кривых пулах → ROI.
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t || base.size() != 42) continue;
 
@@ -296,14 +458,9 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             if (basePrice == 0) continue;
         }
 
-        std::string pair;
-        bool tokenIsZero = false;
-        bool knownSide = false;
-        if (!cachedPair.empty() && base == cachedBase) {
-            pair = cachedPair;
-            tokenIsZero = (cachedSide == 0);
-            knownSide = (cachedSide >= 0);
-        }
+        std::string pair = cachedPair;
+        bool tokenIsZero = (cachedSide == 0);
+        bool knownSide = (cachedSide >= 0 && !pair.empty());
 
         if (pair.empty()) {
             std::string data = "0xe6a43905";
@@ -333,6 +490,8 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             const std::string t0hex = t0.get<std::string>();
             if (t0hex.size() < 66) continue;
             tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
+            const std::string stored = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+            savePairCache(t, stored);  // RAM + БД + ts
         }
 
         const cpp_int tokenRes = tokenIsZero ? r0 : r1;
@@ -353,30 +512,17 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
 
         if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) continue;
 
-        const cpp_int liqNanos = (baseRes * cpp_int(basePrice) * 2) / baseScale;
-        const double liqUsd = static_cast<double>(static_cast<long long>(
-            liqNanos > cpp_int("9000000000000000000") ? cpp_int("9000000000000000000") : liqNanos)) / 1e9;
-
-        if (liqUsd > bestLiq) {
-            bestLiq = liqUsd;
-            bestPrice = static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
-            bestStored = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
-        }
-    }
-
-    if (bestPrice > 0) {
-        if (!bestStored.empty()) {
-            {
-                std::lock_guard<std::mutex> l(g_pairCacheMutex);
-                PAIR_CACHE[t] = bestStored;
+        {
+            const cpp_int liqNanos = (baseRes * cpp_int(basePrice) * 2) / baseScale;
+            const double liqUsd = static_cast<double>(static_cast<long long>(
+                liqNanos > cpp_int("9000000000000000000") ? cpp_int("9000000000000000000") : liqNanos)) / 1e9;
+            if (liqUsd > 0.0) {
+                std::lock_guard<std::mutex> l(cacheMutex);
+                POOL_LIQUIDITY_CACHE[t] = liqUsd;
+                POOL_LIQUIDITY_TS[t] = time(nullptr);
             }
-            savePairCache(t, bestStored);
         }
-        if (bestLiq > 0.0) {
-            std::lock_guard<std::mutex> l(cacheMutex);
-            POOL_LIQUIDITY_CACHE[t] = bestLiq;
-        }
-        return bestPrice;
+        return static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
     }
     {
         std::lock_guard<std::mutex> l(g_pairCacheMutex);
@@ -421,6 +567,7 @@ uint64_t getPriceNanos(const std::string& token) {
             if (bestLiquidity >= 0.0) {
                 std::lock_guard<std::mutex> l(cacheMutex);
                 POOL_LIQUIDITY_CACHE[a] = bestLiquidity;
+                POOL_LIQUIDITY_TS[a] = time(nullptr);
             }
         }
     } catch (...) {}
