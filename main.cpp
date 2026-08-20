@@ -1864,16 +1864,16 @@ void telegramLoop() {
                                   << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
-                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load()
-                                << " · giveup: " << g_stats.rpc_giveups.load()
-                                << "\n💰 Price src: cache " << g_stats.price_cache_hit.load()
-                                << " · pool " << g_stats.price_from_pool.load()
-                                << " · dex " << g_stats.price_from_dex.load()
-                                << " · cg " << g_stats.price_from_cg.load()
-                                << "\n💰 Price guard: thin " << g_stats.price_thin_pool.load()
-                                << " · stale " << g_stats.price_fallbacks.load()
-                                << " · div " << g_stats.price_divergence.load()
-                                << " · spike " << g_stats.price_spike_reject.load()
+                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · "
+                                << g_stats.rpc_giveups.load() << " отказов"
+                                << "\n💰 Цена: кэш " << g_stats.price_cache_hit.load()
+                                << " · пул " << g_stats.price_from_pool.load()
+                                << " · DexScreener " << g_stats.price_from_dex.load()
+                                << " · CoinGecko " << g_stats.price_from_cg.load()
+                                << "\n💰 Защита: тонкий пул " << g_stats.price_thin_pool.load()
+                                << " · устаревший кэш " << g_stats.price_fallbacks.load()
+                                << " · расхождение " << g_stats.price_divergence.load()
+                                << " · скачок " << g_stats.price_spike_reject.load()
                                 << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
                                 << "\n📨 Sent: " << g_stats.alerts_sent.load()
                                 << "\n🔍 TX: " << g_stats.tx_processed.load()
