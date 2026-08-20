@@ -257,7 +257,7 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
-constexpr time_t PRICE_TTL = 180;
+constexpr time_t PRICE_TTL = 600;
 constexpr size_t MAX_USERS = 1000000;
 
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -349,6 +349,10 @@ void initDB() {
             last_seen INTEGER NOT NULL,
             PRIMARY KEY (wallet, token)
         );
+        CREATE TABLE IF NOT EXISTS pair_cache (
+            token TEXT PRIMARY KEY,
+            val TEXT NOT NULL
+        );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
     {
@@ -413,6 +417,36 @@ void loadTokenCache() {
         uint64_t pn=sqlite3_column_int64(s,3); time_t ts=sqlite3_column_int64(s,4);
         if (pn>0) PRICE_NANOS_CACHE[a]={pn,ts};
     } sqlite3_finalize(s);
+}
+
+std::mutex g_pairCacheMutex;
+std::map<std::string, std::string> PAIR_CACHE;
+
+void savePairCache(const std::string& token, const std::string& val) {
+    if (val.empty()) return;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT INTO pair_cache(token,val) VALUES(?,?) ON CONFLICT(token) DO UPDATE SET val=excluded.val")) return;
+    sqlite3_bind_text(s,1,token.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,2,val.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+
+void loadPairCache() {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT token,val FROM pair_cache")) return;
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> pl(g_pairCacheMutex);
+        while (sqlite3_step(s)==SQLITE_ROW) {
+            std::string t = toLower(safeColumnText(s,0));
+            std::string v = safeColumnText(s,1);
+            if (t.size()==42 && !v.empty()) { PAIR_CACHE[t]=v; ++n; }
+        }
+    }
+    sqlite3_finalize(s);
+    if (n>0) std::cout << "[STARTUP] Loaded " << n << " cached pairs" << std::endl;
 }
 void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -1135,9 +1169,6 @@ double getPoolLiquidityUsd(const std::string& token) {
     return it != POOL_LIQUIDITY_CACHE.end() ? it->second : 0.0;
 }
 
-std::mutex g_pairCacheMutex;
-std::map<std::string, std::string> PAIR_CACHE;   // токен -> "пара|база|0/1", "" = пар нет
-
 static uint64_t cachedNativePriceNanos() {
     const std::string w = toLower(chainCtx().wrappedNative);
     std::lock_guard<std::mutex> l(cacheMutex);
@@ -1224,8 +1255,12 @@ uint64_t priceFromPoolReserves(const std::string& token) {
             const std::string t0hex = t0.get<std::string>();
             if (t0hex.size() < 66) continue;
             tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
-            std::lock_guard<std::mutex> l(g_pairCacheMutex);
-            PAIR_CACHE[t] = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+            const std::string stored = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+            {
+                std::lock_guard<std::mutex> l(g_pairCacheMutex);
+                PAIR_CACHE[t] = stored;
+            }
+            savePairCache(t, stored);
             cachedPair = pair;
             cachedBase = base;
             cachedSide = tokenIsZero ? 0 : 1;
@@ -2368,6 +2403,7 @@ int main() {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     loadTokenCache();
+    loadPairCache();
     ensureNativePrice();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
