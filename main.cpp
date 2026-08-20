@@ -1159,8 +1159,13 @@ uint64_t priceFromPoolReserves(const std::string& token) {
         }
     }
     if (bases.empty()) {
-        for (const auto& sc : ctx.stablecoins) bases.push_back({sc, 1000000000ULL});
+        // WBNB first — most common pair on BSC, fewer RPC calls
         bases.push_back({ctx.wrappedNative, 0});
+        int added = 0;
+        for (const auto& sc : ctx.stablecoins) {
+            bases.push_back({sc, 1000000000ULL});
+            if (++added >= 2) break;  // USDT + USDC enough
+        }
     }
 
     for (const auto& [base, fixedPrice] : bases) {
@@ -1220,7 +1225,7 @@ uint64_t priceFromPoolReserves(const std::string& token) {
         uint64_t basePrice = fixedPrice;
         if (basePrice == 0) {
             std::lock_guard<std::mutex> l(cacheMutex);
-            auto it = PRICE_NANOS_CACHE.find(ctx.wrappedNative);
+            auto it = PRICE_NANOS_CACHE.find(toLower(ctx.wrappedNative));
             if (it != PRICE_NANOS_CACHE.end()) basePrice = it->second.first;
         }
         if (basePrice == 0) continue;
@@ -1316,6 +1321,65 @@ uint64_t getPriceNanos(const std::string& token) {
     }
     return n;
 }
+
+void ensureNativePrice() {
+    const std::string& w = chainCtx().wrappedNative;
+    if (w.empty()) return;
+
+    {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        auto it = PRICE_NANOS_CACHE.find(toLower(w));
+        if (it != PRICE_NANOS_CACHE.end() && it->second.first > 0)
+            return;
+    }
+
+    double p = 0.0;
+
+    auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + w, "", 8);
+    try {
+        auto j = json::parse(r, nullptr, false);
+        if (j.is_object() && j.contains("pairs") && j["pairs"].is_array()) {
+            for (const auto& pair : j["pairs"]) {
+                if (!pair.is_object()) continue;
+                if (pair.value("chainId", "") != chainCtx().dexscreenerChainId) continue;
+                if (!pair.contains("priceUsd") || !pair["priceUsd"].is_string()) continue;
+                try {
+                    double price = std::stod(pair["priceUsd"].get<std::string>());
+                    if (std::isfinite(price) && price > 0.0 && price < 1e6) {
+                        p = price;
+                        break;
+                    }
+                } catch (...) {}
+            }
+        }
+    } catch (...) {}
+
+    if (p <= 0.0) {
+        const std::string platform = chainCtx().coingeckoPlatform.empty()
+            ? "binance-smart-chain" : chainCtx().coingeckoPlatform;
+        auto r2 = http(
+            "https://api.coingecko.com/api/v3/simple/token_price/" + platform +
+            "?contract_addresses=" + w + "&vs_currencies=usd", "", 8);
+        try {
+            auto j2 = json::parse(r2, nullptr, false);
+            std::string a = toLower(w);
+            if (j2.contains(a) && j2[a].contains("usd") && j2[a]["usd"].is_number()) {
+                double cg = j2[a]["usd"].get<double>();
+                if (std::isfinite(cg) && cg > 0.0) p = cg;
+            }
+        } catch (...) {}
+    }
+
+    if (p > 0.0) {
+        uint64_t n = static_cast<uint64_t>(p * 1e9);
+        std::lock_guard<std::mutex> l(cacheMutex);
+        PRICE_NANOS_CACHE[toLower(w)] = {n, time(nullptr)};
+        std::cout << "[PRICE] Native price loaded: $" << p << std::endl;
+    } else {
+        std::cerr << "[PRICE] Failed to load native price — pool pricing limited" << std::endl;
+    }
+}
+
 
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
                               const TxResult& res, const std::string& hash, Lang lang) {
@@ -2305,6 +2369,7 @@ int main() {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     loadTokenCache();
+    ensureNativePrice();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     checkTranslations();
