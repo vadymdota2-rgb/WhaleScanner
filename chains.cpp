@@ -12,6 +12,7 @@ ChainContext makeBscContext() {
     c.nativeSymbol = "BNB";
     c.nativeMarker = NATIVE_BNB_MARKER;
     c.wrappedNative = WBNB_ADDR;
+    c.v2Factory = "0xca143ce32fe78f1f7019d7d551a6402fc5350c73";
     c.stablecoins = {
         "0x55d398326f99059ff775485246999027b3197955",
         "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",
