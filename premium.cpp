@@ -362,8 +362,6 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
         return false;
     }
 
-    // Если у человека уже есть живой счёт - отдаём его же. Иначе он вышел,
-    // зашёл, увидел другую метку, а перевёл по старой - и платёж повис бы.
     {
         const long long now = static_cast<long long>(time(nullptr));
         std::lock_guard<std::mutex> l(dbMutex);
