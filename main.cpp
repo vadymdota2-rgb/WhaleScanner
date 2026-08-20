@@ -1683,12 +1683,12 @@ void dbMaintenanceLoop() {
     while (running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::minutes(1));
         try {
+            cleanupTokenPricesPeriodic();
             bool doTruncate = std::chrono::duration_cast<std::chrono::minutes>(
                 std::chrono::steady_clock::now() - lastTruncate).count() >= 30;
             walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);
             if (doTruncate) {
                 cleanupOldTx(g_lastProcessedBlock.load(std::memory_order_relaxed));
-                cleanupPriceHistory();
                 lastTruncate = std::chrono::steady_clock::now();
             }
         } catch (const std::exception& e) { std::cerr << "[DB-MAINT][ERROR] " << e.what() << std::endl; }
