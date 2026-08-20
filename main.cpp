@@ -45,6 +45,8 @@ struct Stats {
     std::atomic<uint64_t> rpc_failures{0};
     std::atomic<uint64_t> rpc_giveups{0};
     std::atomic<uint64_t> price_fallbacks{0};
+    std::atomic<uint64_t> price_thin_pool{0};
+    std::atomic<uint64_t> price_from_pool{0};
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
@@ -1115,9 +1117,88 @@ double getPoolLiquidityUsd(const std::string& token) {
     return it != POOL_LIQUIDITY_CACHE.end() ? it->second : 0.0;
 }
 
+uint64_t priceFromPoolReserves(const std::string& token) {
+    const auto& ctx = chainCtx();
+    if (ctx.v2Factory.empty() || ctx.wrappedNative.empty()) return 0;
+    const std::string t = toLower(token);
+    if (t == ctx.wrappedNative) return 0;
+
+    std::vector<std::pair<std::string, uint64_t>> bases;
+    for (const auto& sc : ctx.stablecoins) bases.push_back({sc, 1000000000ULL});
+    bases.push_back({ctx.wrappedNative, 0});
+
+    for (const auto& [base, fixedPrice] : bases) {
+        if (base == t) continue;
+
+        std::string data = "0xe6a43905";
+        const std::string a = t.substr(2), b = base.substr(2);
+        data += std::string(24, '0') + a;
+        data += std::string(24, '0') + b;
+        json r = rpc("eth_call", json::array({ json{{"to", ctx.v2Factory}, {"data", data}}, "latest" }));
+        if (!r.is_string()) continue;
+        std::string pairHex = r.get<std::string>();
+        if (pairHex.size() < 66) continue;
+        const std::string pair = "0x" + pairHex.substr(pairHex.size() - 40);
+        if (pair == "0x" + std::string(40, '0')) continue;
+
+        json rr = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0902f1ac"}}, "latest" }));
+        if (!rr.is_string()) continue;
+        const std::string res = rr.get<std::string>();
+        if (res.size() < 2 + 64 * 2) continue;
+        const std::string body = res.substr(2);
+
+        cpp_int r0 = hexToCppInt(body.substr(0, 64));
+        cpp_int r1 = hexToCppInt(body.substr(64, 64));
+        if (r0 <= 0 || r1 <= 0) continue;
+
+        json t0 = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0dfe1681"}}, "latest" }));
+        if (!t0.is_string()) continue;
+        const std::string t0hex = t0.get<std::string>();
+        if (t0hex.size() < 66) continue;
+        const std::string token0 = "0x" + toLower(t0hex.substr(t0hex.size() - 40));
+
+        const cpp_int tokenRes = (token0 == t) ? r0 : r1;
+        const cpp_int baseRes  = (token0 == t) ? r1 : r0;
+
+        const int tokenDec = getDecimals(t);
+        const int baseDec  = getDecimals(base);
+        if (tokenDec < 0 || tokenDec > 36 || baseDec < 0 || baseDec > 36) continue;
+
+        uint64_t basePrice = fixedPrice;
+        if (basePrice == 0) {
+            std::lock_guard<std::mutex> l(cacheMutex);
+            auto it = PRICE_NANOS_CACHE.find(ctx.wrappedNative);
+            if (it != PRICE_NANOS_CACHE.end()) basePrice = it->second.first;
+        }
+        if (basePrice == 0) continue;
+
+        cpp_int tokenScale = 1, baseScale = 1;
+        for (int i = 0; i < tokenDec; i++) tokenScale *= 10;
+        for (int i = 0; i < baseDec;  i++) baseScale  *= 10;
+
+        const cpp_int num = baseRes * tokenScale * cpp_int(basePrice);
+        const cpp_int den = tokenRes * baseScale;
+        if (den <= 0) continue;
+        const cpp_int priceNanos = num / den;
+
+        if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) continue;
+        return static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
+    }
+    return 0;
+}
+
 uint64_t getPriceNanos(const std::string& token) {
+    bool thinPoolSeen = false;
     std::string a=toLower(token);
     { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
+    if (uint64_t own = priceFromPoolReserves(a)) {
+        { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={own,time(nullptr)}; }
+        saveTokenPrice(a, own);
+        savePriceHistory(a, own);
+        g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed);
+        return own;
+    }
+
     double p=0;
     auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
     try {
@@ -1136,7 +1217,7 @@ uint64_t getPriceNanos(const std::string& token) {
                 double price = 0.0;
                 try { price = std::stod(pair["priceUsd"].get<std::string>()); } catch (...) { continue; }
                 if (!std::isfinite(price) || price <= 0.0) continue;
-                if (liq < MIN_POOL_LIQUIDITY_USD) continue;
+                if (liq < MIN_POOL_LIQUIDITY_USD) { thinPoolSeen = true; continue; }
                 if (liq > bestLiquidity) { bestLiquidity = liq; p = price; }
             }
             if (bestLiquidity >= 0.0) {
@@ -1165,7 +1246,17 @@ uint64_t getPriceNanos(const std::string& token) {
         saveTokenPrice(a,n);
         savePriceHistory(a,n);
     }
-    else { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&PRICE_NANOS_CACHE[a].first>0) { g_stats.price_fallbacks.fetch_add(1); std::cerr << "[PRICE] Stale cache: " << a << std::endl; return PRICE_NANOS_CACHE[a].first; } }
+    else {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        if (PRICE_NANOS_CACHE.count(a) && PRICE_NANOS_CACHE[a].first > 0) {
+            if (thinPoolSeen) g_stats.price_thin_pool.fetch_add(1);
+            else {
+                g_stats.price_fallbacks.fetch_add(1);
+                std::cerr << "[PRICE] Stale cache: " << a << std::endl;
+            }
+            return PRICE_NANOS_CACHE[a].first;
+        }
+    }
     return n;
 }
 
@@ -2006,7 +2097,7 @@ void telegramLoop() {
                                   << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
-                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · " << g_stats.rpc_giveups.load() << " отказов" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
+                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · " << g_stats.rpc_giveups.load() << " отказов" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << " · тонкий пул: " << g_stats.price_thin_pool.load() << "\n🏊 Из пула: " << g_stats.price_from_pool.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             ss2 << rpcSlowSummary();
                             {
