@@ -22,6 +22,21 @@ ChainContext makeBscContext() {
     };
     c.baseAssets = c.stablecoins;
     c.baseAssets.insert(WBNB_ADDR);
+    // Крупные ликвидные активы BSC — не помечаем ⚠ в холде
+    c.baseAssets.insert("0x7130d2a12b9bcbfae4f2634d864a1ee1ce3ead9c"); // BTCB
+    c.baseAssets.insert("0x2170ed0880ac9a755fd29b2688956bd959f933f8"); // ETH
+    c.baseAssets.insert("0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82"); // CAKE
+    c.baseAssets.insert("0x1af3f329e8be154074d8769d1ffa4ee058b1dbc3"); // DAI
+    c.baseAssets.insert("0x1d2f0da169ceb9fc7b3144628db156f3f6c60dbe"); // XRP
+    c.baseAssets.insert("0x3ee2200efb3400fabb9aacf31297cbdd1d435d47"); // ADA
+    c.baseAssets.insert("0x4338665cbb7b2485a8855a139b75d5e34ab0db94"); // LTC
+    c.baseAssets.insert("0xba2ae424d960c26247dd6c32edc70b295c744c43"); // DOGE
+    c.baseAssets.insert("0x7083609fce4d1d8dc0c979aab8c869ea2c873402"); // DOT
+    c.baseAssets.insert("0xbf5140a22578168fd72bdfcb88963812f75091f0"); // UNI
+    c.baseAssets.insert("0x0d8ce2a99bb6e3b7db580ed848240e4a0f9ae153"); // FIL
+    c.baseAssets.insert("0xcc42724c6683b7e57334c4e856f4c9965ed682bd"); // MATIC
+    c.baseAssets.insert("0x1ce0c2827e2ef14d5c4f29a091d735a204794041"); // AVAX
+    c.baseAssets.insert("0x570a5d26f7765ecb712c0924e4de545b89fd43df"); // SOL
     c.routers = {
         {"0x10ed43c718714eb63d5aa57b78b54704e256024e", "PancakeSwap V2"},
         {"0x13f4ea83d0bd40e75c8222255bc855a974568dd4", "PancakeSwap V3 (Smart Router)"},
