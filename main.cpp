@@ -257,7 +257,7 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
-constexpr time_t PRICE_TTL = 300;
+constexpr time_t PRICE_TTL = 600;
 constexpr size_t MAX_USERS = 1000000;
 
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -411,7 +411,7 @@ void loadTokenCache() {
             while (!clean.empty() && clean.back() == ' ') clean.pop_back();
             if (clean.size() * 2 < sym.size()) clean.clear();
             if (clean.size() > 16) clean.resize(16);
-            if (!clean.empty()) TOKEN_SYMBOLS[a]=clean;
+            if (!clean.empty() && clean != "UNKNOWN") TOKEN_SYMBOLS[a]=clean;
         }
         int d=sqlite3_column_int(s,2); if (d>0) TOKEN_DECIMALS[a]=d;
         uint64_t pn=sqlite3_column_int64(s,3); time_t ts=sqlite3_column_int64(s,4);
@@ -1138,27 +1138,74 @@ int getDecimals(const std::string& addr) {
     if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
     { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
 }
-std::string getSymbol(const std::string& addr) {
-    std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
-    auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"});
-    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return "UNKNOWN"; }
+static std::string parseTokenText(const json& r) {
+    if (!r.is_string()) return {};
+    const std::string raw = r.get<std::string>();
     std::string sym;
-    if (r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
-        if (len>0&&len<=32) { std::string sh=h.substr(128,len*2); for (size_t i=0;i<sh.length();i+=2) sym+=static_cast<char>(std::stoi(sh.substr(i,2),nullptr,16)); } } catch (...) {} }
-    if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
-        for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
-    {
-        std::string clean;
-        for (unsigned char c : sym) {
-            if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
-        }
-        while (!clean.empty() && clean.back() == ' ') clean.pop_back();
-        while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-        if (clean.size() * 2 < sym.size()) clean.clear();
-        if (clean.size() > 16) clean.resize(16);
-        sym = clean;
+    if (raw.length() > 130) {
+        try {
+            std::string h = raw.substr(2);
+            int len = std::stoi(h.substr(64, 64), nullptr, 16);
+            if (len > 0 && len <= 32) {
+                std::string sh = h.substr(128, static_cast<size_t>(len) * 2);
+                for (size_t i = 0; i < sh.length(); i += 2)
+                    sym += static_cast<char>(std::stoi(sh.substr(i, 2), nullptr, 16));
+            }
+        } catch (...) {}
     }
-    if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
+    if (sym.empty() && raw.length() >= 66) {
+        try {
+            std::string h = raw.substr(2, 64);
+            for (size_t i = 0; i < h.length(); i += 2) {
+                char c = static_cast<char>(std::stoi(h.substr(i, 2), nullptr, 16));
+                if (c == '\0') break;
+                sym += c;
+            }
+        } catch (...) {}
+    }
+    std::string clean;
+    for (unsigned char c : sym)
+        if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
+    while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+    while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
+    if (clean.size() * 2 < sym.size()) clean.clear();
+    if (clean.size() > 16) clean.resize(16);
+    return clean;
+}
+
+std::string getSymbol(const std::string& addr) {
+    std::string a = toLower(addr);
+    {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        auto it = TOKEN_SYMBOLS.find(a);
+        if (it != TOKEN_SYMBOLS.end() && !it->second.empty() && it->second != "UNKNOWN")
+            return it->second;
+    }
+
+    // 1) symbol()
+    auto r = rpc("eth_call", {{{"to", addr}, {"data", "0x95d89b41"}}, "latest"});
+    if (!r.is_string())
+        g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
+    std::string sym = parseTokenText(r);
+
+    // 2) fallback: name()
+    if (sym.empty()) {
+        auto rn = rpc("eth_call", {{{"to", addr}, {"data", "0x06fdde03"}}, "latest"});
+        if (!rn.is_string())
+            g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
+        else
+            sym = parseTokenText(rn);
+    }
+
+    // 3) не кэшируем UNKNOWN — следующий раз попробуем снова
+    if (sym.empty()) return "UNKNOWN";
+
+    {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        TOKEN_SYMBOLS[a] = sym;
+    }
+    saveTokenMetadata(a, sym, 0);
+    return sym;
 }
 constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
 std::map<std::string, double> POOL_LIQUIDITY_CACHE;
