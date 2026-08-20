@@ -65,25 +65,11 @@ struct BigRow {
     std::string txHash;
     long long usdNanos = 0;
     long long closedPnlNanos = 0;
-    long long feeNanos = 0;
     long long marginNanos = 0;
     long long accountValueNanos = 0;
     int leverage = 0;
     bool isBuy = false;
 };
-
-
-std::vector<BigRow> uniqueByWallet(std::vector<BigRow> rows) {
-    std::unordered_set<std::string> seen;
-    std::vector<BigRow> out;
-    out.reserve(rows.size());
-    for (auto& r : rows) {
-        const std::string key = toLower(r.wallet);
-        if (!seen.insert(key).second) continue;
-        out.push_back(std::move(r));
-    }
-    return out;
-}
 
 std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     std::vector<BigRow> out;
@@ -92,11 +78,13 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     sqlite3_stmt* s;
     if (!prepareOrLog(hl::g_hlDb, &s,
         "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, "
-        "       closed_pnl_nanos, fee_nanos, margin_nanos, account_value_nanos "
+        "       closed_pnl_nanos, margin_nanos, account_value_nanos "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
         "AND (dir LIKE '%Open Long%' OR dir LIKE '%Open Short%') "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
+        "GROUP BY wallet "
+        "HAVING notional_nanos = MAX(notional_nanos) "
         "ORDER BY notional_nanos DESC LIMIT ?")) return out;
     sqlite3_bind_int64(s, 1, sinceSec * 1000LL);
     sqlite3_bind_int(s, 2, limit);
@@ -110,9 +98,8 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
         r.pxStr              = safeColumnText(s, 5);
         r.amountStr          = safeColumnText(s, 6);
         r.closedPnlNanos     = sqlite3_column_int64(s, 7);
-        r.feeNanos           = sqlite3_column_int64(s, 8);
-        r.marginNanos        = sqlite3_column_int64(s, 9);
-        r.accountValueNanos  = sqlite3_column_int64(s, 10);
+        r.marginNanos        = sqlite3_column_int64(s, 8);
+        r.accountValueNanos  = sqlite3_column_int64(s, 9);
         r.isBuy              = hlSideUp(r.side);
         out.push_back(std::move(r));
     }
@@ -132,6 +119,8 @@ std::vector<BigRow> spotRows(long long sinceSec, int limit) {
         "AND t.usd_nanos <= ? "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw "
         "                WHERE iw.wallet = t.wallet AND iw.permanent = 1) "
+        "GROUP BY t.wallet "
+        "HAVING t.usd_nanos = MAX(t.usd_nanos) "
         "ORDER BY t.usd_nanos DESC LIMIT ?")) return out;
     sqlite3_bind_int64(s, 1, sinceSec);
     sqlite3_bind_int64(s, 2, MAX_SPOT_USD_NANOS);
@@ -207,8 +196,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const int maxRows = premium ? MAX_ROWS : FREE_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
-    std::vector<BigRow> rows = perp ? perpRows(since, maxRows * 5) : spotRows(since, maxRows * 5);
-    rows = uniqueByWallet(std::move(rows));
+    std::vector<BigRow> rows = perp ? perpRows(since, maxRows) : spotRows(since, maxRows);
     if (static_cast<int>(rows.size()) > maxRows)
         rows.resize(static_cast<size_t>(maxRows));
 
@@ -301,7 +289,6 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                           << tr(lang, r.isBuy ? "alert_buy_price" : "alert_sell_price")
                           << ": <b>" << formatPriceUsd(unit) << "</b>\n";
                 }
-                // USD notional ≈ spent (buy) / received (sell); counter asset not stored in trades.
                 t << (r.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ")
                   << tr(lang, r.isBuy ? "alert_spent" : "alert_received")
                   << ": <b>" << formatUsd(cpp_int(r.usdNanos)) << "</b>\n";
