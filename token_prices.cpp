@@ -283,6 +283,10 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         }
     }
 
+    uint64_t bestPrice = 0;
+    double bestLiq = -1.0;
+    std::string bestStored;
+
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t || base.size() != 42) continue;
 
@@ -292,9 +296,14 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             if (basePrice == 0) continue;
         }
 
-        std::string pair = cachedPair;
-        bool tokenIsZero = (cachedSide == 0);
-        bool knownSide = (cachedSide >= 0 && !pair.empty());
+        std::string pair;
+        bool tokenIsZero = false;
+        bool knownSide = false;
+        if (!cachedPair.empty() && base == cachedBase) {
+            pair = cachedPair;
+            tokenIsZero = (cachedSide == 0);
+            knownSide = (cachedSide >= 0);
+        }
 
         if (pair.empty()) {
             std::string data = "0xe6a43905";
@@ -324,16 +333,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             const std::string t0hex = t0.get<std::string>();
             if (t0hex.size() < 66) continue;
             tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
-            const std::string stored = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
-            {
-                std::lock_guard<std::mutex> l(g_pairCacheMutex);
-                PAIR_CACHE[t] = stored;
-            }
-            savePairCache(t, stored);
-            cachedPair = pair;
-            cachedBase = base;
-            cachedSide = tokenIsZero ? 0 : 1;
-            knownSide = true;
         }
 
         const cpp_int tokenRes = tokenIsZero ? r0 : r1;
@@ -354,16 +353,30 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
 
         if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) continue;
 
-        {
-            const cpp_int liqNanos = (baseRes * cpp_int(basePrice) * 2) / baseScale;
-            const double liqUsd = static_cast<double>(static_cast<long long>(
-                liqNanos > cpp_int("9000000000000000000") ? cpp_int("9000000000000000000") : liqNanos)) / 1e9;
-            if (liqUsd > 0.0) {
-                std::lock_guard<std::mutex> l(cacheMutex);
-                POOL_LIQUIDITY_CACHE[t] = liqUsd;
-            }
+        const cpp_int liqNanos = (baseRes * cpp_int(basePrice) * 2) / baseScale;
+        const double liqUsd = static_cast<double>(static_cast<long long>(
+            liqNanos > cpp_int("9000000000000000000") ? cpp_int("9000000000000000000") : liqNanos)) / 1e9;
+
+        if (liqUsd > bestLiq) {
+            bestLiq = liqUsd;
+            bestPrice = static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
+            bestStored = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
         }
-        return static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
+    }
+
+    if (bestPrice > 0) {
+        if (!bestStored.empty()) {
+            {
+                std::lock_guard<std::mutex> l(g_pairCacheMutex);
+                PAIR_CACHE[t] = bestStored;
+            }
+            savePairCache(t, bestStored);
+        }
+        if (bestLiq > 0.0) {
+            std::lock_guard<std::mutex> l(cacheMutex);
+            POOL_LIQUIDITY_CACHE[t] = bestLiq;
+        }
+        return bestPrice;
     }
     {
         std::lock_guard<std::mutex> l(g_pairCacheMutex);
