@@ -326,11 +326,16 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
         if (usd < cpp_int(DUST_USD_NANOS)) continue;
 
         bool illiquid = false;
-        const bool stable = chainCtx().stablecoins.count(t) > 0;
-        const double liq = stable ? 0.0 : getPoolLiquidityUsd(t);
+        const auto& ctx = chainCtx();
+        const bool stable = ctx.stablecoins.count(t) > 0;
+        // Крупные ликвидные активы (WBNB, BTCB, ETH, стейблы…) — без ⚠
+        const bool major = stable
+            || t == toLower(ctx.wrappedNative)
+            || ctx.baseAssets.count(t) > 0;
+        const double liq = major ? 0.0 : getPoolLiquidityUsd(t);
 
         bool capped = false;
-        if (!stable) {
+        if (!major) {
             // liq == 0 → неизвестно (не ⚠); 0 < liq < порог → тонкий пул подтверждён
             if (liq > 0.0 && liq < MIN_POOL_LIQUIDITY_USD) {
                 illiquid = true;
