@@ -257,7 +257,7 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
-constexpr time_t PRICE_TTL = 180;
+constexpr time_t PRICE_TTL = 300;
 constexpr size_t MAX_USERS = 1000000;
 
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
