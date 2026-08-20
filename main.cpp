@@ -257,7 +257,7 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
-constexpr time_t PRICE_TTL = 120;
+constexpr time_t PRICE_TTL = 300;
 constexpr size_t MAX_USERS = 1000000;
 
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -401,7 +401,14 @@ void loadTokenCache() {
     if (!prepareOrLog(db,&s,"SELECT address,symbol,decimals,price_nanos,price_ts FROM token_cache")) return;
     while (sqlite3_step(s)==SQLITE_ROW) {
         std::string a=safeColumnText(s,0), sym=safeColumnText(s,1);
-        if (!sym.empty()) TOKEN_SYMBOLS[a]=sym;
+        if (!sym.empty()) {
+            std::string clean;
+            for (unsigned char c : sym) if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
+            while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+            if (clean.size() * 2 < sym.size()) clean.clear();
+            if (clean.size() > 16) clean.resize(16);
+            if (!clean.empty()) TOKEN_SYMBOLS[a]=clean;
+        }
         int d=sqlite3_column_int(s,2); if (d>0) TOKEN_DECIMALS[a]=d;
         uint64_t pn=sqlite3_column_int64(s,3); time_t ts=sqlite3_column_int64(s,4);
         if (pn>0) PRICE_NANOS_CACHE[a]={pn,ts};
@@ -1106,6 +1113,17 @@ std::string getSymbol(const std::string& addr) {
         if (len>0&&len<=32) { std::string sh=h.substr(128,len*2); for (size_t i=0;i<sh.length();i+=2) sym+=static_cast<char>(std::stoi(sh.substr(i,2),nullptr,16)); } } catch (...) {} }
     if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
         for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
+    {
+        std::string clean;
+        for (unsigned char c : sym) {
+            if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
+        }
+        while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+        while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
+        if (clean.size() * 2 < sym.size()) clean.clear();
+        if (clean.size() > 16) clean.resize(16);
+        sym = clean;
+    }
     if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
 }
 constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
@@ -1117,6 +1135,9 @@ double getPoolLiquidityUsd(const std::string& token) {
     return it != POOL_LIQUIDITY_CACHE.end() ? it->second : 0.0;
 }
 
+std::mutex g_pairCacheMutex;
+std::map<std::string, std::string> PAIR_CACHE;   // токен -> "пара|база", "" = пар нет
+
 uint64_t priceFromPoolReserves(const std::string& token) {
     const auto& ctx = chainCtx();
     if (ctx.v2Factory.empty() || ctx.wrappedNative.empty()) return 0;
@@ -1124,8 +1145,23 @@ uint64_t priceFromPoolReserves(const std::string& token) {
     if (t == ctx.wrappedNative) return 0;
 
     std::vector<std::pair<std::string, uint64_t>> bases;
-    for (const auto& sc : ctx.stablecoins) bases.push_back({sc, 1000000000ULL});
-    bases.push_back({ctx.wrappedNative, 0});
+    {
+        std::lock_guard<std::mutex> l(g_pairCacheMutex);
+        auto it = PAIR_CACHE.find(t);
+        if (it != PAIR_CACHE.end()) {
+            if (it->second.empty()) return 0;          // знаем, что пар нет
+            const size_t b1 = it->second.find('|');
+            const size_t b2 = it->second.rfind('|');
+            if (b1 != std::string::npos && b2 > b1) {
+                const std::string base = it->second.substr(b1 + 1, b2 - b1 - 1);
+                bases.push_back({base, ctx.stablecoins.count(base) ? 1000000000ULL : 0});
+            }
+        }
+    }
+    if (bases.empty()) {
+        for (const auto& sc : ctx.stablecoins) bases.push_back({sc, 1000000000ULL});
+        bases.push_back({ctx.wrappedNative, 0});
+    }
 
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t) continue;
@@ -1151,14 +1187,31 @@ uint64_t priceFromPoolReserves(const std::string& token) {
         cpp_int r1 = hexToCppInt(body.substr(64, 64));
         if (r0 <= 0 || r1 <= 0) continue;
 
-        json t0 = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0dfe1681"}}, "latest" }));
-        if (!t0.is_string()) continue;
-        const std::string t0hex = t0.get<std::string>();
-        if (t0hex.size() < 66) continue;
-        const std::string token0 = "0x" + toLower(t0hex.substr(t0hex.size() - 40));
+        bool tokenIsZero = false;
+        bool knownSide = false;
+        {
+            std::lock_guard<std::mutex> l(g_pairCacheMutex);
+            auto it = PAIR_CACHE.find(t);
+            if (it != PAIR_CACHE.end()) {
+                const size_t b2 = it->second.rfind('|');
+                if (b2 != std::string::npos && b2 + 1 < it->second.size()) {
+                    tokenIsZero = it->second[b2 + 1] == '0';
+                    knownSide = true;
+                }
+            }
+        }
+        if (!knownSide) {
+            json t0 = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0dfe1681"}}, "latest" }));
+            if (!t0.is_string()) continue;
+            const std::string t0hex = t0.get<std::string>();
+            if (t0hex.size() < 66) continue;
+            tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
+            std::lock_guard<std::mutex> l(g_pairCacheMutex);
+            PAIR_CACHE[t] = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+        }
 
-        const cpp_int tokenRes = (token0 == t) ? r0 : r1;
-        const cpp_int baseRes  = (token0 == t) ? r1 : r0;
+        const cpp_int tokenRes = tokenIsZero ? r0 : r1;
+        const cpp_int baseRes  = tokenIsZero ? r1 : r0;
 
         const int tokenDec = getDecimals(t);
         const int baseDec  = getDecimals(base);
@@ -1183,6 +1236,10 @@ uint64_t priceFromPoolReserves(const std::string& token) {
 
         if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) continue;
         return static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
+    }
+    {
+        std::lock_guard<std::mutex> l(g_pairCacheMutex);
+        if (!PAIR_CACHE.count(t)) PAIR_CACHE[t] = "";
     }
     return 0;
 }
