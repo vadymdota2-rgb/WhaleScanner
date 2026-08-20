@@ -38,6 +38,7 @@ struct ChainContext {
     std::string nativeSymbol;
     std::string nativeMarker;
     std::string wrappedNative;
+    std::string v2Factory;
     std::set<std::string> baseAssets;
     std::set<std::string> stablecoins;
     std::map<std::string, std::string> routers;
