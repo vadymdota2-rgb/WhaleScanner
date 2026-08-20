@@ -18,4 +18,7 @@ void saveTokenMetadata(const std::string& addr, const std::string& symbol, int d
 void saveTokenPrice(const std::string& addr, uint64_t priceNanos);
 void savePriceHistory(const std::string& addr, uint64_t priceNanos);
 void cleanupPriceHistory();
+void cleanupPairCache();
+/** Единая точка: разные кэши чистятся с разным периодом. Звать из maintenance ~раз в минуту. */
+void cleanupTokenPricesPeriodic();
 void seedWalletTokensFromTrades();
