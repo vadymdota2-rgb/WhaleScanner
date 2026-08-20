@@ -331,9 +331,10 @@ UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
 
         bool capped = false;
         if (!stable) {
-            if (liq < MIN_POOL_LIQUIDITY_USD) {
+            // liq == 0 → неизвестно (не ⚠); 0 < liq < порог → тонкий пул подтверждён
+            if (liq > 0.0 && liq < MIN_POOL_LIQUIDITY_USD) {
                 illiquid = true;
-            } else {
+            } else if (liq >= MIN_POOL_LIQUIDITY_USD) {
                 const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
                 if (usd > poolCap) { capped = true; usd = poolCap; }
             }
