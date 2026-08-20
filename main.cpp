@@ -1136,51 +1136,77 @@ double getPoolLiquidityUsd(const std::string& token) {
 }
 
 std::mutex g_pairCacheMutex;
-std::map<std::string, std::string> PAIR_CACHE;   // токен -> "пара|база", "" = пар нет
+std::map<std::string, std::string> PAIR_CACHE;   // токен -> "пара|база|0/1", "" = пар нет
+
+static uint64_t cachedNativePriceNanos() {
+    const std::string w = toLower(chainCtx().wrappedNative);
+    std::lock_guard<std::mutex> l(cacheMutex);
+    auto it = PRICE_NANOS_CACHE.find(w);
+    return (it != PRICE_NANOS_CACHE.end()) ? it->second.first : 0;
+}
 
 uint64_t priceFromPoolReserves(const std::string& token) {
     const auto& ctx = chainCtx();
     if (ctx.v2Factory.empty() || ctx.wrappedNative.empty()) return 0;
     const std::string t = toLower(token);
-    if (t == ctx.wrappedNative) return 0;
+    if (t.size() != 42 || t.rfind("0x", 0) != 0) return 0;
+    if (t == toLower(ctx.wrappedNative)) return 0;
+    if (ctx.stablecoins.count(t)) return 1000000000ULL;
 
-    std::vector<std::pair<std::string, uint64_t>> bases;
+    std::string cachedPair, cachedBase;
+    int cachedSide = -1;
     {
         std::lock_guard<std::mutex> l(g_pairCacheMutex);
         auto it = PAIR_CACHE.find(t);
         if (it != PAIR_CACHE.end()) {
-            if (it->second.empty()) return 0;          // знаем, что пар нет
+            if (it->second.empty()) return 0;
             const size_t b1 = it->second.find('|');
             const size_t b2 = it->second.rfind('|');
             if (b1 != std::string::npos && b2 > b1) {
-                const std::string base = it->second.substr(b1 + 1, b2 - b1 - 1);
-                bases.push_back({base, ctx.stablecoins.count(base) ? 1000000000ULL : 0});
+                cachedPair = it->second.substr(0, b1);
+                cachedBase = it->second.substr(b1 + 1, b2 - b1 - 1);
+                if (b2 + 1 < it->second.size())
+                    cachedSide = (it->second[b2 + 1] == '0') ? 0 : 1;
             }
         }
     }
-    if (bases.empty()) {
-        // WBNB first — most common pair on BSC, fewer RPC calls
-        bases.push_back({ctx.wrappedNative, 0});
+
+    std::vector<std::pair<std::string, uint64_t>> bases;
+    if (!cachedBase.empty()) {
+        bases.push_back({cachedBase, ctx.stablecoins.count(cachedBase) ? 1000000000ULL : 0});
+    } else {
+        bases.push_back({toLower(ctx.wrappedNative), 0});
         int added = 0;
         for (const auto& sc : ctx.stablecoins) {
             bases.push_back({sc, 1000000000ULL});
-            if (++added >= 2) break;  // USDT + USDC enough
+            if (++added >= 2) break;
         }
     }
 
     for (const auto& [base, fixedPrice] : bases) {
-        if (base == t) continue;
+        if (base == t || base.size() != 42) continue;
 
-        std::string data = "0xe6a43905";
-        const std::string a = t.substr(2), b = base.substr(2);
-        data += std::string(24, '0') + a;
-        data += std::string(24, '0') + b;
-        json r = rpc("eth_call", json::array({ json{{"to", ctx.v2Factory}, {"data", data}}, "latest" }));
-        if (!r.is_string()) continue;
-        std::string pairHex = r.get<std::string>();
-        if (pairHex.size() < 66) continue;
-        const std::string pair = "0x" + pairHex.substr(pairHex.size() - 40);
-        if (pair == "0x" + std::string(40, '0')) continue;
+        uint64_t basePrice = fixedPrice;
+        if (basePrice == 0) {
+            basePrice = cachedNativePriceNanos();
+            if (basePrice == 0) continue;
+        }
+
+        std::string pair = cachedPair;
+        bool tokenIsZero = (cachedSide == 0);
+        bool knownSide = (cachedSide >= 0 && !pair.empty());
+
+        if (pair.empty()) {
+            std::string data = "0xe6a43905";
+            data += std::string(24, '0') + t.substr(2);
+            data += std::string(24, '0') + base.substr(2);
+            json r = rpc("eth_call", json::array({ json{{"to", ctx.v2Factory}, {"data", data}}, "latest" }));
+            if (!r.is_string()) continue;
+            std::string pairHex = r.get<std::string>();
+            if (pairHex.size() < 66) continue;
+            pair = "0x" + toLower(pairHex.substr(pairHex.size() - 40));
+            if (pair == "0x" + std::string(40, '0')) continue;
+        }
 
         json rr = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0902f1ac"}}, "latest" }));
         if (!rr.is_string()) continue;
@@ -1188,23 +1214,10 @@ uint64_t priceFromPoolReserves(const std::string& token) {
         if (res.size() < 2 + 64 * 2) continue;
         const std::string body = res.substr(2);
 
-        cpp_int r0 = hexToCppInt(body.substr(0, 64));
-        cpp_int r1 = hexToCppInt(body.substr(64, 64));
+        cpp_int r0 = hexToCppInt("0x" + body.substr(0, 64));
+        cpp_int r1 = hexToCppInt("0x" + body.substr(64, 64));
         if (r0 <= 0 || r1 <= 0) continue;
 
-        bool tokenIsZero = false;
-        bool knownSide = false;
-        {
-            std::lock_guard<std::mutex> l(g_pairCacheMutex);
-            auto it = PAIR_CACHE.find(t);
-            if (it != PAIR_CACHE.end()) {
-                const size_t b2 = it->second.rfind('|');
-                if (b2 != std::string::npos && b2 + 1 < it->second.size()) {
-                    tokenIsZero = it->second[b2 + 1] == '0';
-                    knownSide = true;
-                }
-            }
-        }
         if (!knownSide) {
             json t0 = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0dfe1681"}}, "latest" }));
             if (!t0.is_string()) continue;
@@ -1213,6 +1226,10 @@ uint64_t priceFromPoolReserves(const std::string& token) {
             tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
             std::lock_guard<std::mutex> l(g_pairCacheMutex);
             PAIR_CACHE[t] = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+            cachedPair = pair;
+            cachedBase = base;
+            cachedSide = tokenIsZero ? 0 : 1;
+            knownSide = true;
         }
 
         const cpp_int tokenRes = tokenIsZero ? r0 : r1;
@@ -1221,14 +1238,6 @@ uint64_t priceFromPoolReserves(const std::string& token) {
         const int tokenDec = getDecimals(t);
         const int baseDec  = getDecimals(base);
         if (tokenDec < 0 || tokenDec > 36 || baseDec < 0 || baseDec > 36) continue;
-
-        uint64_t basePrice = fixedPrice;
-        if (basePrice == 0) {
-            std::lock_guard<std::mutex> l(cacheMutex);
-            auto it = PRICE_NANOS_CACHE.find(toLower(ctx.wrappedNative));
-            if (it != PRICE_NANOS_CACHE.end()) basePrice = it->second.first;
-        }
-        if (basePrice == 0) continue;
 
         cpp_int tokenScale = 1, baseScale = 1;
         for (int i = 0; i < tokenDec; i++) tokenScale *= 10;
@@ -1323,19 +1332,12 @@ uint64_t getPriceNanos(const std::string& token) {
 }
 
 void ensureNativePrice() {
-    const std::string& w = chainCtx().wrappedNative;
+    const std::string w = toLower(chainCtx().wrappedNative);
     if (w.empty()) return;
-
-    {
-        std::lock_guard<std::mutex> l(cacheMutex);
-        auto it = PRICE_NANOS_CACHE.find(toLower(w));
-        if (it != PRICE_NANOS_CACHE.end() && it->second.first > 0)
-            return;
-    }
+    if (cachedNativePriceNanos() > 0) return;
 
     double p = 0.0;
-
-    auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + w, "", 8);
+    auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + w);
     try {
         auto j = json::parse(r, nullptr, false);
         if (j.is_object() && j.contains("pairs") && j["pairs"].is_array()) {
@@ -1357,14 +1359,12 @@ void ensureNativePrice() {
     if (p <= 0.0) {
         const std::string platform = chainCtx().coingeckoPlatform.empty()
             ? "binance-smart-chain" : chainCtx().coingeckoPlatform;
-        auto r2 = http(
-            "https://api.coingecko.com/api/v3/simple/token_price/" + platform +
-            "?contract_addresses=" + w + "&vs_currencies=usd", "", 8);
+        auto r2 = http("https://api.coingecko.com/api/v3/simple/token_price/" + platform +
+                       "?contract_addresses=" + w + "&vs_currencies=usd");
         try {
             auto j2 = json::parse(r2, nullptr, false);
-            std::string a = toLower(w);
-            if (j2.contains(a) && j2[a].contains("usd") && j2[a]["usd"].is_number()) {
-                double cg = j2[a]["usd"].get<double>();
+            if (j2.contains(w) && j2[w].contains("usd") && j2[w]["usd"].is_number()) {
+                double cg = j2[w]["usd"].get<double>();
                 if (std::isfinite(cg) && cg > 0.0) p = cg;
             }
         } catch (...) {}
@@ -1373,13 +1373,12 @@ void ensureNativePrice() {
     if (p > 0.0) {
         uint64_t n = static_cast<uint64_t>(p * 1e9);
         std::lock_guard<std::mutex> l(cacheMutex);
-        PRICE_NANOS_CACHE[toLower(w)] = {n, time(nullptr)};
+        PRICE_NANOS_CACHE[w] = {n, time(nullptr)};
         std::cout << "[PRICE] Native price loaded: $" << p << std::endl;
     } else {
         std::cerr << "[PRICE] Failed to load native price — pool pricing limited" << std::endl;
     }
 }
-
 
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
                               const TxResult& res, const std::string& hash, Lang lang) {
