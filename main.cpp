@@ -48,6 +48,11 @@ struct Stats {
     std::atomic<uint64_t> price_fallbacks{0};
     std::atomic<uint64_t> price_thin_pool{0};
     std::atomic<uint64_t> price_from_pool{0};
+    std::atomic<uint64_t> price_from_dex{0};
+    std::atomic<uint64_t> price_from_cg{0};
+    std::atomic<uint64_t> price_cache_hit{0};
+    std::atomic<uint64_t> price_divergence{0};
+    std::atomic<uint64_t> price_spike_reject{0};
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
@@ -1859,8 +1864,21 @@ void telegramLoop() {
                                   << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
-                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · " << g_stats.rpc_giveups.load() << " отказов" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << " · тонкий пул: " << g_stats.price_thin_pool.load() << "\n🏊 Из пула: " << g_stats.price_from_pool.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
-                                << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
+                                << "⚙️ RPC fail: " << g_stats.rpc_failures.load()
+                                << " · giveup: " << g_stats.rpc_giveups.load()
+                                << "\n💰 Price src: cache " << g_stats.price_cache_hit.load()
+                                << " · pool " << g_stats.price_from_pool.load()
+                                << " · dex " << g_stats.price_from_dex.load()
+                                << " · cg " << g_stats.price_from_cg.load()
+                                << "\n💰 Price guard: thin " << g_stats.price_thin_pool.load()
+                                << " · stale " << g_stats.price_fallbacks.load()
+                                << " · div " << g_stats.price_divergence.load()
+                                << " · spike " << g_stats.price_spike_reject.load()
+                                << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
+                                << "\n📨 Sent: " << g_stats.alerts_sent.load()
+                                << "\n🔍 TX: " << g_stats.tx_processed.load()
+                                << "\n⏳ Lag: " << g_stats.current_lag.load()
+                                << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             ss2 << rpcSlowSummary();
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
@@ -2007,13 +2025,33 @@ int main() {
             case 0: g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 1: g_stats.price_thin_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 2: g_stats.price_fallbacks.fetch_add(1, std::memory_order_relaxed); break;
-            default: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break;
+            case 3: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break; // meta rpc
+            case 4: g_stats.price_divergence.fetch_add(1, std::memory_order_relaxed); break;
+            case 5: g_stats.price_spike_reject.fetch_add(1, std::memory_order_relaxed); break;
+            case 6: g_stats.price_from_dex.fetch_add(1, std::memory_order_relaxed); break;
+            case 7: g_stats.price_from_cg.fetch_add(1, std::memory_order_relaxed); break;
+            case 8: g_stats.price_cache_hit.fetch_add(1, std::memory_order_relaxed); break;
+            default: break;
         }
     });
     setRpcGiveUpHandler([]{
         g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
-    initDB(); initRankingDB(); seedWalletTokensFromTrades();
+    initDB(); initRankingDB();
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        const char* sql =
+            "INSERT OR IGNORE INTO wallet_tokens(wallet, token, last_seen) "
+            "SELECT wallet, token, MAX(timestamp) FROM trades GROUP BY wallet, token";
+        char* err = nullptr;
+        if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+            std::cerr << "[STARTUP] wallet_tokens seed failed: " << (err ? err : "") << std::endl;
+            sqlite3_free(err);
+        } else {
+            int n = sqlite3_changes(db);
+            if (n > 0) std::cout << "[STARTUP] Seeded " << n << " wallet/token pairs from trade history" << std::endl;
+        }
+    }
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
