@@ -13,7 +13,7 @@ enum class PriceSource : int {
     Cache = 1,
     Pool = 2,        // V2/V3 on-chain (в т.ч. TWAP-сглаживание)
     DexScreener = 3,
-    CoinGecko = 4
+    CoinGecko = 4  // unused, kept for stats enum stability
 };
 
 int         getDecimals(const std::string& token);
