@@ -75,7 +75,6 @@ ChainContext makeBscContext() {
         "0xc697d2898e0d09264376196696c51d7abbbaa4a9",
     };
     c.rpcEndpoints = {
-    "https://bsc-rpc.publicnode.com",
     "https://bscrpc.pancakeswap.finance",
     "https://rpc-bsc.48.club",
     "https://bsc.rpc.blxrbdn.com",
