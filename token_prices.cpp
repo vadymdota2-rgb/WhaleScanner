@@ -70,7 +70,7 @@ static time_t priceTtlFor(const std::string& a) {
         return NATIVE_PRICE_TTL; // совпадает с пулами
     return isMajorToken(a) ? PRICE_TTL_MAJOR : PRICE_TTL;
 }
-constexpr time_t PAIR_CACHE_TTL = 6 * 3600;      // пары: 6 ч
+constexpr time_t PAIR_CACHE_TTL = 24 * 3600;     // пары: 24 ч (адрес не меняется)
 constexpr time_t NEGATIVE_PAIR_TTL = 1800;        // «пары нет»: 30 мин
 constexpr time_t LIQ_CACHE_TTL = 20 * 60;         // оценка liq в RAM: 20 мин
 constexpr time_t CLEAN_NEG_EVERY = 10 * 60;
@@ -708,12 +708,14 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
     std::string bestStored;
     std::set<std::string> triedBase;
     const std::string v3f = v3FactoryAddress();
-    // Сначала частые tier'ы; редкие — только если по этой базе ещё ничего не нашли
     static const uint32_t kV3FeesPrimary[] = {2500, 500};
+    bool gotStableQuote = false; // стейбл-V2/V3 уже дал цену → WBNB-базу не трогаем
 
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t || base.size() != 42) continue;
         if (!triedBase.insert(base).second) continue;
+        // fixedPrice==0 → база = wrapped native; пропускаем, если стейбл уже сработал
+        if (fixedPrice == 0 && gotStableQuote) continue;
 
         uint64_t basePrice = fixedPrice;
         if (basePrice == 0) {
@@ -768,6 +770,9 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             }
             // secondary tiers (100/10000) отключены — слишком дорого для mark
         }
+
+        if (fixedPrice != 0 && wSum > baseWBefore)
+            gotStableQuote = true;
 
         // Достаточный V2/V3 — дальше базы не долбим
         if (bestLiq >= STRONG_POOL_LIQ_USD)
@@ -908,24 +913,7 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         }
     }
 
-    if (n == 0) {
-        const std::string platform = chainCtx().coingeckoPlatform.empty()
-            ? std::string("binance-smart-chain") : chainCtx().coingeckoPlatform;
-        auto r2 = http("https://api.coingecko.com/api/v3/simple/token_price/" + platform +
-                       "?contract_addresses=" + a + "&vs_currencies=usd");
-        try {
-            auto j2 = json::parse(r2);
-            if (j2.contains(a) && j2[a].contains("usd") && j2[a]["usd"].is_number()) {
-                double cg = j2[a]["usd"].get<double>();
-                if (std::isfinite(cg) && cg > 0.0 && cg < MAX_SANE_PRICE_USD) {
-                    n = static_cast<uint64_t>(cg * 1e9);
-                    src = PriceSource::CoinGecko;
-                }
-            }
-        } catch (...) {}
-    }
-
-    if (n > 0 && prevCached > 0 && poolLiq < SPIKE_TRUST_LIQ_USD && src != PriceSource::CoinGecko) {
+    if (n > 0 && prevCached > 0 && poolLiq < SPIKE_TRUST_LIQ_USD) {
         const double prev = static_cast<double>(prevCached);
         const double cur  = static_cast<double>(n);
         const double rel = std::fabs(cur - prev) / std::max(prev, cur);
@@ -947,7 +935,6 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         savePriceHistory(a, n);
         if (src == PriceSource::Pool) bump(0);
         else if (src == PriceSource::DexScreener) bump(6);
-        else if (src == PriceSource::CoinGecko) bump(7);
         if (sourceOut) *sourceOut = src;
         return n;
     }
@@ -988,7 +975,7 @@ void ensureNativePrice() {
         return;
     }
 
-    // 2) DexScreener → CoinGecko
+    // 2) DexScreener only (CoinGecko removed — no external CG traffic)
     double p = 0.0;
     auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + w);
     try {
@@ -1012,20 +999,6 @@ void ensureNativePrice() {
         }
     } catch (...) {}
 
-    if (p <= 0.0) {
-        const std::string platform = chainCtx().coingeckoPlatform.empty()
-            ? "binance-smart-chain" : chainCtx().coingeckoPlatform;
-        auto r2 = http("https://api.coingecko.com/api/v3/simple/token_price/" + platform +
-                       "?contract_addresses=" + w + "&vs_currencies=usd");
-        try {
-            auto j2 = json::parse(r2, nullptr, false);
-            if (j2.contains(w) && j2[w].contains("usd") && j2[w]["usd"].is_number()) {
-                double cg = j2[w]["usd"].get<double>();
-                if (std::isfinite(cg) && cg > 0.0) p = cg;
-            }
-        } catch (...) {}
-    }
-
     if (p > 0.0) {
         uint64_t n = static_cast<uint64_t>(p * 1e9);
         {
@@ -1033,7 +1006,7 @@ void ensureNativePrice() {
             PRICE_NANOS_CACHE[w] = {n, time(nullptr)};
         }
         saveTokenPrice(w, n);
-        std::cout << "[PRICE] Native price loaded (API): $" << p << std::endl;
+        std::cout << "[PRICE] Native price loaded (DexScreener): $" << p << std::endl;
     } else {
         std::cerr << "[PRICE] Failed to load native price — pool pricing limited" << std::endl;
     }
