@@ -26,7 +26,6 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ranking.h"
-#include "token_prices.h"
 #include "big_trades.h"
 #include "alert_settings.h"
 #include "rpc_client.h"
@@ -48,11 +47,6 @@ struct Stats {
     std::atomic<uint64_t> price_fallbacks{0};
     std::atomic<uint64_t> price_thin_pool{0};
     std::atomic<uint64_t> price_from_pool{0};
-    std::atomic<uint64_t> price_from_dex{0};
-    std::atomic<uint64_t> price_from_cg{0};
-    std::atomic<uint64_t> price_cache_hit{0};
-    std::atomic<uint64_t> price_divergence{0};
-    std::atomic<uint64_t> price_spike_reject{0};
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
     std::atomic<uint64_t> alerts_sent{0};
@@ -263,6 +257,7 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
+constexpr time_t PRICE_TTL = 600;
 constexpr size_t MAX_USERS = 1000000;
 
 double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
@@ -273,6 +268,9 @@ void signalHandler(int) { running.store(false, std::memory_order_relaxed); }
 
 std::mutex dbMutex, cacheMutex;
 sqlite3* db = nullptr;
+std::map<std::string, std::string> TOKEN_SYMBOLS;
+std::map<std::string, int> TOKEN_DECIMALS;
+std::map<std::string, std::pair<uint64_t, time_t>> PRICE_NANOS_CACHE;
 
 struct Watcher {
     std::string chatId;
@@ -351,10 +349,6 @@ void initDB() {
             last_seen INTEGER NOT NULL,
             PRIMARY KEY (wallet, token)
         );
-        CREATE TABLE IF NOT EXISTS pair_cache (
-            token TEXT PRIMARY KEY,
-            val TEXT NOT NULL
-        );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
     {
@@ -402,7 +396,67 @@ void rollbackToBlock(long long t) {
     sqlite3_bind_int64(s,1,t); sqlite3_step(s); sqlite3_finalize(s);
     std::cerr << "[REORG] Rolled back above block " << t << std::endl;
 }
+void loadTokenCache() {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT address,symbol,decimals,price_nanos,price_ts FROM token_cache")) return;
+    while (sqlite3_step(s)==SQLITE_ROW) {
+        std::string a=safeColumnText(s,0), sym=safeColumnText(s,1);
+        if (!sym.empty()) {
+            std::string clean;
+            for (unsigned char c : sym) if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
+            while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+            if (clean.size() * 2 < sym.size()) clean.clear();
+            if (clean.size() > 16) clean.resize(16);
+            if (!clean.empty()) TOKEN_SYMBOLS[a]=clean;
+        }
+        int d=sqlite3_column_int(s,2); if (d>0) TOKEN_DECIMALS[a]=d;
+        uint64_t pn=sqlite3_column_int64(s,3); time_t ts=sqlite3_column_int64(s,4);
+        if (pn>0) PRICE_NANOS_CACHE[a]={pn,ts};
+    } sqlite3_finalize(s);
+}
+void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,symbol,decimals) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET symbol=CASE WHEN excluded.symbol!='' THEN excluded.symbol ELSE token_cache.symbol END, decimals=CASE WHEN excluded.decimals>0 THEN excluded.decimals ELSE token_cache.decimals END")) return;
+    sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,sym.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int(s,3,dec);
+    sqlite3_step(s); sqlite3_finalize(s);
+}
+constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
+constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
 
+void savePriceHistory(const std::string& a, uint64_t pn) {
+    if (!pn) return;
+    const long long slot = (static_cast<long long>(time(nullptr)) / PRICE_HISTORY_STEP_SEC)
+                         * PRICE_HISTORY_STEP_SEC;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "INSERT OR IGNORE INTO token_price_history(address,ts,price_nanos) VALUES(?,?,?)")) return;
+    sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, slot);
+    sqlite3_bind_int64(s, 3, static_cast<sqlite3_int64>(pn));
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
+void cleanupPriceHistory() {
+    const long long cutoff = static_cast<long long>(time(nullptr)) - PRICE_HISTORY_TTL_SEC;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "DELETE FROM token_price_history WHERE ts<?")) return;
+    sqlite3_bind_int64(s, 1, cutoff);
+    if (sqlite3_step(s) == SQLITE_DONE) {
+        const int n = sqlite3_changes(db);
+        if (n > 0) std::cout << "[PRICE-HIST] удалено снимков старше срока: " << n << std::endl;
+    }
+    sqlite3_finalize(s);
+}
+
+void saveTokenPrice(const std::string& a, uint64_t pn) {
+    if (!pn) return; std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,price_nanos,price_ts) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET price_nanos=excluded.price_nanos, price_ts=excluded.price_ts")) return;
+    sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,pn); sqlite3_bind_int64(s,3,time(nullptr));
+    sqlite3_step(s); sqlite3_finalize(s);
+}
 bool isTxProcessed(const std::string& h) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT 1 FROM processed_tx WHERE tx_hash=?")) return false;
@@ -925,6 +979,21 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
+void seedWalletTokensFromTrades() {
+    std::lock_guard<std::mutex> l(dbMutex);
+    const char* sql =
+        "INSERT OR IGNORE INTO wallet_tokens(wallet, token, last_seen) "
+        "SELECT wallet, token, MAX(timestamp) FROM trades GROUP BY wallet, token";
+    char* err = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[STARTUP] wallet_tokens seed failed: " << (err ? err : "") << std::endl;
+        sqlite3_free(err);
+        return;
+    }
+    int n = sqlite3_changes(db);
+    if (n > 0) std::cout << "[STARTUP] Seeded " << n << " wallet/token pairs from trade history" << std::endl;
+}
+
 void rememberWalletToken(const std::string& wallet, const std::string& token, long long ts) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO wallet_tokens(wallet,token,last_seen) VALUES(?,?,?) "
@@ -1025,6 +1094,227 @@ bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_in
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
     out = hexToCppInt(r.get<std::string>());
     return true;
+}
+
+int getDecimals(const std::string& addr) {
+    std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
+    auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return 18; }
+    int d=18;
+    if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
+    { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
+}
+std::string getSymbol(const std::string& addr) {
+    std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_SYMBOLS.count(a)) return TOKEN_SYMBOLS[a]; }
+    auto r=rpc("eth_call",{{{"to",addr},{"data","0x95d89b41"}},"latest"});
+    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return "UNKNOWN"; }
+    std::string sym;
+    if (r.get<std::string>().length()>130) { try { std::string h=r.get<std::string>().substr(2); int len=std::stoi(h.substr(64,64),nullptr,16);
+        if (len>0&&len<=32) { std::string sh=h.substr(128,len*2); for (size_t i=0;i<sh.length();i+=2) sym+=static_cast<char>(std::stoi(sh.substr(i,2),nullptr,16)); } } catch (...) {} }
+    if (sym.empty()&&r.get<std::string>().length()>=66) { try { std::string h=r.get<std::string>().substr(2,64);
+        for (size_t i=0;i<h.length();i+=2) { char c=static_cast<char>(std::stoi(h.substr(i,2),nullptr,16)); if (c=='\0') break; sym+=c; } } catch (...) {} }
+    {
+        std::string clean;
+        for (unsigned char c : sym) {
+            if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
+        }
+        while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+        while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
+        if (clean.size() * 2 < sym.size()) clean.clear();
+        if (clean.size() > 16) clean.resize(16);
+        sym = clean;
+    }
+    if (sym.empty()) sym="UNKNOWN"; { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_SYMBOLS[a]=sym; } saveTokenMetadata(a,sym,0); return sym;
+}
+constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
+std::map<std::string, double> POOL_LIQUIDITY_CACHE;
+
+double getPoolLiquidityUsd(const std::string& token) {
+    std::lock_guard<std::mutex> l(cacheMutex);
+    auto it = POOL_LIQUIDITY_CACHE.find(toLower(token));
+    return it != POOL_LIQUIDITY_CACHE.end() ? it->second : 0.0;
+}
+
+std::mutex g_pairCacheMutex;
+std::map<std::string, std::string> PAIR_CACHE;   // токен -> "пара|база", "" = пар нет
+
+uint64_t priceFromPoolReserves(const std::string& token) {
+    const auto& ctx = chainCtx();
+    if (ctx.v2Factory.empty() || ctx.wrappedNative.empty()) return 0;
+    const std::string t = toLower(token);
+    if (t == ctx.wrappedNative) return 0;
+
+    std::vector<std::pair<std::string, uint64_t>> bases;
+    {
+        std::lock_guard<std::mutex> l(g_pairCacheMutex);
+        auto it = PAIR_CACHE.find(t);
+        if (it != PAIR_CACHE.end()) {
+            if (it->second.empty()) return 0;          // знаем, что пар нет
+            const size_t b1 = it->second.find('|');
+            const size_t b2 = it->second.rfind('|');
+            if (b1 != std::string::npos && b2 > b1) {
+                const std::string base = it->second.substr(b1 + 1, b2 - b1 - 1);
+                bases.push_back({base, ctx.stablecoins.count(base) ? 1000000000ULL : 0});
+            }
+        }
+    }
+    if (bases.empty()) {
+        for (const auto& sc : ctx.stablecoins) bases.push_back({sc, 1000000000ULL});
+        bases.push_back({ctx.wrappedNative, 0});
+    }
+
+    for (const auto& [base, fixedPrice] : bases) {
+        if (base == t) continue;
+
+        std::string data = "0xe6a43905";
+        const std::string a = t.substr(2), b = base.substr(2);
+        data += std::string(24, '0') + a;
+        data += std::string(24, '0') + b;
+        json r = rpc("eth_call", json::array({ json{{"to", ctx.v2Factory}, {"data", data}}, "latest" }));
+        if (!r.is_string()) continue;
+        std::string pairHex = r.get<std::string>();
+        if (pairHex.size() < 66) continue;
+        const std::string pair = "0x" + pairHex.substr(pairHex.size() - 40);
+        if (pair == "0x" + std::string(40, '0')) continue;
+
+        json rr = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0902f1ac"}}, "latest" }));
+        if (!rr.is_string()) continue;
+        const std::string res = rr.get<std::string>();
+        if (res.size() < 2 + 64 * 2) continue;
+        const std::string body = res.substr(2);
+
+        cpp_int r0 = hexToCppInt(body.substr(0, 64));
+        cpp_int r1 = hexToCppInt(body.substr(64, 64));
+        if (r0 <= 0 || r1 <= 0) continue;
+
+        bool tokenIsZero = false;
+        bool knownSide = false;
+        {
+            std::lock_guard<std::mutex> l(g_pairCacheMutex);
+            auto it = PAIR_CACHE.find(t);
+            if (it != PAIR_CACHE.end()) {
+                const size_t b2 = it->second.rfind('|');
+                if (b2 != std::string::npos && b2 + 1 < it->second.size()) {
+                    tokenIsZero = it->second[b2 + 1] == '0';
+                    knownSide = true;
+                }
+            }
+        }
+        if (!knownSide) {
+            json t0 = rpc("eth_call", json::array({ json{{"to", pair}, {"data", "0x0dfe1681"}}, "latest" }));
+            if (!t0.is_string()) continue;
+            const std::string t0hex = t0.get<std::string>();
+            if (t0hex.size() < 66) continue;
+            tokenIsZero = ("0x" + toLower(t0hex.substr(t0hex.size() - 40))) == t;
+            std::lock_guard<std::mutex> l(g_pairCacheMutex);
+            PAIR_CACHE[t] = pair + "|" + base + "|" + (tokenIsZero ? "0" : "1");
+        }
+
+        const cpp_int tokenRes = tokenIsZero ? r0 : r1;
+        const cpp_int baseRes  = tokenIsZero ? r1 : r0;
+
+        const int tokenDec = getDecimals(t);
+        const int baseDec  = getDecimals(base);
+        if (tokenDec < 0 || tokenDec > 36 || baseDec < 0 || baseDec > 36) continue;
+
+        uint64_t basePrice = fixedPrice;
+        if (basePrice == 0) {
+            std::lock_guard<std::mutex> l(cacheMutex);
+            auto it = PRICE_NANOS_CACHE.find(ctx.wrappedNative);
+            if (it != PRICE_NANOS_CACHE.end()) basePrice = it->second.first;
+        }
+        if (basePrice == 0) continue;
+
+        cpp_int tokenScale = 1, baseScale = 1;
+        for (int i = 0; i < tokenDec; i++) tokenScale *= 10;
+        for (int i = 0; i < baseDec;  i++) baseScale  *= 10;
+
+        const cpp_int num = baseRes * tokenScale * cpp_int(basePrice);
+        const cpp_int den = tokenRes * baseScale;
+        if (den <= 0) continue;
+        const cpp_int priceNanos = num / den;
+
+        if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) continue;
+        return static_cast<uint64_t>(static_cast<unsigned long long>(priceNanos));
+    }
+    {
+        std::lock_guard<std::mutex> l(g_pairCacheMutex);
+        if (!PAIR_CACHE.count(t)) PAIR_CACHE[t] = "";
+    }
+    return 0;
+}
+
+uint64_t getPriceNanos(const std::string& token) {
+    bool thinPoolSeen = false;
+    std::string a=toLower(token);
+    { std::lock_guard<std::mutex> l(cacheMutex); if (PRICE_NANOS_CACHE.count(a)&&time(nullptr)-PRICE_NANOS_CACHE[a].second<PRICE_TTL) return PRICE_NANOS_CACHE[a].first; }
+    if (uint64_t own = priceFromPoolReserves(a)) {
+        { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={own,time(nullptr)}; }
+        saveTokenPrice(a, own);
+        savePriceHistory(a, own);
+        g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed);
+        return own;
+    }
+
+    double p=0;
+    auto r=http("https://api.dexscreener.com/latest/dex/tokens/"+token);
+    try {
+        auto j=json::parse(r);
+        if (j.contains("pairs") && j["pairs"].is_array()) {
+            const std::string wantChain = chainCtx().dexscreenerChainId;
+            double bestLiquidity = -1.0;
+            for (const auto& pair : j["pairs"]) {
+                if (!pair.is_object()) continue;
+                if (!wantChain.empty() && pair.value("chainId", std::string()) != wantChain) continue;
+                if (!pair.contains("priceUsd") || !pair["priceUsd"].is_string()) continue;
+                double liq = 0.0;
+                if (pair.contains("liquidity") && pair["liquidity"].is_object() &&
+                    pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
+                    liq = pair["liquidity"]["usd"].get<double>();
+                double price = 0.0;
+                try { price = std::stod(pair["priceUsd"].get<std::string>()); } catch (...) { continue; }
+                if (!std::isfinite(price) || price <= 0.0) continue;
+                if (liq < MIN_POOL_LIQUIDITY_USD) { thinPoolSeen = true; continue; }
+                if (liq > bestLiquidity) { bestLiquidity = liq; p = price; }
+            }
+            if (bestLiquidity >= 0.0) {
+                std::lock_guard<std::mutex> l(cacheMutex);
+                POOL_LIQUIDITY_CACHE[a] = bestLiquidity;
+            }
+        }
+    } catch (...) {}
+    if (p > 1e12) {
+        std::cerr << "[PRICE] отброшена бессмысленная цена " << p << " для " << a << std::endl;
+        p = 0;
+    }
+    if (p==0) {
+        const std::string platform = chainCtx().coingeckoPlatform.empty()
+                                   ? std::string("binance-smart-chain") : chainCtx().coingeckoPlatform;
+        auto r2=http("https://api.coingecko.com/api/v3/simple/token_price/"+platform+"?contract_addresses="+token+"&vs_currencies=usd");
+        try { auto j2=json::parse(r2); if (j2.contains(a)&&j2[a].contains("usd")&&j2[a]["usd"].is_number()) {
+            double cg = j2[a]["usd"].get<double>();
+            if (std::isfinite(cg) && cg > 0.0) p = cg;
+        } } catch (...) {} }
+    constexpr double MAX_SANE_PRICE_USD = 1e6;
+    uint64_t n = (std::isfinite(p) && p > 0.0 && p < MAX_SANE_PRICE_USD)
+               ? static_cast<uint64_t>(p * 1000000000.0) : 0;
+    if (n>0) {
+        { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a]={n,time(nullptr)}; }
+        saveTokenPrice(a,n);
+        savePriceHistory(a,n);
+    }
+    else {
+        std::lock_guard<std::mutex> l(cacheMutex);
+        if (PRICE_NANOS_CACHE.count(a) && PRICE_NANOS_CACHE[a].first > 0) {
+            if (thinPoolSeen) g_stats.price_thin_pool.fetch_add(1);
+            else {
+                g_stats.price_fallbacks.fetch_add(1);
+                std::cerr << "[PRICE] Stale cache: " << a << std::endl;
+            }
+            return PRICE_NANOS_CACHE[a].first;
+        }
+    }
+    return n;
 }
 
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
@@ -1688,12 +1978,12 @@ void dbMaintenanceLoop() {
     while (running.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::minutes(1));
         try {
-            cleanupTokenPricesPeriodic();
             bool doTruncate = std::chrono::duration_cast<std::chrono::minutes>(
                 std::chrono::steady_clock::now() - lastTruncate).count() >= 30;
             walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);
             if (doTruncate) {
                 cleanupOldTx(g_lastProcessedBlock.load(std::memory_order_relaxed));
+                cleanupPriceHistory();
                 lastTruncate = std::chrono::steady_clock::now();
             }
         } catch (const std::exception& e) { std::cerr << "[DB-MAINT][ERROR] " << e.what() << std::endl; }
@@ -1864,21 +2154,8 @@ void telegramLoop() {
                                   << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
                             if (!langStats.empty()) ss2 << "\n" << langStats;
                             ss2 << "\n\n"
-                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · "
-                                << g_stats.rpc_giveups.load() << " отказов"
-                                << "\n💰 Цена: кэш " << g_stats.price_cache_hit.load()
-                                << " · пул " << g_stats.price_from_pool.load()
-                                << " · DexScreener " << g_stats.price_from_dex.load()
-                                << " · CoinGecko " << g_stats.price_from_cg.load()
-                                << "\n💰 Защита: тонкий пул " << g_stats.price_thin_pool.load()
-                                << " · устаревший кэш " << g_stats.price_fallbacks.load()
-                                << " · расхождение " << g_stats.price_divergence.load()
-                                << " · скачок " << g_stats.price_spike_reject.load()
-                                << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
-                                << "\n📨 Sent: " << g_stats.alerts_sent.load()
-                                << "\n🔍 TX: " << g_stats.tx_processed.load()
-                                << "\n⏳ Lag: " << g_stats.current_lag.load()
-                                << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
+                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · " << g_stats.rpc_giveups.load() << " отказов" << "\n💰 Price fb: " << g_stats.price_fallbacks.load() << " · тонкий пул: " << g_stats.price_thin_pool.load() << "\n🏊 Из пула: " << g_stats.price_from_pool.load() << "\n🔄 REORG: " << g_stats.reorg_verifications.load() << "\n📨 Sent: " << g_stats.alerts_sent.load() << "\n🔍 TX: " << g_stats.tx_processed.load()
+                                << "\n⏳ Lag: " << g_stats.current_lag.load() << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             ss2 << rpcSlowSummary();
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
@@ -2020,44 +2297,14 @@ int main() {
         g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
         g_stats.last_rpc_failure.store(time(nullptr), std::memory_order_relaxed);
     });
-    setPriceStatHandler([](int kind){
-        switch (kind) {
-            case 0: g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed); break;
-            case 1: g_stats.price_thin_pool.fetch_add(1, std::memory_order_relaxed); break;
-            case 2: g_stats.price_fallbacks.fetch_add(1, std::memory_order_relaxed); break;
-            case 3: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break; // meta rpc
-            case 4: g_stats.price_divergence.fetch_add(1, std::memory_order_relaxed); break;
-            case 5: g_stats.price_spike_reject.fetch_add(1, std::memory_order_relaxed); break;
-            case 6: g_stats.price_from_dex.fetch_add(1, std::memory_order_relaxed); break;
-            case 7: g_stats.price_from_cg.fetch_add(1, std::memory_order_relaxed); break;
-            case 8: g_stats.price_cache_hit.fetch_add(1, std::memory_order_relaxed); break;
-            default: break;
-        }
-    });
     setRpcGiveUpHandler([]{
         g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
-    initDB(); initRankingDB();
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        const char* sql =
-            "INSERT OR IGNORE INTO wallet_tokens(wallet, token, last_seen) "
-            "SELECT wallet, token, MAX(timestamp) FROM trades GROUP BY wallet, token";
-        char* err = nullptr;
-        if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-            std::cerr << "[STARTUP] wallet_tokens seed failed: " << (err ? err : "") << std::endl;
-            sqlite3_free(err);
-        } else {
-            int n = sqlite3_changes(db);
-            if (n > 0) std::cout << "[STARTUP] Seeded " << n << " wallet/token pairs from trade history" << std::endl;
-        }
-    }
+    initDB(); initRankingDB(); seedWalletTokensFromTrades();
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     loadTokenCache();
-    loadPairCache();
-    ensureNativePrice();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     checkTranslations();
@@ -2112,7 +2359,6 @@ int main() {
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
                 warmGramRate();
-                ensureNativePrice();
                 lrt=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); cleanupWalletTokens(); lcl=std::chrono::steady_clock::now(); }
