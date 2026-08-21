@@ -33,7 +33,7 @@ namespace {
 
 constexpr time_t PRICE_TTL = 300;          // обычные токены: 5 мин
 constexpr time_t PRICE_TTL_MAJOR = 900;    // major (WBNB/BTCB/стейблы…): 15 мин
-constexpr time_t NATIVE_PRICE_TTL = 300;   // 5 мин
+constexpr time_t NATIVE_PRICE_TTL = 900;   // 15 мин (как major, реже RPC на BNB)
 constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
 constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
 constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
