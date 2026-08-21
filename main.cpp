@@ -39,6 +39,7 @@
 #include "tx_analyzer.h"
 #include "beneficiary_stats.h"
 #include "hyperliquid.h"
+#include "hyperliquid_internal.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -283,8 +284,11 @@ struct Watcher {
 std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
-// Адреса для матча в processBlock (BSC): есть спот-сделка или добавлены <14 дней.
+// BSC processBlock: спот-сделка или <14 дней с добавления.
 std::shared_ptr<const std::unordered_set<std::string>> BSC_ACTIVE_PTR =
+    std::make_shared<const std::unordered_set<std::string>>();
+// HL подписка: fill в hl_fills или <14 дней с добавления (не таскаем чистый BSC-спот).
+std::shared_ptr<const std::unordered_set<std::string>> HL_ACTIVE_PTR =
     std::make_shared<const std::unordered_set<std::string>>();
 
 void initDB() {
@@ -469,11 +473,29 @@ size_t countUsers() {
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
     auto bscActive = std::make_shared<std::unordered_set<std::string>>();
+    auto hlActive = std::make_shared<std::unordered_set<std::string>>();
     long long now = static_cast<long long>(time(nullptr));
-    constexpr long long SPOT_WATCH_GRACE_SEC = 14LL * 86400LL;
-    const long long graceAfter = now - SPOT_WATCH_GRACE_SEC;
+    constexpr long long MARKET_WATCH_GRACE_SEC = 14LL * 86400LL;
+    const long long graceAfter = now - MARKET_WATCH_GRACE_SEC;
     bool queryOk = false;
-    size_t bscOn = 0, bscOff = 0;
+    size_t bscOff = 0, hlOff = 0;
+
+    // Кошельки с любой HL-активностью (один проход по hl_fills).
+    std::unordered_set<std::string> hasHlFill;
+    {
+        std::lock_guard<std::mutex> hlLock(hl::g_hlDbMutex);
+        if (hl::g_hlDb) {
+            sqlite3_stmt* hs = nullptr;
+            if (prepareOrLog(hl::g_hlDb, &hs, "SELECT DISTINCT lower(wallet) FROM hl_fills")) {
+                while (sqlite3_step(hs) == SQLITE_ROW) {
+                    std::string w = safeColumnText(hs, 0);
+                    if (!w.empty()) hasHlFill.insert(std::move(w));
+                }
+                sqlite3_finalize(hs);
+            }
+        }
+    }
+
     {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
 
@@ -498,19 +520,26 @@ void refreshWatchers() {
                 bool prem = sqlite3_column_int(s,4) != 0;
                 long long createdAt = sqlite3_column_int64(s,5);
                 bool hasSpot = sqlite3_column_int(s,6) != 0;
+                const bool inGrace = (createdAt <= 0) || (createdAt >= graceAfter);
+                const bool hasHl = hasHlFill.count(addr) > 0;
 
-                // Полный список — алерты + HL (hlWatchedAddresses читает WATCHERS).
+                // Полный список — получатели алертов (оба рынка).
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
                 if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
 
-                // BSC processBlock: только спот-активные или «льгота» 14 дней после добавления.
-                const bool bscOk = hasSpot || createdAt <= 0 || createdAt >= graceAfter;
-                if (bscOk) {
-                    if (bscActive->insert(addr).second) ++bscOn;
+                // BSC: спот или льгота 14 дней
+                if (hasSpot || inGrace) {
+                    bscActive->insert(addr);
                 } else {
                     ++bscOff;
+                }
+                // HL: перп-fill или льгота 14 дней (чистый многолетний BSC-спот не подписываем)
+                if (hasHl || inGrace) {
+                    hlActive->insert(addr);
+                } else {
+                    ++hlOff;
                 }
             }
             queryOk = (stepRc == SQLITE_DONE);
@@ -524,19 +553,22 @@ void refreshWatchers() {
     }
     std::cout << "[WATCHERS] total=" << m->size()
               << " bsc_active=" << bscActive->size()
-              << " bsc_cold_links=" << bscOff << std::endl;
+              << " hl_active=" << hlActive->size()
+              << " bsc_cold_links=" << bscOff
+              << " hl_cold_links=" << hlOff << std::endl;
     std::unique_lock l(watchersMutex);
     WATCHERS_PTR = m;
     BSC_ACTIVE_PTR = bscActive;
+    HL_ACTIVE_PTR = hlActive;
 }
 
 std::vector<std::string> hlWatchedAddresses() {
-    std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
-    { std::shared_lock l(watchersMutex); snapshot = WATCHERS_PTR; }
+    std::shared_ptr<const std::unordered_set<std::string>> hlActive;
+    { std::shared_lock l(watchersMutex); hlActive = HL_ACTIVE_PTR; }
     std::vector<std::string> out;
-    if (!snapshot) return out;
-    out.reserve(snapshot->size());
-    for (const auto& kv : *snapshot) out.push_back(kv.first);
+    if (!hlActive) return out;
+    out.reserve(hlActive->size());
+    for (const auto& a : *hlActive) out.push_back(a);
     return out;
 }
 
