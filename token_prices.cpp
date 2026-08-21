@@ -31,7 +31,7 @@ namespace { inline void bump(int kind) { if (g_priceStatHandler) g_priceStatHand
 
 namespace {
 
-constexpr time_t PRICE_TTL = 300;          // обычные токены: 5 мин
+constexpr time_t PRICE_TTL = 600;          // обычные токены: 10 мин (меньше RPC)
 constexpr time_t PRICE_TTL_MAJOR = 900;    // major (WBNB/BTCB/стейблы…): 15 мин
 constexpr time_t NATIVE_PRICE_TTL = 900;   // 15 мин (как major, реже RPC на BNB)
 constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
@@ -693,7 +693,7 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         int added = 0;
         for (const auto& sc : ctx.stablecoins) {
             bases.push_back({toLower(sc), 1000000000ULL});
-            if (++added >= 3) break;
+            if (++added >= 2) break; // было 3 — меньше factory/reserves
         }
         bases.push_back({toLower(ctx.wrappedNative), 0});
     }
@@ -710,7 +710,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
     const std::string v3f = v3FactoryAddress();
     // Сначала частые tier'ы; редкие — только если по этой базе ещё ничего не нашли
     static const uint32_t kV3FeesPrimary[] = {2500, 500};
-    static const uint32_t kV3FeesSecondary[] = {100, 10000};
 
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t || base.size() != 42) continue;
@@ -755,27 +754,23 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             }
         }
 
-        // --- V3: primary fees, secondary только если по базе пусто ---
-        if (!v3f.empty() && bestLiq < STRONG_POOL_LIQ_USD) {
-            auto tryFees = [&](const uint32_t* fees, size_t n) {
-                for (size_t i = 0; i < n; ++i) {
-                    std::string pool = v3GetPool(v3f, t, base, fees[i]);
-                    if (pool.empty()) continue;
-                    uint64_t px = 0;
-                    double liq = 0;
-                    if (!quoteV3Pool(t, base, basePrice, pool, px, liq)) continue;
-                    pwSum += static_cast<double>(px) * liq;
-                    wSum  += liq;
-                    if (liq > bestLiq) bestLiq = liq;
-                }
-            };
-            tryFees(kV3FeesPrimary, 2);
-            if (wSum <= baseWBefore)
-                tryFees(kV3FeesSecondary, 2);
+        // --- V3 только если по этой базе V2 пусто (экономия 2–6 eth_call) ---
+        if (!v3f.empty() && wSum <= baseWBefore) {
+            for (uint32_t fee : kV3FeesPrimary) {
+                std::string pool = v3GetPool(v3f, t, base, fee);
+                if (pool.empty()) continue;
+                uint64_t px = 0;
+                double liq = 0;
+                if (!quoteV3Pool(t, base, basePrice, pool, px, liq)) continue;
+                pwSum += static_cast<double>(px) * liq;
+                wSum  += liq;
+                if (liq > bestLiq) bestLiq = liq;
+            }
+            // secondary tiers (100/10000) отключены — слишком дорого для mark
         }
 
-        // Ранний выход только если набрали вес с нескольких источников / очень глубокий пул
-        if (bestLiq >= STRONG_POOL_LIQ_USD * 5.0 && wSum >= bestLiq * 1.5)
+        // Достаточный V2/V3 — дальше базы не долбим
+        if (bestLiq >= STRONG_POOL_LIQ_USD)
             break;
     }
 
@@ -943,11 +938,8 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         }
     }
 
-    // TWAP-сглаживание только для ончейн-цены (не ломаем CG/dex одной точкой)
-    if (n > 0 && src == PriceSource::Pool) {
-        uint64_t tw = softTwap(a, n);
-        if (tw > 0) n = tw;
-    }
+    // softTwap отключён в облегчённом режиме (лишний SELECT на каждый pool-miss)
+    (void)softTwap;
 
     if (n > 0) {
         { std::lock_guard<std::mutex> l(cacheMutex); PRICE_NANOS_CACHE[a] = {n, time(nullptr)}; }
