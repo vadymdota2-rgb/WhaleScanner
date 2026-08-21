@@ -370,6 +370,48 @@ static std::string parseTokenText(const json& r) {
     return clean;
 }
 
+
+// Имя/тикер с DexScreener, если ончейн symbol/name пустые.
+static std::string fetchDexScreenerSymbol(const std::string& a) {
+    auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + a);
+    try {
+        auto j = json::parse(r);
+        if (!j.contains("pairs") || !j["pairs"].is_array()) return "";
+        const std::string wantChain = chainCtx().dexscreenerChainId;
+        std::string bestSym;
+        double bestLiq = -1.0;
+        for (const auto& pair : j["pairs"]) {
+            if (!pair.is_object()) continue;
+            if (!wantChain.empty() && pair.value("chainId", std::string()) != wantChain) continue;
+            double liq = 0.0;
+            if (pair.contains("liquidity") && pair["liquidity"].is_object() &&
+                pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
+                liq = pair["liquidity"]["usd"].get<double>();
+            std::string sym;
+            // наш токен — base или quote
+            if (pair.contains("baseToken") && pair["baseToken"].is_object()) {
+                std::string ba = toLower(pair["baseToken"].value("address", ""));
+                if (ba == a) sym = pair["baseToken"].value("symbol", "");
+            }
+            if (sym.empty() && pair.contains("quoteToken") && pair["quoteToken"].is_object()) {
+                std::string qa = toLower(pair["quoteToken"].value("address", ""));
+                if (qa == a) sym = pair["quoteToken"].value("symbol", "");
+            }
+            if (sym.empty()) continue;
+            // лёгкая чистка как у ончейн
+            std::string clean;
+            for (unsigned char c : sym) {
+                if (c >= 32 && c < 127) clean.push_back(static_cast<char>(c));
+            }
+            while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
+            while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+            if (clean.empty() || clean.size() > 32) continue;
+            if (liq >= bestLiq) { bestLiq = liq; bestSym = clean; }
+        }
+        return bestSym;
+    } catch (...) { return ""; }
+}
+
 std::string getSymbol(const std::string& addr) {
     std::string a = toLower(addr);
     {
@@ -392,6 +434,10 @@ std::string getSymbol(const std::string& addr) {
             sym = parseTokenText(rn);
     }
 
+    if (sym.empty()) {
+        // ончейн пусто → DexScreener (тикер из лучшей пары по liq)
+        sym = fetchDexScreenerSymbol(a);
+    }
     if (sym.empty()) return "UNKNOWN";
 
     {
