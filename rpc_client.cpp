@@ -135,20 +135,12 @@ json rpcSpread(size_t seed, const std::string& method, json params) {
 }
 
 const long long RPC_SLOW_THRESHOLD_MS = 1000;
-const int RPC_SLOW_STREAK_LIMIT = 2; // было 3 — слишком редко набиралось
+const int RPC_SLOW_STREAK_LIMIT = 3;
 std::mutex g_rpcLatencyMutex;
 std::map<std::string, uint64_t> g_rpcSlowCount;
 std::map<std::string, int64_t> g_rpcSlowMaxMs;
 std::mutex g_rpcStreakMutex;
 std::map<std::string, int> g_rpcSlowStreakByEp;
-
-// Лёгкие вызовы не сбрасывают slow-streak (иначе eth_blockNumber обнуляет серию).
-static bool isLightRpcMethod(const std::string& method) {
-    return method == "eth_blockNumber"
-        || method == "eth_chainId"
-        || method == "net_version"
-        || method == "web3_clientVersion";
-}
 
 json rpc(const std::string& method, json params, int maxRetries) {
     if (RPC_ENDPOINTS.empty()) { reportFailure(); reportGiveUp(); return nullptr; }
@@ -174,13 +166,10 @@ json rpc(const std::string& method, json params, int maxRetries) {
                 if (streak >= RPC_SLOW_STREAK_LIMIT) g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
             }
             if (streak >= RPC_SLOW_STREAK_LIMIT) {
-                size_t next = usableEndpointFrom(idx + 1);
-                rpcIndex.store(next, std::memory_order_relaxed);
-                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[idx]
-                          << " → " << RPC_ENDPOINTS[next] << std::endl;
+                rpcIndex.store((idx + 1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+                std::cerr << "[RPC] Rotating away from slow endpoint " << RPC_ENDPOINTS[idx] << std::endl;
             }
-        } else if (!isLightRpcMethod(method)) {
-            // Только «тяжёлый» быстрый ответ сбрасывает streak
+        } else {
             std::lock_guard<std::mutex> sl(g_rpcStreakMutex);
             g_rpcSlowStreakByEp[RPC_ENDPOINTS[idx]] = 0;
         }
@@ -194,9 +183,8 @@ json rpc(const std::string& method, json params, int maxRetries) {
         {
             reportEndpoint(idx, false);
             reportFailure();
-            size_t next = usableEndpointFrom(idx + 1);
-            rpcIndex.store(next, std::memory_order_relaxed);
-            std::cerr << "[RPC] Switching to " << next
+            rpcIndex.store((idx + 1) % RPC_ENDPOINTS.size(), std::memory_order_relaxed);
+            std::cerr << "[RPC] Switching to " << ((idx + 1) % RPC_ENDPOINTS.size())
                       << " after failure on " << RPC_ENDPOINTS[idx] << std::endl;
         }
         if (a < maxRetries-1) std::this_thread::sleep_for(std::chrono::milliseconds((1<<a)*500));
