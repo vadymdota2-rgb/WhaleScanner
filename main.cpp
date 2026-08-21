@@ -40,6 +40,7 @@
 #include "beneficiary_stats.h"
 #include "hyperliquid.h"
 #include "hyperliquid_internal.h"
+#include "ws_heads.h"
 
 using json = nlohmann::json;
 using boost::multiprecision::cpp_int;
@@ -1941,6 +1942,14 @@ void telegramLoop() {
                                 << "\n🔍 TX: " << g_stats.tx_processed.load()
                                 << "\n⏳ Lag: " << g_stats.current_lag.load()
                                 << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
+                            if (wsHeadsOk()) {
+                                ss2 << "\n🔌 WS: ✅ newHeads · блок " << wsHeadsLatest();
+                            } else {
+                                ss2 << "\n🔌 WS: ❌ HTTP fallback"
+                                    << (wsHeadsLatest() > 0
+                                            ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
+                                            : "");
+                            }
                             ss2 << rpcSlowSummary();
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
@@ -2077,6 +2086,17 @@ int main() {
         setRpcEndpoints(cfg.rpcEndpoints);
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
                   << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
+        {
+            const char* wsEnv = std::getenv("WHALE_WS_URL");
+            std::string wsUrl = (wsEnv && *wsEnv) ? std::string(wsEnv)
+                                                  : std::string("wss://rpc-bsc.blockmachine.io");
+            // пустая строка WHALE_WS_URL=  → WS выкл
+            if (wsEnv && std::string(wsEnv).empty()) wsUrl.clear();
+            if (!wsUrl.empty() && (chainName == "bsc" || chainName == "bnb"))
+                startWsHeads(wsUrl);
+            else if (!wsUrl.empty())
+                std::cout << "[WS] skip (non-BSC chain)" << std::endl;
+        }
     }
     setRpcFailureHandler([]{
         g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed);
@@ -2146,8 +2166,17 @@ int main() {
     auto lrt=std::chrono::steady_clock::now()-std::chrono::minutes(10);
     while (running.load(std::memory_order_relaxed)) {
         try {
-            auto lj=rpc("eth_blockNumber",{}); long long lat;
-            if (!lj.is_string()||!hexToLL(lj.get<std::string>(),lat)) { std::this_thread::sleep_for(std::chrono::seconds(2)); continue; }
+            long long lat = 0;
+            if (wsHeadsOk()) {
+                lat = static_cast<long long>(wsHeadsLatest());
+            }
+            if (lat <= 0) {
+                auto lj=rpc("eth_blockNumber",{});
+                if (!lj.is_string()||!hexToLL(lj.get<std::string>(),lat)) {
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                    continue;
+                }
+            }
             {
                 int64_t lagNow = lat - lb;
                 g_stats.current_lag.store(lagNow, std::memory_order_relaxed);
@@ -2194,6 +2223,7 @@ int main() {
     af.join();
     dm.join();
     stopHyperliquid();
+    stopWsHeads();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
