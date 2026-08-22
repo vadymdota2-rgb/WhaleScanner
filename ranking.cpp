@@ -30,7 +30,17 @@ extern std::mutex dbMutex;
 extern std::atomic<bool> running;
 
 namespace {
-constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
+constexpr long long WINDOW_SECONDS = 30LL * 86400LL; // bot filter + default rank
+constexpr int RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
+
+int clampRankWindowDays(int days) {
+    for (int d : RANK_WINDOWS_DAYS) if (d == days) return d;
+    return 30;
+}
+
+std::string rankCacheKey(const std::string& kind, int days) {
+    return "global_" + kind + "_" + std::to_string(clampRankWindowDays(days));
+}
 constexpr long long RETENTION_SECONDS = 365LL * 86400LL;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
@@ -333,10 +343,11 @@ struct GlobalRankings {
     std::vector<PnlRow> byActive;
 };
 
-std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
+std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
     ok = false;
     std::vector<PnlRow> results;
-    long long since = static_cast<long long>(time(nullptr)) - WINDOW_SECONDS;
+    if (windowSeconds < 86400LL) windowSeconds = 86400LL;
+    long long since = static_cast<long long>(time(nullptr)) - windowSeconds;
 
     std::string curWallet, curToken;
     cpp_int heldQty = 0, heldCost = 0;
@@ -388,7 +399,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
         cpp_int amount;
         if (!safeParseAmount(amountStr, "wallet=" + wallet + " token=" + token, amount)) {
             sqlite3_finalize(s);
-            std::cerr << "[RANKING] computeGlobalTop30D() aborted: corrupted token_amount" << std::endl;
+            std::cerr << "[RANKING] computeGlobalTopWindow() aborted: corrupted token_amount" << std::endl;
             return results;
         }
 
@@ -431,7 +442,7 @@ std::vector<PnlRow> computeGlobalTop30D(bool& ok) {
     }
     sqlite3_finalize(s);
     if (stepRc != SQLITE_DONE) {
-        std::cerr << "[RANKING] computeGlobalTop30D() interrupted mid-read: "
+        std::cerr << "[RANKING] computeGlobalTopWindow() interrupted mid-read: "
                   << sqlite3_errmsg(rdb) << std::endl;
         return results;
     }
@@ -481,7 +492,8 @@ std::string globalTitle(GlobalRankKind kind, Lang lang) {
 }
 
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
-                                int maxRank, bool showUpgrade, Lang lang) {
+                                int maxRank, bool showUpgrade, Lang lang, int windowDays) {
+    windowDays = clampRankWindowDays(windowDays);
     if (maxRank < 1) maxRank = 1;
     int visible = std::min(static_cast<int>(rows.size()), maxRank);
     int totalPages = std::max(1, (visible + GLOBAL_PER_PAGE - 1) / GLOBAL_PER_PAGE);
@@ -492,7 +504,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     std::stringstream text;
     const char* const dm = dirMark(lang);
 
-    text << dm << "🟡 <b>BSC \u2014 " << globalTitle(kind, lang) << "</b>\n\n";
+    text << dm << "🟡 <b>BSC \u2014 " << globalTitle(kind, lang) << "</b> · " << windowDays << tr(lang, "unit_day") << "\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -530,11 +542,25 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     }
 
     std::string kindParam = globalRankKindToString(kind);
+    const std::string winSuffix = ":" + std::to_string(windowDays);
     json navRow = json::array();
-    if (page > 1) navRow.push_back({{"text", "⬅️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page - 1)}});
+    if (page > 1) navRow.push_back({{"text", "⬅️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page - 1) + winSuffix}});
     navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
-    if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1)}});
+    if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1) + winSuffix}});
     keyboard["inline_keyboard"].push_back(navRow);
+
+    // после «Отслеживать» и навигации — окна, перед «Назад»
+    json winRow = json::array();
+    for (int d : RANK_WINDOWS_DAYS) {
+        const bool on = (d == windowDays);
+        const std::string label = on
+            ? ("· " + std::to_string(d) + tr(lang, "unit_day") + " ·")
+            : (std::to_string(d) + tr(lang, "unit_day"));
+        winRow.push_back({{"text", label},
+                          {"callback_data", "gt_open:" + kindParam + ":" + std::to_string(d)}});
+    }
+    keyboard["inline_keyboard"].push_back(winRow);
+
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
@@ -546,39 +572,54 @@ RankingMessage buildGeneratingMessage(Lang lang) {
     return {tr(lang, "rk_generating"), ""};
 }
 
-RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade, Lang lang) {
+RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, bool showUpgrade, Lang lang,
+                                    int windowDays = 30) {
+    windowDays = clampRankWindowDays(windowDays);
     std::string payload;
-    if (!loadCachedPayload("global_" + globalRankKindToString(kind), payload)) {
+    if (!loadCachedPayload(rankCacheKey(globalRankKindToString(kind), windowDays), payload)) {
         return buildGeneratingMessage(lang);
     }
     std::vector<PnlRow> rows;
     if (!rowsFromJson(payload, rows)) return buildGeneratingMessage(lang);
-    return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang);
+    return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang, windowDays);
 }
 
 void rebuildAllRankings() {
     auto t0 = std::chrono::steady_clock::now();
 
-    bool ok = false;
-    std::vector<PnlRow> base = computeGlobalTop30D(ok);
-    if (!ok) {
-        std::cerr << "[RANKING] cache rebuild aborted: global ranking read was interrupted, keeping previous cache" << std::endl;
+    std::vector<std::pair<std::string, std::string>> entries;
+    bool anyOk = false;
+    for (int days : RANK_WINDOWS_DAYS) {
+        bool ok = false;
+        std::vector<PnlRow> base = computeGlobalTopWindow(static_cast<long long>(days) * 86400LL, ok);
+        if (!ok) {
+            std::cerr << "[RANKING] cache rebuild: window " << days
+                      << "d interrupted, keeping previous payload for this window" << std::endl;
+            continue;
+        }
+        anyOk = true;
+        GlobalRankings g = buildGlobalRankings(base);
+        if (days == 30) {
+            std::vector<std::string> top;
+            top.reserve(g.byPnl.size());
+            for (const auto& r : g.byPnl) top.push_back(r.wallet);
+            markRankPresence("spot", top);
+        }
+        entries.emplace_back(rankCacheKey("pnl", days), rowsToJson(g.byPnl));
+        entries.emplace_back(rankCacheKey("roi", days), rowsToJson(g.byRoi));
+        entries.emplace_back(rankCacheKey("winrate", days), rowsToJson(g.byWinRate));
+        entries.emplace_back(rankCacheKey("active", days), rowsToJson(g.byActive));
+        if (days == 30) {
+            entries.emplace_back("global_pnl", rowsToJson(g.byPnl));
+            entries.emplace_back("global_roi", rowsToJson(g.byRoi));
+            entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
+            entries.emplace_back("global_active", rowsToJson(g.byActive));
+        }
+    }
+    if (!anyOk || entries.empty()) {
+        std::cerr << "[RANKING] cache rebuild aborted: no window completed" << std::endl;
         return;
     }
-    GlobalRankings g = buildGlobalRankings(base);
-
-    {
-        std::vector<std::string> top;
-        top.reserve(g.byPnl.size());
-        for (const auto& r : g.byPnl) top.push_back(r.wallet);
-        markRankPresence("spot", top);
-    }
-
-    std::vector<std::pair<std::string, std::string>> entries;
-    entries.emplace_back("global_pnl", rowsToJson(g.byPnl));
-    entries.emplace_back("global_roi", rowsToJson(g.byRoi));
-    entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
-    entries.emplace_back("global_active", rowsToJson(g.byActive));
 
     long long now = static_cast<long long>(time(nullptr));
     {
@@ -588,25 +629,15 @@ void rebuildAllRankings() {
             return;
         }
         sqlite3_stmt* s;
-        if (!prepareOrLog(db, &s, "DELETE FROM ranking_cache")) {
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-            return;
-        }
-        int delRc = sqlite3_step(s);
-        sqlite3_finalize(s);
-        if (delRc != SQLITE_DONE) {
-            std::cerr << "[RANKING] cache rebuild: DELETE failed: " << sqlite3_errmsg(db) << std::endl;
-            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-            return;
-        }
         if (!prepareOrLog(db, &s,
-            "INSERT INTO ranking_cache(cache_key,payload,updated_at) VALUES(?,?,?)")) {
+            "INSERT OR REPLACE INTO ranking_cache(cache_key,payload,updated_at) VALUES(?,?,?)")) {
             sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
             return;
         }
         bool insOk = true;
         for (const auto& e : entries) {
             sqlite3_reset(s);
+            sqlite3_clear_bindings(s);
             sqlite3_bind_text(s, 1, e.first.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(s, 2, e.second.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(s, 3, now);
@@ -1123,27 +1154,47 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
         if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
     else if (action == "gt_open") {
+        // gt_open:pnl  |  gt_open:pnl:90
+        std::string kindStr = param;
+        int windowDays = 30;
+        const size_t sep = param.find(':');
+        if (sep != std::string::npos) {
+            kindStr = param.substr(0, sep);
+            try { windowDays = std::stoi(param.substr(sep + 1)); } catch (...) {}
+        }
         GlobalRankKind kind;
-        if (parseGlobalRankKind(param, kind)) {
+        if (parseGlobalRankKind(kindStr, kind)) {
             rememberView(chatId, data);
-            auto msg = buildGlobalTopMessage(chatId, kind,
-                                             premiumTopTradersLimit(chatId),
-                                             !isPremium(chatId));
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            auto msg = buildGlobalFromCache(kind, 1,
+                                            premiumTopTradersLimit(chatId),
+                                            !isPremium(chatId), lang, windowDays);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         }
     }
     else if (action == "gt_page") {
+        // gt_page:pnl:2  |  gt_page:pnl:2:90
         size_t sep = param.find(':');
         if (sep != std::string::npos) {
             std::string kindStr = param.substr(0, sep);
+            std::string rest = param.substr(sep + 1);
             int page = 1;
-            try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
+            int windowDays = 30;
+            size_t sep2 = rest.find(':');
+            try {
+                if (sep2 == std::string::npos) page = std::stoi(rest);
+                else {
+                    page = std::stoi(rest.substr(0, sep2));
+                    windowDays = std::stoi(rest.substr(sep2 + 1));
+                }
+            } catch (...) {}
             GlobalRankKind kind;
             if (parseGlobalRankKind(kindStr, kind)) {
                 rememberView(chatId, data);
-                auto msg = buildGlobalTopPage(chatId, kind, page,
-                                              premiumTopTradersLimit(chatId),
-                                              !isPremium(chatId));
+                Lang lang = langFromCode(getUserLanguage(chatId));
+                auto msg = buildGlobalFromCache(kind, page,
+                                                premiumTopTradersLimit(chatId),
+                                                !isPremium(chatId), lang, windowDays);
                 replyInPlace(chatId, messageId, msg.text, msg.keyboard);
             }
         }
