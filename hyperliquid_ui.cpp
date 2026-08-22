@@ -160,11 +160,12 @@ std::string perpKindStr(PerpKind k) {
 }
 
 std::string perpTitle(PerpKind k, Lang lang) {
+    // rk_btn_* уже с эмодзи, без «(30д)» — срок только windowDays
     switch (k) {
-        case PerpKind::ROI:     return "\U0001F4C8 " + tr(lang, "rk_top_roi_30d");
-        case PerpKind::WINRATE: return "\U0001F3AF " + tr(lang, "rk_top_winrate_30d");
-        case PerpKind::ACTIVE:  return "\U0001F504 " + tr(lang, "rk_most_active_30d");
-        default:                return "\U0001F4B5 " + tr(lang, "rk_top_pnl_30d");
+        case PerpKind::ROI:     return tr(lang, "rk_btn_top_roi");
+        case PerpKind::WINRATE: return tr(lang, "rk_btn_top_winrate");
+        case PerpKind::ACTIVE:  return tr(lang, "rk_btn_most_active");
+        default:                return tr(lang, "rk_btn_top_pnl");
     }
 }
 
