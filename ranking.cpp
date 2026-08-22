@@ -499,11 +499,12 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
 }
 
 std::string globalTitle(GlobalRankKind kind, Lang lang) {
+    // rk_btn_* уже с эмодзи, без «(30д)» — срок только windowDays
     switch (kind) {
-        case GlobalRankKind::PNL: return "💵 " + tr(lang, "rk_top_pnl_30d");
-        case GlobalRankKind::ROI: return "📈 " + tr(lang, "rk_top_roi_30d");
-        case GlobalRankKind::WIN_RATE: return "🎯 " + tr(lang, "rk_top_winrate_30d");
-        case GlobalRankKind::ACTIVE: return "🔄 " + tr(lang, "rk_most_active_30d");
+        case GlobalRankKind::PNL: return tr(lang, "rk_btn_top_pnl");
+        case GlobalRankKind::ROI: return tr(lang, "rk_btn_top_roi");
+        case GlobalRankKind::WIN_RATE: return tr(lang, "rk_btn_top_winrate");
+        case GlobalRankKind::ACTIVE: return tr(lang, "rk_btn_most_active");
     }
     return "🏆 " + tr(lang, "rk_top_traders_30d");
 }
@@ -593,7 +594,13 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
                                     int windowDays = 30) {
     windowDays = clampRankWindowDays(windowDays);
     std::string payload;
-    if (!loadCachedPayload(rankCacheKey(globalRankKindToString(kind), windowDays), payload)) {
+    const std::string key = rankCacheKey(globalRankKindToString(kind), windowDays);
+    if (!loadCachedPayload(key, payload)) {
+        // окно ещё не считали (разнесённый график) — помечаем due, чтобы
+        // следующий тик rankingCacheLoop взял именно его
+        const int idx = rankWindowIndex(windowDays);
+        g_rankWindowBuiltAt[idx] = 0;
+        g_forceRebuild.store(true, std::memory_order_relaxed);
         return buildGeneratingMessage(lang);
     }
     std::vector<PnlRow> rows;
@@ -609,26 +616,22 @@ void rebuildAllRankings() {
     std::vector<std::pair<std::string, std::string>> entries;
     bool anyOk = false;
 
-    // выбираем окна к пересчёту: force → все due; иначе одно самое просроченное
-    // (иначе 30д каждые 15 мин забивает слот и 90/365 никогда не считаются)
+    // одно самое просроченное / ни разу не собранное окно.
+    // force только будит цикл раньше сна — не гоняет все 4 окна сразу.
     std::vector<int> todo;
-    if (force) {
-        for (int i = 0; i < RANK_WINDOWS_COUNT; i++) todo.push_back(i);
-    } else {
-        int best = -1;
-        double bestScore = -1.0;
-        for (int i = 0; i < RANK_WINDOWS_COUNT; i++) {
-            const long long interval = RANK_WINDOW_INTERVAL_SEC[i];
-            const long long built = g_rankWindowBuiltAt[i];
-            if (built > 0 && (now - built) < interval) continue;
-            // не собранное — приоритет коротким окнам (30д первый)
-            const double score = (built <= 0)
-                ? (1000.0 - i)
-                : static_cast<double>(now - built) / static_cast<double>(interval);
-            if (score > bestScore) { bestScore = score; best = i; }
-        }
-        if (best >= 0) todo.push_back(best);
+    int best = -1;
+    double bestScore = -1.0;
+    for (int i = 0; i < RANK_WINDOWS_COUNT; i++) {
+        const long long interval = RANK_WINDOW_INTERVAL_SEC[i];
+        const long long built = g_rankWindowBuiltAt[i];
+        if (!force && built > 0 && (now - built) < interval) continue;
+        // не собранное — приоритет коротким (30д), иначе % просрочки
+        const double score = (built <= 0)
+            ? (1000.0 - i)
+            : static_cast<double>(now - built) / static_cast<double>(interval);
+        if (score > bestScore) { bestScore = score; best = i; }
     }
+    if (best >= 0) todo.push_back(best);
 
     for (int i : todo) {
         const int days = RANK_WINDOWS_DAYS[i];
