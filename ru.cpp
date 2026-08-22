@@ -120,7 +120,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"big_liq_loss", {"Loss", "Убыток"}},
         {"big_liq_position", {"Position", "Позиция"}},
         {"big_liq_closed_at", {"Closed at", "Закрыли по"}},
-        {"big_liq_account_was", {"Account was", "На счету было"}},
+        {"big_liq_account_was", {"Deposit left", "Остаток депозита"}},
         {"big_spot_title", {"Biggest trades · BSC Spot", "Крупные сделки · BSC Спот"}},
         {"big_perp_title", {"Biggest trades · Hyperliquid", "Крупные сделки · Hyperliquid"}},
         {"big_win_1h", {"1 hour", "1 час"}},
