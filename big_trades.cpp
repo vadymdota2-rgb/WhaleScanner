@@ -107,6 +107,41 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     return out;
 }
 
+std::vector<BigRow> liqRows(long long sinceSec, int limit) {
+    std::vector<BigRow> out;
+    std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
+    if (!hl::g_hlDb) return out;
+    sqlite3_stmt* s;
+    if (!prepareOrLog(hl::g_hlDb, &s,
+        "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, "
+        "       closed_pnl_nanos, margin_nanos, account_value_nanos "
+        "FROM hl_fills "
+        "WHERE ts >= ? AND notional_nanos > 0 "
+        "AND dir LIKE '%Liquidat%' "
+        "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
+        "GROUP BY wallet "
+        "HAVING notional_nanos = MAX(notional_nanos) "
+        "ORDER BY notional_nanos DESC LIMIT ?")) return out;
+    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);
+    sqlite3_bind_int(s, 2, limit);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        BigRow r;
+        r.wallet             = safeColumnText(s, 0);
+        r.asset              = safeColumnText(s, 1);
+        r.side               = safeColumnText(s, 2);
+        r.usdNanos           = sqlite3_column_int64(s, 3);
+        r.leverage           = sqlite3_column_int(s, 4);
+        r.pxStr              = safeColumnText(s, 5);
+        r.amountStr          = safeColumnText(s, 6);
+        r.closedPnlNanos     = sqlite3_column_int64(s, 7);
+        r.marginNanos        = sqlite3_column_int64(s, 8);
+        r.accountValueNanos  = sqlite3_column_int64(s, 9);
+        out.push_back(std::move(r));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
 std::vector<BigRow> spotRows(long long sinceSec, int limit) {
     std::vector<BigRow> out;
     std::lock_guard<std::mutex> l(dbMutex);
@@ -170,6 +205,13 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
             {{"text", perpBtn}, {"callback_data", "bg_open:perp:24h"}}
         }));
     }
+    {
+        std::string liqBtn = tr(lang, "big_btn_liq");
+        if (!isPremium(chatId)) liqBtn += " \U0001F512";
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", liqBtn}, {"callback_data", "bg_open:liq:24h"}}
+        }));
+    }
     kb["inline_keyboard"].push_back(backRow(lang, "menu:main"));
     return {t.str(), kb.dump()};
 }
@@ -177,12 +219,13 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
 BigTradesMessage buildBigList(const std::string& chatId, const std::string& venue,
                               const std::string& window, int page) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
-    const bool perp = venue == "perp";
+    const bool liq  = venue == "liq";
+    const bool perp = venue == "perp" || liq;
     const bool premium = isPremium(chatId);
 
     if (perp && !premium) {
         std::ostringstream t;
-        t << "\U0001F525 <b>" << tr(lang, "big_perp_title") << "</b>\n\n"
+        t << "\U0001F525 <b>" << tr(lang, liq ? "big_liq_title" : "big_perp_title") << "</b>\n\n"
           << "\U0001F512 " << tr(lang, "hl_locked_body");
         json kb;
         kb["inline_keyboard"] = json::array();
@@ -196,12 +239,14 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const int maxRows = premium ? MAX_ROWS : FREE_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
-    std::vector<BigRow> rows = perp ? perpRows(since, maxRows) : spotRows(since, maxRows);
+    std::vector<BigRow> rows = liq  ? liqRows(since, maxRows)
+                             : perp ? perpRows(since, maxRows)
+                                    : spotRows(since, maxRows);
     if (static_cast<int>(rows.size()) > maxRows)
         rows.resize(static_cast<size_t>(maxRows));
 
     std::ostringstream t;
-    t << "\U0001F525 <b>" << tr(lang, perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
+    t << "\U0001F525 <b>" << tr(lang, liq ? "big_liq_title" : perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
       << "<i>" << tr(lang, windowKey(window)) << "</i>\n\n";
 
     json kb;
