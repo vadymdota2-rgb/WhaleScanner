@@ -43,6 +43,20 @@ constexpr int HL_PICKER_PER_PAGE = 5;
 constexpr int HL_MIN_CLOSED_TRADES = 5;
 constexpr int HL_PER_PAGE = 5;
 constexpr long long HL_RANK_CACHE_SEC = 300;
+constexpr int HL_RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
+constexpr int HL_RANK_WINDOWS_COUNT = 4;
+
+int clampHlWindowDays(int days) {
+    for (int d : HL_RANK_WINDOWS_DAYS) if (d == days) return d;
+    return 30;
+}
+
+int hlWindowIndex(int days) {
+    days = clampHlWindowDays(days);
+    for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++)
+        if (HL_RANK_WINDOWS_DAYS[i] == days) return i;
+    return 0;
+}
 
 struct PerpRow {
     std::string wallet;
@@ -57,13 +71,14 @@ struct PerpRow {
 };
 
 std::mutex g_rankMutex;
-long long g_rankBuiltAt = 0;
-std::vector<PerpRow> g_rankCache;
+long long g_rankBuiltAt[4] = {0, 0, 0, 0};
+std::vector<PerpRow> g_rankCache[4];
 
-std::vector<PerpRow> computeRanking(bool& ok) {
+std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     ok = false;
     std::vector<PerpRow> rows;
-    const long long sinceMs = (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL;
+    if (windowSec < 86400LL) windowSec = 86400LL;
+    const long long sinceMs = (nowSec() - windowSec) * 1000LL;
 
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return rows;
@@ -113,9 +128,10 @@ std::vector<PerpRow> computeRanking(bool& ok) {
     return rows;
 }
 
-void rankingSnapshot(std::vector<PerpRow>& localCopy) {
+void rankingSnapshot(std::vector<PerpRow>& localCopy, int windowDays = 30) {
+    const int idx = hlWindowIndex(windowDays);
     std::lock_guard<std::mutex> l(g_rankMutex);
-    localCopy = g_rankCache;
+    localCopy = g_rankCache[idx];
 }
 
 enum class PerpKind { PNL, ROI, WINRATE, ACTIVE };
@@ -179,14 +195,15 @@ std::string rankLabel(int rank) {
     }
 }
 
-HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
+HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int windowDays = 30) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
+    windowDays = clampHlWindowDays(windowDays);
     int maxRank = premiumTopTradersLimit(chatId);
     if (maxRank < 1) maxRank = 1;
     const bool showUpgrade = !isPremium(chatId);
 
     std::vector<PerpRow> rows;
-    rankingSnapshot(rows);
+    rankingSnapshot(rows, windowDays);
     sortByKind(rows, kind);
 
     const int visible = std::min(static_cast<int>(rows.size()), maxRank);
@@ -198,7 +215,7 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     const char* const dm = dirMark(lang);
 
     std::stringstream text;
-    text << dm << "\U0001F535 <b>Hyperliquid \u2014 " << perpTitle(kind, lang) << "</b>\n\n";
+    text << dm << "\U0001F535 <b>Hyperliquid \u2014 " << perpTitle(kind, lang) << "</b> · " << windowDays << tr(lang, "unit_day") << "\n\n";
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
@@ -241,13 +258,26 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
     }
 
     const std::string kindParam = perpKindStr(kind);
+    const std::string winSuffix = ":" + std::to_string(windowDays);
     json navRow = json::array();
     if (page > 1)
-        navRow.push_back({{"text", "\u2B05\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page - 1)}});
+        navRow.push_back({{"text", "\u2B05\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page - 1) + winSuffix}});
     navRow.push_back({{"text", std::to_string(page) + "/" + std::to_string(totalPages)}, {"callback_data", "tt_noop"}});
     if (page < totalPages)
-        navRow.push_back({{"text", "\u27A1\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page + 1)}});
+        navRow.push_back({{"text", "\u27A1\uFE0F"}, {"callback_data", "hl_page:" + kindParam + ":" + std::to_string(page + 1) + winSuffix}});
     keyboard["inline_keyboard"].push_back(navRow);
+
+    json winRow = json::array();
+    for (int d : HL_RANK_WINDOWS_DAYS) {
+        const bool on = (d == windowDays);
+        const std::string label = on
+            ? ("· " + std::to_string(d) + tr(lang, "unit_day") + " ·")
+            : (std::to_string(d) + tr(lang, "unit_day"));
+        winRow.push_back({{"text", label},
+                          {"callback_data", "hl_open:" + kindParam + ":" + std::to_string(d)}});
+    }
+    keyboard["inline_keyboard"].push_back(winRow);
+
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
@@ -311,7 +341,7 @@ std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree() {
     std::vector<PerpRow> rows;
     {
         std::lock_guard<std::mutex> l(g_rankMutex);
-        rows = g_rankCache;
+        rows = g_rankCache[0]; // 30d
     }
     std::sort(rows.begin(), rows.end(),
               [](const PerpRow& a, const PerpRow& b) { return a.pnlNanos > b.pnlNanos; });
@@ -335,7 +365,7 @@ bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
     std::vector<PerpRow> rows;
     {
         std::lock_guard<std::mutex> l(g_rankMutex);
-        rows = g_rankCache;
+        rows = g_rankCache[0]; // 30d
     }
     if (rows.empty()) return false;
     std::sort(rows.begin(), rows.end(),
@@ -357,17 +387,20 @@ bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
 
 namespace hl {
 void rebuildRankCache() {
-    bool ok = false;
-    std::vector<PerpRow> fresh = computeRanking(ok);
     std::vector<std::string> top;
-    {
+    for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
+        const int days = HL_RANK_WINDOWS_DAYS[i];
+        bool ok = false;
+        std::vector<PerpRow> fresh = computeRanking(static_cast<long long>(days) * 86400LL, ok);
         std::lock_guard<std::mutex> l(g_rankMutex);
         if (ok) {
-            g_rankCache.swap(fresh);
+            g_rankCache[i].swap(fresh);
+            g_rankBuiltAt[i] = nowSec();
         }
-        top.reserve(g_rankCache.size());
-        for (const auto& r : g_rankCache) top.push_back(r.wallet);
-        g_rankBuiltAt = nowSec();
+        if (i == 0) {
+            top.reserve(g_rankCache[0].size());
+            for (const auto& r : g_rankCache[0]) top.push_back(r.wallet);
+        }
     }
     // markRankPresence берёт dbMutex — только снаружи g_rankMutex
     markRankPresence("perp", top);
@@ -375,8 +408,10 @@ void rebuildRankCache() {
 
 void invalidateRankCache() {
     std::lock_guard<std::mutex> l(g_rankMutex);
-    g_rankBuiltAt = 0;
-    g_rankCache.clear();
+    for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
+        g_rankBuiltAt[i] = 0;
+        g_rankCache[i].clear();
+    }
 }
 }
 
@@ -706,19 +741,37 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
     if (action == "hl_pos") { out = buildWalletPositions(chatId, param); return true; }
     if (action == "hl_menu") { out = buildPerpTopMenu(chatId); return true; }
     if (action == "hl_open") {
+        // hl_open:pnl  |  hl_open:pnl:90
+        std::string kindStr = param;
+        int windowDays = 30;
+        const size_t sep = param.find(':');
+        if (sep != std::string::npos) {
+            kindStr = param.substr(0, sep);
+            try { windowDays = std::stoi(param.substr(sep + 1)); } catch (...) {}
+        }
         PerpKind kind;
-        if (!parsePerpKind(param, kind)) return false;
-        out = renderPerpPage(chatId, kind, 1);
+        if (!parsePerpKind(kindStr, kind)) return false;
+        out = renderPerpPage(chatId, kind, 1, windowDays);
         return true;
     }
     if (action == "hl_page") {
+        // hl_page:pnl:2  |  hl_page:pnl:2:90
         const size_t sep = param.find(':');
         if (sep == std::string::npos) return false;
         PerpKind kind;
         if (!parsePerpKind(param.substr(0, sep), kind)) return false;
+        std::string rest = param.substr(sep + 1);
         int page = 1;
-        try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
-        out = renderPerpPage(chatId, kind, page);
+        int windowDays = 30;
+        const size_t sep2 = rest.find(':');
+        try {
+            if (sep2 == std::string::npos) page = std::stoi(rest);
+            else {
+                page = std::stoi(rest.substr(0, sep2));
+                windowDays = std::stoi(rest.substr(sep2 + 1));
+            }
+        } catch (...) {}
+        out = renderPerpPage(chatId, kind, page, windowDays);
         return true;
     }
     return false;
