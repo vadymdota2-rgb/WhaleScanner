@@ -74,7 +74,7 @@ constexpr long long HL_CLEANUP_INTERVAL_SEC = 3600;
 constexpr long long HL_RANK_REBUILD_SEC = 300;
 constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
-constexpr long long HL_FILL_TTL_SEC = HL_RANK_WINDOW_SEC;
+constexpr long long HL_FILL_TTL_SEC = 365LL * 86400LL;
 
 constexpr int HL_MAX_BOT_TRADES = 1000;
 
