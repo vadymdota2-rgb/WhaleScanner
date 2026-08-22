@@ -45,6 +45,12 @@ constexpr int HL_PER_PAGE = 5;
 constexpr long long HL_RANK_CACHE_SEC = 300;
 constexpr int HL_RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
 constexpr int HL_RANK_WINDOWS_COUNT = 4;
+constexpr long long HL_RANK_WINDOW_INTERVAL_SEC[] = {
+    15 * 60,            // 30д  — 15 мин
+    47 * 60,            // 90д  — 47 мин
+    3 * 3600 + 11 * 60, // 180д — 3ч 11м
+    6 * 3600 + 13 * 60, // 365д — 6ч 13м
+};
 
 int clampHlWindowDays(int days) {
     for (int d : HL_RANK_WINDOWS_DAYS) if (d == days) return d;
@@ -388,22 +394,39 @@ bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
 namespace hl {
 void rebuildRankCache() {
     std::vector<std::string> top;
+    const long long now = nowSec();
+
+    // одно самое просроченное окно (не 30д всегда первым — иначе 365 не доживёт)
+    int best = -1;
+    double bestScore = -1.0;
     for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
-        const int days = HL_RANK_WINDOWS_DAYS[i];
-        bool ok = false;
-        std::vector<PerpRow> fresh = computeRanking(static_cast<long long>(days) * 86400LL, ok);
+        const long long interval = HL_RANK_WINDOW_INTERVAL_SEC[i];
+        const long long built = g_rankBuiltAt[i];
+        if (built > 0 && (now - built) < interval) continue;
+        const double score = (built <= 0)
+            ? (1000.0 - i)
+            : static_cast<double>(now - built) / static_cast<double>(interval);
+        if (score > bestScore) { bestScore = score; best = i; }
+    }
+    if (best < 0) return;
+
+    const int days = HL_RANK_WINDOWS_DAYS[best];
+    bool ok = false;
+    std::vector<PerpRow> fresh = computeRanking(static_cast<long long>(days) * 86400LL, ok);
+    {
         std::lock_guard<std::mutex> l(g_rankMutex);
         if (ok) {
-            g_rankCache[i].swap(fresh);
-            g_rankBuiltAt[i] = nowSec();
+            g_rankCache[best].swap(fresh);
+            g_rankBuiltAt[best] = now;
         }
-        if (i == 0) {
+        if (best == 0) {
             top.reserve(g_rankCache[0].size());
             for (const auto& r : g_rankCache[0]) top.push_back(r.wallet);
         }
     }
     // markRankPresence берёт dbMutex — только снаружи g_rankMutex
-    markRankPresence("perp", top);
+    if (!top.empty())
+        markRankPresence("perp", top);
 }
 
 void invalidateRankCache() {
