@@ -220,6 +220,9 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page) {
                 text << dm << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
                      << static_cast<int>(r.avgLeverage + 0.5) << "\u00D7\n";
             }
+            if (const int days = rankPresenceDays("perp", r.wallet); days > 0)
+                text << dm << "\U0001F4C5 <b>" << tr(lang, "rk_in_top") << ":</b> "
+                     << days << " " << tr(lang, "rk_days") << "\n";
             if (i + 1 < endIdx) text << "\n" << dm << HL_CARD_SEPARATOR << "\n\n";
 
             keyboard["inline_keyboard"].push_back(json::array({
@@ -359,6 +362,15 @@ void rebuildRankCache() {
     std::lock_guard<std::mutex> l(g_rankMutex);
     if (ok) {
         g_rankCache.swap(fresh);
+    }
+    {
+        std::vector<std::string> top;
+        {
+            std::lock_guard<std::mutex> l(g_rankMutex);
+            top.reserve(g_rankCache.size());
+            for (const auto& r : g_rankCache) top.push_back(r.wallet);
+        }
+        markRankPresence("perp", top);
         g_rankBuiltAt = nowSec();
     }
 }
