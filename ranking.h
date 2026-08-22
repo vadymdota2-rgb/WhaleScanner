@@ -29,6 +29,9 @@ struct SpotRankInfo {
 
 bool spotRankOf(const std::string& wallet, SpotRankInfo& out);
 
+void markRankPresence(const char* venue, const std::vector<std::string>& wallets);
+int  rankPresenceDays(const char* venue, const std::string& wallet);
+
 void rankingCacheLoop();
 
 struct RankingMessage {
