@@ -359,20 +359,18 @@ namespace hl {
 void rebuildRankCache() {
     bool ok = false;
     std::vector<PerpRow> fresh = computeRanking(ok);
-    std::lock_guard<std::mutex> l(g_rankMutex);
-    if (ok) {
-        g_rankCache.swap(fresh);
-    }
+    std::vector<std::string> top;
     {
-        std::vector<std::string> top;
-        {
-            std::lock_guard<std::mutex> l(g_rankMutex);
-            top.reserve(g_rankCache.size());
-            for (const auto& r : g_rankCache) top.push_back(r.wallet);
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        if (ok) {
+            g_rankCache.swap(fresh);
         }
-        markRankPresence("perp", top);
+        top.reserve(g_rankCache.size());
+        for (const auto& r : g_rankCache) top.push_back(r.wallet);
         g_rankBuiltAt = nowSec();
     }
+    // markRankPresence берёт dbMutex — только снаружи g_rankMutex
+    markRankPresence("perp", top);
 }
 
 void invalidateRankCache() {
