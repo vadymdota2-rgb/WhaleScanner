@@ -31,6 +31,7 @@ extern std::atomic<bool> running;
 
 namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
+constexpr long long RETENTION_SECONDS = 365LL * 86400LL;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
@@ -116,6 +117,14 @@ void initRankingDB() {
         CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp);
         DROP INDEX IF EXISTS idx_trades_token;
         CREATE INDEX IF NOT EXISTS idx_trades_token_time ON trades(token,timestamp);
+
+        CREATE TABLE IF NOT EXISTS rank_presence (
+            venue TEXT NOT NULL,
+            wallet TEXT NOT NULL,
+            day INTEGER NOT NULL,
+            PRIMARY KEY(venue, wallet, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_presence_lookup ON rank_presence(venue, wallet);
         CREATE TABLE IF NOT EXISTS ignored_wallets(
             wallet TEXT PRIMARY KEY,
             ignored_until INTEGER NOT NULL,
@@ -172,19 +181,50 @@ void closeRankingDB() {
     }
 }
 
+void markRankPresence(const char* venue, const std::vector<std::string>& wallets) {
+    if (wallets.empty()) return;
+    const long long day = static_cast<long long>(time(nullptr)) / 86400;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "INSERT OR IGNORE INTO rank_presence(venue, wallet, day) VALUES(?,?,?)")) return;
+    for (const auto& w : wallets) {
+        sqlite3_bind_text(s, 1, venue, -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 2, w.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 3, day);
+        sqlite3_step(s);
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+    }
+    sqlite3_finalize(s);
+}
+
+int rankPresenceDays(const char* venue, const std::string& wallet) {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT COUNT(*) FROM rank_presence WHERE venue=? AND wallet=?")) return 0;
+    sqlite3_bind_text(s, 1, venue, -1, SQLITE_STATIC);
+    sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    int n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
 void cleanupOldTrades() {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
     {
         sqlite3_stmt* h;
         if (prepareOrLog(db, &h, "DELETE FROM wallet_history WHERE timestamp < ?")) {
-            sqlite3_bind_int64(h, 1, static_cast<sqlite3_int64>(time(nullptr)) - WINDOW_SECONDS);
+            sqlite3_bind_int64(h, 1, static_cast<sqlite3_int64>(time(nullptr)) - RETENTION_SECONDS);
             sqlite3_step(h);
             sqlite3_finalize(h);
         }
     }
     if (!prepareOrLog(db, &s, "DELETE FROM trades WHERE timestamp < ?")) return;
-    sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)) - WINDOW_SECONDS);
+    sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)) - RETENTION_SECONDS);
     int rc1 = sqlite3_step(s);
     int deleted = (rc1 == SQLITE_DONE) ? sqlite3_changes(db) : 0;
     if (rc1 != SQLITE_DONE) std::cerr << "[RANKING] trades cleanup DELETE failed: " << sqlite3_errmsg(db) << std::endl;
@@ -470,6 +510,9 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             text << dm << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << dm << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             text << dm << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
+            if (int days = rankPresenceDays("spot", r.wallet); days > 0)
+                text << dm << "\U0001F4C5 " << tr(lang, "rk_in_top") << ": <b>"
+                     << days << "</b> " << tr(lang, "rk_days") << "\n";
             if (i + 1 < endIdx) text << "\n" << dm << CARD_SEPARATOR << "\n\n";
 
             json row;
@@ -523,6 +566,13 @@ void rebuildAllRankings() {
         return;
     }
     GlobalRankings g = buildGlobalRankings(base);
+
+    {
+        std::vector<std::string> top;
+        top.reserve(g.byPnl.size());
+        for (const auto& r : g.byPnl) top.push_back(r.wallet);
+        markRankPresence("spot", top);
+    }
 
     std::vector<std::pair<std::string, std::string>> entries;
     entries.emplace_back("global_pnl", rowsToJson(g.byPnl));
