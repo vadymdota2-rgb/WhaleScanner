@@ -32,10 +32,27 @@ extern std::atomic<bool> running;
 namespace {
 constexpr long long WINDOW_SECONDS = 30LL * 86400LL; // bot filter + default rank
 constexpr int RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
+constexpr int RANK_WINDOWS_COUNT = 4;
+// пересчёт в разное время — пик нагрузки не складывается
+// минуты «кривые», чтобы реже совпадать с тиком 15 мин и друг с другом
+constexpr long long RANK_WINDOW_INTERVAL_SEC[] = {
+    15 * 60,            // 30д  — 15 мин
+    47 * 60,            // 90д  — 47 мин
+    3 * 3600 + 11 * 60, // 180д — 3ч 11м
+    6 * 3600 + 13 * 60, // 365д — 6ч 13м
+};
+long long g_rankWindowBuiltAt[4] = {0, 0, 0, 0};
 
 int clampRankWindowDays(int days) {
     for (int d : RANK_WINDOWS_DAYS) if (d == days) return d;
     return 30;
+}
+
+int rankWindowIndex(int days) {
+    days = clampRankWindowDays(days);
+    for (int i = 0; i < RANK_WINDOWS_COUNT; i++)
+        if (RANK_WINDOWS_DAYS[i] == days) return i;
+    return 0;
 }
 
 std::string rankCacheKey(const std::string& kind, int days) {
@@ -586,15 +603,40 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
 
 void rebuildAllRankings() {
     auto t0 = std::chrono::steady_clock::now();
+    const long long now = static_cast<long long>(time(nullptr));
+    const bool force = g_forceRebuild.load(std::memory_order_relaxed);
 
     std::vector<std::pair<std::string, std::string>> entries;
     bool anyOk = false;
-    for (int days : RANK_WINDOWS_DAYS) {
+
+    // выбираем окна к пересчёту: force → все due; иначе одно самое просроченное
+    // (иначе 30д каждые 15 мин забивает слот и 90/365 никогда не считаются)
+    std::vector<int> todo;
+    if (force) {
+        for (int i = 0; i < RANK_WINDOWS_COUNT; i++) todo.push_back(i);
+    } else {
+        int best = -1;
+        double bestScore = -1.0;
+        for (int i = 0; i < RANK_WINDOWS_COUNT; i++) {
+            const long long interval = RANK_WINDOW_INTERVAL_SEC[i];
+            const long long built = g_rankWindowBuiltAt[i];
+            if (built > 0 && (now - built) < interval) continue;
+            // не собранное — приоритет коротким окнам (30д первый)
+            const double score = (built <= 0)
+                ? (1000.0 - i)
+                : static_cast<double>(now - built) / static_cast<double>(interval);
+            if (score > bestScore) { bestScore = score; best = i; }
+        }
+        if (best >= 0) todo.push_back(best);
+    }
+
+    for (int i : todo) {
+        const int days = RANK_WINDOWS_DAYS[i];
         bool ok = false;
         std::vector<PnlRow> base = computeGlobalTopWindow(static_cast<long long>(days) * 86400LL, ok);
         if (!ok) {
             std::cerr << "[RANKING] cache rebuild: window " << days
-                      << "d interrupted, keeping previous payload for this window" << std::endl;
+                      << "d interrupted, keeping previous payload" << std::endl;
             continue;
         }
         anyOk = true;
@@ -615,13 +657,18 @@ void rebuildAllRankings() {
             entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
             entries.emplace_back("global_active", rowsToJson(g.byActive));
         }
+        g_rankWindowBuiltAt[i] = now;
     }
-    if (!anyOk || entries.empty()) {
+
+    if (entries.empty()) {
+        // нечего писать — все окна ещё свежие
+        return;
+    }
+    if (!anyOk) {
         std::cerr << "[RANKING] cache rebuild aborted: no window completed" << std::endl;
         return;
     }
 
-    long long now = static_cast<long long>(time(nullptr));
     {
         std::lock_guard<std::mutex> l(dbMutex);
         if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
