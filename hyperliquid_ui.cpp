@@ -41,6 +41,7 @@ namespace {
 constexpr int HL_PICKER_PER_PAGE = 5;
 
 constexpr int HL_MIN_CLOSED_TRADES = 5;
+constexpr int HL_MAX_CLOSED_TRADES_30D = 200;  // как спот: >200/30д = бот
 constexpr int HL_PER_PAGE = 5;
 constexpr long long HL_RANK_CACHE_SEC = 300;
 constexpr int HL_RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
@@ -117,6 +118,10 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.lastTs = sqlite3_column_int64(s, 7);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
+        // потолок как спот ~200/30д, пропорционально окну рейтинга
+        const long long maxForWindow = std::max(1LL,
+            (HL_MAX_CLOSED_TRADES_30D * windowSec + (30LL * 86400LL - 1)) / (30LL * 86400LL));
+        if (r.closedTrades > maxForWindow) continue;
         r.winRatePercent = static_cast<int>((100LL * wins) / r.closedTrades);
         if (avgAccount > 0.0) {
             r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / avgAccount;
