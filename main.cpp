@@ -1263,15 +1263,7 @@ void flushPendingAlerts(bool force) {
 
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
-    json block = nullptr;
-    // lag > 50 → assist (ротация WS) пробует getBlock; не вышло → HTTP RPC
-    if (wsAssistWanted(g_stats.current_lag.load(std::memory_order_relaxed))) {
-        block = wsAssistGetBlock(bn);
-    }
-    if (block.is_null() || !block.is_object() || !block.contains("transactions") ||
-        !block["transactions"].is_array()) {
-        block = rpc("eth_getBlockByNumber", {ss.str(), true});
-    }
+    auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
     if (block.is_null()||!block.is_object()||!block.contains("transactions")||!block["transactions"].is_array()) return false;
     std::string ph=block.value("parentHash",""), ep=getLastBlockHash();
     long long blockTs = 0;
@@ -1951,14 +1943,13 @@ void telegramLoop() {
                                 << "\n⏳ Lag: " << g_stats.current_lag.load()
                                 << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             if (wsHeadsOk()) {
-                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest() << " · assist " << (wsAssistOk() ? wsAssistActiveLabel() : "❌") << " (" << wsAssistBlocksOk() << ")";
+                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest();
                             } else {
                                 ss2 << "\n🔌 WS: ❌ HTTP fallback"
                                     << (wsHeadsLatest() > 0
                                             ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
                                             : "")
-                                    << " · assist " << (wsAssistOk() ? wsAssistActiveLabel() : "❌")
-                                    << " (" << wsAssistBlocksOk() << ")";
+                                    
                             }
                             ss2 << rpcSlowSummary();
                             {
