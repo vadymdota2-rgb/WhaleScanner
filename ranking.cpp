@@ -509,6 +509,17 @@ std::string globalTitle(GlobalRankKind kind, Lang lang) {
     return "🏆 " + tr(lang, "rk_top_traders_30d");
 }
 
+
+int countBscBannedBots() {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "SELECT COUNT(*) FROM ignored_wallets WHERE permanent=1")) return 0;
+    int n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
                                 int maxRank, bool showUpgrade, Lang lang, int windowDays) {
     windowDays = clampRankWindowDays(windowDays);
@@ -558,6 +569,7 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
         }));
     }
+
 
     std::string kindParam = globalRankKindToString(kind);
     const std::string winSuffix = ":" + std::to_string(windowDays);
