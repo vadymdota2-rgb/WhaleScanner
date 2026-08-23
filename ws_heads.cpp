@@ -110,6 +110,10 @@ bool wsSession(const std::string& url, int idx) {
         return false;
     }
 
+    // После долгого простоя старый lastSeen (>45с) иначе сразу рвёт сессию,
+    // не дождавшись первого head. Grace от момента subscribe.
+    g_wsLastSeen.store(time(nullptr), std::memory_order_relaxed);
+
     std::vector<char> buf(64 * 1024);
     std::string acc;
     while (running.load(std::memory_order_relaxed) && !g_wsStop.load(std::memory_order_relaxed)) {
