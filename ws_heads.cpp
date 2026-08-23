@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -429,4 +430,44 @@ nlohmann::json wsAssistGetBlock(long long blockNumber, int timeoutMs) {
 
 uint64_t wsAssistBlocksOk() {
     return g_assistBlocks.load(std::memory_order_relaxed);
+}
+
+
+// ─── BSC defaults: 3 разных провайдера ─────────────────────────────────────
+
+void startWsBsc() {
+    // heads
+    const char* wsEnv = std::getenv("WHALE_WS_URL");
+    std::string heads;
+    if (wsEnv && std::string(wsEnv).empty()) {
+        // явно выкл
+        std::cout << "[WS] heads disabled (WHALE_WS_URL=)" << std::endl;
+    } else if (wsEnv && *wsEnv) {
+        heads = wsEnv;
+    } else {
+        heads = "wss://rpc-bsc.blockmachine.io,"
+                "wss://bnb.api.onfinality.io/public-ws";
+    }
+    if (!heads.empty()) startWsHeads(heads);
+
+    // assist (третий провайдер)
+    const char* assistEnv = std::getenv("WHALE_WS_ASSIST_URL");
+    std::string assist;
+    if (assistEnv && std::string(assistEnv).empty()) {
+        std::cout << "[WS-assist] disabled (WHALE_WS_ASSIST_URL=)" << std::endl;
+    } else if (assistEnv && *assistEnv) {
+        assist = assistEnv;
+    } else {
+        assist = "wss://rpc.nodeflare.app/bnb/ws/public";
+    }
+    if (!assist.empty()) startWsAssist(assist);
+}
+
+void stopWsBsc() {
+    stopWsHeads();
+    stopWsAssist();
+}
+
+bool wsAssistWanted(int64_t lagBlocks) {
+    return lagBlocks > WS_ASSIST_LAG_THRESHOLD && wsAssistOk();
 }
