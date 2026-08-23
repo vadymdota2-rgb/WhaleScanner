@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 /** Только newHeads: номер блока. Цены/analyze не трогает.
  *
