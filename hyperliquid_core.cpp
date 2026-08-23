@@ -76,7 +76,7 @@ constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
 constexpr long long HL_FILL_TTL_SEC = 365LL * 86400LL;
 
-constexpr int HL_MAX_BOT_TRADES = 1000;
+constexpr int HL_MAX_BOT_TRADES = 200;  // как спот: >200 fills/30д → hl_banned + untrack
 
 const char* const HL_CARD_SEPARATOR = "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501";
 
