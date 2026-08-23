@@ -1396,11 +1396,25 @@ std::string pagingRoot(const std::string& data) {
         if (c != std::string::npos) return "bg_open:" + data.substr(a + 1, c - a - 1);
         return "menu:big";
     }
+    // gt_open:pnl / gt_open:pnl:90 / gt_page:pnl:2:90 → один экран (смена периода не в стек)
+    if (data.rfind("gt_open:", 0) == 0) {
+        const size_t k1 = data.find(':');
+        const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
+        if (k2 != std::string::npos) return data.substr(0, k2);
+        return data;
+    }
     if (data.rfind("gt_page:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = data.find(':', k1 + 1);
         if (k2 != std::string::npos) return "gt_open:" + data.substr(k1 + 1, k2 - k1 - 1);
         return "menu:toptrader_spot";
+    }
+    // hl_open:pnl / hl_open:pnl:90 / hl_page:pnl:2:90 → один экран
+    if (data.rfind("hl_open:", 0) == 0) {
+        const size_t k1 = data.find(':');
+        const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
+        if (k2 != std::string::npos) return data.substr(0, k2);
+        return data;
     }
     if (data.rfind("hl_page:", 0) == 0) {
         const size_t k1 = data.find(':');
