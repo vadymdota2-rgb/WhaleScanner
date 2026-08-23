@@ -270,18 +270,27 @@ std::string wsHeadsActiveLabel() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Assist WS — eth_getBlockByNumber при lag > 200 (разгрузка HTTP RPC)
+// Assist WS — eth_getBlockByNumber (lag > 50) (разгрузка HTTP RPC)
+// Несколько URL с ротацией. Heads (primary/backup) не трогает.
 // ═══════════════════════════════════════════════════════════════════════════
 
 namespace {
 
 std::mutex g_assistMu;
 CURL* g_assistCurl = nullptr;
-std::string g_assistUrl;
+std::vector<std::string> g_assistUrls;
+size_t g_assistIdx = 0;
 std::atomic<bool> g_assistConfigured{false};
 std::atomic<uint64_t> g_assistBlocks{0};
+std::atomic<int> g_assistActiveIdx{-1};
 int g_assistNextId = 1;
-time_t g_assistLastOk = 0;
+
+std::string assistLabel(size_t idx) {
+    if (idx == 0) return "a1";
+    if (idx == 1) return "a2";
+    if (idx == 2) return "a3";
+    return "a" + std::to_string(idx + 1);
+}
 
 void assistDisconnectLocked() {
     if (g_assistCurl) {
@@ -292,32 +301,48 @@ void assistDisconnectLocked() {
 
 bool assistConnectLocked() {
     assistDisconnectLocked();
-    if (g_assistUrl.empty()) return false;
+    if (g_assistUrls.empty()) return false;
 
-    CURL* curl = curl_easy_init();
-    if (!curl) return false;
-    curl_easy_setopt(curl, CURLOPT_URL, g_assistUrl.c_str());
-    curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    const size_t n = g_assistUrls.size();
+    for (size_t try_i = 0; try_i < n; ++try_i) {
+        const size_t idx = (g_assistIdx + try_i) % n;
+        const std::string& url = g_assistUrls[idx];
+        if (url.empty()) continue;
 
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        std::cerr << "[WS-assist] connect failed: " << curl_easy_strerror(rc)
-                  << " | " << g_assistUrl << std::endl;
-        curl_easy_cleanup(curl);
-        return false;
+        CURL* curl = curl_easy_init();
+        if (!curl) continue;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 8L);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+        CURLcode rc = curl_easy_perform(curl);
+        if (rc != CURLE_OK) {
+            std::cerr << "[WS-assist] connect fail (" << assistLabel(idx) << "): "
+                      << curl_easy_strerror(rc) << " | " << url << std::endl;
+            curl_easy_cleanup(curl);
+            continue;
+        }
+        g_assistCurl = curl;
+        g_assistIdx = idx;
+        g_assistActiveIdx.store(static_cast<int>(idx), std::memory_order_relaxed);
+        std::cout << "[WS-assist] connected (" << assistLabel(idx) << "): " << url << std::endl;
+        return true;
     }
-    g_assistCurl = curl;
-    std::cout << "[WS-assist] connected: " << g_assistUrl << std::endl;
-    return true;
+    return false;
 }
 
-nlohmann::json assistRpcLocked(const std::string& method, const nlohmann::json& params,
-                                int timeoutMs) {
+void assistRotateLocked() {
+    assistDisconnectLocked();
+    if (g_assistUrls.empty()) return;
+    g_assistIdx = (g_assistIdx + 1) % g_assistUrls.size();
+}
+
+nlohmann::json assistRpcOnceLocked(const std::string& method, const nlohmann::json& params,
+                                    int timeoutMs) {
     if (!g_assistCurl && !assistConnectLocked()) return nullptr;
 
     const int id = g_assistNextId++;
@@ -354,7 +379,6 @@ nlohmann::json assistRpcLocked(const std::string& method, const nlohmann::json& 
                     auto j = nlohmann::json::parse(acc, nullptr, false);
                     acc.clear();
                     if (!j.is_object()) continue;
-                    // id may be number or string
                     int rid = -1;
                     if (j.contains("id")) {
                         if (j["id"].is_number_integer()) rid = j["id"].get<int>();
@@ -389,31 +413,59 @@ nlohmann::json assistRpcLocked(const std::string& method, const nlohmann::json& 
     return nullptr;
 }
 
+nlohmann::json assistRpcLocked(const std::string& method, const nlohmann::json& params,
+                                int timeoutMs) {
+    // полный круг по всем URL, потом отдаём null → RPC
+    const size_t n = g_assistUrls.empty() ? 1 : g_assistUrls.size();
+    for (size_t attempt = 0; attempt < n; ++attempt) {
+        auto r = assistRpcOnceLocked(method, params, timeoutMs);
+        if (!r.is_null()) return r;
+        assistRotateLocked();
+    }
+    return nullptr;
+}
+
 } // namespace
 
-void startWsAssist(const std::string& wssUrl) {
+void startWsAssist(const std::string& wssUrlOrList) {
     std::lock_guard<std::mutex> l(g_assistMu);
-    g_assistUrl = wssUrl;
-    g_assistConfigured.store(!wssUrl.empty(), std::memory_order_relaxed);
-    if (wssUrl.empty()) {
+    assistDisconnectLocked();
+    g_assistUrls.clear();
+    g_assistIdx = 0;
+    g_assistActiveIdx.store(-1, std::memory_order_relaxed);
+
+    // split comma/semicolon (reuse heads splitter logic inline)
+    std::string cur;
+    for (char c : wssUrlOrList) {
+        if (c == ',' || c == ';' || c == ' ' || c == '\t' || c == '\n') {
+            if (!cur.empty()) { g_assistUrls.push_back(cur); cur.clear(); }
+        } else cur.push_back(c);
+    }
+    if (!cur.empty()) g_assistUrls.push_back(cur);
+
+    g_assistConfigured.store(!g_assistUrls.empty(), std::memory_order_relaxed);
+    if (g_assistUrls.empty()) {
         std::cout << "[WS-assist] disabled" << std::endl;
         return;
     }
-    // connect lazily on first getBlock
-    std::cout << "[WS-assist] ready (lag>200 → getBlock): " << wssUrl << std::endl;
+    std::cout << "[WS-assist] ready (lag>" << WS_ASSIST_LAG_THRESHOLD
+              << " → getBlock), " << g_assistUrls.size() << " endpoint(s):" << std::endl;
+    for (size_t i = 0; i < g_assistUrls.size(); ++i)
+        std::cout << "  [" << assistLabel(i) << "] " << g_assistUrls[i] << std::endl;
 }
 
 void stopWsAssist() {
     std::lock_guard<std::mutex> l(g_assistMu);
     assistDisconnectLocked();
     g_assistConfigured.store(false, std::memory_order_relaxed);
-    g_assistUrl.clear();
+    g_assistUrls.clear();
+    g_assistActiveIdx.store(-1, std::memory_order_relaxed);
 }
 
 bool wsAssistOk() {
     if (!g_assistConfigured.load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> l(g_assistMu);
-    return g_assistCurl != nullptr || !g_assistUrl.empty();
+    return g_assistCurl != nullptr || !g_assistUrls.empty();
 }
 
 nlohmann::json wsAssistGetBlock(long long blockNumber, int timeoutMs) {
@@ -426,7 +478,6 @@ nlohmann::json wsAssistGetBlock(long long blockNumber, int timeoutMs) {
     auto result = assistRpcLocked("eth_getBlockByNumber", params, timeoutMs);
     if (result.is_object() && result.contains("transactions")) {
         g_assistBlocks.fetch_add(1, std::memory_order_relaxed);
-        g_assistLastOk = time(nullptr);
         return result;
     }
     return nullptr;
@@ -436,6 +487,14 @@ uint64_t wsAssistBlocksOk() {
     return g_assistBlocks.load(std::memory_order_relaxed);
 }
 
+std::string wsAssistActiveLabel() {
+    int idx = g_assistActiveIdx.load(std::memory_order_relaxed);
+    if (idx < 0) return "—";
+    if (idx == 0) return "a1";
+    if (idx == 1) return "a2";
+    if (idx == 2) return "a3";
+    return "a" + std::to_string(idx + 1);
+}
 
 // ─── BSC defaults: 3 разных провайдера ─────────────────────────────────────
 
@@ -454,7 +513,7 @@ void startWsBsc() {
     }
     if (!heads.empty()) startWsHeads(heads);
 
-    // assist (третий провайдер)
+    // assist: ротация бесплатных WSS (heads primary/backup не трогаем)
     const char* assistEnv = std::getenv("WHALE_WS_ASSIST_URL");
     std::string assist;
     if (assistEnv && std::string(assistEnv).empty()) {
@@ -462,7 +521,9 @@ void startWsBsc() {
     } else if (assistEnv && *assistEnv) {
         assist = assistEnv;
     } else {
-        assist = "wss://rpc.nodeflare.app/bnb/ws/public";
+        assist = "wss://rpc.nodeflare.app/bnb/ws/public,"
+                 "wss://bsc.publicnode.com,"
+                 "wss://rpc-bsc.blockmachine.io";
     }
     if (!assist.empty()) startWsAssist(assist);
 }
