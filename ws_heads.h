@@ -6,31 +6,35 @@
 
 #include "json.hpp"
 
-/** Только newHeads: номер блока. Цены/analyze не трогает.
- *  urls — primary, затем backup(ы). При обрыве/тишине крутит по кругу. */
-void startWsHeads(const std::vector<std::string>& wssUrls);
-/** Один URL или список через запятую. */
-void startWsHeads(const std::string& wssUrlOrList);
-void stopWsHeads();
+// ─── Старт / стоп (дефолты и роли — здесь, не в main) ───────────────────────
+//
+// heads primary  → wss://rpc-bsc.blockmachine.io
+// heads backup   → wss://bnb.api.onfinality.io/public-ws
+// assist getBlock→ wss://rpc.nodeflare.app/bnb/ws/public  (только lag > 200)
+//
+// WHALE_WS_URL=url1,url2     — свой список heads (пусто = выкл heads)
+// WHALE_WS_ASSIST_URL=url    — свой assist (пусто = выкл assist)
 
-/** true, если за последние ~30 с приходил head с WS. */
+/** Поднять heads + assist с дефолтами / env. */
+void startWsBsc();
+void stopWsBsc();
+
+// ─── Heads: только номер блока ──────────────────────────────────────────────
+
 bool wsHeadsOk();
-
-/** Последний номер блока с WS (0 если ещё не было). */
 int64_t wsHeadsLatest();
-
-/** Короткое имя активного endpoint для stats (primary/backup/…). */
 std::string wsHeadsActiveLabel();
 
-// ─── Assist WS: eth_getBlockByNumber при высоком лаге ───────────────────────
+// ─── Assist: full getBlock при высоком лаге ─────────────────────────────────
 
-/** Третий сокет: JSON-RPC getBlock, чтобы разгрузить HTTP при lag > порога. */
-void startWsAssist(const std::string& wssUrl);
-void stopWsAssist();
 bool wsAssistOk();
+uint64_t wsAssistBlocksOk();
 
-/** Запрос блока с full txs через assist-WS. null при ошибке/таймауте. */
+/** true, если lag выше порога и assist готов — можно звать getBlock. */
+bool wsAssistWanted(int64_t lagBlocks);
+
+/** eth_getBlockByNumber(full). null при ошибке. */
 nlohmann::json wsAssistGetBlock(long long blockNumber, int timeoutMs = 8000);
 
-/** Сколько блоков успешно взяли через assist (для stats). */
-uint64_t wsAssistBlocksOk();
+// порог лага для assist (main может показать в stats)
+constexpr int64_t WS_ASSIST_LAG_THRESHOLD = 200;
