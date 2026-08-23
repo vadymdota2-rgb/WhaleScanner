@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -28,6 +29,7 @@ std::atomic<bool> g_wsStop{false};
 
 std::mutex g_urlMutex;
 std::vector<std::string> g_wsUrls;
+std::atomic<bool> g_subRejected{false};
 std::atomic<int> g_activeIdx{0};
 
 std::string shortLabel(int idx, const std::string& /*url*/) {
@@ -58,12 +60,22 @@ void handleWsPayload(const std::string& payload) {
                 return;
             int64_t n = 0;
             if (hexToI64(result["number"].get<std::string>(), n) && n > 0) {
-                g_wsHead.store(n, std::memory_order_relaxed);
+                int64_t prev = g_wsHead.load(std::memory_order_relaxed);
+                while (n > prev &&
+                       !g_wsHead.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {}
                 g_wsOk.store(true, std::memory_order_relaxed);
                 g_wsLastSeen.store(time(nullptr), std::memory_order_relaxed);
             }
         };
 
+        if (j.contains("error") && j["error"].is_object()) {
+            std::string msg;
+            if (j["error"].contains("message") && j["error"]["message"].is_string())
+                msg = j["error"]["message"].get<std::string>();
+            std::cerr << "[WS] subscribe rejected: " << (msg.empty() ? "unknown" : msg) << std::endl;
+            g_subRejected.store(true, std::memory_order_relaxed);
+            return;
+        }
         if (j.contains("method") && j["method"].is_string() &&
             j["method"].get<std::string>() == "eth_subscription" &&
             j.contains("params") && j["params"].is_object()) {
@@ -79,6 +91,7 @@ void handleWsPayload(const std::string& payload) {
 }
 
 bool wsSession(const std::string& url, int idx) {
+    g_subRejected.store(false, std::memory_order_relaxed);
     CURL* curl = curl_easy_init();
     if (!curl) return false;
 
@@ -110,8 +123,6 @@ bool wsSession(const std::string& url, int idx) {
         return false;
     }
 
-    // После долгого простоя старый lastSeen (>45с) иначе сразу рвёт сессию,
-    // не дождавшись первого head. Grace от момента subscribe.
     g_wsLastSeen.store(time(nullptr), std::memory_order_relaxed);
 
     std::vector<char> buf(64 * 1024);
@@ -123,13 +134,18 @@ bool wsSession(const std::string& url, int idx) {
         if (rc == CURLE_OK && nread > 0 && meta) {
             if (meta->flags & CURLWS_TEXT) {
                 acc.append(buf.data(), nread);
-                handleWsPayload(acc);
-                acc.clear();
+                if (meta->bytesleft == 0) {
+                    handleWsPayload(acc);
+                    acc.clear();
+                } else if (acc.size() > 1024u * 1024u) {
+                    std::cerr << "[WS] payload too large, dropping ("
+                              << shortLabel(idx, url) << ")" << std::endl;
+                    acc.clear();
+                }
             } else if (meta->flags & CURLWS_CLOSE) {
                 std::cerr << "[WS] server closed (" << shortLabel(idx, url) << ")" << std::endl;
                 break;
             } else if (meta->flags & CURLWS_PING) {
-                // libcurl may auto-pong
             }
         } else if (rc == CURLE_AGAIN) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -139,7 +155,12 @@ bool wsSession(const std::string& url, int idx) {
             break;
         }
 
-        // тишина > 45с → считаем endpoint мёртвым, пробуем следующий
+        if (g_subRejected.load(std::memory_order_relaxed)) {
+            std::cerr << "[WS] switching after rejected subscribe ("
+                      << shortLabel(idx, url) << ")" << std::endl;
+            break;
+        }
+
         time_t last = g_wsLastSeen.load(std::memory_order_relaxed);
         if (last > 0 && time(nullptr) - last > 45) {
             std::cerr << "[WS] stale >45s on " << shortLabel(idx, url)
@@ -174,14 +195,12 @@ void wsLoop() {
         const std::string& url = urls[idx];
         const bool ok = wsSession(url, static_cast<int>(idx));
 
-        // следующий endpoint по кругу (failover)
         nextIdx = (idx + 1) % urls.size();
 
         if (!running.load(std::memory_order_relaxed) || g_wsStop.load(std::memory_order_relaxed))
             break;
         g_wsOk.store(false, std::memory_order_relaxed);
 
-        // при нескольких URL после обрыва быстро пробуем backup
         const int waitSec = (urls.size() > 1) ? std::min(backoffSec, 3) : backoffSec;
         std::cerr << "[WS] next try in " << waitSec << "s → "
                   << shortLabel(static_cast<int>(nextIdx),
@@ -268,8 +287,6 @@ std::string wsHeadsActiveLabel() {
     if (idx < 0 || idx >= static_cast<int>(g_wsUrls.size())) return "—";
     return shortLabel(idx, g_wsUrls[static_cast<size_t>(idx)]);
 }
-
-// ─── BSC: только heads primary + backup ────────────────────────────────────
 
 void startWsBsc() {
     const char* wsEnv = std::getenv("WHALE_WS_URL");
