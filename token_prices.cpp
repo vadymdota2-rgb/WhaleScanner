@@ -37,7 +37,7 @@ constexpr time_t NATIVE_PRICE_TTL = 900;   // 15 мин (как major, реже 
 constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
 constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
 constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
-constexpr double STRONG_POOL_LIQ_USD = 10000.0;  // выше — DexScreener не зовём
+constexpr double STRONG_POOL_LIQ_USD = 10000.0;  // порог liq (spike/прочее); порядок: Dex → пул
 constexpr double SPIKE_RATIO = 0.40;             // >40% vs кэш без глубокой liq → отбой
 constexpr double SPIKE_TRUST_LIQ_USD = 50000.0;
 
@@ -898,7 +898,7 @@ static uint64_t softTwap(const std::string& a, uint64_t fresh) {
 
 uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
     constexpr double MAX_SANE_PRICE_USD = 1e6;
-    constexpr double DIVERGENCE_REJECT = 0.15;
+    // divergence pool↔dex отключён: порядок Dex → пул (экономия RPC)
     if (sourceOut) *sourceOut = PriceSource::None;
 
     bool thinPoolSeen = false;
@@ -917,46 +917,42 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         }
     }
 
-    uint64_t poolPx = priceFromPoolReserves(a);
-    double poolLiq = poolPx ? getPoolLiquidityUsd(a) : 0.0;
-
-    const bool needDex = (poolPx == 0) || (poolLiq < STRONG_POOL_LIQ_USD);
+    // 1) DexScreener (BSC) — без RPC
+    // 2) свои пулы — только если Dex не дал цену
     double dexP = 0, dexLiq = 0;
     bool haveDex = false;
-    if (needDex) {
+    {
         bool dexThin = false;
         haveDex = fetchDexScreenerPrice(a, dexP, dexLiq, dexThin);
         if (dexThin) thinPoolSeen = true;
         if (haveDex && dexP > 1e12) { dexP = 0; haveDex = false; }
+        if (haveDex && !(dexP > 0.0 && dexP < MAX_SANE_PRICE_USD)) {
+            haveDex = false;
+            dexP = 0;
+        }
+    }
+
+    uint64_t poolPx = 0;
+    double poolLiq = 0.0;
+    if (!haveDex) {
+        poolPx = priceFromPoolReserves(a);
+        poolLiq = poolPx ? getPoolLiquidityUsd(a) : 0.0;
     }
 
     uint64_t n = 0;
     PriceSource src = PriceSource::None;
 
-    if (poolPx > 0 && haveDex && dexP > 0.0 && dexP < MAX_SANE_PRICE_USD) {
-        const double poolUsd = static_cast<double>(poolPx) / 1e9;
-        const double denom = std::max(poolUsd, dexP);
-        const double rel = std::fabs(poolUsd - dexP) / denom;
-        if (rel <= DIVERGENCE_REJECT) {
-            n = poolPx; src = PriceSource::Pool;
-        } else if (dexLiq >= poolLiq) {
-            n = static_cast<uint64_t>(dexP * 1e9); src = PriceSource::DexScreener;
-            bump(4);
-            std::cerr << "[PRICE] divergence " << (rel * 100.0) << "% " << a << " → dex\n";
-        } else {
-            n = poolPx; src = PriceSource::Pool;
-            bump(4);
-            std::cerr << "[PRICE] divergence " << (rel * 100.0) << "% " << a << " → pool\n";
-        }
-    } else if (poolPx > 0) {
-        n = poolPx; src = PriceSource::Pool;
-    } else if (haveDex && dexP > 0.0 && dexP < MAX_SANE_PRICE_USD) {
-        n = static_cast<uint64_t>(dexP * 1e9); src = PriceSource::DexScreener;
+    if (haveDex) {
+        n = static_cast<uint64_t>(dexP * 1e9);
+        src = PriceSource::DexScreener;
         {
             std::lock_guard<std::mutex> l(cacheMutex);
             POOL_LIQUIDITY_CACHE[a] = dexLiq;
             POOL_LIQUIDITY_TS[a] = time(nullptr);
         }
+    } else if (poolPx > 0) {
+        n = poolPx;
+        src = PriceSource::Pool;
     }
 
     if (n > 0 && prevCached > 0 && poolLiq < SPIKE_TRUST_LIQ_USD) {
