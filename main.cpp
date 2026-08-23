@@ -1264,7 +1264,7 @@ void flushPendingAlerts(bool force) {
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
     json block = nullptr;
-    // lag > 200 → третий WS (assist) тянет блок, HTTP RPC отдыхает
+    // lag > 50 → assist (ротация WS) пробует getBlock; не вышло → HTTP RPC
     if (wsAssistWanted(g_stats.current_lag.load(std::memory_order_relaxed))) {
         block = wsAssistGetBlock(bn);
     }
@@ -1951,13 +1951,13 @@ void telegramLoop() {
                                 << "\n⏳ Lag: " << g_stats.current_lag.load()
                                 << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             if (wsHeadsOk()) {
-                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest() << " · assist " << (wsAssistOk() ? "✅" : "❌") << " (" << wsAssistBlocksOk() << ")";
+                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest() << " · assist " << (wsAssistOk() ? wsAssistActiveLabel() : "❌") << " (" << wsAssistBlocksOk() << ")";
                             } else {
                                 ss2 << "\n🔌 WS: ❌ HTTP fallback"
                                     << (wsHeadsLatest() > 0
                                             ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
                                             : "")
-                                    << " · assist " << (wsAssistOk() ? "✅" : "❌")
+                                    << " · assist " << (wsAssistOk() ? wsAssistActiveLabel() : "❌")
                                     << " (" << wsAssistBlocksOk() << ")";
                             }
                             ss2 << rpcSlowSummary();
