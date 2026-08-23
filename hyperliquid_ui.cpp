@@ -207,6 +207,7 @@ std::string rankLabel(int rank) {
     }
 }
 
+
 HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int windowDays = 30) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
     windowDays = clampHlWindowDays(windowDays);
@@ -299,6 +300,8 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int
 
 }
 
+int countBscBannedBots();
+
 std::string hyperliquidStatsLine() {
     std::stringstream ss;
     const long long last = g_lastMsgTs.load(std::memory_order_relaxed);
@@ -341,8 +344,10 @@ std::string hyperliquidStatsLine() {
        << "\n\u2022 запросов истории: " << formatThousands(enr);
     if (queued > 0) ss << "\n\u2022 ждут проверки: " << queued << " кошельков";
 
+    const int bscBanned = countBscBannedBots();
     ss << "\n\n\U0001F916 <b>Фильтры</b>"
-       << "\n\u2022 ботов исключено всего: " << formatThousands(static_cast<uint64_t>(bannedTotal));
+       << "\n\u2022 боты BSC (бан): " << formatThousands(static_cast<uint64_t>(bscBanned))
+       << "\n\u2022 боты HL (бан): " << formatThousands(static_cast<uint64_t>(bannedTotal));
     ss << "\n\u2022 пропущено по лимиту API: " << formatThousands(skips);
     if (recon > 0) ss << "\n\u2022 обрывов связи: " << recon;
 
