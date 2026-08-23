@@ -62,7 +62,7 @@ constexpr long long RETENTION_SECONDS = 365LL * 86400LL;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
-constexpr int MAX_BOT_FILTER_TRADES = 1000;
+constexpr int MAX_BOT_FILTER_TRADES = 200;  // спот + бан трека; >200 сделок/30д = бот
 constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
