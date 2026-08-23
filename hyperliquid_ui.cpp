@@ -300,8 +300,6 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int
 
 }
 
-int countBscBannedBots();
-
 std::string hyperliquidStatsLine() {
     std::stringstream ss;
     const long long last = g_lastMsgTs.load(std::memory_order_relaxed);
@@ -344,7 +342,19 @@ std::string hyperliquidStatsLine() {
        << "\n\u2022 запросов истории: " << formatThousands(enr);
     if (queued > 0) ss << "\n\u2022 ждут проверки: " << queued << " кошельков";
 
-    const int bscBanned = countBscBannedBots();
+    long long bscBanned = 0;
+    {
+        extern sqlite3* db;
+        extern std::mutex dbMutex;
+        std::lock_guard<std::mutex> l(dbMutex);
+        if (db) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM ignored_wallets WHERE permanent=1")) {
+                if (sqlite3_step(s) == SQLITE_ROW) bscBanned = sqlite3_column_int64(s, 0);
+                sqlite3_finalize(s);
+            }
+        }
+    }
     ss << "\n\n\U0001F916 <b>Фильтры</b>"
        << "\n\u2022 боты BSC (бан): " << formatThousands(static_cast<uint64_t>(bscBanned))
        << "\n\u2022 боты HL (бан): " << formatThousands(static_cast<uint64_t>(bannedTotal));
