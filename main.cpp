@@ -1948,8 +1948,7 @@ void telegramLoop() {
                                 ss2 << "\n🔌 WS: ❌ HTTP fallback"
                                     << (wsHeadsLatest() > 0
                                             ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
-                                            : "")
-                                    
+                                            : "");
                             }
                             ss2 << rpcSlowSummary();
                             {
