@@ -1263,7 +1263,15 @@ void flushPendingAlerts(bool force) {
 
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
-    auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
+    json block = nullptr;
+    // lag > 200 → третий WS (assist) тянет блок, HTTP RPC отдыхает
+    if (g_stats.current_lag.load(std::memory_order_relaxed) > 200 && wsAssistOk()) {
+        block = wsAssistGetBlock(bn);
+    }
+    if (block.is_null() || !block.is_object() || !block.contains("transactions") ||
+        !block["transactions"].is_array()) {
+        block = rpc("eth_getBlockByNumber", {ss.str(), true});
+    }
     if (block.is_null()||!block.is_object()||!block.contains("transactions")||!block["transactions"].is_array()) return false;
     std::string ph=block.value("parentHash",""), ep=getLastBlockHash();
     long long blockTs = 0;
@@ -1943,12 +1951,14 @@ void telegramLoop() {
                                 << "\n⏳ Lag: " << g_stats.current_lag.load()
                                 << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
                             if (wsHeadsOk()) {
-                                ss2 << "\n🔌 WS: ✅ newHeads · блок " << wsHeadsLatest();
+                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest() << " · assist " << (wsAssistOk() ? "✅" : "❌") << " (" << wsAssistBlocksOk() << ")";
                             } else {
                                 ss2 << "\n🔌 WS: ❌ HTTP fallback"
                                     << (wsHeadsLatest() > 0
                                             ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
-                                            : "");
+                                            : "")
+                                    << " · assist " << (wsAssistOk() ? "✅" : "❌")
+                                    << " (" << wsAssistBlocksOk() << ")";
                             }
                             ss2 << rpcSlowSummary();
                             {
@@ -2087,15 +2097,30 @@ int main() {
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
                   << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
         {
-            const char* wsEnv = std::getenv("WHALE_WS_URL");
-            std::string wsUrl = (wsEnv && *wsEnv) ? std::string(wsEnv)
-                                                  : std::string("wss://rpc-bsc.blockmachine.io");
+            // WHALE_WS_URL — один URL или список через запятую.
             // пустая строка WHALE_WS_URL=  → WS выкл
-            if (wsEnv && std::string(wsEnv).empty()) wsUrl.clear();
-            if (!wsUrl.empty() && (chainName == "bsc" || chainName == "bnb"))
+            // по умолчанию: primary + backup newHeads
+            const char* wsEnv = std::getenv("WHALE_WS_URL");
+            std::string wsUrl;
+            if (wsEnv && std::string(wsEnv).empty()) {
+                wsUrl.clear();
+            } else if (wsEnv && *wsEnv) {
+                wsUrl = wsEnv;
+            } else {
+                wsUrl = "wss://rpc-bsc.blockmachine.io,"
+                        "wss://bnb.api.onfinality.io/public-ws";
+            }
+            if (!wsUrl.empty() && (chainName == "bsc" || chainName == "bnb")) {
                 startWsHeads(wsUrl);
-            else if (!wsUrl.empty())
+                const char* assistEnv = std::getenv("WHALE_WS_ASSIST_URL");
+                std::string assistUrl = (assistEnv && *assistEnv)
+                    ? std::string(assistEnv)
+                    : std::string("wss://rpc-bsc.blockmachine.io");
+                if (assistEnv && std::string(assistEnv).empty()) assistUrl.clear();
+                if (!assistUrl.empty()) startWsAssist(assistUrl);
+            } else if (!wsUrl.empty()) {
                 std::cout << "[WS] skip (non-BSC chain)" << std::endl;
+            }
         }
     }
     setRpcFailureHandler([]{
@@ -2224,6 +2249,7 @@ int main() {
     dm.join();
     stopHyperliquid();
     stopWsHeads();
+    stopWsAssist();
     walCheckpoint();
     closeRankingDB();
     if (db) sqlite3_close(db);
