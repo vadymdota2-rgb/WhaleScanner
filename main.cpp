@@ -476,7 +476,7 @@ void refreshWatchers() {
     auto bscActive = std::make_shared<std::unordered_set<std::string>>();
     auto hlActive = std::make_shared<std::unordered_set<std::string>>();
     long long now = static_cast<long long>(time(nullptr));
-    constexpr long long MARKET_WATCH_GRACE_SEC = 14LL * 86400LL;
+    constexpr long long MARKET_WATCH_GRACE_SEC = 30LL * 86400LL;
     const long long graceAfter = now - MARKET_WATCH_GRACE_SEC;
     bool queryOk = false;
     size_t bscOff = 0, hlOff = 0;
