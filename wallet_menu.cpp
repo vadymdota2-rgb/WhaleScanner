@@ -7,15 +7,12 @@
 #include <algorithm>
 #include <mutex>
 #include <ctime>
-#include <cmath>
-#include <cstdio>
 #include <sqlite3.h>
 
 #include "json.hpp"
 #include "utils.h"
 #include "premium.h"
 #include "ranking.h"
-#include "tx_analyzer.h"
 #include "alert_settings.h"
 
 using json = nlohmann::json;
@@ -56,14 +53,6 @@ std::string shortAddress(const std::string& a) {
     if (a.length() <= 12) return a;
     return a.substr(0, 6) + "..." + a.substr(a.length() - 4);
 }
-std::string fmtUsdNanos(const cpp_int& nanos) {
-    std::string s = nanos.convert_to<std::string>();
-    if (s.size() > 18) return formatUsd(nanos);
-    long long v = 0;
-    try { v = std::stoll(s); } catch (...) { return formatUsd(nanos); }
-    return formatUsdNanosSigned(v, false);
-}
-
 bool isTrackingWallet(const std::string& chatId, const std::string& address) {
     const std::string addr = toLower(address);
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -263,7 +252,7 @@ UIMessage buildAccountMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_my_wallets") + " (" + std::to_string(count) + ")"},
          {"callback_data", "menu:my_wallets"}}
     }));
-        kb["inline_keyboard"].push_back(json::array({
+    kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_positions")}, {"callback_data", "hl_positions"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
@@ -320,7 +309,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
     for (int i = startIdx; i < endIdx; i++) {
         const std::string& address = walletRows[i].address;
         const std::string& label = walletRows[i].label;
-        size_t idx = static_cast<size_t>(i);
 
         if (i > startIdx) text << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n";
         const bool isPrimary = walletRows[i].primary;
@@ -684,14 +672,14 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
             replyInPlace(chatId, session.promptMessageId, tr(lang, "already_tracking") + "\n\n" + msg.text, msg.keyboard);
         }
-                else if (result == AddWhaleResult::PERMANENTLY_BANNED) {
+        else if (result == AddWhaleResult::PERMANENTLY_BANNED) {
             Lang lang = langFromCode(getUserLanguage(chatId));
             std::string back = getLastView(chatId);
             g_sessionManager.clearSession(chatId);
             auto msg = back.empty() ? TelegramUI::buildMainMenu(chatId) : renderViewByData(chatId, back);
             replyInPlace(chatId, session.promptMessageId, tr(lang, "wallet_bot_banned") + "\n\n" + msg.text, msg.keyboard);
         }
-else if (result == AddWhaleResult::LIMIT_REACHED) {
+        else if (result == AddWhaleResult::LIMIT_REACHED) {
             g_sessionManager.clearSession(chatId);
             Lang lang = langFromCode(getUserLanguage(chatId));
             if (isPremium(chatId)) {
