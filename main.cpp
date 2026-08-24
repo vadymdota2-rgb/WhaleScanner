@@ -977,23 +977,6 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
-bool getNativeBalance(const std::string& wallet, cpp_int& out) {
-    auto r = rpc("eth_getBalance", {wallet, "latest"});
-    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
-    out = hexToCppInt(r.get<std::string>());
-    return true;
-}
-
-bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_int& out) {
-    std::string w = toLower(wallet);
-    if (w.size() == 42 && w.rfind("0x",0) == 0) w = w.substr(2);
-    std::string data = "0x70a08231" + std::string(24, '0') + w;
-    auto r = rpc("eth_call", {{{"to", token}, {"data", data}}, "latest"});
-    if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
-    out = hexToCppInt(r.get<std::string>());
-    return true;
-}
-
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
                               const TxResult& res, const std::string& hash, Lang lang) {
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
