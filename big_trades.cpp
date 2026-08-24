@@ -1,4 +1,5 @@
 #include "big_trades.h"
+#include "token_prices.h"
 
 #include <algorithm>
 #include <mutex>
@@ -44,7 +45,6 @@ const char* windowKey(const std::string& w) {
 }
 
 const char* hlDirKey(const std::string& dir) {
-    // Liquidated * раньше Long/Short — иначе "Liquidated Long" → open long
     if (dir.find("Liquidat") != std::string::npos) {
         if (dir.find("Short") != std::string::npos) return "hl_liq_short";
         return "hl_liq_long";
@@ -274,7 +274,6 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                 const char* dk = hlDirKey(r.side);
                 const bool up = hlSideUp(r.side);
                 const std::string coin = safeString(r.asset.empty() ? "?" : r.asset, 16);
-                // ликвидации: всегда череп; open long/short — зелёный/красный
                 const char* mark = liq ? "\U0001F480"
                                        : (up ? "\U0001F7E2" : "\U0001F534");
 
@@ -283,7 +282,6 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                   << tr(lang, dk) << " \u00B7 " << coin << "</b>\n";
 
                 if (liq) {
-                    // Простая карточка: сначала убыток, потом размер и цена
                     if (r.closedPnlNanos != 0)
                         t << "\U0001F4B8 <b>" << tr(lang, "big_liq_loss") << ":</b> "
                           << formatUsdNanosSigned(r.closedPnlNanos, true) << "\n";
