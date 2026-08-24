@@ -3,8 +3,6 @@
 #include <string>
 #include <cstddef>
 #include <vector>
-#include <boost/multiprecision/cpp_int.hpp>
-using boost::multiprecision::cpp_int;
 #include "alert_settings.h"
 #include "ru.h"
 
@@ -30,16 +28,6 @@ void untrackWalletFromService(const std::string& wallet);
 namespace TelegramUI {
 UIMessage buildWalletsList(const std::string& chatId, int page = 1);
 UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& address, const std::string& label, Lang lang);
-}
-
-bool getNativeBalance(const std::string& wallet, cpp_int& out);
-bool getTokenBalance(const std::string& token, const std::string& wallet, cpp_int& out);
-int getDecimals(const std::string& addr);
-std::string getSymbol(const std::string& addr);
-uint64_t getPriceNanos(const std::string& token);
-double getPoolLiquidityUsd(const std::string& token);
-
-namespace TelegramUI {
 UIMessage buildAccountMenu(const std::string& chatId);
 }
 
