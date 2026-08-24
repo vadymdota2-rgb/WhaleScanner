@@ -263,10 +263,7 @@ UIMessage buildAccountMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_my_wallets") + " (" + std::to_string(count) + ")"},
          {"callback_data", "menu:my_wallets"}}
     }));
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_hold")}, {"callback_data", "menu:hold"}}
-    }));
-    kb["inline_keyboard"].push_back(json::array({
+        kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_positions")}, {"callback_data", "hl_positions"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
@@ -275,115 +272,6 @@ UIMessage buildAccountMenu(const std::string& chatId) {
 
     std::stringstream text;
     text << tr(lang, "account_title") << "\n\n" << tr(lang, "account_desc");
-    return {text.str(), kb.dump()};
-}
-
-UIMessage buildHoldCard(const std::string& chatId, const std::string& address) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    constexpr uint64_t DUST_USD_NANOS = 10ULL * 1000000000ULL;
-    constexpr double MIN_POOL_LIQUIDITY_USD = 5000.0;
-    constexpr int MAX_TOKENS_TO_CHECK = 40;
-
-    std::vector<PortfolioItem> held;
-    cpp_int totalUsdNanos = 0;
-    int failedReads = 0;
-    int illiquidCount = 0;
-
-    {
-        cpp_int wei = 0;
-        if (!getNativeBalance(address, wei)) {
-            ++failedReads;
-        } else if (wei > 0) {
-            uint64_t price = getPriceNanos(chainCtx().wrappedNative);
-            if (price > 0) {
-                cpp_int usd = (wei * cpp_int(price)) / cpp_int("1000000000000000000");
-                if (usd >= cpp_int(DUST_USD_NANOS)) {
-                    held.push_back({chainCtx().nativeSymbol, formatAmount(wei, 18), usd});
-                    totalUsdNanos += usd;
-                }
-            }
-        }
-    }
-
-    std::vector<std::string> tokens = getWalletTokens(address, MAX_TOKENS_TO_CHECK);
-    for (const auto& t : tokens) {
-        cpp_int raw = 0;
-        if (!getTokenBalance(t, address, raw)) {
-            ++failedReads;
-            continue;
-        }
-        if (raw <= 0) {
-            forgetWalletToken(address, t);
-            continue;
-        }
-        int dec = getDecimals(t);
-        uint64_t price = chainCtx().stablecoins.count(t)
-                       ? 1000000000ULL
-                       : getPriceNanos(t);
-        if (price == 0) continue;
-        cpp_int denom = 1; for (int i = 0; i < dec; ++i) denom *= 10;
-        cpp_int usd = (raw * cpp_int(price)) / denom;
-        if (usd < cpp_int(DUST_USD_NANOS)) continue;
-
-        bool illiquid = false;
-        const auto& ctx = chainCtx();
-        const bool stable = ctx.stablecoins.count(t) > 0;
-        // Крупные ликвидные активы (WBNB, BTCB, ETH, стейблы…) — без ⚠
-        const bool major = stable
-            || t == toLower(ctx.wrappedNative)
-            || ctx.baseAssets.count(t) > 0;
-        const double liq = major ? 0.0 : getPoolLiquidityUsd(t);
-
-        bool capped = false;
-        if (!major) {
-            // liq == 0 → неизвестно (не ⚠); 0 < liq < порог → тонкий пул подтверждён
-            if (liq > 0.0 && liq < MIN_POOL_LIQUIDITY_USD) {
-                illiquid = true;
-            } else if (liq >= MIN_POOL_LIQUIDITY_USD) {
-                const cpp_int poolCap = cpp_int(static_cast<long long>(liq * 0.5)) * cpp_int(1000000000LL);
-                if (usd > poolCap) { capped = true; usd = poolCap; }
-            }
-        }
-
-        std::string sym = safeString(getSymbol(t), 12);
-        if (illiquid) sym += " \u26A0";
-        else if (capped) sym += " \u2248";
-        held.push_back({sym, formatAmount(raw, dec), usd});
-        if (!illiquid) totalUsdNanos += usd;
-        if (illiquid) ++illiquidCount;
-    }
-
-    std::sort(held.begin(), held.end(),
-              [](const PortfolioItem& a, const PortfolioItem& b) { return a.usdNanos > b.usdNanos; });
-
-    std::stringstream text;
-    text << tr(lang, "hold_title") << "\n";
-    text << "<code>" << safeString(address, 42) << "</code>\n\n";
-    text << "\U0001F4B0 <b>" << tr(lang, "hold_total") << ":</b> "
-         << fmtUsdNanos(totalUsdNanos) << "\n\n";
-
-    if (held.empty()) {
-        text << tr(lang, "hold_empty");
-        if (tokens.empty()) text << "\n\n" << tr(lang, "hold_no_history");
-    } else {
-        text << "\U0001FA99 <b>" << tr(lang, "hold_coins") << ":</b>\n";
-        for (const auto& h : held) {
-            text << "• <b>" << h.symbol << "</b> — "
-                 << fmtUsdNanos(h.usdNanos)
-                 << "  <i>(" << h.amount << ")</i>\n";
-        }
-        text << "\n<i>" << tr(lang, "hold_dust_note") << "</i>";
-    }
-    if (illiquidCount > 0)
-        text << "\n<i>\u26A0 " << tr(lang, "hold_illiquid") << "</i>";
-    if (failedReads > 0)
-        text << "\n<i>" << tr(lang, "hold_partial") << "</i>";
-
-    json kb;
-    kb["inline_keyboard"] = json::array();
-    kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
     return {text.str(), kb.dump()};
 }
 
