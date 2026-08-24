@@ -1,4 +1,7 @@
 #include "ranking.h"
+#include "token_prices.h"
+#include <boost/multiprecision/cpp_int.hpp>
+using boost::multiprecision::cpp_int;
 
 #include <sqlite3.h>
 #include <mutex>
@@ -30,16 +33,14 @@ extern std::mutex dbMutex;
 extern std::atomic<bool> running;
 
 namespace {
-constexpr long long WINDOW_SECONDS = 30LL * 86400LL; // bot filter + default rank
+constexpr long long WINDOW_SECONDS = 30LL * 86400LL;
 constexpr int RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
 constexpr int RANK_WINDOWS_COUNT = 4;
-// пересчёт в разное время — пик нагрузки не складывается
-// минуты «кривые», чтобы реже совпадать с тиком 15 мин и друг с другом
 constexpr long long RANK_WINDOW_INTERVAL_SEC[] = {
-    15 * 60,            // 30д  — 15 мин
-    47 * 60,            // 90д  — 47 мин
-    3 * 3600 + 11 * 60, // 180д — 3ч 11м
-    6 * 3600 + 13 * 60, // 365д — 6ч 13м
+    15 * 60,
+    47 * 60,
+    3 * 3600 + 11 * 60,
+    6 * 3600 + 13 * 60,
 };
 long long g_rankWindowBuiltAt[4] = {0, 0, 0, 0};
 
@@ -62,7 +63,7 @@ constexpr long long RETENTION_SECONDS = 365LL * 86400LL;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 constexpr int MAX_GLOBAL_RANKED = 100;
 
-constexpr int MAX_BOT_FILTER_TRADES = 200;  // спот + бан трека; >200 сделок/30д = бот
+constexpr int MAX_BOT_FILTER_TRADES = 200;
 constexpr int GLOBAL_PER_PAGE = 5;
 constexpr long long REBUILD_INTERVAL_SECONDS = 15 * 60;
 
@@ -499,7 +500,6 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
 }
 
 std::string globalTitle(GlobalRankKind kind, Lang lang) {
-    // rk_btn_* уже с эмодзи, без «(30д)» — срок только windowDays
     switch (kind) {
         case GlobalRankKind::PNL: return tr(lang, "rk_btn_top_pnl");
         case GlobalRankKind::ROI: return tr(lang, "rk_btn_top_roi");
@@ -508,7 +508,6 @@ std::string globalTitle(GlobalRankKind kind, Lang lang) {
     }
     return "🏆 " + tr(lang, "rk_top_traders_30d");
 }
-
 
 int countBscBannedBots() {
     std::lock_guard<std::mutex> l(dbMutex);
@@ -570,7 +569,6 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
         }));
     }
 
-
     std::string kindParam = globalRankKindToString(kind);
     const std::string winSuffix = ":" + std::to_string(windowDays);
     json navRow = json::array();
@@ -579,7 +577,6 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
     if (page < totalPages) navRow.push_back({{"text", "➡️"}, {"callback_data", "gt_page:" + kindParam + ":" + std::to_string(page + 1) + winSuffix}});
     keyboard["inline_keyboard"].push_back(navRow);
 
-    // после «Отслеживать» и навигации — окна, перед «Назад»
     json winRow = json::array();
     for (int d : RANK_WINDOWS_DAYS) {
         const bool on = (d == windowDays);
@@ -608,8 +605,6 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
     std::string payload;
     const std::string key = rankCacheKey(globalRankKindToString(kind), windowDays);
     if (!loadCachedPayload(key, payload)) {
-        // окно ещё не считали (разнесённый график) — помечаем due, чтобы
-        // следующий тик rankingCacheLoop взял именно его
         const int idx = rankWindowIndex(windowDays);
         g_rankWindowBuiltAt[idx] = 0;
         g_forceRebuild.store(true, std::memory_order_relaxed);
@@ -628,8 +623,6 @@ void rebuildAllRankings() {
     std::vector<std::pair<std::string, std::string>> entries;
     bool anyOk = false;
 
-    // одно самое просроченное / ни разу не собранное окно.
-    // force только будит цикл раньше сна — не гоняет все 4 окна сразу.
     std::vector<int> todo;
     int best = -1;
     double bestScore = -1.0;
@@ -637,7 +630,6 @@ void rebuildAllRankings() {
         const long long interval = RANK_WINDOW_INTERVAL_SEC[i];
         const long long built = g_rankWindowBuiltAt[i];
         if (!force && built > 0 && (now - built) < interval) continue;
-        // не собранное — приоритет коротким (30д), иначе % просрочки
         const double score = (built <= 0)
             ? (1000.0 - i)
             : static_cast<double>(now - built) / static_cast<double>(interval);
@@ -676,7 +668,6 @@ void rebuildAllRankings() {
     }
 
     if (entries.empty()) {
-        // нечего писать — все окна ещё свежие
         return;
     }
     if (!anyOk) {
@@ -1216,7 +1207,6 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
         if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     }
     else if (action == "gt_open") {
-        // gt_open:pnl  |  gt_open:pnl:90
         std::string kindStr = param;
         int windowDays = 30;
         const size_t sep = param.find(':');
@@ -1235,7 +1225,6 @@ bool handleRankingCallback(const std::string& chatId, const std::string& action,
         }
     }
     else if (action == "gt_page") {
-        // gt_page:pnl:2  |  gt_page:pnl:2:90
         size_t sep = param.find(':');
         if (sep != std::string::npos) {
             std::string kindStr = param.substr(0, sep);
