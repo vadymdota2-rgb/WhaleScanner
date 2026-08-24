@@ -1,5 +1,9 @@
 #include "big_trades.h"
 #include "token_prices.h"
+#include "rpc_client.h"
+#include <cmath>
+#include <cstdio>
+#include <map>
 
 #include <algorithm>
 #include <mutex>
@@ -27,9 +31,24 @@ void rememberView(const std::string& chatId, const std::string& data);
 
 namespace {
 
+struct FundingRow {
+    std::string symbol;
+    double rate = 0.0;
+    double oiUsd = 0.0;
+    double volUsd = 0.0;
+};
+
+std::mutex g_fundMutex;
+std::vector<FundingRow> g_fundCache;
+time_t g_fundAt = 0;
+
+constexpr double FUNDING_MIN_ABS = 0.001;
+constexpr int    FUNDING_MAX_ROWS = 30;
+constexpr int    FUNDING_REFRESH_SEC = 240;
+constexpr double FUNDING_MIN_OI_USD = 500000.0;
+
 constexpr int PER_PAGE  = 5;
 constexpr int MAX_ROWS  = 30;
-constexpr int FREE_ROWS = 10;
 constexpr long long MAX_SPOT_USD_NANOS = 10000000000000000LL;
 
 long long windowSeconds(const std::string& w) {
@@ -192,6 +211,123 @@ std::string spotAssetLabel(const std::string& tokenAddr) {
 
 }
 
+namespace {
+std::string compactUsd(double v) {
+    char b[48];
+    if (v >= 1e9)      std::snprintf(b, sizeof(b), "$%.1fB", v / 1e9);
+    else if (v >= 1e6) std::snprintf(b, sizeof(b), "$%.1fM", v / 1e6);
+    else if (v >= 1e3) std::snprintf(b, sizeof(b), "$%.0fK", v / 1e3);
+    else               std::snprintf(b, sizeof(b), "$%.0f", v);
+    return b;
+}
+
+double jnum(const json& v) {
+    if (v.is_number()) return v.get<double>();
+    if (v.is_string()) {
+        try { return std::stod(v.get<std::string>()); } catch (...) { return 0.0; }
+    }
+    return 0.0;
+}
+
+std::string baseSymbol(std::string sym) {
+    const size_t dash = sym.find('-');
+    if (dash != std::string::npos) sym = sym.substr(0, dash);
+    return sym;
+}
+}
+
+void refreshFundingCache() {
+    const std::string body = http(
+        "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex", "", 12);
+    if (body.empty()) return;
+
+    json j = json::parse(body, nullptr, false);
+    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) return;
+
+    std::vector<FundingRow> fresh;
+    for (const auto& it : j["data"]) {
+        if (!it.is_object()) continue;
+        if (!it.contains("symbol") || !it["symbol"].is_string()) continue;
+        if (!it.contains("lastFundingRate")) continue;
+
+        double rate = 0.0;
+        if (it["lastFundingRate"].is_string()) {
+            try { rate = std::stod(it["lastFundingRate"].get<std::string>()); } catch (...) { continue; }
+        } else if (it["lastFundingRate"].is_number()) {
+            rate = it["lastFundingRate"].get<double>();
+        } else continue;
+
+        if (!std::isfinite(rate) || std::fabs(rate) < FUNDING_MIN_ABS) continue;
+        if (std::fabs(rate) > 1.0) continue;
+
+        std::string sym = it["symbol"].get<std::string>();
+        const size_t dash = sym.find('-');
+        if (dash != std::string::npos) sym = sym.substr(0, dash);
+        if (sym.empty() || sym.size() > 16) continue;
+
+        fresh.push_back({sym, rate});
+    }
+
+    if (fresh.empty()) return;
+
+    {
+        const std::string tick = http(
+            "https://open-api.bingx.com/openApi/swap/v2/quote/ticker", "", 12);
+        std::map<std::string, std::pair<double,double>> extra;   // символ -> {интерес, оборот}
+        if (!tick.empty()) {
+            json tj = json::parse(tick, nullptr, false);
+            if (tj.is_object() && tj.contains("data") && tj["data"].is_array()) {
+                for (const auto& it : tj["data"]) {
+                    if (!it.is_object() || !it.contains("symbol") || !it["symbol"].is_string()) continue;
+                    const std::string sym = baseSymbol(it["symbol"].get<std::string>());
+                    if (sym.empty()) continue;
+
+                    double last = it.contains("lastPrice") ? jnum(it["lastPrice"]) : 0.0;
+                    double oi = 0.0;
+                    if (it.contains("openInterest")) oi = jnum(it["openInterest"]);
+                    if (oi > 0.0 && last > 0.0) oi *= last;
+
+                    double vol = 0.0;
+                    if (it.contains("quoteVolume")) vol = jnum(it["quoteVolume"]);
+                    else if (it.contains("volume")) {
+                        vol = jnum(it["volume"]);
+                        if (vol > 0.0 && last > 0.0) vol *= last;
+                    }
+
+                    if (!std::isfinite(oi) || oi < 0.0) oi = 0.0;
+                    if (!std::isfinite(vol) || vol < 0.0) vol = 0.0;
+                    extra[sym] = {oi, vol};
+                }
+            }
+        }
+
+        for (auto& r : fresh) {
+            auto it = extra.find(r.symbol);
+            if (it == extra.end()) continue;
+            r.oiUsd = it->second.first;
+            r.volUsd = it->second.second;
+        }
+
+        if (!extra.empty()) {
+            std::vector<FundingRow> kept;
+            kept.reserve(fresh.size());
+            for (const auto& r : fresh)
+                if (r.oiUsd >= FUNDING_MIN_OI_USD) kept.push_back(r);
+            if (!kept.empty()) fresh.swap(kept);
+        }
+    }
+
+    std::sort(fresh.begin(), fresh.end(), [](const FundingRow& a, const FundingRow& b) {
+        return std::fabs(a.rate) > std::fabs(b.rate);
+    });
+    if (fresh.size() > static_cast<size_t>(FUNDING_MAX_ROWS))
+        fresh.resize(static_cast<size_t>(FUNDING_MAX_ROWS));
+
+    std::lock_guard<std::mutex> l(g_fundMutex);
+    g_fundCache.swap(fresh);
+    g_fundAt = time(nullptr);
+}
+
 BigTradesMessage buildBigMenu(const std::string& chatId) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
     std::ostringstream t;
@@ -203,6 +339,9 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
     kb["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "big_btn_spot")}, {"callback_data", "bg_open:spot:24h"}}
     }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "big_btn_liq")}, {"callback_data", "bg_open:liq:24h"}}
+    }));
     {
         std::string perpBtn = tr(lang, "big_btn_perp");
         if (!isPremium(chatId)) perpBtn += " \U0001F512";
@@ -211,13 +350,81 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
         }));
     }
     {
-        std::string liqBtn = tr(lang, "big_btn_liq");
-        if (!isPremium(chatId)) liqBtn += " \U0001F512";
+        std::string fundBtn = tr(lang, "fund_btn");
+        if (!isPremium(chatId)) fundBtn += " \U0001F512";
         kb["inline_keyboard"].push_back(json::array({
-            {{"text", liqBtn}, {"callback_data", "bg_open:liq:24h"}}
+            {{"text", fundBtn}, {"callback_data", "bg_open:fund:24h"}}
         }));
     }
     kb["inline_keyboard"].push_back(backRow(lang, "menu:main"));
+    return {t.str(), kb.dump()};
+}
+
+BigTradesMessage buildFundingList(const std::string& chatId) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    std::ostringstream t;
+    json kb;
+    kb["inline_keyboard"] = json::array();
+
+    if (!isPremium(chatId)) {
+        t << "\U0001F4A2 <b>" << tr(lang, "fund_title") << "</b>\n\n"
+          << "\U0001F512 " << tr(lang, "hl_locked_body");
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
+        }));
+        kb["inline_keyboard"].push_back(backRow(lang, "menu:big"));
+        return {t.str(), kb.dump()};
+    }
+
+    std::vector<FundingRow> rows;
+    time_t at = 0;
+    {
+        std::lock_guard<std::mutex> l(g_fundMutex);
+        rows = g_fundCache;
+        at = g_fundAt;
+    }
+
+    t << "\U0001F4A2 <b>" << tr(lang, "fund_title") << "</b>\n"
+      << "<i>" << tr(lang, "fund_hint") << "</i>\n\n";
+
+    if (rows.empty()) {
+        t << tr(lang, "fund_empty");
+    } else {
+        int n = 0;
+        for (const auto& r : rows) {
+            const bool longsPay = r.rate > 0.0;
+            const double pct = r.rate * 100.0;
+            const double apr = pct * 3.0 * 365.0;
+
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "%+.3f%%", pct);
+            char aprBuf[64];
+            std::snprintf(aprBuf, sizeof(aprBuf), "%+.0f%%", apr);
+
+            t << "<b>" << (++n) << ".</b> " << (longsPay ? "\U0001F4C8" : "\U0001F4C9")
+              << " <b>" << safeString(r.symbol, 16) << "</b>  <code>" << buf << "</code>"
+              << " \u00B7 " << tr(lang, longsPay ? "fund_longs_pay" : "fund_shorts_pay") << "\n"
+              << "   <i>" << tr(lang, "fund_apr") << " " << aprBuf << "</i>\n";
+
+            if (r.oiUsd > 0.0 || r.volUsd > 0.0) {
+                t << "   ";
+                if (r.oiUsd > 0.0)
+                    t << tr(lang, "fund_oi") << " " << compactUsd(r.oiUsd);
+                if (r.oiUsd > 0.0 && r.volUsd > 0.0) t << " \u00B7 ";
+                if (r.volUsd > 0.0)
+                    t << tr(lang, "fund_vol") << " " << compactUsd(r.volUsd);
+                t << "\n";
+            }
+            t << "\n";
+        }
+        if (at > 0) {
+            const long long mins = (static_cast<long long>(time(nullptr)) - at) / 60;
+            t << "<i>" << tr(lang, "fund_updated") << " " << mins << " "
+              << tr(lang, "fund_min_ago") << "</i>";
+        }
+    }
+
+    kb["inline_keyboard"].push_back(backRow(lang, "menu:big"));
     return {t.str(), kb.dump()};
 }
 
@@ -228,7 +435,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const bool perp = venue == "perp" || liq;
     const bool premium = isPremium(chatId);
 
-    if (perp && !premium) {
+    if (perp && !liq && !premium) {
         std::ostringstream t;
         t << "\U0001F525 <b>" << tr(lang, liq ? "big_liq_title" : "big_perp_title") << "</b>\n\n"
           << "\U0001F512 " << tr(lang, "hl_locked_body");
@@ -241,7 +448,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
         return {t.str(), kb.dump()};
     }
 
-    const int maxRows = premium ? MAX_ROWS : FREE_ROWS;
+    const int maxRows = MAX_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
     std::vector<BigRow> rows = liq  ? liqRows(since, maxRows)
@@ -381,8 +588,6 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
             }
         }
 
-        if (!premium) t << "<i>" << tr(lang, "big_free_note") << "</i>\n\n";
-
         json nav = json::array();
         if (page > 1)
             nav.push_back({{"text", "\u2B05\uFE0F"},
@@ -411,6 +616,7 @@ bool renderBigTradesView(const std::string& chatId, const std::string& action,
     if (action == "bg_open") {
         const size_t sep = param.find(':');
         if (sep == std::string::npos) return false;
+        if (param.substr(0, sep) == "fund") { out = buildFundingList(chatId); return true; }
         out = buildBigList(chatId, param.substr(0, sep), param.substr(sep + 1), 1);
         return true;
     }
