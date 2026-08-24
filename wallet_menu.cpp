@@ -348,7 +348,10 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         text << "\n";
 
         json row;
-        row.push_back({{"text", "✏️ " + shortAddress(address)}, {"callback_data", "rename:" + address}});
+        std::string btnLabel = (toLower(label) == address)
+                             ? tr(lang, "alert_wallet")
+                             : truncateUtf8(label, 32);
+        row.push_back({{"text", "✏️ " + btnLabel}, {"callback_data", "rename:" + address}});
         if (walletRows.size() > 1 && !isPrimary)
             row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
         row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
