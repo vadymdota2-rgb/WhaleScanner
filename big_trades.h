@@ -8,6 +8,8 @@ struct BigTradesMessage {
     std::string keyboard;
 };
 
+void refreshFundingCache();
+
 BigTradesMessage buildBigMenu(const std::string& chatId);
 BigTradesMessage buildBigList(const std::string& chatId, const std::string& venue,
                               const std::string& window, int page);
