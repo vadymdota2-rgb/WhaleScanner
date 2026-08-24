@@ -285,8 +285,10 @@ struct Watcher {
 std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
+// BSC processBlock: спот-сделка или <14 дней с добавления.
 std::shared_ptr<const std::unordered_set<std::string>> BSC_ACTIVE_PTR =
     std::make_shared<const std::unordered_set<std::string>>();
+// HL подписка: fill в hl_fills или <14 дней с добавления (не таскаем чистый BSC-спот).
 std::shared_ptr<const std::unordered_set<std::string>> HL_ACTIVE_PTR =
     std::make_shared<const std::unordered_set<std::string>>();
 
@@ -351,14 +353,7 @@ void initDB() {
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_prio ON deliveries(status, next_retry_at, priority DESC, id) WHERE status IN (0,3);
-        CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
-        CREATE TABLE IF NOT EXISTS wallet_tokens (
-            wallet TEXT NOT NULL,
-            token TEXT NOT NULL,
-            last_seen INTEGER NOT NULL,
-            PRIMARY KEY (wallet, token)
-        );
-        CREATE TABLE IF NOT EXISTS pair_cache (
+        CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);        CREATE TABLE IF NOT EXISTS pair_cache (
             token TEXT PRIMARY KEY,
             val TEXT NOT NULL
         );
@@ -474,11 +469,12 @@ void refreshWatchers() {
     auto bscActive = std::make_shared<std::unordered_set<std::string>>();
     auto hlActive = std::make_shared<std::unordered_set<std::string>>();
     long long now = static_cast<long long>(time(nullptr));
-    constexpr long long MARKET_WATCH_GRACE_SEC = 14LL * 86400LL;
+    constexpr long long MARKET_WATCH_GRACE_SEC = 30LL * 86400LL;
     const long long graceAfter = now - MARKET_WATCH_GRACE_SEC;
     bool queryOk = false;
     size_t bscOff = 0, hlOff = 0;
 
+    // Кошельки с любой HL-активностью (один проход по hl_fills).
     std::unordered_set<std::string> hasHlFill;
     {
         std::lock_guard<std::mutex> hlLock(hl::g_hlDbMutex);
@@ -521,16 +517,19 @@ void refreshWatchers() {
                 const bool inGrace = (createdAt <= 0) || (createdAt >= graceAfter);
                 const bool hasHl = hasHlFill.count(addr) > 0;
 
+                // Полный список — получатели алертов (оба рынка).
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
                 if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
 
+                // BSC: спот или льгота 14 дней
                 if (hasSpot || inGrace) {
                     bscActive->insert(addr);
                 } else {
                     ++bscOff;
                 }
+                // HL: перп-fill или льгота 14 дней (чистый многолетний BSC-спот не подписываем)
                 if (hasHl || inGrace) {
                     hlActive->insert(addr);
                 } else {
@@ -978,91 +977,6 @@ void setupBotCommands() {
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
 
-void rememberWalletToken(const std::string& wallet, const std::string& token, long long ts) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT INTO wallet_tokens(wallet,token,last_seen) VALUES(?,?,?) "
-                            "ON CONFLICT(wallet,token) DO UPDATE SET last_seen=excluded.last_seen")) return;
-    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(s,2,toLower(token).c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s,3,ts);
-    sqlite3_step(s); sqlite3_finalize(s);
-}
-
-void forgetWalletToken(const std::string& wallet, const std::string& token) {
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"DELETE FROM wallet_tokens WHERE wallet=? AND token=?")) return;
-    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_text(s,2,toLower(token).c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
-}
-
-void rememberTokensFromReceipt(const std::string& wallet, const nlohmann::json& receipt, long long ts) {
-    if (!receipt.is_object() || !receipt.contains("logs") || !receipt["logs"].is_array()) return;
-    static const std::string TRANSFER_TOPIC =
-        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-    const std::string w = toLower(wallet);
-    std::set<std::string> seen;
-
-    for (const auto& lg : receipt["logs"]) {
-        if (!lg.is_object() || !lg.contains("topics") || !lg["topics"].is_array()) continue;
-        const auto& tp = lg["topics"];
-        if (tp.size() < 3 || !tp[0].is_string()) continue;
-        if (toLower(tp[0].get<std::string>()) != TRANSFER_TOPIC) continue;
-
-        bool involvesWallet = false;
-        for (int i = 1; i <= 2 && !involvesWallet; ++i) {
-            if (!tp[i].is_string()) continue;
-            std::string t = toLower(tp[i].get<std::string>());
-            if (t.size() >= 40 && ("0x" + t.substr(t.size() - 40)) == w) involvesWallet = true;
-        }
-        if (!involvesWallet) continue;
-
-        if (!lg.contains("address") || !lg["address"].is_string()) continue;
-        std::string token = toLower(lg["address"].get<std::string>());
-        if (token.empty() || !seen.insert(token).second) continue;
-        rememberWalletToken(wallet, token, ts);
-    }
-}
-
-void cleanupWalletTokens() {
-    const long long now = static_cast<long long>(time(nullptr));
-    const long long cutoff = now - WALLET_TOKEN_TTL_SEC;
-
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-
-    if (prepareOrLog(db, &s,
-        "DELETE FROM wallet_tokens WHERE wallet NOT IN "
-        "(SELECT wa.address FROM whale_addresses wa "
-        " JOIN user_whales uw ON uw.whale_id = wa.id)")) {
-        if (sqlite3_step(s) == SQLITE_DONE) {
-            const int n = sqlite3_changes(db);
-            if (n > 0) std::cout << "[CLEANUP] wallet_tokens: удалено осиротевших " << n << std::endl;
-        }
-        sqlite3_finalize(s);
-    }
-
-    if (prepareOrLog(db, &s, "DELETE FROM wallet_tokens WHERE last_seen < ?")) {
-        sqlite3_bind_int64(s, 1, cutoff);
-        if (sqlite3_step(s) == SQLITE_DONE) {
-            const int n = sqlite3_changes(db);
-            if (n > 0) std::cout << "[CLEANUP] wallet_tokens: удалено старых " << n << std::endl;
-        }
-        sqlite3_finalize(s);
-    }
-}
-
-std::vector<std::string> getWalletTokens(const std::string& wallet, int limit) {
-    std::vector<std::string> out;
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"SELECT token FROM wallet_tokens WHERE wallet=? ORDER BY last_seen DESC LIMIT ?")) return out;
-    sqlite3_bind_text(s,1,toLower(wallet).c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_bind_int(s,2,limit);
-    while (sqlite3_step(s)==SQLITE_ROW) out.push_back(safeColumnText(s,0));
-    sqlite3_finalize(s);
-    return out;
-}
-
 bool getNativeBalance(const std::string& wallet, cpp_int& out) {
     auto r = rpc("eth_getBalance", {wallet, "latest"});
     if (!r.is_string()) { g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); return false; }
@@ -1344,7 +1258,6 @@ bool processBlock(long long bn) {
         auto wit = watchers->find(mA);
         if (wit == watchers->end()) { markTxProcessed(hash,bn); continue; }
 
-        rememberTokensFromReceipt(mA, receipt, blockTs);
         if (!isSaneAlertNotional(res)) {
             std::cerr << "[ALERT] skip insane notional " << hash
                       << " usdNanos=" << res.usdNanos.convert_to<std::string>()
@@ -1390,6 +1303,7 @@ std::string pagingRoot(const std::string& data) {
         if (c != std::string::npos) return "bg_open:" + data.substr(a + 1, c - a - 1);
         return "menu:big";
     }
+    // gt_open:pnl / gt_open:pnl:90 / gt_page:pnl:2:90 → один экран (смена периода не в стек)
     if (data.rfind("gt_open:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
@@ -1402,6 +1316,7 @@ std::string pagingRoot(const std::string& data) {
         if (k2 != std::string::npos) return "gt_open:" + data.substr(k1 + 1, k2 - k1 - 1);
         return "menu:toptrader_spot";
     }
+    // hl_open:pnl / hl_open:pnl:90 / hl_page:pnl:2:90 → один экран
     if (data.rfind("hl_open:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
@@ -1555,13 +1470,6 @@ void handleCallbackQuery(const json& callbackQuery) {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildAccountMenu(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "hold") {
-            rememberView(chatId, data);
-            Lang lang = langFromCode(getUserLanguage(chatId));
-            g_sessionManager.setState(chatId, UserState::AWAITING_HOLD_ADDRESS);
-            replyInPlace(chatId, messageId, tr(lang, "hold_prompt"),
-                         TelegramUI::buildCancelWithSpotTop(lang));
         }
         else if (param == "my_wallets") {
             rememberView(chatId, data);
@@ -1731,23 +1639,6 @@ bool handleTextInput(const std::string& chatId, const std::string& text) {
 
     if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD)
         return handleThresholdText(chatId, text);
-
-        if (session.state == UserState::AWAITING_HOLD_ADDRESS) {
-        const std::string addr = toLower(trim(text));
-        Lang lang = langFromCode(getUserLanguage(chatId));
-
-        if (!isValidAddress(addr)) {
-            sendMsg(chatId, tr(lang, "hold_bad_address"),
-                    TelegramUI::buildCancelWithSpotTop(lang));
-            return true;
-        }
-
-        g_sessionManager.clearSession(chatId);
-        sendMsg(chatId, tr(lang, "hold_loading"));
-        auto msg = TelegramUI::buildHoldCard(chatId, addr);
-        sendMsg(chatId, msg.text, msg.keyboard);
-        return true;
-    }
 
     return false;
 }
@@ -1956,7 +1847,6 @@ void telegramLoop() {
                                             ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
                                             : "");
                             }
-                            ss2 << " · смен/простоев/отказов/связи: " << wsHeadsStats();
                             ss2 << rpcSlowSummary();
                             {
                                 auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
@@ -2094,6 +1984,7 @@ int main() {
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
                   << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
         {
+            // URL и роли WS — в ws_heads (startWsBsc). Здесь только вкл на BSC.
             if (chainName == "bsc" || chainName == "bnb")
                 startWsBsc();
             else
@@ -2109,7 +2000,7 @@ int main() {
             case 0: g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 1: g_stats.price_thin_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 2: g_stats.price_fallbacks.fetch_add(1, std::memory_order_relaxed); break;
-            case 3: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break;
+            case 3: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break; // meta rpc
             case 4: g_stats.price_divergence.fetch_add(1, std::memory_order_relaxed); break;
             case 5: g_stats.price_spike_reject.fetch_add(1, std::memory_order_relaxed); break;
             case 6: g_stats.price_from_dex.fetch_add(1, std::memory_order_relaxed); break;
@@ -2122,20 +2013,6 @@ int main() {
         g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
     initDB(); initRankingDB();
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        const char* sql =
-            "INSERT OR IGNORE INTO wallet_tokens(wallet, token, last_seen) "
-            "SELECT wallet, token, MAX(timestamp) FROM trades GROUP BY wallet, token";
-        char* err = nullptr;
-        if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-            std::cerr << "[STARTUP] wallet_tokens seed failed: " << (err ? err : "") << std::endl;
-            sqlite3_free(err);
-        } else {
-            int n = sqlite3_changes(db);
-            if (n > 0) std::cout << "[STARTUP] Seeded " << n << " wallet/token pairs from trade history" << std::endl;
-        }
-    }
     if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
@@ -2208,7 +2085,7 @@ int main() {
                 ensureNativePrice();
                 lrt=std::chrono::steady_clock::now();
             }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); cleanupWalletTokens(); lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
