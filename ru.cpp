@@ -109,6 +109,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"fund_updated", {"updated", "обновлено"}},
         {"fund_min_ago", {"min ago", "мин назад"}},
         {"fund_empty", {"No strong anomalies right now.", "Сейчас нет сильных аномалий."}},
+        {"fund_loading", {"Loading data, open in a few seconds.", "Данные загружаются, откройте через несколько секунд."}},
         {"big_liq_title", {"Biggest liquidations · Hyperliquid", "Крупнейшие ликвидации · Hyperliquid"}},
         {"big_spot_title", {"Biggest trades · BSC Spot", "Крупные сделки · BSC Спот"}},
         {"big_perp_title", {"Biggest trades · Hyperliquid", "Крупные сделки · Hyperliquid"}},
