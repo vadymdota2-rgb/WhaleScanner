@@ -2002,6 +2002,7 @@ int main() {
     loadTokenCache();
     loadPairCache();
     ensureNativePrice();
+    refreshFundingCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     checkTranslations();
@@ -2066,6 +2067,7 @@ int main() {
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
                 warmGramRate();
                 ensureNativePrice();
+                refreshFundingCache();
                 lrt=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
