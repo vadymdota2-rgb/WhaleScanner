@@ -1,5 +1,13 @@
 #pragma once
 
+#include <atomic>
+#include <mutex>
+#include <set>
+#include <string>
+#include <sqlite3.h>
+#include "json.hpp"
+#include "ru.h"
+
 // Числовой признак направления сделки: разбирается один раз при записи.
 enum HlDirCode {
     DIR_UNKNOWN     = 0,
@@ -33,14 +41,6 @@ inline int dirCode(const std::string& dir) {
 inline bool dirIsLiquidation(int c) { return c >= DIR_LIQ_LONG && c <= DIR_LIQ_OTHER; }
 inline bool dirIsOpen(int c)        { return c == DIR_OPEN_LONG || c == DIR_OPEN_SHORT; }
 inline bool dirIsLong(int c)        { return c == DIR_OPEN_LONG || c == DIR_CLOSE_LONG || c == DIR_LIQ_LONG; }
-
-#include <atomic>
-#include <mutex>
-#include <set>
-#include <string>
-#include <sqlite3.h>
-#include "json.hpp"
-#include "ru.h"
 
 namespace hl {
 
