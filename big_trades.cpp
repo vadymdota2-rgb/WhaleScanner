@@ -45,12 +45,13 @@ std::mutex g_fundMutex;
 std::vector<FundingRow> g_fundCache;
 time_t g_fundAt = 0;
 std::atomic<bool> g_fundLoading{false};
+std::map<std::string, double> g_lastPriceTmp;
 
 constexpr double FUNDING_MIN_ABS = 0.001;
 constexpr int    FUNDING_MAX_ROWS = 15;
 constexpr int    FUNDING_REFRESH_SEC = 240;
 constexpr double FUNDING_MIN_OI_USD  = 500000.0;
-constexpr double FUNDING_MIN_VOL_USD = 2000000.0;
+constexpr double FUNDING_MIN_VOL_USD = 500000.0;
 
 constexpr int PER_PAGE  = 5;
 constexpr int MAX_ROWS  = 30;
@@ -240,6 +241,16 @@ double jnum(const json& v) {
     return 0.0;
 }
 
+std::string unwrapTicker(std::string t) {
+    if (t.rfind("NCSK", 0) == 0 && t.size() > 8) {
+        std::string inner = t.substr(4);
+        if (inner.size() > 4 && inner.compare(inner.size() - 4, 4, "2USD") == 0)
+            inner = inner.substr(0, inner.size() - 4);
+        if (!inner.empty() && inner.size() <= 12) return inner;
+    }
+    return t;
+}
+
 std::string baseSymbol(std::string sym) {
     const size_t dash = sym.find('-');
     if (dash != std::string::npos) sym = sym.substr(0, dash);
@@ -285,12 +296,8 @@ void refreshFundingCache() {
 
         const std::string sym = it["symbol"].get<std::string>();
         if (sym.empty() || sym.size() > 32) continue;
-        const std::string base = baseSymbol(sym);
+        const std::string base = unwrapTicker(baseSymbol(sym));
         if (base.empty()) continue;
-
-        if (base.rfind("NCSK", 0) == 0) continue;
-        if (base.size() >= 4 && base.compare(base.size() - 3, 3, "USD") == 0) continue;
-        if (base.size() > 10) continue;
 
         FundingRow row;
         row.symbol = base;
@@ -313,6 +320,7 @@ void refreshFundingCache() {
         const std::string tick = http(
             "https://open-api.bingx.com/openApi/swap/v2/quote/ticker", "", 12);
         std::map<std::string, std::pair<double,double>> extra;   // символ -> {интерес, оборот}
+        std::map<std::string, double> lastPrice;
         if (!tick.empty()) {
             json tj = json::parse(tick, nullptr, false);
             if (tj.is_object() && tj.contains("data") && tj["data"].is_array()) {
@@ -338,9 +346,12 @@ void refreshFundingCache() {
                     if (oi > 1e12) oi = 0.0;
                     if (vol > 1e12) vol = 0.0;
                     extra[sym] = {oi, vol};
+                    if (last > 0.0 && std::isfinite(last)) lastPrice[sym] = last;
                 }
             }
         }
+
+            g_lastPriceTmp.swap(lastPrice);
 
         int withOi = 0, withVol = 0;
         for (auto& r : fresh) {
@@ -372,6 +383,31 @@ void refreshFundingCache() {
     });
     if (fresh.size() > static_cast<size_t>(FUNDING_MAX_ROWS))
         fresh.resize(static_cast<size_t>(FUNDING_MAX_ROWS));
+
+    for (auto& r : fresh) {
+        if (!running.load(std::memory_order_relaxed)) break;
+        if (r.oiUsd > 0.0) continue;
+
+        const std::string oiBody = http(
+            "https://open-api.bingx.com/openApi/swap/v2/quote/openInterest?symbol="
+            + r.rawSymbol, "", 8);
+        if (oiBody.empty()) continue;
+
+        json oj = json::parse(oiBody, nullptr, false);
+        if (!oj.is_object() || !oj.contains("data")) continue;
+        const json& d = oj["data"];
+        if (!d.is_object() || !d.contains("openInterest")) continue;
+
+        double oi = jnum(d["openInterest"]);
+        if (!std::isfinite(oi) || oi <= 0.0) continue;
+
+        auto pit = g_lastPriceTmp.find(r.rawSymbol);
+        if (pit == g_lastPriceTmp.end() || pit->second <= 0.0) continue;
+        oi *= pit->second;
+
+        if (oi > 1e12) continue;
+        r.oiUsd = oi;
+    }
 
     std::lock_guard<std::mutex> l(g_fundMutex);
     g_fundCache.swap(fresh);
