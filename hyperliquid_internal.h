@@ -1,5 +1,22 @@
 #pragma once
 
+// Числовой признак направления сделки: разбирается один раз при записи.
+enum HlDirCode {
+    DIR_UNKNOWN     = 0,
+    DIR_OPEN_LONG   = 1,
+    DIR_OPEN_SHORT  = 2,
+    DIR_CLOSE_LONG  = 3,
+    DIR_CLOSE_SHORT = 4,
+    DIR_FLIP        = 5,
+    DIR_LIQ_LONG    = 6,
+    DIR_LIQ_SHORT   = 7,
+    DIR_LIQ_OTHER   = 8,
+};
+
+inline bool dirIsLiquidation(int c) { return c >= DIR_LIQ_LONG && c <= DIR_LIQ_OTHER; }
+inline bool dirIsOpen(int c)        { return c == DIR_OPEN_LONG || c == DIR_OPEN_SHORT; }
+inline bool dirIsLong(int c)        { return c == DIR_OPEN_LONG || c == DIR_CLOSE_LONG || c == DIR_LIQ_LONG; }
+
 #include <atomic>
 #include <mutex>
 #include <set>
