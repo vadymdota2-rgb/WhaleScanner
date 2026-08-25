@@ -76,7 +76,7 @@ constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
 constexpr long long HL_FILL_TTL_SEC = 365LL * 86400LL;
 
-constexpr int HL_MAX_BOT_TRADES = 200;  // как спот: >200 fills/30д → hl_banned + untrack
+constexpr int HL_MAX_BOT_TRADES = 1000;
 
 const char* const HL_CARD_SEPARATOR = "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501";
 
@@ -656,8 +656,8 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     if (!prepareOrLog(g_hlDb, &s,
             "INSERT OR IGNORE INTO hl_fills"
             "(tid,wallet,coin,dir,side,px,sz,closed_pnl_nanos,fee_nanos,"
-            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash,dir_code) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
@@ -681,10 +681,31 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_int64(s, 14, accountValueNanos);
     sqlite3_bind_int64(s, 15, f.value("time", 0LL));
     sqlite3_bind_text(s,  16, hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 17, dirCode(dir));
     bool ok = sqlite3_step(s) == SQLITE_DONE;
     int changed = sqlite3_changes(g_hlDb);
     sqlite3_finalize(s);
     return ok && changed > 0;
+}
+
+int dirCode(const std::string& dir) {
+    const bool isLong  = dir.find("Long")  != std::string::npos;
+    const bool isShort = dir.find("Short") != std::string::npos;
+
+    if (dir.find("Liquidat") != std::string::npos ||
+        dir.find("liquidat") != std::string::npos ||
+        dir.find("ADL")      != std::string::npos) {
+        if (isLong)  return DIR_LIQ_LONG;
+        if (isShort) return DIR_LIQ_SHORT;
+        return DIR_LIQ_OTHER;
+    }
+    if (dir.find("Long > Short") != std::string::npos ||
+        dir.find("Short > Long") != std::string::npos) return DIR_FLIP;
+    if (dir.find("Open Long")   != std::string::npos) return DIR_OPEN_LONG;
+    if (dir.find("Open Short")  != std::string::npos) return DIR_OPEN_SHORT;
+    if (dir.find("Close Long")  != std::string::npos) return DIR_CLOSE_LONG;
+    if (dir.find("Close Short") != std::string::npos) return DIR_CLOSE_SHORT;
+    return DIR_UNKNOWN;
 }
 
 std::string dirKey(const std::string& dir) {
@@ -1251,6 +1272,7 @@ bool initHyperliquid() {
         "  coin TEXT NOT NULL DEFAULT '',"
         "  dir TEXT NOT NULL DEFAULT '',"
         "  side TEXT NOT NULL DEFAULT '',"
+        "  dir_code INTEGER NOT NULL DEFAULT 0,"
         "  px TEXT NOT NULL DEFAULT '',"
         "  sz TEXT NOT NULL DEFAULT '',"
         "  closed_pnl_nanos INTEGER NOT NULL DEFAULT 0,"
@@ -1263,6 +1285,7 @@ bool initHyperliquid() {
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
+        "CREATE INDEX IF NOT EXISTS idx_hl_fills_code_ts ON hl_fills(dir_code, ts);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         "CREATE TABLE IF NOT EXISTS hl_wallet_state ("
         "  wallet TEXT PRIMARY KEY,"
@@ -1285,6 +1308,7 @@ bool initHyperliquid() {
     }
 
     const char* const migrations[] = {
+        "ALTER TABLE hl_fills ADD COLUMN dir_code INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN notional_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN margin_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN leverage INTEGER NOT NULL DEFAULT 0",
@@ -1296,6 +1320,27 @@ bool initHyperliquid() {
         if (sqlite3_exec(g_hlDb, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[HL] база обновлена: " << sql << std::endl;
         if (mErr) sqlite3_free(mErr);
+    }
+
+    {
+        const char* const backfill =
+            "UPDATE hl_fills SET dir_code = CASE"
+            "  WHEN dir LIKE '%Liquidat%' AND dir LIKE '%Long%'  THEN 6"
+            "  WHEN dir LIKE '%Liquidat%' AND dir LIKE '%Short%' THEN 7"
+            "  WHEN dir LIKE '%Liquidat%' OR dir LIKE '%ADL%'    THEN 8"
+            "  WHEN dir LIKE '%Long > Short%' OR dir LIKE '%Short > Long%' THEN 5"
+            "  WHEN dir LIKE '%Open Long%'   THEN 1"
+            "  WHEN dir LIKE '%Open Short%'  THEN 2"
+            "  WHEN dir LIKE '%Close Long%'  THEN 3"
+            "  WHEN dir LIKE '%Close Short%' THEN 4"
+            "  ELSE 0 END "
+            "WHERE dir_code = 0 AND dir <> ''";
+        char* bErr = nullptr;
+        if (sqlite3_exec(g_hlDb, backfill, nullptr, nullptr, &bErr) == SQLITE_OK) {
+            const int n = sqlite3_changes(g_hlDb);
+            if (n > 0) std::cout << "[HL] признак направления проставлен: " << n << std::endl;
+        }
+        if (bErr) sqlite3_free(bErr);
     }
 
     sqlite3_stmt* probe = nullptr;
