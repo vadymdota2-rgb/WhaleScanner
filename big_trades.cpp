@@ -67,29 +67,25 @@ const char* windowKey(const std::string& w) {
     return "big_win_24h";
 }
 
-const char* hlDirKey(const std::string& dir) {
-    if (dir.find("Liquidat") != std::string::npos ||
-        dir.find("liquidat") != std::string::npos ||
-        dir.find("ADL") != std::string::npos) {
-        if (dir.find("Short") != std::string::npos) return "hl_liq_short";
-        return "hl_liq_long";
+const char* hlDirKey(int code) {
+    switch (code) {
+        case DIR_LIQ_SHORT:   return "hl_liq_short";
+        case DIR_LIQ_LONG:
+        case DIR_LIQ_OTHER:   return "hl_liq_long";
+        case DIR_OPEN_SHORT:
+        case DIR_CLOSE_SHORT: return "hl_open_short";
+        default:              return "hl_open_long";
     }
-    if (dir.find("Open Long")   != std::string::npos) return "hl_open_long";
-    if (dir.find("Open Short")  != std::string::npos) return "hl_open_short";
-    if (dir.find("Long")  != std::string::npos) return "hl_open_long";
-    if (dir.find("Short") != std::string::npos) return "hl_open_short";
-    return "hl_open_long";
 }
 
-bool hlSideUp(const std::string& dir) {
-    const char* k = hlDirKey(dir);
-    return std::string(k) == "hl_open_long";
-}
+bool hlSideUp(int code) { return !(code == DIR_OPEN_SHORT || code == DIR_CLOSE_SHORT ||
+                                   code == DIR_LIQ_SHORT); }
 
 struct BigRow {
     std::string wallet;
     std::string asset;
     std::string side;
+    int dirCode = 0;
     std::string amountStr;
     std::string pxStr;
     std::string txHash;
@@ -108,15 +104,15 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     sqlite3_stmt* s;
     if (!prepareOrLog(hl::g_hlDb, &s,
         "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, "
-        "       closed_pnl_nanos, margin_nanos, account_value_nanos "
+        "       closed_pnl_nanos, margin_nanos, account_value_nanos, dir_code "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
-        "AND (dir LIKE '%Open Long%' OR dir LIKE '%Open Short%') "
+        "AND dir_code IN (1,2) "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "GROUP BY wallet "
         "HAVING notional_nanos = MAX(notional_nanos) "
         "ORDER BY notional_nanos DESC LIMIT ?")) return out;
-    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);
+    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);   // hl_fills: время в мс
     sqlite3_bind_int(s, 2, limit);
     while (sqlite3_step(s) == SQLITE_ROW) {
         BigRow r;
@@ -130,7 +126,8 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
         r.closedPnlNanos     = sqlite3_column_int64(s, 7);
         r.marginNanos        = sqlite3_column_int64(s, 8);
         r.accountValueNanos  = sqlite3_column_int64(s, 9);
-        r.isBuy              = hlSideUp(r.side);
+        r.dirCode            = sqlite3_column_int(s, 10);
+        r.isBuy              = hlSideUp(r.dirCode);
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
@@ -144,16 +141,15 @@ std::vector<BigRow> liqRows(long long sinceSec, int limit) {
     sqlite3_stmt* s;
     if (!prepareOrLog(hl::g_hlDb, &s,
         "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, "
-        "       closed_pnl_nanos, margin_nanos, account_value_nanos "
+        "       closed_pnl_nanos, margin_nanos, account_value_nanos, dir_code "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
-        "AND (dir LIKE '%Liquidat%' OR dir LIKE '%liquidat%' "
-        "     OR dir LIKE '%Liquidation%' OR dir LIKE '%ADL%') "
+        "AND dir_code IN (6,7,8) "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "GROUP BY wallet "
         "HAVING notional_nanos = MAX(notional_nanos) "
         "ORDER BY notional_nanos DESC LIMIT ?")) return out;
-    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);
+    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);   // hl_fills: время в мс
     sqlite3_bind_int(s, 2, limit);
     while (sqlite3_step(s) == SQLITE_ROW) {
         BigRow r;
@@ -167,6 +163,8 @@ std::vector<BigRow> liqRows(long long sinceSec, int limit) {
         r.closedPnlNanos     = sqlite3_column_int64(s, 7);
         r.marginNanos        = sqlite3_column_int64(s, 8);
         r.accountValueNanos  = sqlite3_column_int64(s, 9);
+        r.dirCode            = sqlite3_column_int(s, 10);
+        r.isBuy              = hlSideUp(r.dirCode);
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
@@ -188,7 +186,7 @@ std::vector<BigRow> spotRows(long long sinceSec, int limit) {
         "GROUP BY t.wallet "
         "HAVING t.usd_nanos = MAX(t.usd_nanos) "
         "ORDER BY t.usd_nanos DESC LIMIT ?")) return out;
-    sqlite3_bind_int64(s, 1, sinceSec);
+    sqlite3_bind_int64(s, 1, sinceSec);           // trades: время в секундах
     sqlite3_bind_int64(s, 2, MAX_SPOT_USD_NANOS);
     sqlite3_bind_int(s, 3, limit);
     while (sqlite3_step(s) == SQLITE_ROW) {
@@ -567,8 +565,8 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
             const BigRow& r = rows[i];
 
             if (perp) {
-                const char* dk = hlDirKey(r.side);
-                const bool up = hlSideUp(r.side);
+                const char* dk = hlDirKey(r.dirCode);
+                const bool up = hlSideUp(r.dirCode);
                 const std::string coin = safeString(r.asset.empty() ? "?" : r.asset, 16);
                 const char* mark = liq ? "\U0001F480"
                                        : (up ? "\U0001F7E2" : "\U0001F534");
