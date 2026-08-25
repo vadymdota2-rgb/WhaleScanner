@@ -285,10 +285,8 @@ struct Watcher {
 std::shared_mutex watchersMutex;
 std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> WATCHERS_PTR =
     std::make_shared<const std::unordered_map<std::string, std::vector<Watcher>>>();
-// BSC processBlock: спот-сделка или <14 дней с добавления.
 std::shared_ptr<const std::unordered_set<std::string>> BSC_ACTIVE_PTR =
     std::make_shared<const std::unordered_set<std::string>>();
-// HL подписка: fill в hl_fills или <14 дней с добавления (не таскаем чистый BSC-спот).
 std::shared_ptr<const std::unordered_set<std::string>> HL_ACTIVE_PTR =
     std::make_shared<const std::unordered_set<std::string>>();
 
@@ -474,7 +472,6 @@ void refreshWatchers() {
     bool queryOk = false;
     size_t bscOff = 0, hlOff = 0;
 
-    // Кошельки с любой HL-активностью (один проход по hl_fills).
     std::unordered_set<std::string> hasHlFill;
     {
         std::lock_guard<std::mutex> hlLock(hl::g_hlDbMutex);
@@ -517,19 +514,16 @@ void refreshWatchers() {
                 const bool inGrace = (createdAt <= 0) || (createdAt >= graceAfter);
                 const bool hasHl = hasHlFill.count(addr) > 0;
 
-                // Полный список — получатели алертов (оба рынка).
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
                 if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
 
-                // BSC: спот или льгота 14 дней
                 if (hasSpot || inGrace) {
                     bscActive->insert(addr);
                 } else {
                     ++bscOff;
                 }
-                // HL: перп-fill или льгота 14 дней (чистый многолетний BSC-спот не подписываем)
                 if (hasHl || inGrace) {
                     hlActive->insert(addr);
                 } else {
@@ -680,6 +674,34 @@ public:
         s.last=now; s.hist.push_back(now); return true;
     }
 } g_rateLimiter;
+
+struct CallbackLimiter {
+    struct S { std::chrono::steady_clock::time_point last; std::deque<std::chrono::steady_clock::time_point> hist; };
+    std::mutex mtx;
+    std::map<std::string, S> users;
+    static constexpr int MIN_MS = 250;
+    static constexpr int MAX_MIN = 90;
+    static constexpr int CLEANUP_H = 6;
+
+    bool allow(const std::string& c) {
+        std::lock_guard<std::mutex> l(mtx);
+        auto now = std::chrono::steady_clock::now();
+        static int cc = 0;
+        if (++cc % 1000 == 0)
+            for (auto it = users.begin(); it != users.end();)
+                if (std::chrono::duration_cast<std::chrono::hours>(now - it->second.last).count() > CLEANUP_H)
+                    it = users.erase(it);
+                else ++it;
+        auto& st = users[c];
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last).count() < MIN_MS) return false;
+        while (!st.hist.empty() &&
+               std::chrono::duration_cast<std::chrono::seconds>(now - st.hist.front()).count() > 60)
+            st.hist.pop_front();
+        if (static_cast<int>(st.hist.size()) >= MAX_MIN) return false;
+        st.last = now; st.hist.push_back(now);
+        return true;
+    }
+} g_callbackLimiter;
 
 namespace TelegramUI {
 
@@ -1286,7 +1308,6 @@ std::string pagingRoot(const std::string& data) {
         if (c != std::string::npos) return "bg_open:" + data.substr(a + 1, c - a - 1);
         return "menu:big";
     }
-    // gt_open:pnl / gt_open:pnl:90 / gt_page:pnl:2:90 → один экран (смена периода не в стек)
     if (data.rfind("gt_open:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
@@ -1299,7 +1320,6 @@ std::string pagingRoot(const std::string& data) {
         if (k2 != std::string::npos) return "gt_open:" + data.substr(k1 + 1, k2 - k1 - 1);
         return "menu:toptrader_spot";
     }
-    // hl_open:pnl / hl_open:pnl:90 / hl_page:pnl:2:90 → один экран
     if (data.rfind("hl_open:", 0) == 0) {
         const size_t k1 = data.find(':');
         const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
@@ -1664,7 +1684,19 @@ void telegramLoop() {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
 
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
-                    handleCallbackQuery(u["callback_query"]);
+                    const json& cq = u["callback_query"];
+                    std::string ccid;
+                    if (cq.contains("message") && cq["message"].is_object() &&
+                        cq["message"].contains("chat") && cq["message"]["chat"].is_object() &&
+                        cq["message"]["chat"].contains("id"))
+                        ccid = std::to_string(cq["message"]["chat"]["id"].get<long>());
+
+                    if (!ccid.empty() && !g_callbackLimiter.allow(ccid)) {
+                        if (cq.contains("id") && cq["id"].is_string())
+                            answerCallbackQuery(cq["id"].get<std::string>());
+                        offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                    }
+                    handleCallbackQuery(cq);
                     offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
                 }
 
@@ -1967,7 +1999,6 @@ int main() {
         std::cout << "[CHAIN] Running on " << chainName << " (native: " << chainCtx().nativeSymbol
                   << ", nodes: " << cfg.rpcEndpoints.size() << ")" << std::endl;
         {
-            // URL и роли WS — в ws_heads (startWsBsc). Здесь только вкл на BSC.
             if (chainName == "bsc" || chainName == "bnb")
                 startWsBsc();
             else
