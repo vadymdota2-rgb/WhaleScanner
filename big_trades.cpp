@@ -36,6 +36,7 @@ struct FundingRow {
     std::string symbol;
     std::string rawSymbol;
     double rate = 0.0;
+    int payoutsPerDay = 3;
     double oiUsd = 0.0;
     double volUsd = 0.0;
 };
@@ -68,7 +69,9 @@ const char* windowKey(const std::string& w) {
 }
 
 const char* hlDirKey(const std::string& dir) {
-    if (dir.find("Liquidat") != std::string::npos) {
+    if (dir.find("Liquidat") != std::string::npos ||
+        dir.find("liquidat") != std::string::npos ||
+        dir.find("ADL") != std::string::npos) {
         if (dir.find("Short") != std::string::npos) return "hl_liq_short";
         return "hl_liq_long";
     }
@@ -145,7 +148,8 @@ std::vector<BigRow> liqRows(long long sinceSec, int limit) {
         "       closed_pnl_nanos, margin_nanos, account_value_nanos "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
-        "AND dir LIKE '%Liquidat%' "
+        "AND (dir LIKE '%Liquidat%' OR dir LIKE '%liquidat%' "
+        "     OR dir LIKE '%Liquidation%' OR dir LIKE '%ADL%') "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "GROUP BY wallet "
         "HAVING notional_nanos = MAX(notional_nanos) "
@@ -244,6 +248,7 @@ std::string baseSymbol(std::string sym) {
 }
 
 void refreshFundingCache() {
+    if (!running.load(std::memory_order_relaxed)) return;
     if (g_fundLoading.exchange(true, std::memory_order_acq_rel)) return;
     struct Guard {
         ~Guard() { g_fundLoading.store(false, std::memory_order_release); }
@@ -287,6 +292,14 @@ void refreshFundingCache() {
         row.symbol = base;
         row.rawSymbol = sym;
         row.rate = rate;
+
+        if (it.contains("nextFundingTime") && it.contains("lastFundingTime")) {
+            const double nextMs = jnum(it["nextFundingTime"]);
+            const double lastMs = jnum(it["lastFundingTime"]);
+            const double stepH = (nextMs - lastMs) / 3600000.0;
+            if (stepH >= 0.9 && stepH <= 24.5)
+                row.payoutsPerDay = static_cast<int>(24.0 / stepH + 0.5);
+        }
         fresh.push_back(std::move(row));
     }
 
@@ -318,6 +331,8 @@ void refreshFundingCache() {
 
                     if (!std::isfinite(oi) || oi < 0.0) oi = 0.0;
                     if (!std::isfinite(vol) || vol < 0.0) vol = 0.0;
+                    if (oi > 1e12) oi = 0.0;
+                    if (vol > 1e12) vol = 0.0;
                     extra[sym] = {oi, vol};
                 }
             }
@@ -417,7 +432,8 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
 
     const bool stale = rows.empty() ||
                        (time(nullptr) - at) > 2 * FUNDING_REFRESH_SEC;
-    if (stale && !g_fundLoading.load(std::memory_order_acquire)) {
+    if (stale && running.load(std::memory_order_relaxed) &&
+        !g_fundLoading.load(std::memory_order_acquire)) {
         std::thread(refreshFundingCache).detach();
     }
 
@@ -431,7 +447,7 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
         for (const auto& r : rows) {
             const bool longsPay = r.rate > 0.0;
             const double pct = r.rate * 100.0;
-            const double apr = pct * 3.0 * 365.0;
+            const double apr = pct * static_cast<double>(r.payoutsPerDay) * 365.0;
 
             char buf[96];
             std::snprintf(buf, sizeof(buf), "%+.3f%%", pct);
