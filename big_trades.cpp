@@ -45,7 +45,6 @@ std::mutex g_fundMutex;
 std::vector<FundingRow> g_fundCache;
 time_t g_fundAt = 0;
 std::atomic<bool> g_fundLoading{false};
-std::map<std::string, double> g_lastPriceTmp;
 
 constexpr double FUNDING_MIN_ABS = 0.001;
 constexpr int    FUNDING_MAX_ROWS = 15;
@@ -320,7 +319,6 @@ void refreshFundingCache() {
         const std::string tick = http(
             "https://open-api.bingx.com/openApi/swap/v2/quote/ticker", "", 12);
         std::map<std::string, std::pair<double,double>> extra;   // символ -> {интерес, оборот}
-        std::map<std::string, double> lastPrice;
         if (!tick.empty()) {
             json tj = json::parse(tick, nullptr, false);
             if (tj.is_object() && tj.contains("data") && tj["data"].is_array()) {
@@ -332,7 +330,6 @@ void refreshFundingCache() {
                     double last = it.contains("lastPrice") ? jnum(it["lastPrice"]) : 0.0;
                     double oi = 0.0;
                     if (it.contains("openInterest")) oi = jnum(it["openInterest"]);
-                    if (oi > 0.0 && last > 0.0) oi *= last;
 
                     double vol = 0.0;
                     if (it.contains("quoteVolume")) vol = jnum(it["quoteVolume"]);
@@ -346,12 +343,9 @@ void refreshFundingCache() {
                     if (oi > 1e12) oi = 0.0;
                     if (vol > 1e12) vol = 0.0;
                     extra[sym] = {oi, vol};
-                    if (last > 0.0 && std::isfinite(last)) lastPrice[sym] = last;
                 }
             }
         }
-
-            g_lastPriceTmp.swap(lastPrice);
 
         int withOi = 0, withVol = 0;
         for (auto& r : fresh) {
@@ -401,11 +395,8 @@ void refreshFundingCache() {
         double oi = jnum(d["openInterest"]);
         if (!std::isfinite(oi) || oi <= 0.0) continue;
 
-        auto pit = g_lastPriceTmp.find(r.rawSymbol);
-        if (pit == g_lastPriceTmp.end() || pit->second <= 0.0) continue;
-        oi *= pit->second;
-
         if (oi > 1e12) continue;
+        if (r.volUsd > 0.0 && oi > r.volUsd * 100.0) continue;
         r.oiUsd = oi;
     }
 
@@ -492,7 +483,7 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
             char buf[96];
             std::snprintf(buf, sizeof(buf), "%+.3f%%", pct);
             char aprBuf[64];
-            std::snprintf(aprBuf, sizeof(aprBuf), "%+.0f%%", apr);
+            std::snprintf(aprBuf, sizeof(aprBuf), "%.0f%%", std::fabs(apr));
 
             t << "<b>" << (++n) << ".</b> " << (longsPay ? "\U0001F4C8" : "\U0001F4C9")
               << " <b>" << safeString(r.symbol, 16) << "</b>  <code>" << buf << "</code>"
