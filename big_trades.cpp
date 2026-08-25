@@ -50,7 +50,7 @@ constexpr double FUNDING_MIN_ABS = 0.001;
 constexpr int    FUNDING_MAX_ROWS = 15;
 constexpr int    FUNDING_REFRESH_SEC = 240;
 constexpr double FUNDING_MIN_OI_USD  = 500000.0;
-constexpr double FUNDING_MIN_VOL_USD = 1000000.0;
+constexpr double FUNDING_MIN_VOL_USD = 2000000.0;
 
 constexpr int PER_PAGE  = 5;
 constexpr int MAX_ROWS  = 30;
@@ -287,6 +287,10 @@ void refreshFundingCache() {
         if (sym.empty() || sym.size() > 32) continue;
         const std::string base = baseSymbol(sym);
         if (base.empty()) continue;
+
+        if (base.rfind("NCSK", 0) == 0) continue;
+        if (base.size() >= 4 && base.compare(base.size() - 3, 3, "USD") == 0) continue;
+        if (base.size() > 10) continue;
 
         FundingRow row;
         row.symbol = base;
