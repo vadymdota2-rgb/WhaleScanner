@@ -1265,7 +1265,6 @@ bool initHyperliquid() {
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
-        "CREATE INDEX IF NOT EXISTS idx_hl_fills_code_ts ON hl_fills(dir_code, ts);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         "CREATE TABLE IF NOT EXISTS hl_wallet_state ("
         "  wallet TEXT PRIMARY KEY,"
@@ -1300,6 +1299,14 @@ bool initHyperliquid() {
         if (sqlite3_exec(g_hlDb, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[HL] база обновлена: " << sql << std::endl;
         if (mErr) sqlite3_free(mErr);
+    }
+
+    {
+        char* iErr = nullptr;
+        sqlite3_exec(g_hlDb,
+            "CREATE INDEX IF NOT EXISTS idx_hl_fills_code_ts ON hl_fills(dir_code, ts)",
+            nullptr, nullptr, &iErr);
+        if (iErr) sqlite3_free(iErr);
     }
 
     {
