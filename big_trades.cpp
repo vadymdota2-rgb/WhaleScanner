@@ -49,7 +49,6 @@ std::atomic<bool> g_fundLoading{false};
 constexpr double FUNDING_MIN_ABS = 0.001;
 constexpr int    FUNDING_MAX_ROWS = 15;
 constexpr int    FUNDING_REFRESH_SEC = 240;
-constexpr double FUNDING_MIN_OI_USD  = 500000.0;
 constexpr double FUNDING_MIN_VOL_USD = 500000.0;
 
 constexpr int PER_PAGE  = 5;
@@ -347,28 +346,23 @@ void refreshFundingCache() {
             }
         }
 
-        int withOi = 0, withVol = 0;
+        int withVol = 0;
         for (auto& r : fresh) {
             auto it = extra.find(r.rawSymbol);
             if (it == extra.end()) continue;
             r.oiUsd = it->second.first;
             r.volUsd = it->second.second;
-            if (r.oiUsd > 0.0) withOi++;
             if (r.volUsd > 0.0) withVol++;
         }
 
-        std::vector<FundingRow> kept;
-        kept.reserve(fresh.size());
-        if (withOi > 0) {
-            for (const auto& r : fresh)
-                if (r.oiUsd >= FUNDING_MIN_OI_USD) kept.push_back(r);
-            fresh.swap(kept);
-        } else if (withVol > 0) {
+        if (withVol > 0) {
+            std::vector<FundingRow> kept;
+            kept.reserve(fresh.size());
             for (const auto& r : fresh)
                 if (r.volUsd >= FUNDING_MIN_VOL_USD) kept.push_back(r);
             fresh.swap(kept);
         } else {
-            std::cerr << "[FUNDING] нет ни интереса, ни оборота — отсечка не применена" << std::endl;
+            std::cerr << "[FUNDING] оборот не пришёл — отсечка не применена" << std::endl;
         }
     }
 
@@ -378,13 +372,15 @@ void refreshFundingCache() {
     if (fresh.size() > static_cast<size_t>(FUNDING_MAX_ROWS))
         fresh.resize(static_cast<size_t>(FUNDING_MAX_ROWS));
 
+    const time_t oiDeadline = time(nullptr) + 45;
     for (auto& r : fresh) {
         if (!running.load(std::memory_order_relaxed)) break;
+        if (time(nullptr) > oiDeadline) break;
         if (r.oiUsd > 0.0) continue;
 
         const std::string oiBody = http(
             "https://open-api.bingx.com/openApi/swap/v2/quote/openInterest?symbol="
-            + r.rawSymbol, "", 8);
+            + r.rawSymbol, "", 4);
         if (oiBody.empty()) continue;
 
         json oj = json::parse(oiBody, nullptr, false);
