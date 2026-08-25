@@ -1,6 +1,8 @@
 #include "big_trades.h"
 #include "token_prices.h"
 #include "rpc_client.h"
+#include <atomic>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -10,7 +12,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <unordered_set>
 #include <sqlite3.h>
 
 #include "json.hpp"
@@ -33,6 +34,7 @@ namespace {
 
 struct FundingRow {
     std::string symbol;
+    std::string rawSymbol;
     double rate = 0.0;
     double oiUsd = 0.0;
     double volUsd = 0.0;
@@ -41,11 +43,13 @@ struct FundingRow {
 std::mutex g_fundMutex;
 std::vector<FundingRow> g_fundCache;
 time_t g_fundAt = 0;
+std::atomic<bool> g_fundLoading{false};
 
 constexpr double FUNDING_MIN_ABS = 0.001;
-constexpr int    FUNDING_MAX_ROWS = 30;
+constexpr int    FUNDING_MAX_ROWS = 15;
 constexpr int    FUNDING_REFRESH_SEC = 240;
-constexpr double FUNDING_MIN_OI_USD = 500000.0;
+constexpr double FUNDING_MIN_OI_USD  = 500000.0;
+constexpr double FUNDING_MIN_VOL_USD = 1000000.0;
 
 constexpr int PER_PAGE  = 5;
 constexpr int MAX_ROWS  = 30;
@@ -203,10 +207,13 @@ json backRow(Lang lang, const std::string& data) {
     return json::array({ {{"text", tr(lang, "back_button")}, {"callback_data", data}} });
 }
 
+bool hasKnownSymbol(const std::string& tokenAddr) {
+    const std::string sym = getSymbol(tokenAddr);
+    return !sym.empty() && sym != "UNKNOWN";
+}
+
 std::string spotAssetLabel(const std::string& tokenAddr) {
-    std::string sym = getSymbol(tokenAddr);
-    if (sym.empty()) return shortAddress(tokenAddr);
-    return safeString(sym, 16);
+    return safeString(getSymbol(tokenAddr), 16);
 }
 
 }
@@ -237,12 +244,23 @@ std::string baseSymbol(std::string sym) {
 }
 
 void refreshFundingCache() {
+    if (g_fundLoading.exchange(true, std::memory_order_acq_rel)) return;
+    struct Guard {
+        ~Guard() { g_fundLoading.store(false, std::memory_order_release); }
+    } guard;
+
     const std::string body = http(
         "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex", "", 12);
-    if (body.empty()) return;
+    if (body.empty()) {
+        std::cerr << "[FUNDING] пустой ответ по ставкам — кэш не тронут" << std::endl;
+        return;
+    }
 
     json j = json::parse(body, nullptr, false);
-    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) return;
+    if (!j.is_object() || !j.contains("data") || !j["data"].is_array()) {
+        std::cerr << "[FUNDING] неразбираемый ответ по ставкам" << std::endl;
+        return;
+    }
 
     std::vector<FundingRow> fresh;
     for (const auto& it : j["data"]) {
@@ -260,12 +278,16 @@ void refreshFundingCache() {
         if (!std::isfinite(rate) || std::fabs(rate) < FUNDING_MIN_ABS) continue;
         if (std::fabs(rate) > 1.0) continue;
 
-        std::string sym = it["symbol"].get<std::string>();
-        const size_t dash = sym.find('-');
-        if (dash != std::string::npos) sym = sym.substr(0, dash);
-        if (sym.empty() || sym.size() > 16) continue;
+        const std::string sym = it["symbol"].get<std::string>();
+        if (sym.empty() || sym.size() > 32) continue;
+        const std::string base = baseSymbol(sym);
+        if (base.empty()) continue;
 
-        fresh.push_back({sym, rate});
+        FundingRow row;
+        row.symbol = base;
+        row.rawSymbol = sym;
+        row.rate = rate;
+        fresh.push_back(std::move(row));
     }
 
     if (fresh.empty()) return;
@@ -279,7 +301,7 @@ void refreshFundingCache() {
             if (tj.is_object() && tj.contains("data") && tj["data"].is_array()) {
                 for (const auto& it : tj["data"]) {
                     if (!it.is_object() || !it.contains("symbol") || !it["symbol"].is_string()) continue;
-                    const std::string sym = baseSymbol(it["symbol"].get<std::string>());
+                    const std::string sym = it["symbol"].get<std::string>();
                     if (sym.empty()) continue;
 
                     double last = it.contains("lastPrice") ? jnum(it["lastPrice"]) : 0.0;
@@ -301,19 +323,28 @@ void refreshFundingCache() {
             }
         }
 
+        int withOi = 0, withVol = 0;
         for (auto& r : fresh) {
-            auto it = extra.find(r.symbol);
+            auto it = extra.find(r.rawSymbol);
             if (it == extra.end()) continue;
             r.oiUsd = it->second.first;
             r.volUsd = it->second.second;
+            if (r.oiUsd > 0.0) withOi++;
+            if (r.volUsd > 0.0) withVol++;
         }
 
-        if (!extra.empty()) {
-            std::vector<FundingRow> kept;
-            kept.reserve(fresh.size());
+        std::vector<FundingRow> kept;
+        kept.reserve(fresh.size());
+        if (withOi > 0) {
             for (const auto& r : fresh)
                 if (r.oiUsd >= FUNDING_MIN_OI_USD) kept.push_back(r);
-            if (!kept.empty()) fresh.swap(kept);
+            fresh.swap(kept);
+        } else if (withVol > 0) {
+            for (const auto& r : fresh)
+                if (r.volUsd >= FUNDING_MIN_VOL_USD) kept.push_back(r);
+            fresh.swap(kept);
+        } else {
+            std::cerr << "[FUNDING] нет ни интереса, ни оборота — отсечка не применена" << std::endl;
         }
     }
 
@@ -384,11 +415,17 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
         at = g_fundAt;
     }
 
+    const bool stale = rows.empty() ||
+                       (time(nullptr) - at) > 2 * FUNDING_REFRESH_SEC;
+    if (stale && !g_fundLoading.load(std::memory_order_acquire)) {
+        std::thread(refreshFundingCache).detach();
+    }
+
     t << "\U0001F4A2 <b>" << tr(lang, "fund_title") << "</b>\n"
       << "<i>" << tr(lang, "fund_hint") << "</i>\n\n";
 
     if (rows.empty()) {
-        t << tr(lang, "fund_empty");
+        t << tr(lang, at > 0 ? "fund_empty" : "fund_loading");
     } else {
         int n = 0;
         for (const auto& r : rows) {
@@ -451,9 +488,18 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     const int maxRows = MAX_ROWS;
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
-    std::vector<BigRow> rows = liq  ? liqRows(since, maxRows)
-                             : perp ? perpRows(since, maxRows)
-                                    : spotRows(since, maxRows);
+    const int fetchRows = perp ? maxRows : maxRows * 3;
+    std::vector<BigRow> rows = liq  ? liqRows(since, fetchRows)
+                             : perp ? perpRows(since, fetchRows)
+                                    : spotRows(since, fetchRows);
+
+    if (!perp) {
+        std::vector<BigRow> named;
+        named.reserve(rows.size());
+        for (auto& r : rows)
+            if (hasKnownSymbol(r.asset)) named.push_back(std::move(r));
+        rows.swap(named);
+    }
     if (static_cast<int>(rows.size()) > maxRows)
         rows.resize(static_cast<size_t>(maxRows));
 
