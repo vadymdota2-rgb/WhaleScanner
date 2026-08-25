@@ -688,26 +688,6 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     return ok && changed > 0;
 }
 
-int dirCode(const std::string& dir) {
-    const bool isLong  = dir.find("Long")  != std::string::npos;
-    const bool isShort = dir.find("Short") != std::string::npos;
-
-    if (dir.find("Liquidat") != std::string::npos ||
-        dir.find("liquidat") != std::string::npos ||
-        dir.find("ADL")      != std::string::npos) {
-        if (isLong)  return DIR_LIQ_LONG;
-        if (isShort) return DIR_LIQ_SHORT;
-        return DIR_LIQ_OTHER;
-    }
-    if (dir.find("Long > Short") != std::string::npos ||
-        dir.find("Short > Long") != std::string::npos) return DIR_FLIP;
-    if (dir.find("Open Long")   != std::string::npos) return DIR_OPEN_LONG;
-    if (dir.find("Open Short")  != std::string::npos) return DIR_OPEN_SHORT;
-    if (dir.find("Close Long")  != std::string::npos) return DIR_CLOSE_LONG;
-    if (dir.find("Close Short") != std::string::npos) return DIR_CLOSE_SHORT;
-    return DIR_UNKNOWN;
-}
-
 std::string dirKey(const std::string& dir) {
     if (dir.find("Open Long")   != std::string::npos) return "hl_open_long";
     if (dir.find("Close Long")  != std::string::npos) return "hl_close_long";
