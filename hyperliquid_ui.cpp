@@ -43,7 +43,6 @@ constexpr int HL_PICKER_PER_PAGE = 5;
 constexpr int HL_MIN_CLOSED_TRADES = 5;
 constexpr int HL_MAX_CLOSED_TRADES_30D = 200;  // как спот: >200/30д = бот
 constexpr int HL_PER_PAGE = 5;
-constexpr long long HL_RANK_CACHE_SEC = 300;
 constexpr int HL_RANK_WINDOWS_DAYS[] = {30, 90, 180, 365};
 constexpr int HL_RANK_WINDOWS_COUNT = 4;
 constexpr long long HL_RANK_WINDOW_INTERVAL_SEC[] = {
@@ -118,7 +117,6 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.lastTs = sqlite3_column_int64(s, 7);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
-        // потолок как спот ~200/30д, пропорционально окну рейтинга
         const long long maxForWindow = std::max(1LL,
             (HL_MAX_CLOSED_TRADES_30D * windowSec + (30LL * 86400LL - 1)) / (30LL * 86400LL));
         if (r.closedTrades > maxForWindow) continue;
@@ -165,7 +163,6 @@ std::string perpKindStr(PerpKind k) {
 }
 
 std::string perpTitle(PerpKind k, Lang lang) {
-    // rk_btn_* уже с эмодзи, без «(30д)» — срок только windowDays
     switch (k) {
         case PerpKind::ROI:     return tr(lang, "rk_btn_top_roi");
         case PerpKind::WINRATE: return tr(lang, "rk_btn_top_winrate");
@@ -206,7 +203,6 @@ std::string rankLabel(int rank) {
         default: return "#" + std::to_string(rank);
     }
 }
-
 
 HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int windowDays = 30) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
@@ -417,7 +413,6 @@ void rebuildRankCache() {
     std::vector<std::string> top;
     const long long now = nowSec();
 
-    // одно самое просроченное окно (не 30д всегда первым — иначе 365 не доживёт)
     int best = -1;
     double bestScore = -1.0;
     for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
@@ -445,7 +440,6 @@ void rebuildRankCache() {
             for (const auto& r : g_rankCache[0]) top.push_back(r.wallet);
         }
     }
-    // markRankPresence берёт dbMutex — только снаружи g_rankMutex
     if (!top.empty())
         markRankPresence("perp", top);
 }
@@ -785,7 +779,6 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
     if (action == "hl_pos") { out = buildWalletPositions(chatId, param); return true; }
     if (action == "hl_menu") { out = buildPerpTopMenu(chatId); return true; }
     if (action == "hl_open") {
-        // hl_open:pnl  |  hl_open:pnl:90
         std::string kindStr = param;
         int windowDays = 30;
         const size_t sep = param.find(':');
@@ -799,7 +792,6 @@ bool renderHyperliquidView(const std::string& chatId, const std::string& action,
         return true;
     }
     if (action == "hl_page") {
-        // hl_page:pnl:2  |  hl_page:pnl:2:90
         const size_t sep = param.find(':');
         if (sep == std::string::npos) return false;
         PerpKind kind;
@@ -845,5 +837,6 @@ bool handleHyperliquidCallback(const std::string& chatId, const std::string& act
     }
     rememberView(chatId, data);
     replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+    if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
     return true;
 }
