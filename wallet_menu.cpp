@@ -3,6 +3,7 @@
 
 #include <sstream>
 #include <iostream>
+#include <map>
 #include <vector>
 #include <algorithm>
 #include <mutex>
@@ -62,6 +63,23 @@ bool isTrackingWallet(const std::string& chatId, const std::string& address) {
     bool e=sqlite3_step(s)==SQLITE_ROW; sqlite3_finalize(s); return e;
 }
 
+thread_local bool g_cbAnswered = false;
+
+void answerOnce(const std::string& id, const std::string& text, bool alert) {
+    if (id.empty()) return;
+    answerCallbackQuery(id, text, alert);
+    g_cbAnswered = true;
+}
+
+size_t countUserWhalesLocked(const std::string& chatId) {
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM user_whales WHERE user_id=?")) return 0;
+    sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+    size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0);
+    sqlite3_finalize(s);
+    return n;
+}
+
 size_t countUserWhales(const std::string& chatId) {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM user_whales WHERE user_id=?")) return 0;
@@ -89,6 +107,10 @@ void untrackWalletFromService(const std::string& wallet) {
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
+        if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+            std::cerr << "[DB] untrackWalletFromService BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+            return;
+        }
         if (prepareOrLog(db, &s,
                 "SELECT uw.user_id, uw.label FROM user_whales uw "
                 "JOIN whale_addresses wa ON wa.id = uw.whale_id "
@@ -103,14 +125,29 @@ void untrackWalletFromService(const std::string& wallet) {
         }
         if (!prepareOrLog(db, &s,
             "DELETE FROM user_whales WHERE whale_id=("
-            "SELECT id FROM whale_addresses WHERE address=?)")) return;
+            "SELECT id FROM whale_addresses WHERE address=?)")) {
+                sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+                return;
+            }
         sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(s) == SQLITE_DONE) removed = sqlite3_changes(db);
+        const bool deleted = sqlite3_step(s) == SQLITE_DONE;
+        if (deleted) removed = sqlite3_changes(db);
         else std::cerr << "[WATCHERS] bot untrack failed: " << sqlite3_errmsg(db) << std::endl;
         sqlite3_finalize(s);
 
-        if (removed > 0)
+        if (!deleted) {
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return;
+        }
+        if (removed > 0) {
             for (const auto& r : recipients) reassignPrimaryLocked(r.first);
+        }
+        if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
+            std::cerr << "[DB] untrackWalletFromService COMMIT failed: "
+                      << sqlite3_errmsg(db) << std::endl;
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return;
+        }
     }
     if (removed <= 0) return;
 
@@ -139,16 +176,17 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
         return AddWhaleResult::PERMANENTLY_BANNED;
     }
 
-    if (chatId != SERVICE_CHAT_ID &&
-        countUserWhales(chatId) >= premiumMaxWallets(chatId))
-    {
-        return AddWhaleResult::LIMIT_REACHED;
-    }
+    const size_t maxWallets = (chatId != SERVICE_CHAT_ID)
+                            ? premiumMaxWallets(chatId) : 0;
 
     std::lock_guard<std::mutex> l(dbMutex);
     if (sqlite3_exec(db,"BEGIN IMMEDIATE",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[DB] addUserWhale BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
         return AddWhaleResult::ERROR;
+    }
+    if (maxWallets > 0 && countUserWhalesLocked(chatId) >= maxWallets) {
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        return AddWhaleResult::LIMIT_REACHED;
     }
     sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT OR IGNORE INTO whale_addresses(address) VALUES(?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
@@ -416,7 +454,7 @@ void startAddWalletFlow(const std::string& chatId, long long messageId) {
             TelegramUI::buildCancelWithTopTraders(lang));
 }
 
-bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
+bool handleWalletCallbackImpl(const std::string& chatId, const std::string& action, const std::string& param,
                           const std::string& data, long long messageId, const std::string& callbackQueryId) {
     if (action == "mw_page") {
         g_sessionManager.clearSession(chatId);
@@ -483,7 +521,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         const Lang lang = langFromCode(getUserLanguage(chatId));
         const std::string address = toLower(param);
         if (!isValidAddress(address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_invalid_address"), true);
+            if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_invalid_address"), true);
             return true;
         }
         bool changed = false;
@@ -508,7 +546,14 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
                     else ok = false;
                     sqlite3_finalize(s);
                 } else ok = false;
-                if (ok && changed) sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+                if (ok && changed) {
+                    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                        std::cerr << "[DB] setmain COMMIT failed: "
+                                  << sqlite3_errmsg(db) << std::endl;
+                        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+                        changed = false;
+                    }
+                }
                 else {
                     sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
                     changed = false;
@@ -516,11 +561,11 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
             }
         }
         if (!changed) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
+            if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
             return true;
         }
         refreshWatchers();
-        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "toast_main_wallet_set"), false);
+        if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "toast_main_wallet_set"), false);
         auto msg = TelegramUI::buildWalletsList(chatId, lastWalletPage(chatId));
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
@@ -551,7 +596,7 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         std::string address = toLower(param);
         Lang lang = langFromCode(getUserLanguage(chatId));
         if (!isValidAddress(address)) {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_invalid_address"), true);
+            if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_invalid_address"), true);
             replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), errorBackKeyboard(chatId, lang));
             return true;
         }
@@ -559,18 +604,27 @@ bool handleWalletCallback(const std::string& chatId, const std::string& action, 
         bool removed = removeUserWhale(chatId, address);
         if (removed) {
             refreshWatchers();
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "toast_wallet_removed"), false);
+            if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "toast_wallet_removed"), false);
             int page = lastWalletPage(chatId);
             auto msg = TelegramUI::buildWalletsList(chatId, page);
             rememberView(chatId, "mw_page:" + std::to_string(page));
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
         } else {
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
+            if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_wallet_not_found"), true);
             replyInPlace(chatId, messageId, tr(lang, "err_wallet_not_found"), errorBackKeyboard(chatId, lang));
         }
     }
     else return false;
     return true;
+}
+
+bool handleWalletCallback(const std::string& chatId, const std::string& action, const std::string& param,
+                          const std::string& data, long long messageId, const std::string& callbackQueryId) {
+        g_cbAnswered = false;
+    const bool handled = handleWalletCallbackImpl(chatId, action, param, data, messageId, callbackQueryId);
+    if (handled && !g_cbAnswered && !callbackQueryId.empty())
+        answerCallbackQuery(callbackQueryId);
+    return handled;
 }
 
 bool handleWalletText(const std::string& chatId, const std::string& text, const UserSession& session) {
