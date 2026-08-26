@@ -88,15 +88,17 @@ size_t countUserWhales(const std::string& chatId) {
 }
 
 namespace {
-void reassignPrimaryLocked(const std::string& chatId) {
+bool reassignPrimaryLocked(const std::string& chatId) {
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
         "UPDATE user_whales SET is_primary=1 WHERE user_id=? AND whale_id=("
         "SELECT whale_id FROM user_whales WHERE user_id=? ORDER BY created_at ASC, rowid ASC LIMIT 1) "
-        "AND NOT EXISTS (SELECT 1 FROM user_whales WHERE user_id=? AND is_primary=1)")) return;
+        "AND NOT EXISTS (SELECT 1 FROM user_whales WHERE user_id=? AND is_primary=1)")) return false;
     for (int i = 1; i <= 3; i++) sqlite3_bind_text(s, i, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(s);
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    if (!ok) std::cerr << "[DB] reassignPrimary failed: " << sqlite3_errmsg(db) << std::endl;
     sqlite3_finalize(s);
+    return ok;
 }
 }
 
@@ -111,17 +113,26 @@ void untrackWalletFromService(const std::string& wallet) {
             std::cerr << "[DB] untrackWalletFromService BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
             return;
         }
-        if (prepareOrLog(db, &s,
+        if (!prepareOrLog(db, &s,
                 "SELECT uw.user_id, uw.label FROM user_whales uw "
                 "JOIN whale_addresses wa ON wa.id = uw.whale_id "
                 "WHERE wa.address = ?")) {
-            sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
-            while (sqlite3_step(s) == SQLITE_ROW) {
-                std::string cid = safeColumnText(s, 0);
-                std::string lab = safeColumnText(s, 1);
-                if (!cid.empty()) recipients.emplace_back(std::move(cid), std::move(lab));
-            }
-            sqlite3_finalize(s);
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return;
+        }
+        sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
+        int rc;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+            std::string cid = safeColumnText(s, 0);
+            std::string lab = safeColumnText(s, 1);
+            if (!cid.empty()) recipients.emplace_back(std::move(cid), std::move(lab));
+        }
+        sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) {
+            std::cerr << "[DB] untrack recipients read failed: "
+                      << sqlite3_errmsg(db) << std::endl;
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return;
         }
         if (!prepareOrLog(db, &s,
             "DELETE FROM user_whales WHERE whale_id=("
@@ -140,7 +151,9 @@ void untrackWalletFromService(const std::string& wallet) {
             return;
         }
         if (removed > 0) {
-            for (const auto& r : recipients) reassignPrimaryLocked(r.first);
+            for (const auto& r : recipients)
+                if (!reassignPrimaryLocked(r.first))
+                    std::cerr << "[WATCHERS] primary не переназначен: " << r.first << std::endl;
         }
         if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
             std::cerr << "[DB] untrackWalletFromService COMMIT failed: "
@@ -211,11 +224,20 @@ AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addres
     bool firstWallet = false;
     {
         sqlite3_stmt* c;
-        if (prepareOrLog(db,&c,"SELECT 1 FROM user_whales WHERE user_id=? LIMIT 1")) {
-            sqlite3_bind_text(c,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
-            firstWallet = sqlite3_step(c) != SQLITE_ROW;
-            sqlite3_finalize(c);
+        if (!prepareOrLog(db,&c,"SELECT 1 FROM user_whales WHERE user_id=? LIMIT 1")) {
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return AddWhaleResult::ERROR;
         }
+        sqlite3_bind_text(c,1,chatId.c_str(),-1,SQLITE_TRANSIENT);
+        const int rc = sqlite3_step(c);
+        sqlite3_finalize(c);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+            std::cerr << "[DB] addUserWhale primary check failed: "
+                      << sqlite3_errmsg(db) << std::endl;
+            sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+            return AddWhaleResult::ERROR;
+        }
+        firstWallet = rc != SQLITE_ROW;
     }
     if (!prepareOrLog(db,&s,"INSERT INTO user_whales(user_id,whale_id,label,created_at,is_primary) VALUES(?,?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return AddWhaleResult::ERROR; }
     sqlite3_bind_text(s,1,chatId.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,whaleId);
@@ -268,7 +290,10 @@ bool removeUserWhale(const std::string& chatId, const std::string& addressArg) {
     }
     sqlite3_finalize(s);
 
-    if (removed) reassignPrimaryLocked(chatId);
+    if (removed && !reassignPrimaryLocked(chatId)) {
+        sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr);
+        return false;
+    }
 
     if (sqlite3_exec(db,"COMMIT",nullptr,nullptr,nullptr)!=SQLITE_OK) {
         std::cerr << "[DB] removeUserWhale COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
