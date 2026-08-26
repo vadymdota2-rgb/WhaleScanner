@@ -1629,6 +1629,8 @@ void handleCallbackQuery(const json& callbackQuery) {
              action == "hl_pospage" || action == "hl_posnoop") {
         handleHyperliquidCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
+
+    if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
 }
 
 bool handleTextInput(const std::string& chatId, const std::string& text) {
