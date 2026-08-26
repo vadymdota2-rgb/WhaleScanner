@@ -76,7 +76,7 @@ constexpr size_t HL_POSITION_CACHE_CAP = 20000;
 
 constexpr long long HL_FILL_TTL_SEC = 365LL * 86400LL;
 
-constexpr int HL_MAX_BOT_TRADES = 1000;
+constexpr int HL_MAX_BOT_TRADES = 200;
 
 const char* const HL_CARD_SEPARATOR = "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501";
 
@@ -689,18 +689,17 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
 }
 
 std::string dirKey(const std::string& dir) {
-    if (dir.find("Open Long")   != std::string::npos) return "hl_open_long";
-    if (dir.find("Close Long")  != std::string::npos) return "hl_close_long";
-    if (dir.find("Open Short")  != std::string::npos) return "hl_open_short";
-    if (dir.find("Close Short") != std::string::npos) return "hl_close_short";
-    if (dir.find("Long > Short") != std::string::npos ||
-        dir.find("Short > Long") != std::string::npos) return "hl_flip";
-    if (dir.find("Liquidat") != std::string::npos) {
-        if (dir.find("Long")  != std::string::npos) return "hl_liq_long";
-        if (dir.find("Short") != std::string::npos) return "hl_liq_short";
-        return "hl_liquidated";
+    switch (dirCode(dir)) {
+        case DIR_OPEN_LONG:   return "hl_open_long";
+        case DIR_OPEN_SHORT:  return "hl_open_short";
+        case DIR_CLOSE_LONG:  return "hl_close_long";
+        case DIR_CLOSE_SHORT: return "hl_close_short";
+        case DIR_FLIP:        return "hl_flip";
+        case DIR_LIQ_LONG:    return "hl_liq_long";
+        case DIR_LIQ_SHORT:   return "hl_liq_short";
+        case DIR_LIQ_OTHER:   return "hl_liquidated";
+        default:              return "hl_trade";
     }
-    return "hl_trade";
 }
 
 std::string dirEmoji(const std::string& key) {
@@ -1312,16 +1311,25 @@ bool initHyperliquid() {
     {
         const char* const backfill =
             "UPDATE hl_fills SET dir_code = CASE"
-            "  WHEN dir LIKE '%Liquidat%' AND dir LIKE '%Long%'  THEN 6"
-            "  WHEN dir LIKE '%Liquidat%' AND dir LIKE '%Short%' THEN 7"
-            "  WHEN dir LIKE '%Liquidat%' OR dir LIKE '%ADL%'    THEN 8"
+            "  WHEN (dir LIKE '%Liquidat%' OR dir LIKE '%ADL%') AND dir LIKE '%Short%' THEN 7"
+            "  WHEN (dir LIKE '%Liquidat%' OR dir LIKE '%ADL%') AND dir LIKE '%Long%'  THEN 6"
+            "  WHEN  dir LIKE '%Liquidat%' OR dir LIKE '%ADL%'                         THEN 8"
             "  WHEN dir LIKE '%Long > Short%' OR dir LIKE '%Short > Long%' THEN 5"
             "  WHEN dir LIKE '%Open Long%'   THEN 1"
             "  WHEN dir LIKE '%Open Short%'  THEN 2"
             "  WHEN dir LIKE '%Close Long%'  THEN 3"
             "  WHEN dir LIKE '%Close Short%' THEN 4"
             "  ELSE 0 END "
-            "WHERE dir_code = 0 AND dir <> ''";
+            "WHERE dir <> '' AND dir_code <> CASE"
+            "  WHEN (dir LIKE '%Liquidat%' OR dir LIKE '%ADL%') AND dir LIKE '%Short%' THEN 7"
+            "  WHEN (dir LIKE '%Liquidat%' OR dir LIKE '%ADL%') AND dir LIKE '%Long%'  THEN 6"
+            "  WHEN  dir LIKE '%Liquidat%' OR dir LIKE '%ADL%'                         THEN 8"
+            "  WHEN dir LIKE '%Long > Short%' OR dir LIKE '%Short > Long%' THEN 5"
+            "  WHEN dir LIKE '%Open Long%'   THEN 1"
+            "  WHEN dir LIKE '%Open Short%'  THEN 2"
+            "  WHEN dir LIKE '%Close Long%'  THEN 3"
+            "  WHEN dir LIKE '%Close Short%' THEN 4"
+            "  ELSE 0 END";
         char* bErr = nullptr;
         if (sqlite3_exec(g_hlDb, backfill, nullptr, nullptr, &bErr) == SQLITE_OK) {
             const int n = sqlite3_changes(g_hlDb);
