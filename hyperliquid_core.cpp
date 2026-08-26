@@ -897,7 +897,12 @@ void enrichWallet(const std::string& wallet) {
                     if (p.notional > 0) freshRows.push_back(i);
                 }
             }
-            if (bulk) sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+            if (bulk && sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+                std::cerr << "[HL] COMMIT сделок не прошёл: " << sqlite3_errmsg(g_hlDb) << std::endl;
+                sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+                stored = 0;
+                freshRows.clear();
+            }
         }
     }
 
