@@ -2,7 +2,6 @@
 
 #include <string>
 #include <cstddef>
-#include <vector>
 #include "alert_settings.h"
 #include "ru.h"
 
