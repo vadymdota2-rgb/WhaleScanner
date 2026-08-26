@@ -8,7 +8,6 @@
 #include "json.hpp"
 #include "ru.h"
 
-// Числовой признак направления сделки: разбирается один раз при записи.
 enum HlDirCode {
     DIR_UNKNOWN     = 0,
     DIR_OPEN_LONG   = 1,
@@ -21,20 +20,27 @@ enum HlDirCode {
     DIR_LIQ_OTHER   = 8,
 };
 
-inline int dirCode(const std::string& dir) {
-    if (dir.find("Liquidat") != std::string::npos ||
-        dir.find("liquidat") != std::string::npos ||
-        dir.find("ADL") != std::string::npos) {
-        if (dir.find("Short") != std::string::npos) return DIR_LIQ_SHORT;
-        if (dir.find("Long")  != std::string::npos) return DIR_LIQ_LONG;
+inline int dirCode(const std::string& dirRaw) {
+    std::string dir;
+    dir.reserve(dirRaw.size());
+    for (char c : dirRaw)
+        dir += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+
+    const bool isLong  = dir.find("long")  != std::string::npos;
+    const bool isShort = dir.find("short") != std::string::npos;
+
+    if (dir.find("liquidat") != std::string::npos ||
+        dir.find("adl")      != std::string::npos) {
+        if (isShort) return DIR_LIQ_SHORT;
+        if (isLong)  return DIR_LIQ_LONG;
         return DIR_LIQ_OTHER;
     }
-    if (dir.find("Long > Short") != std::string::npos ||
-        dir.find("Short > Long") != std::string::npos) return DIR_FLIP;
-    if (dir.find("Open Long")   != std::string::npos) return DIR_OPEN_LONG;
-    if (dir.find("Open Short")  != std::string::npos) return DIR_OPEN_SHORT;
-    if (dir.find("Close Long")  != std::string::npos) return DIR_CLOSE_LONG;
-    if (dir.find("Close Short") != std::string::npos) return DIR_CLOSE_SHORT;
+    if (dir.find("long > short") != std::string::npos ||
+        dir.find("short > long") != std::string::npos) return DIR_FLIP;
+    if (dir.find("open long")   != std::string::npos) return DIR_OPEN_LONG;
+    if (dir.find("open short")  != std::string::npos) return DIR_OPEN_SHORT;
+    if (dir.find("close long")  != std::string::npos) return DIR_CLOSE_LONG;
+    if (dir.find("close short") != std::string::npos) return DIR_CLOSE_SHORT;
     return DIR_UNKNOWN;
 }
 
