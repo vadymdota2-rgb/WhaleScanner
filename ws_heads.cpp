@@ -8,7 +8,6 @@
 #include <iostream>
 #include <mutex>
 #include <string>
-#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -112,7 +111,7 @@ bool wsSession(const std::string& url, int idx) {
     if (!curl) return false;
 
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L); // WebSocket
+    curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 2L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -166,6 +165,8 @@ bool wsSession(const std::string& url, int idx) {
                 std::cerr << "[WS] server closed (" << shortLabel(idx, url) << ")" << std::endl;
                 break;
             } else if (meta->flags & CURLWS_PING) {
+                size_t sent = 0;
+                curl_ws_send(curl, buf.data(), nread, &sent, 0, CURLWS_PONG);
             }
         } else if (rc == CURLE_AGAIN) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -186,7 +187,7 @@ bool wsSession(const std::string& url, int idx) {
                                 ? WS_STALE_SEC : WS_SUBSCRIBE_WAIT_SEC;
         if (last > 0 && time(nullptr) - last > staleLimit) {
             g_wsStales.fetch_add(1, std::memory_order_relaxed);
-            std::cerr << "[WS] stale >" << WS_STALE_SEC << "s on " << shortLabel(idx, url)
+            std::cerr << "[WS] stale >" << staleLimit << "s on " << shortLabel(idx, url)
                       << " — switching" << std::endl;
             g_wsOk.store(false, std::memory_order_relaxed);
             break;
@@ -255,7 +256,7 @@ std::vector<std::string> splitUrls(const std::string& s) {
     return out;
 }
 
-} // namespace
+}
 
 void startWsHeads(const std::vector<std::string>& wssUrls) {
     std::vector<std::string> cleaned;
