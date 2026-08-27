@@ -11,12 +11,12 @@
 using boost::multiprecision::cpp_int;
 
 struct TxResult {
-    bool valid, isSwap, isBuy;
-    cpp_int rawAmount, usdNanos;
+    bool valid = false, isSwap = false, isBuy = false;
+    cpp_int rawAmount = 0, usdNanos = 0;
     std::string tokenAddr;
     std::string venue;
     std::string counterAddr;
-    cpp_int counterAmount;
+    cpp_int counterAmount = 0;
     cpp_int gasUsdNanos = 0;
     bool hasSwapEvent = false;
     bool isUniversalRouter = false;
