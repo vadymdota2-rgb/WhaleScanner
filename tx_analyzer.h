@@ -54,6 +54,7 @@ void setChainContext(const ChainContext& ctx);
 
 bool isBaseAsset(const std::string& a);
 std::string lookupRouterLabel(const std::string& addr);
+std::string lookupInfraLabel(const std::string& addr);
 
 cpp_int parseUint256(const std::string& h);
 cpp_int hexToCppInt(const std::string& h);
