@@ -27,6 +27,7 @@ std::string buildTopAddrList(const std::unordered_map<std::string, uint64_t>& m,
         ss << (i + 1) << ". <code>" << v[i].first << "</code> — " << v[i].second;
         if (labelRouters) {
             std::string lbl = lookupRouterLabel(v[i].first);
+            if (lbl.empty()) lbl = lookupInfraLabel(v[i].first);
             ss << (lbl.empty() ? " ❓" : (" (" + lbl + ")"));
         }
         ss << "\n";
