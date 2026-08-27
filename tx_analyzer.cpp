@@ -14,8 +14,8 @@ uint64_t getPriceNanos(const std::string& token);
 int getDecimals(const std::string& addr);
 std::string getSymbol(const std::string& addr);
 
-const cpp_int MAX_TRADE_USD_NANOS        = cpp_int("10000000000000000");   // $10 млн
-const cpp_int MAX_SANE_UNIT_PRICE_NANOS  = cpp_int("1000000000000000");    // $1 млн за токен
+const cpp_int MAX_TRADE_USD_NANOS        = cpp_int("10000000000000000");
+const cpp_int MAX_SANE_UNIT_PRICE_NANOS  = cpp_int("1000000000000000");
 
 cpp_int hexNibbles(const std::string& h, size_t from, size_t count) {
     cpp_int r = 0;
@@ -43,11 +43,29 @@ std::string formatAmount(const cpp_int& raw, int dec) {
     if (raw == 0) return "0.00";
     cpp_int d = 1;
     for (int i = 0; i < dec; i++) d *= 10;
-    std::string ip = (raw / d).convert_to<std::string>();
-    std::string fp = (raw % d).convert_to<std::string>();
-    while (static_cast<int>(fp.length()) < dec) fp = "0" + fp;
-    if (fp.length() > 2) fp = fp.substr(0, 2);
-    while (fp.length() < 2) fp += "0";
+    const cpp_int whole = raw / d;
+    int keep = 2;
+    if (whole == 0) {
+        cpp_int probe = raw;
+        int lead = 0;
+        while (probe < d && lead < 8) { probe *= 10; lead++; }
+        keep = lead + 2;
+        if (keep > 10) keep = 10;
+    }
+    if (keep > dec) keep = dec;
+
+    cpp_int scale = 1;
+    for (int i = 0; i < dec - keep; i++) scale *= 10;
+    cpp_int rounded = (dec > keep) ? (raw + scale / 2) / scale : raw;
+
+    cpp_int unit = 1;
+    for (int i = 0; i < keep; i++) unit *= 10;
+
+    std::string ip = (rounded / unit).convert_to<std::string>();
+    std::string fp = (rounded % unit).convert_to<std::string>();
+    while (static_cast<int>(fp.length()) < keep) fp = "0" + fp;
+    while (fp.size() > 2 && fp.back() == '0') fp.pop_back();
+    while (fp.size() < 2) fp += "0";
     std::string grouped; int cnt=0;
     for (auto it=ip.rbegin(); it!=ip.rend(); ++it) {
         if (cnt && cnt%3==0 && *it>='0' && *it<='9') grouped.push_back(',');
@@ -65,11 +83,14 @@ cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) {
     if (usd > MAX_TRADE_USD_NANOS) return 0;
     return usd;
 }
-std::string formatUsd(const cpp_int& n) {
+std::string formatUsd(const cpp_int& nRaw) {
+    cpp_int n = nRaw;
+    if (n < 0) n = 0;
+    n = (n + 5000000) / 10000000;
     std::string s = n.convert_to<std::string>();
-    while (s.length() < 10) s = "0" + s;
-    std::string dl = s.substr(0, s.length() - 9);
-    std::string ct = s.substr(s.length() - 9, 2);
+    while (s.length() < 3) s = "0" + s;
+    std::string dl = s.substr(0, s.length() - 2);
+    std::string ct = s.substr(s.length() - 2, 2);
     if (dl.empty()) dl = "0";
     std::string grouped;
     int cnt = 0;
@@ -159,7 +180,7 @@ UniversalRouterCommands parseExecuteCommands(const std::string& input) {
     if (hexNo0x.size() < 8 + 64) return out;
 
     uint64_t offsetCommands = hexWordToU64(hexNo0x, 8);
-    if (offsetCommands > hexNo0x.size()) return out;
+    if (offsetCommands > (hexNo0x.size() - 8) / 2) return out;
     size_t lenHexPos = 8 + offsetCommands * 2;
     if (hexNo0x.size() < lenHexPos + 64) return out;
 
