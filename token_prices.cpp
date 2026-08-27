@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -91,6 +92,40 @@ static void ensurePairCacheSchema() {
 
 }
 
+std::string sanitizeSymbol(const std::string& sym) {
+    std::string clean;
+    size_t bad = 0;
+    for (size_t i = 0; i < sym.size(); ) {
+        const unsigned char c = static_cast<unsigned char>(sym[i]);
+        if (c < 0x20 || c == 0x7F) { i++; bad++; continue; }
+        if (c < 0x80) { clean += static_cast<char>(c); i++; continue; }
+
+        int need; uint32_t cp, lo;
+        if      ((c >> 5) == 0x06) { need = 1; cp = c & 0x1F; lo = 0x80; }
+        else if ((c >> 4) == 0x0E) { need = 2; cp = c & 0x0F; lo = 0x800; }
+        else if ((c >> 3) == 0x1E) { need = 3; cp = c & 0x07; lo = 0x10000; }
+        else { i++; bad++; continue; }
+
+        if (i + static_cast<size_t>(need) >= sym.size()) { i++; bad++; continue; }
+        bool ok = true;
+        for (int k = 1; k <= need; k++) {
+            const unsigned char b = static_cast<unsigned char>(sym[i + static_cast<size_t>(k)]);
+            if ((b >> 6) != 0x02) { ok = false; break; }
+            cp = (cp << 6) | (b & 0x3F);
+        }
+        if (!ok || cp < lo || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+            i++; bad++; continue;
+        }
+        clean.append(sym, i, static_cast<size_t>(need) + 1);
+        i += static_cast<size_t>(need) + 1;
+    }
+    while (!clean.empty() && clean.back() == ' ') clean.pop_back();
+    while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
+    if (bad * 2 > sym.size()) clean.clear();
+    if (clean.size() > 16) clean = truncateUtf8(clean, 16);
+    return clean;
+}
+
 void loadTokenCache() {
     std::vector<std::tuple<std::string,std::string,int,uint64_t,time_t>> rows;
     {
@@ -109,11 +144,7 @@ void loadTokenCache() {
     std::lock_guard<std::mutex> cl(cacheMutex);
     for (auto& [a, sym, d, pn, ts] : rows) {
         if (!sym.empty()) {
-            std::string clean;
-            for (unsigned char c : sym) if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
-            while (!clean.empty() && clean.back() == ' ') clean.pop_back();
-            if (clean.size() * 2 < sym.size()) clean.clear();
-            if (clean.size() > 16) clean.resize(16);
+            std::string clean = sanitizeSymbol(sym);
             if (!clean.empty() && clean != "UNKNOWN") TOKEN_SYMBOLS[a] = std::move(clean);
         }
         if (d > 0) TOKEN_DECIMALS[a] = d;
@@ -368,14 +399,7 @@ static std::string parseTokenText(const json& r) {
             }
         } catch (...) {}
     }
-    std::string clean;
-    for (unsigned char c : sym)
-        if (c >= 0x20 && c < 0x7F) clean += static_cast<char>(c);
-    while (!clean.empty() && clean.back() == ' ') clean.pop_back();
-    while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-    if (clean.size() * 2 < sym.size()) clean.clear();
-    if (clean.size() > 16) clean.resize(16);
-    return clean;
+    return sanitizeSymbol(sym);
 }
 
 static std::string fetchDexScreenerSymbol(const std::string& a) {
@@ -403,13 +427,8 @@ static std::string fetchDexScreenerSymbol(const std::string& a) {
                 if (qa == a) sym = pair["quoteToken"].value("symbol", "");
             }
             if (sym.empty()) continue;
-            std::string clean;
-            for (unsigned char c : sym) {
-                if (c >= 32 && c < 127) clean.push_back(static_cast<char>(c));
-            }
-            while (!clean.empty() && clean.front() == ' ') clean.erase(clean.begin());
-            while (!clean.empty() && clean.back() == ' ') clean.pop_back();
-            if (clean.empty() || clean.size() > 32) continue;
+            const std::string clean = sanitizeSymbol(sym);
+            if (clean.empty()) continue;
             if (liq >= bestLiq) { bestLiq = liq; bestSym = clean; }
         }
         return bestSym;
