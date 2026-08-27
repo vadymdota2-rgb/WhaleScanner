@@ -3,12 +3,11 @@
 #include <cstdint>
 #include <string>
 
-/** Только newHeads: номер блока. Цены/analyze не трогает.
+/** Только newHeads: номер блока. Цены и разбор сделок не трогает.
  *
- * primary  → wss://rpc-bsc.blockmachine.io
- * backup   → wss://bnb.api.onfinality.io/public-ws
- *
- * WHALE_WS_URL=url1,url2  — свой список (пусто = выкл)
+ * Адреса по умолчанию заданы в ws_heads.cpp — здесь их нет намеренно,
+ * чтобы список не разъезжался с кодом.
+ * WHALE_WS_URL=url1,url2 — свой список (пусто = выключено).
  */
 
 /** Поднять heads с дефолтами / env. */
