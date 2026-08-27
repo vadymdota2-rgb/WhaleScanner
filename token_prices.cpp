@@ -51,7 +51,6 @@ std::map<std::string, time_t> POOL_LIQUIDITY_TS;
 std::mutex g_pairCacheMutex;
 std::map<std::string, std::string> PAIR_CACHE;
 std::map<std::string, time_t> PAIR_CACHE_TS;
-// V3: позитивный адрес — навсегда; пустой + ts — негатив с TTL (не яд при сбое RPC)
 std::map<std::string, std::string> V3_POOL_CACHE;
 std::map<std::string, time_t> V3_POOL_CACHE_TS;
 constexpr time_t V3_NEGATIVE_TTL = 1800;
@@ -159,7 +158,6 @@ void loadPairCache() {
             sqlite3_finalize(d);
         }
         sqlite3_stmt* s;
-        // ts=0 — старые записи: берём, возраст = now, протухнут через TTL
         if (!prepareOrLog(db,&s,"SELECT token,val,ts FROM pair_cache")) return;
         while (sqlite3_step(s)==SQLITE_ROW) {
             std::string t = toLower(safeColumnText(s,0));
@@ -328,10 +326,20 @@ void saveTokenPrice(const std::string& a, uint64_t pn) {
 
 int getDecimals(const std::string& addr) {
     std::string a=toLower(addr); { std::lock_guard<std::mutex> l(cacheMutex); if (TOKEN_DECIMALS.count(a)) return TOKEN_DECIMALS[a]; }
-    auto r=rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
+    json r;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        r = rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
+        if (r.is_string()) break;
+    }
     if (!r.is_string()) { bump(3); return 18; }
-    int d=18;
-    if (r.get<std::string>().length()>=66) try { d=std::stoi(r.get<std::string>().substr(2),nullptr,16); } catch (...) {}
+
+    const std::string hex = r.get<std::string>();
+    int d = -1;
+    if (hex.length() >= 66) {
+        try { d = std::stoi(hex.substr(2), nullptr, 16); } catch (...) { d = -1; }
+    }
+    if (d < 0 || d > 36) { bump(3); return 18; }
+
     { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
 }
 
@@ -370,8 +378,6 @@ static std::string parseTokenText(const json& r) {
     return clean;
 }
 
-
-// Имя/тикер с DexScreener, если ончейн symbol/name пустые.
 static std::string fetchDexScreenerSymbol(const std::string& a) {
     auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + a);
     try {
@@ -388,7 +394,6 @@ static std::string fetchDexScreenerSymbol(const std::string& a) {
                 pair["liquidity"].contains("usd") && pair["liquidity"]["usd"].is_number())
                 liq = pair["liquidity"]["usd"].get<double>();
             std::string sym;
-            // наш токен — base или quote
             if (pair.contains("baseToken") && pair["baseToken"].is_object()) {
                 std::string ba = toLower(pair["baseToken"].value("address", ""));
                 if (ba == a) sym = pair["baseToken"].value("symbol", "");
@@ -398,7 +403,6 @@ static std::string fetchDexScreenerSymbol(const std::string& a) {
                 if (qa == a) sym = pair["quoteToken"].value("symbol", "");
             }
             if (sym.empty()) continue;
-            // лёгкая чистка как у ончейн
             std::string clean;
             for (unsigned char c : sym) {
                 if (c >= 32 && c < 127) clean.push_back(static_cast<char>(c));
@@ -435,7 +439,6 @@ std::string getSymbol(const std::string& addr) {
     }
 
     if (sym.empty()) {
-        // ончейн пусто → DexScreener (тикер из лучшей пары по liq)
         sym = fetchDexScreenerSymbol(a);
     }
     if (sym.empty()) return "UNKNOWN";
@@ -471,7 +474,6 @@ static uint64_t cachedNativePriceNanos() {
     return it->second.first;
 }
 
-// Цена token в nanos USD из конкретной V2-пары. liqUsdOut — оценка 2*base.
 static bool quoteV2Pair(const std::string& token, const std::string& base, uint64_t basePriceNanos,
                         const std::string& pair, bool tokenIsZero,
                         uint64_t& priceOut, double& liqUsdOut) {
@@ -530,7 +532,6 @@ static std::string factoryGetPair(const std::string& a, const std::string& b) {
     return pair;
 }
 
-// Uniswap V3 / Pancake V3 factory по сети
 static std::string v3FactoryAddress() {
     const std::string id = chainCtx().dexscreenerChainId;
     if (id == "bsc") return "0x0bfbcf9fa4f9c56b0f40a671ad40e0805a091865";       // Pancake V3
@@ -565,19 +566,16 @@ static std::string v3GetPool(const std::string& factory, const std::string& a,
             if (tsIt != V3_POOL_CACHE_TS.end() &&
                 time(nullptr) - tsIt->second < V3_NEGATIVE_TTL)
                 return {}; // негатив ещё свежий
-            // негатив протух — переспросим
             V3_POOL_CACHE.erase(it);
             if (tsIt != V3_POOL_CACHE_TS.end()) V3_POOL_CACHE_TS.erase(tsIt);
         }
     }
-    // getPool(address,address,uint24) → 0x1698ee82
     std::string data = "0x1698ee82";
     data += padAddr(a);
     data += padAddr(b);
     data += padUint(fee);
     json r = rpc("eth_call", json::array({ json{{"to", factory}, {"data", data}}, "latest" }));
 
-    // Сбой RPC — НЕ кэшируем (иначе яд до рестарта)
     if (!r.is_string()) return {};
 
     std::string pool;
@@ -597,10 +595,8 @@ static std::string v3GetPool(const std::string& factory, const std::string& a,
     return pool;
 }
 
-// V3 slot0 → цена token в USD nanos. liqUsdOut — грубая оценка через liquidity().
 static bool quoteV3Pool(const std::string& token, const std::string& base, uint64_t basePriceNanos,
                         const std::string& pool, uint64_t& priceOut, double& liqUsdOut) {
-    // slot0(): 0x3850c7bd
     json rs = rpc("eth_call", json::array({ json{{"to", pool}, {"data", "0x3850c7bd"}}, "latest" }));
     if (!rs.is_string()) return false;
     const std::string sh = rs.get<std::string>();
@@ -622,17 +618,12 @@ static bool quoteV3Pool(const std::string& token, const std::string& base, uint6
     const cpp_int Q96 = cpp_int(1) << 96;
     const cpp_int Q192 = Q96 * Q96;
     cpp_int priceNanos;
-    // price(token0 in token1) = sqrtP^2 / 2^192
     if (tokenIsZero) {
-        // token = token0, base = token1
-        // usd = basePrice * (sqrtP^2 / 2^192) * 10^tokenDec / 10^baseDec
         const cpp_int num = cpp_int(basePriceNanos) * sqrtP * sqrtP * tokenScale;
         const cpp_int den = Q192 * baseScale;
         if (den <= 0) return false;
         priceNanos = num / den;
     } else {
-        // token = token1, base = token0
-        // usd = basePrice * (2^192 / sqrtP^2) * 10^tokenDec / 10^baseDec
         const cpp_int num = cpp_int(basePriceNanos) * Q192 * tokenScale;
         const cpp_int den = sqrtP * sqrtP * baseScale;
         if (den <= 0) return false;
@@ -640,8 +631,6 @@ static bool quoteV3Pool(const std::string& token, const std::string& base, uint6
     }
     if (priceNanos <= 0 || priceNanos > cpp_int("1000000000000000")) return false;
 
-    // liquidity() + sqrtP → виртуальные резервы обеих сторон (как в V3 whitepaper для L)
-    // depth ≈ 2 * min(virt_base_usd) — без tick-range это верхняя оценка, но стабильнее одной стороны
     double liqProxy = 0.0;
     json rl = rpc("eth_call", json::array({ json{{"to", pool}, {"data", "0x1a686502"}}, "latest" }));
     if (rl.is_string()) {
@@ -655,7 +644,6 @@ static bool quoteV3Pool(const std::string& token, const std::string& base, uint6
                 const cpp_int liqNanos = (baseVirt * cpp_int(basePriceNanos) * 2) / baseScale;
                 liqProxy = static_cast<double>(static_cast<long long>(
                     liqNanos > cpp_int("9000000000000000000") ? cpp_int("9000000000000000000") : liqNanos)) / 1e9;
-                // Без tick-range оценка завышена — режем вес V3 в средневзвешенной
                 liqProxy *= 0.5;
             }
         }
@@ -667,7 +655,6 @@ static bool quoteV3Pool(const std::string& token, const std::string& base, uint6
     return true;
 }
 
-// BNB/ETH из пула к стейблу — без DexScreener.
 static uint64_t nativePriceFromPool() {
     const auto& ctx = chainCtx();
     const std::string w = toLower(ctx.wrappedNative);
@@ -685,7 +672,6 @@ static uint64_t nativePriceFromPool() {
         if (!resolvePairSide(w, pair, tokenIsZero)) continue;
         uint64_t px = 0;
         double liq = 0;
-        // base = stable → $1
         if (!quoteV2Pair(w, base, 1000000000ULL, pair, tokenIsZero, px, liq)) continue;
         if (liq < MIN_POOL_LIQUIDITY_USD) continue;
         if (liq > bestLiq) {
@@ -733,7 +719,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         }
     }
 
-    // Стейблы первыми (цена $1), потом native. Только пулы с liq ≥ порога.
     std::vector<std::pair<std::string, uint64_t>> bases;
     {
         int added = 0;
@@ -743,13 +728,11 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
         }
         bases.push_back({toLower(ctx.wrappedNative), 0});
     }
-    // Кэшированную базу пробуем первой, если ещё свежая
     if (!cachedBase.empty()) {
         uint64_t fp = ctx.stablecoins.count(cachedBase) ? 1000000000ULL : 0;
         bases.insert(bases.begin(), {cachedBase, fp});
     }
 
-    // Средневзвешенная: V2 + V3, вес = оценка liq, только ≥ порога
     double wSum = 0.0, pwSum = 0.0, bestLiq = -1.0;
     std::string bestStored;
     std::set<std::string> triedBase;
@@ -760,7 +743,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
     for (const auto& [base, fixedPrice] : bases) {
         if (base == t || base.size() != 42) continue;
         if (!triedBase.insert(base).second) continue;
-        // fixedPrice==0 → база = wrapped native; пропускаем, если стейбл уже сработал
         if (fixedPrice == 0 && gotStableQuote) continue;
 
         uint64_t basePrice = fixedPrice;
@@ -771,7 +753,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
 
         double baseWBefore = wSum;
 
-        // --- V2 ---
         std::string pair;
         bool tokenIsZero = false;
         bool knownSide = false;
@@ -802,7 +783,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
             }
         }
 
-        // --- V3 только если по этой базе V2 пусто (экономия 2–6 eth_call) ---
         if (!v3f.empty() && wSum <= baseWBefore) {
             for (uint32_t fee : kV3FeesPrimary) {
                 std::string pool = v3GetPool(v3f, t, base, fee);
@@ -814,13 +794,11 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
                 wSum  += liq;
                 if (liq > bestLiq) bestLiq = liq;
             }
-            // secondary tiers (100/10000) отключены — слишком дорого для mark
         }
 
         if (fixedPrice != 0 && wSum > baseWBefore)
             gotStableQuote = true;
 
-        // Достаточный V2/V3 — дальше базы не долбим
         if (bestLiq >= STRONG_POOL_LIQ_USD)
             break;
     }
@@ -842,7 +820,6 @@ static uint64_t priceFromPoolReserves(const std::string& token) {
     return 0;
 }
 
-// DexScreener: лучшая цена среди пар с liq ≥ порога. thinOut — видели только тонкие.
 static bool fetchDexScreenerPrice(const std::string& a, double& priceOut, double& liqOut, bool& thinOut) {
     priceOut = 0; liqOut = 0; thinOut = false;
     auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + a);
@@ -869,7 +846,6 @@ static bool fetchDexScreenerPrice(const std::string& a, double& priceOut, double
     } catch (...) { return false; }
 }
 
-// Лёгкий TWAP: среднее fresh + до 4 снимков за последний час из token_price_history
 static uint64_t softTwap(const std::string& a, uint64_t fresh) {
     if (!fresh) return 0;
     const long long cutoff = static_cast<long long>(time(nullptr)) - 3600;
@@ -898,7 +874,6 @@ static uint64_t softTwap(const std::string& a, uint64_t fresh) {
 
 uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
     constexpr double MAX_SANE_PRICE_USD = 1e6;
-    // divergence pool↔dex отключён: порядок Dex → пул (экономия RPC)
     if (sourceOut) *sourceOut = PriceSource::None;
 
     bool thinPoolSeen = false;
@@ -917,8 +892,6 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         }
     }
 
-    // 1) DexScreener (BSC) — без RPC
-    // 2) свои пулы — только если Dex не дал цену
     double dexP = 0, dexLiq = 0;
     bool haveDex = false;
     {
@@ -955,13 +928,14 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         src = PriceSource::Pool;
     }
 
-    if (n > 0 && prevCached > 0 && poolLiq < SPIKE_TRUST_LIQ_USD) {
+    const double trustLiq = haveDex ? dexLiq : poolLiq;
+    if (n > 0 && prevCached > 0 && trustLiq < SPIKE_TRUST_LIQ_USD) {
         const double prev = static_cast<double>(prevCached);
         const double cur  = static_cast<double>(n);
         const double rel = std::fabs(cur - prev) / std::max(prev, cur);
         if (rel > SPIKE_RATIO) {
             std::cerr << "[PRICE] spike " << (rel * 100.0) << "% " << a
-                      << " keep cache (liq=$" << poolLiq << ")\n";
+                      << " keep cache (liq=$" << trustLiq << ")\n";
             n = prevCached;
             src = PriceSource::Cache;
             bump(5);
@@ -1005,7 +979,6 @@ void ensureNativePrice() {
     if (w.empty()) return;
     if (cachedNativePriceNanos() > 0) return;
 
-    // 1) Ончейн: WBNB/WETH ↔ стейбл
     if (uint64_t fromPool = nativePriceFromPool()) {
         {
             std::lock_guard<std::mutex> l(cacheMutex);
@@ -1017,7 +990,6 @@ void ensureNativePrice() {
         return;
     }
 
-    // 2) DexScreener only (CoinGecko removed — no external CG traffic)
     double p = 0.0;
     auto r = http("https://api.dexscreener.com/latest/dex/tokens/" + w);
     try {
