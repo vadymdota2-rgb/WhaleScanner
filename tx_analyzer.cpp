@@ -18,7 +18,16 @@ std::string getSymbol(const std::string& addr);
 const cpp_int MAX_TRADE_USD_NANOS        = cpp_int("10000000000000000");
 const cpp_int MAX_SANE_UNIT_PRICE_NANOS  = cpp_int("1000000000000000");
 
-// Включается WHALE_LOG_ARBITRAGE=1. Замер, а не постоянный лог: нужен на
+// Замер класса «взаимодействие»: включается WHALE_LOG_INTERACTION=1,
+// пишется только когда тип таким и остался, после атрибуции сейфа.
+bool interactionProbeEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("WHALE_LOG_INTERACTION");
+        return e && std::string(e) == "1";
+    }();
+    return on;
+}
+
 bool arbitrageProbeEnabled() {
     static const bool on = [] {
         const char* e = std::getenv("WHALE_LOG_ARBITRAGE");
@@ -710,6 +719,7 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
                 ? "SWAP_EVENT_WITHOUT_WALLET_FLOW"
                 : "DEX_SIGNAL_WITHOUT_WALLET_FLOW";
             r.venue = "DEX interaction";
+
             std::map<std::string, std::map<std::string, cpp_int>> perAddr;
             for (const auto& [token, edges] : graph)
                 for (const auto& e : edges) {
@@ -792,6 +802,30 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
             }
 
             if (!vaultAttributed) {
+                if (interactionProbeEnabled()) {
+                    const std::string infra = lookupInfraLabel(txTo);
+                    const std::string router = lookupRouterLabel(txTo);
+                    const char* why = !infra.empty() ? "aa"
+                                    : !hasSwap       ? "noSwapEvt"
+                                                     : "noWalletFlow";
+                    const std::string label = !infra.empty()  ? infra
+                                            : !router.empty() ? router
+                                                              : std::string("-");
+                    const std::string txHash =
+                        (tx.is_object() && tx.contains("hash") && tx["hash"].is_string())
+                            ? tx["hash"].get<std::string>() : std::string();
+                    std::cerr << "[INT] hash=" << txHash
+                              << " wallet=" << wallet
+                              << " to=" << txTo
+                              << " label=" << label
+                              << " why=" << why
+                              << " swapEvt=" << (hasSwap ? 1 : 0)
+                              << " pools=" << swapPools.size()
+                              << " vaultCand=" << vaultCandidates
+                              << " vault=" << (vaultAddr.empty() ? std::string("-") : vaultAddr)
+                              << std::endl;
+                }
+
                 std::string out;
                 int listed = 0;
                 for (const auto& [token, edges] : graph) {
