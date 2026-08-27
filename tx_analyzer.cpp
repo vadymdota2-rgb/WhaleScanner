@@ -1,5 +1,6 @@
 #include "tx_analyzer.h"
 
+#include <cstdlib>
 #include <set>
 #include <map>
 #include <vector>
@@ -16,6 +17,15 @@ std::string getSymbol(const std::string& addr);
 
 const cpp_int MAX_TRADE_USD_NANOS        = cpp_int("10000000000000000");
 const cpp_int MAX_SANE_UNIT_PRICE_NANOS  = cpp_int("1000000000000000");
+
+// Включается WHALE_LOG_ARBITRAGE=1. Замер, а не постоянный лог: нужен на
+bool arbitrageProbeEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("WHALE_LOG_ARBITRAGE");
+        return e && std::string(e) == "1";
+    }();
+    return on;
+}
 
 cpp_int hexNibbles(const std::string& h, size_t from, size_t count) {
     cpp_int r = 0;
@@ -1073,6 +1083,22 @@ TxResult analyzeTx(const json& tx, const json& receipt, const std::string& walle
         if (swapPools.size() >= 2 && nonZeroBase == 1) {
             r.venue = "Arbitrage";
             r.diagnosticReason = "ARBITRAGE_BASE_CYCLE";
+            // Замер перед правкой правила: без него мы бы снова подкрутили
+            if (arbitrageProbeEnabled()) {
+                std::string legs;
+                for (const auto& t : tokenOrder) {
+                    if (netFlow[t] == 0) continue;
+                    legs += (legs.empty() ? "" : " ");
+                    legs += (isBaseAsset(t) ? "base:" : "tok:");
+                    legs += t.substr(0, 10);
+                    legs += (netFlow[t] > 0 ? "+" : "-");
+                }
+                std::cerr << "[ARB] wallet=" << wallet
+                          << " pools=" << swapPools.size()
+                          << " swapEvt=" << (hasSwap ? 1 : 0)
+                          << " legs=[" << legs << "]"
+                          << " to=" << txTo << std::endl;
+            }
         } else {
             r.diagnosticReason = "ONLY_BASE_ASSET_FLOW";
         }
