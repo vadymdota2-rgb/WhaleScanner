@@ -61,6 +61,9 @@ ChainContext makeBscContext() {
         {"0x7dae51bd3e3376b8c7c4900e9107f12be3af1ba8", "MDEX"},
         {"0x114f84658c99aa6ea62e3160a87a16deaf7efe83", "WOOFi"},
         {"0xcef5be73ae943b77f9bc08859367d923c030a269", "WOOFi"},
+        {"0x07964f135f276412b3182a3b2407b8dd45000000", "Transit Swap"},
+        {"0x6aba0315493b7e6989041c91181337b662fb1b90", "Binance Alpha"},
+        {"0x88649f4743a758171077b98ee2003f1989b1615a", "Binance Wallet"},
     };
     c.bridges = {
         "0x4a364f8c717caad9a442737eb7b8a55cc6cf18d8",
