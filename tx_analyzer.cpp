@@ -434,6 +434,20 @@ std::string lookupRouterLabel(const std::string& addr) {
     return it != g_chain.routers.end() ? it->second : std::string();
 }
 
+// Только для подписи в диагностике. В таблицу роутеров эти адреса класть
+// нельзя: оттуда берётся признак «своп через известный роутер», а у
+// абстрактных аккаунтов встречный поток - это внутренние вызовы, не сделка
+// человека. Иначе разбор нарисовал бы покупку с чужим направлением.
+std::string lookupInfraLabel(const std::string& addr) {
+    static const std::map<std::string, std::string> kInfra = {
+        {"0x5ff137d4b0fdcd49dca30c7cf57e578a026d2789", "ERC-4337 EntryPoint v0.6"},
+        {"0x0000000071727de22e5e9d8baf0edac6f37da032", "ERC-4337 EntryPoint v0.7"},
+        {"0x4337084d9e255ff0702461cf8895ce9e3b5ff108", "ERC-4337 EntryPoint v0.8"},
+    };
+    auto it = kInfra.find(toLower(addr));
+    return it != kInfra.end() ? it->second : std::string();
+}
+
 namespace {
 
 const std::set<std::string> SWAP_EVENT_TOPICS = {
