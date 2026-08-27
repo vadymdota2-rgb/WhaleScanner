@@ -256,8 +256,6 @@ std::vector<std::string> splitUrls(const std::string& s) {
     return out;
 }
 
-}
-
 void startWsHeads(const std::vector<std::string>& wssUrls) {
     std::vector<std::string> cleaned;
     for (const auto& u : wssUrls) {
@@ -293,6 +291,8 @@ void stopWsHeads() {
     g_wsStop.store(true, std::memory_order_relaxed);
     if (g_wsThread.joinable()) g_wsThread.join();
     g_wsOk.store(false, std::memory_order_relaxed);
+}
+
 }
 
 bool wsHeadsOk() {
