@@ -11,7 +11,7 @@ void setPriceStatHandler(std::function<void(int)> h);
 enum class PriceSource : int {
     None = 0,
     Cache = 1,
-    Pool = 2,        // V2/V3 on-chain (в т.ч. TWAP-сглаживание)
+    Pool = 2,        // V2/V3 on-chain, цена из резервов
     DexScreener = 3,
     CoinGecko = 4  // unused, kept for stats enum stability
 };
