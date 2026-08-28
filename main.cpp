@@ -719,10 +719,10 @@ UIMessage buildMainMenu(const std::string& chatId) {
         {{"text", tr(lang, "menu_account") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:account"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
+        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
+        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
