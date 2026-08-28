@@ -58,12 +58,14 @@ constexpr long long MAX_SPOT_USD_NANOS = 10000000000000000LL;
 long long windowSeconds(const std::string& w) {
     if (w == "1h") return 3600LL;
     if (w == "7d") return 7LL * 86400LL;
+    if (w == "30d") return 30LL * 86400LL;
     return 86400LL;
 }
 
 const char* windowKey(const std::string& w) {
     if (w == "1h") return "big_win_1h";
     if (w == "7d") return "big_win_7d";
+    if (w == "30d") return "big_win_30d";
     return "big_win_24h";
 }
 
@@ -165,6 +167,68 @@ std::vector<BigRow> liqRows(long long sinceSec, int limit) {
         r.accountValueNanos  = sqlite3_column_int64(s, 9);
         r.dirCode            = sqlite3_column_int(s, 10);
         r.isBuy              = hlSideUp(r.dirCode);
+        out.push_back(std::move(r));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+struct FlowRow {
+    std::string token;
+    long long boughtNanos = 0;
+    long long soldNanos = 0;
+    int buys = 0;
+    int sells = 0;
+    int wallets = 0;
+};
+
+std::mutex g_listCacheMutex;
+
+template <typename T>
+struct ListCache {
+    std::map<std::string, std::pair<time_t, std::vector<T>>> byWindow;
+};
+
+ListCache<FlowRow> g_flowCache;
+ListCache<BigRow>  g_spotCache;
+
+long long cacheTtlFor(const std::string& w) {
+    if (w == "1h")  return 60;
+    if (w == "24h") return 300;
+    if (w == "7d")  return 900;
+    return 1800;                     // 30d
+}
+
+std::vector<FlowRow> flowRows(long long sinceSec, int limit) {
+    std::vector<FlowRow> out;
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (!db) return out;
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s,
+        "SELECT t.token, "
+        "  SUM(CASE WHEN t.is_buy=1 THEN t.usd_nanos ELSE 0 END), "
+        "  SUM(CASE WHEN t.is_buy=0 THEN t.usd_nanos ELSE 0 END), "
+        "  SUM(CASE WHEN t.is_buy=1 THEN 1 ELSE 0 END), "
+        "  SUM(CASE WHEN t.is_buy=0 THEN 1 ELSE 0 END), "
+        "  COUNT(DISTINCT t.wallet) "
+        "FROM trades t "
+        "WHERE t.timestamp >= ? AND t.usd_nanos > 0 AND t.usd_nanos <= ? "
+        "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw "
+        "                WHERE iw.wallet = t.wallet AND iw.permanent = 1) "
+        "GROUP BY t.token "
+        "ORDER BY ABS(SUM(CASE WHEN t.is_buy=1 THEN t.usd_nanos ELSE -t.usd_nanos END)) DESC "
+        "LIMIT ?")) return out;
+    sqlite3_bind_int64(s, 1, sinceSec);
+    sqlite3_bind_int64(s, 2, MAX_SPOT_USD_NANOS);
+    sqlite3_bind_int(s, 3, limit);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        FlowRow r;
+        r.token        = safeColumnText(s, 0);
+        r.boughtNanos  = sqlite3_column_int64(s, 1);
+        r.soldNanos    = sqlite3_column_int64(s, 2);
+        r.buys         = sqlite3_column_int(s, 3);
+        r.sells        = sqlite3_column_int(s, 4);
+        r.wallets      = sqlite3_column_int(s, 5);
         out.push_back(std::move(r));
     }
     sqlite3_finalize(s);
@@ -408,18 +472,21 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
     json kb;
     kb["inline_keyboard"] = json::array();
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "big_btn_spot")}, {"callback_data", "bg_open:spot:24h"}}
+        {{"text", tr(lang, "flow_btn")}, {"callback_data", "bg_open:flow:24h"}}
     }));
     kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "big_btn_liq")}, {"callback_data", "bg_open:liq:24h"}}
+        {{"text", tr(lang, "big_btn_spot")}, {"callback_data", "bg_open:spot:24h"}}
     }));
-    {
+{
         std::string perpBtn = tr(lang, "big_btn_perp");
         if (!isPremium(chatId)) perpBtn += " \U0001F512";
         kb["inline_keyboard"].push_back(json::array({
             {{"text", perpBtn}, {"callback_data", "bg_open:perp:24h"}}
         }));
     }
+        kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "big_btn_liq")}, {"callback_data", "bg_open:liq:24h"}}
+    }));
     {
         std::string fundBtn = tr(lang, "fund_btn");
         if (!isPremium(chatId)) fundBtn += " \U0001F512";
@@ -428,6 +495,95 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
         }));
     }
     kb["inline_keyboard"].push_back(backRow(lang, "menu:main"));
+    return {t.str(), kb.dump()};
+}
+
+constexpr int FLOW_MAX_ROWS = 100;
+constexpr int FLOW_PER_PAGE = 10;
+
+BigTradesMessage buildFlowList(const std::string& chatId, const std::string& window, int page) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
+
+    std::ostringstream t;
+    json kb;
+    kb["inline_keyboard"] = json::array();
+
+    t << "\U0001F525 <b>" << tr(lang, "flow_title") << "</b> \u00B7 "
+      << tr(lang, windowKey(window)) << "\n"
+      << "<i>" << tr(lang, "flow_hint") << "</i>\n\n";
+
+    std::vector<FlowRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        auto it = g_flowCache.byWindow.find(window);
+        if (it != g_flowCache.byWindow.end() &&
+            time(nullptr) - it->second.first < cacheTtlFor(window))
+            rows = it->second.second;
+    }
+    if (rows.empty()) {
+        rows = flowRows(since, FLOW_MAX_ROWS * 3);
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        g_flowCache.byWindow[window] = {time(nullptr), rows};
+    }
+    std::vector<FlowRow> named;
+    named.reserve(rows.size());
+    for (auto& r : rows)
+        if (hasKnownSymbol(r.token)) named.push_back(std::move(r));
+    if (named.size() > static_cast<size_t>(FLOW_MAX_ROWS))
+        named.resize(static_cast<size_t>(FLOW_MAX_ROWS));
+
+    const int total = static_cast<int>(named.size());
+    const int pages = std::max(1, (total + FLOW_PER_PAGE - 1) / FLOW_PER_PAGE);
+    if (page < 1) page = 1;
+    if (page > pages) page = pages;
+    const int from = (page - 1) * FLOW_PER_PAGE;
+    const int to   = std::min(from + FLOW_PER_PAGE, total);
+
+    if (named.empty()) {
+        t << tr(lang, "flow_empty");
+    } else {
+        int n = from;
+        for (int i = from; i < to; i++) {
+            const FlowRow& r = named[static_cast<size_t>(i)];
+            const long long net = r.boughtNanos - r.soldNanos;
+            const bool inflow = net >= 0;
+            t << "<b>" << (++n) << ".</b> " << (inflow ? "\U0001F7E2" : "\U0001F534")
+              << " <b>" << spotAssetLabel(r.token) << "</b>  <code>"
+              << (inflow ? "+" : "\u2212") << formatUsd(cpp_int(net < 0 ? -net : net))
+              << "</code>\n"
+              << "   <i>" << tr(lang, "flow_bought") << " "
+              << compactUsd(static_cast<double>(r.boughtNanos) / 1e9)
+              << " \u00B7 " << tr(lang, "flow_sold") << " "
+              << compactUsd(static_cast<double>(r.soldNanos) / 1e9) << "</i>\n"
+              << "   <i>" << r.buys << " " << tr(lang, "flow_buys") << " / "
+              << r.sells << " " << tr(lang, "flow_sells") << " \u00B7 "
+              << r.wallets << " " << tr(lang, "flow_wallets") << "</i>\n\n";
+        }
+    }
+
+    if (pages > 1) {
+        json nav = json::array();
+        if (page > 1)
+            nav.push_back({{"text", "\u2B05\uFE0F"},
+                           {"callback_data", "bg_page:flow:" + window + ":" + std::to_string(page - 1)}});
+        nav.push_back({{"text", std::to_string(page) + "/" + std::to_string(pages)},
+                       {"callback_data", "bg_noop"}});
+        if (page < pages)
+            nav.push_back({{"text", "\u27A1\uFE0F"},
+                           {"callback_data", "bg_page:flow:" + window + ":" + std::to_string(page + 1)}});
+        kb["inline_keyboard"].push_back(nav);
+    }
+
+    json winRow = json::array();
+    for (const char* w : {"1h", "24h", "7d", "30d"}) {
+        const bool cur = (window == w);
+        winRow.push_back({{"text", std::string(cur ? "\u2705 " : "") + tr(lang, windowKey(w))},
+                          {"callback_data", std::string("bg_open:flow:") + w}});
+    }
+    kb["inline_keyboard"].push_back(winRow);
+
+    kb["inline_keyboard"].push_back(backRow(lang, "menu:big"));
     return {t.str(), kb.dump()};
 }
 
@@ -530,9 +686,22 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
 
     const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
     const int fetchRows = perp ? maxRows : maxRows * 3;
-    std::vector<BigRow> rows = liq  ? liqRows(since, fetchRows)
-                             : perp ? perpRows(since, fetchRows)
-                                    : spotRows(since, fetchRows);
+    const std::string cacheKey = venue + ":" + window;
+    std::vector<BigRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        auto it = g_spotCache.byWindow.find(cacheKey);
+        if (it != g_spotCache.byWindow.end() &&
+            time(nullptr) - it->second.first < cacheTtlFor(window))
+            rows = it->second.second;
+    }
+    if (rows.empty()) {
+        rows = liq  ? liqRows(since, fetchRows)
+             : perp ? perpRows(since, fetchRows)
+                    : spotRows(since, fetchRows);
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        g_spotCache.byWindow[cacheKey] = {time(nullptr), rows};
+    }
 
     if (!perp) {
         std::vector<BigRow> named;
@@ -688,7 +857,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     }
 
     json wins = json::array();
-    for (const char* w : {"1h", "24h", "7d"}) {
+    for (const char* w : {"1h", "24h", "7d", "30d"}) {
         const bool cur = window == w;
         wins.push_back({{"text", std::string(cur ? "\u2705 " : "") + tr(lang, windowKey(w))},
                         {"callback_data", cur ? "bg_noop" : "bg_open:" + venue + ":" + w}});
@@ -704,6 +873,10 @@ bool renderBigTradesView(const std::string& chatId, const std::string& action,
         const size_t sep = param.find(':');
         if (sep == std::string::npos) return false;
         if (param.substr(0, sep) == "fund") { out = buildFundingList(chatId); return true; }
+        if (param.substr(0, sep) == "flow") {
+            out = buildFlowList(chatId, param.substr(sep + 1), 1);
+            return true;
+        }
         out = buildBigList(chatId, param.substr(0, sep), param.substr(sep + 1), 1);
         return true;
     }
@@ -714,7 +887,10 @@ bool renderBigTradesView(const std::string& chatId, const std::string& action,
         if (b == std::string::npos) return false;
         int page = 1;
         try { page = std::stoi(param.substr(b + 1)); } catch (...) {}
-        out = buildBigList(chatId, param.substr(0, a), param.substr(a + 1, b - a - 1), page);
+        const std::string venue = param.substr(0, a);
+        const std::string window = param.substr(a + 1, b - a - 1);
+        if (venue == "flow") out = buildFlowList(chatId, window, page);
+        else                 out = buildBigList(chatId, venue, window, page);
         return true;
     }
     return false;
