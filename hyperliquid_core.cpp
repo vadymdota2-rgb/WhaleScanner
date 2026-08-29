@@ -62,10 +62,12 @@ constexpr int HL_RECONNECT_MAX_SEC = 60;
 constexpr int HL_BUDGET_PER_MINUTE = 1150;
 constexpr int HL_WEIGHT_USER_FILLS = 20;
 constexpr int HL_WEIGHT_META = 20;
+constexpr int HL_WEIGHT_LEDGER = 20;
+constexpr int HL_FILL_PAGES_MAX = 8;
 
 constexpr long long HL_ENRICH_DEBOUNCE_SEC = 60;
 
-constexpr long long HL_SEED_LOOKBACK_MS = 3600LL * 1000LL;
+constexpr long long HL_SEED_LOOKBACK_MS = 30LL * 86400LL * 1000LL;
 
 constexpr int HL_HYPERACTIVE_FILLS = 200;
 constexpr long long HL_HYPERACTIVE_DEBOUNCE_SEC = 600;
@@ -191,6 +193,7 @@ bool perpCoinsLoaded() {
 }
 
 bool isPerpCoin(const std::string& coin) {
+    if (coin.find(':') != std::string::npos) return true; // HIP-3: xyz:TSLA
     std::lock_guard<std::mutex> l(g_coinsMutex);
     if (g_perpCoins.empty()) return true;
     return g_perpCoins.count(coin) > 0;
@@ -335,24 +338,49 @@ void interruptibleSleep(int seconds) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
-bool fetchPerpCoins(std::vector<std::string>& subscribe, std::vector<std::string>& all) {
-    subscribe.clear();
-    all.clear();
+bool fetchDexUniverse(const std::string& dex, std::vector<std::string>& subscribe,
+                      std::vector<std::string>& all) {
     json body;
     body["type"] = "meta";
-    body["dex"] = "";
+    body["dex"] = dex;
     json j = infoPost(body, HL_WEIGHT_META);
-    if (!j.is_object() || !j.contains("universe") || !j["universe"].is_array()) {
-        std::cerr << "[HL] meta: неожиданный ответ" << std::endl;
+    if (!j.is_object() || !j.contains("universe") || !j["universe"].is_array())
         return false;
-    }
     for (const auto& u : j["universe"]) {
         if (!u.is_object() || !u.contains("name") || !u["name"].is_string()) continue;
         std::string name = u["name"].get<std::string>();
         if (name.empty()) continue;
-        all.push_back(name);
-        if (!u.value("isDelisted", false)) subscribe.push_back(name);
+        std::string coin = name;
+        if (!dex.empty() && name.find(':') == std::string::npos)
+            coin = dex + ":" + name;
+        all.push_back(coin);
+        if (!u.value("isDelisted", false)) subscribe.push_back(coin);
     }
+    return true;
+}
+
+bool fetchPerpCoins(std::vector<std::string>& subscribe, std::vector<std::string>& all) {
+    subscribe.clear();
+    all.clear();
+    if (!fetchDexUniverse("", subscribe, all) || all.empty()) {
+        std::cerr << "[HL] meta: неожиданный ответ" << std::endl;
+        return false;
+    }
+    json dexs = infoPost(json{{"type", "perpDexs"}}, HL_WEIGHT_META);
+    if (!dexs.is_array()) return true;
+    int extra = 0;
+    for (const auto& d : dexs) {
+        std::string name;
+        if (d.is_null()) continue;
+        if (d.is_string()) name = d.get<std::string>();
+        else if (d.is_object()) name = d.value("name", "");
+        if (name.empty()) continue;
+        const size_t before = all.size();
+        if (!fetchDexUniverse(name, subscribe, all)) continue;
+        extra += static_cast<int>(all.size() - before);
+    }
+    if (extra > 0)
+        std::cout << "[HL] HIP-3 рынков: " << extra << ", всего: " << all.size() << std::endl;
     return !all.empty();
 }
 
@@ -461,6 +489,7 @@ PositionInfo lastKnownPosition(const std::string& wallet, const std::string& coi
 
 struct WalletState {
     bool seeded = false;
+    bool backfilled30d = false;
     long long lastFillTs = 0;
     long long lastEnriched = 0;
     long long debounce = HL_ENRICH_DEBOUNCE_SEC;
@@ -471,7 +500,8 @@ bool loadWalletState(const std::string& wallet, WalletState& out) {
     if (!g_hlDb) return false;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
-            "SELECT seeded, last_fill_ts, last_enriched, debounce_sec FROM hl_wallet_state WHERE wallet=?"))
+            "SELECT seeded, last_fill_ts, last_enriched, debounce_sec, backfilled_30d "
+            "FROM hl_wallet_state WHERE wallet=?"))
         return false;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     bool found = false;
@@ -481,6 +511,7 @@ bool loadWalletState(const std::string& wallet, WalletState& out) {
         out.lastEnriched = sqlite3_column_int64(s, 2);
         out.debounce = sqlite3_column_int64(s, 3);
         if (out.debounce < HL_ENRICH_DEBOUNCE_SEC) out.debounce = HL_ENRICH_DEBOUNCE_SEC;
+        out.backfilled30d = sqlite3_column_int(s, 4) != 0;
         found = true;
     }
     sqlite3_finalize(s);
@@ -492,16 +523,18 @@ void saveWalletState(const std::string& wallet, const WalletState& st) {
     if (!g_hlDb) return;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
-            "INSERT INTO hl_wallet_state(wallet,seeded,last_fill_ts,last_enriched,debounce_sec) "
-            "VALUES(?,?,?,?,?) ON CONFLICT(wallet) DO UPDATE SET "
+            "INSERT INTO hl_wallet_state(wallet,seeded,last_fill_ts,last_enriched,debounce_sec,backfilled_30d) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(wallet) DO UPDATE SET "
             "seeded=excluded.seeded, last_fill_ts=excluded.last_fill_ts, "
-            "last_enriched=excluded.last_enriched, debounce_sec=excluded.debounce_sec"))
+            "last_enriched=excluded.last_enriched, debounce_sec=excluded.debounce_sec, "
+            "backfilled_30d=excluded.backfilled_30d"))
         return;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(s, 2, st.seeded ? 1 : 0);
     sqlite3_bind_int64(s, 3, st.lastFillTs);
     sqlite3_bind_int64(s, 4, st.lastEnriched);
     sqlite3_bind_int64(s, 5, st.debounce);
+    sqlite3_bind_int(s, 6, st.backfilled30d ? 1 : 0);
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
@@ -590,14 +623,138 @@ int countFillsInWindow(const std::string& wallet) {
     if (!g_hlDb) return 0;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
-            "SELECT COUNT(*) FROM hl_fills"
-            " WHERE wallet=? AND ts >= ? AND closed_pnl_nanos != 0")) return 0;
+            "SELECT COUNT(DISTINCT CASE WHEN oid > 0 THEN oid ELSE tid END) FROM hl_fills"
+            " WHERE wallet=? AND ts >= ? AND dir_code >= 3 AND closed_pnl_nanos != 0")) return 0;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 2, (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL);
     int n = 0;
     if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
     sqlite3_finalize(s);
     return n;
+}
+
+long long sumPnlInWindowLocked(const std::string& wallet, long long sinceMs) {
+    if (!g_hlDb) return 0;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s,
+            "SELECT SUM(closed_pnl_nanos) FROM hl_fills WHERE wallet=? AND ts>=?"))
+        return 0;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, sinceMs);
+    long long n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int64(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
+void stampRoiBaseLocked(const std::string& wallet, long long denom, long long sinceMs) {
+    if (!g_hlDb || denom <= 0) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s,
+            "UPDATE hl_fills SET account_value_nanos=? WHERE wallet=? AND ts>=?"))
+        return;
+    sqlite3_bind_int64(s, 1, denom);
+    sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 3, sinceMs);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
+json fetchFillsPage(const std::string& wallet, long long startMs) {
+    json body;
+    body["type"] = "userFillsByTime";
+    body["user"] = wallet;
+    body["startTime"] = startMs;
+    body["aggregateByTime"] = true;
+    return infoPost(body, HL_WEIGHT_USER_FILLS);
+}
+
+json fetchFillsRange(const std::string& wallet, long long startMs, long long& maxTs, bool& caughtUp) {
+    json all = json::array();
+    caughtUp = false;
+    long long cursor = startMs;
+    for (int page = 0; page < HL_FILL_PAGES_MAX; ++page) {
+        json fills = fetchFillsPage(wallet, cursor);
+        if (!fills.is_array()) {
+            if (page == 0) return json();
+            break;
+        }
+        if (fills.empty()) {
+            caughtUp = true;
+            break;
+        }
+        long long pageMax = cursor;
+        for (const auto& f : fills) {
+            all.push_back(f);
+            const long long ts = f.value("time", 0LL);
+            if (ts > pageMax) pageMax = ts;
+        }
+        if (pageMax > maxTs) maxTs = pageMax;
+        if (fills.size() < 2000) {
+            caughtUp = true;
+            break;
+        }
+        const long long next = pageMax + 1;
+        if (next <= cursor) break;
+        cursor = next;
+    }
+    return all;
+}
+
+struct LedgerNet {
+    long long netNanos = 0;
+    long long maxNetNanos = 0;
+    bool ok = false;
+};
+
+long long ledgerSignedNanos(const json& delta, const std::string& wallet) {
+    const std::string typ = jstr(delta, "type");
+    std::string usdc = jstr(delta, "usdc");
+    if (usdc.empty()) usdc = jstr(delta, "amount");
+    long long n = 0;
+    if (usdc.empty() || !parseDecimalToNanos(usdc, n)) return 0;
+    if (n < 0) n = -n;
+    if (typ == "deposit") return n;
+    if (typ == "withdraw") return -n;
+    if (typ == "vaultDeposit") return -n;
+    if (typ == "vaultWithdraw") return n;
+    if (typ == "internalTransfer" || typ == "subAccountTransfer") {
+        const std::string dest = toLower(jstr(delta, "destination"));
+        const std::string user = toLower(jstr(delta, "user"));
+        const std::string w = toLower(wallet);
+        if (dest == w) return n;
+        if (user == w) return -n;
+        return -n;
+    }
+    return 0;
+}
+
+LedgerNet fetchLedgerNet(const std::string& wallet, long long startMs) {
+    LedgerNet out;
+    json body;
+    body["type"] = "userNonFundingLedgerUpdates";
+    body["user"] = wallet;
+    body["startTime"] = startMs;
+    json j = infoPost(body, HL_WEIGHT_LEDGER);
+    if (!j.is_array()) return out;
+    out.ok = true;
+    std::vector<std::pair<long long, long long>> ev;
+    ev.reserve(j.size());
+    for (const auto& e : j) {
+        if (!e.is_object() || !e.contains("delta") || !e["delta"].is_object()) continue;
+        const long long signedN = ledgerSignedNanos(e["delta"], wallet);
+        if (signedN == 0) continue;
+        ev.push_back({e.value("time", 0LL), signedN});
+    }
+    std::sort(ev.begin(), ev.end());
+    long long cum = 0;
+    for (const auto& p : ev) {
+        cum += p.second;
+        if (cum > out.maxNetNanos) out.maxNetNanos = cum;
+    }
+    out.netNanos = cum;
+    if (out.maxNetNanos < 0) out.maxNetNanos = 0;
+    return out;
 }
 
 bool banWallet(const std::string& wallet, int trades) {
@@ -827,16 +984,23 @@ void enrichWallet(const std::string& wallet) {
         return;
     }
 
-    const long long startMs = (known && st.seeded)
-        ? st.lastFillTs + 1
-        : nowMs() - HL_SEED_LOOKBACK_MS;
+    const long long windowStartMs = (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL;
+    const long long nowMsVal = nowMs();
+    long long startMs;
+    if (!st.backfilled30d) {
+        const bool oldSeedTip = st.seeded && st.lastFillTs >= nowMsVal - 6LL * 3600 * 1000;
+        startMs = (st.lastFillTs > windowStartMs && !oldSeedTip)
+            ? st.lastFillTs + 1
+            : windowStartMs;
+    } else if (known && st.seeded) {
+        startMs = st.lastFillTs + 1;
+    } else {
+        startMs = windowStartMs;
+    }
 
-    json body;
-    body["type"] = "userFillsByTime";
-    body["user"] = wallet;
-    body["startTime"] = startMs;
-    body["aggregateByTime"] = true;
-    json fills = infoPost(body, HL_WEIGHT_USER_FILLS);
+    bool caughtUp = false;
+    long long pageMaxTs = st.lastFillTs;
+    json fills = fetchFillsRange(wallet, startMs, pageMaxTs, caughtUp);
     if (!fills.is_array()) {
         queueWallet(wallet);
         return;
@@ -845,6 +1009,7 @@ void enrichWallet(const std::string& wallet) {
     g_enriched.fetch_add(1, std::memory_order_relaxed);
 
     const bool wasSeeded = known && st.seeded;
+    const bool liveAlerts = st.backfilled30d;
     const long long stateAt = nowSec();
     if (!fills.empty()) fetchAccountState(wallet);
 
@@ -858,7 +1023,7 @@ void enrichWallet(const std::string& wallet) {
     std::vector<Prepared> prepared;
     prepared.reserve(fills.size());
     size_t skippedNonPerp = 0;
-    long long maxTs = st.lastFillTs;
+    long long maxTs = std::max(st.lastFillTs, pageMaxTs);
 
     for (const auto& f : fills) {
         if (!f.is_object()) continue;
@@ -906,7 +1071,22 @@ void enrichWallet(const std::string& wallet) {
         }
     }
 
-    if (wasSeeded && !freshRows.empty()) {
+    if (!fills.empty()) {
+        const LedgerNet led = fetchLedgerNet(wallet, windowStartMs);
+        const long long endAv = lastKnownAccountValue(wallet);
+        if (led.ok && endAv > 0) {
+            std::lock_guard<std::mutex> l(g_hlDbMutex);
+            const long long pnl30 = sumPnlInWindowLocked(wallet, windowStartMs);
+            long long startAv = endAv - pnl30 - led.netNanos;
+            if (startAv < 0) startAv = 0;
+            long long denom = startAv + led.maxNetNanos;
+            const long long floorDenom = 100 * NANOS_PER_UNIT;
+            if (denom < floorDenom) denom = floorDenom;
+            stampRoiBaseLocked(wallet, denom, windowStartMs);
+        }
+    }
+
+    if (liveAlerts && !freshRows.empty()) {
         std::map<std::string, HlAlertData> series;
         for (size_t i : freshRows) {
             const Prepared& p = prepared[i];
@@ -950,7 +1130,7 @@ void enrichWallet(const std::string& wallet) {
                   << " сделок записано молча" << std::endl;
     }
 
-    if (fills.size() >= static_cast<size_t>(HL_HYPERACTIVE_FILLS)) {
+    if (liveAlerts && fills.size() >= static_cast<size_t>(HL_HYPERACTIVE_FILLS)) {
         if (st.debounce < HL_HYPERACTIVE_DEBOUNCE_SEC) {
             st.debounce = HL_HYPERACTIVE_DEBOUNCE_SEC;
             std::cout << "[HL] " << wallet << " торгует слишком часто, опрос раз в "
@@ -959,6 +1139,10 @@ void enrichWallet(const std::string& wallet) {
     }
     if (maxTs < startMs) maxTs = startMs - 1;
     st.seeded = true;
+    if (!st.backfilled30d && caughtUp) {
+        st.backfilled30d = true;
+        std::cout << "[HL] 30д догрузка закрыта: " << wallet << std::endl;
+    }
     st.lastFillTs = maxTs;
     st.lastEnriched = now;
     saveWalletState(wallet, st);
@@ -1275,7 +1459,8 @@ bool initHyperliquid() {
         "  seeded INTEGER NOT NULL DEFAULT 0,"
         "  last_fill_ts INTEGER NOT NULL DEFAULT 0,"
         "  last_enriched INTEGER NOT NULL DEFAULT 0,"
-        "  debounce_sec INTEGER NOT NULL DEFAULT 30);"
+        "  debounce_sec INTEGER NOT NULL DEFAULT 30,"
+        "  backfilled_30d INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE IF NOT EXISTS hl_banned ("
         "  wallet TEXT PRIMARY KEY,"
         "  banned_at INTEGER NOT NULL DEFAULT 0,"
@@ -1297,12 +1482,33 @@ bool initHyperliquid() {
         "ALTER TABLE hl_fills ADD COLUMN leverage INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN account_value_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_wallet_state ADD COLUMN backfilled_30d INTEGER NOT NULL DEFAULT 0",
     };
     for (const char* sql : migrations) {
         char* mErr = nullptr;
         if (sqlite3_exec(g_hlDb, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[HL] база обновлена: " << sql << std::endl;
         if (mErr) sqlite3_free(mErr);
+    }
+
+    {
+        sqlite3_exec(g_hlDb,
+            "CREATE TABLE IF NOT EXISTS hl_kv(k TEXT PRIMARY KEY, v INTEGER NOT NULL);"
+            "INSERT OR IGNORE INTO hl_kv(k,v) VALUES('hip3_refetch',0);",
+            nullptr, nullptr, nullptr);
+        sqlite3_stmt* s = nullptr;
+        int flag = 1;
+        if (prepareOrLog(g_hlDb, &s, "SELECT v FROM hl_kv WHERE k='hip3_refetch'")) {
+            if (sqlite3_step(s) == SQLITE_ROW) flag = sqlite3_column_int(s, 0);
+            sqlite3_finalize(s);
+        }
+        if (flag == 0) {
+            sqlite3_exec(g_hlDb,
+                "UPDATE hl_wallet_state SET backfilled_30d=0;"
+                "UPDATE hl_kv SET v=1 WHERE k='hip3_refetch';",
+                nullptr, nullptr, nullptr);
+            std::cout << "[HL] повторная 30д догрузка: акции HIP-3 раньше отсекались" << std::endl;
+        }
     }
 
     {
