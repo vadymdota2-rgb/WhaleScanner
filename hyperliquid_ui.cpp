@@ -114,14 +114,17 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
             " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos > 0 "
             " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
             " SUM(f.notional_nanos),"
-            " AVG(CASE WHEN f.leverage > 0 THEN f.leverage END),"
+            " AVG(CASE WHEN " + tradePred + " AND f.leverage > 0 THEN f.leverage END),"
             " MAX(f.ts),"
             " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos < 0 "
             " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " SUM(CASE WHEN " + tradePred + " THEN "
+            " SUM(CASE WHEN f.closed_pnl_nanos != 0 THEN "
             "   CASE WHEN f.margin_nanos > 0 THEN f.margin_nanos "
             "        WHEN f.leverage > 0 THEN f.notional_nanos / f.leverage "
-            "        ELSE 0 END ELSE 0 END)"
+            "        ELSE 0 END ELSE 0 END),"
+            " SUM(CASE WHEN f.closed_pnl_nanos != 0 "
+            "      AND (f.margin_nanos > 0 OR f.leverage > 0) "
+            "     THEN f.closed_pnl_nanos ELSE 0 END)"
             " FROM hl_fills f"
             " WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
@@ -152,8 +155,9 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.winRateKnown = decided > 0;
         r.winRatePercent = decided > 0 ? static_cast<int>((100LL * wins) / decided) : 0;
 
+        const long long roiPnl = sqlite3_column_int64(s, 9);
         if (margin > 0) {
-            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(margin);
+            r.roiPercent = 100.0 * static_cast<double>(roiPnl) / static_cast<double>(margin);
             r.roiKnown = true;
         }
         rows.push_back(r);
@@ -333,7 +337,7 @@ std::string hyperliquidStatsLine() {
     std::stringstream ss;
     const long long last = g_lastMsgTs.load(std::memory_order_relaxed);
     size_t queued;
-    { std::lock_guard<std::mutex> l(g_queueMutex); queued = g_enrichQueue.size(); }
+    { std::lock_guard<std::mutex> l(g_queueMutex); queued = g_enrichQueue.size() + g_urgentQueue.size(); }
 
     long long bannedTotal = 0;
     {
