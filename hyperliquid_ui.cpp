@@ -72,6 +72,7 @@ struct PerpRow {
     int closedTrades = 0;
     double avgLeverage = 0.0;
     bool roiKnown = false;
+    bool winRateKnown = false;
     long long volumeNanos = 0;
     long long lastTs = 0;
 };
@@ -97,12 +98,17 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
             " SUM(notional_nanos),"
             " AVG(CASE WHEN leverage > 0 THEN leverage END),"
             " AVG(CASE WHEN account_value_nanos > 0 THEN account_value_nanos END),"
-            " MAX(ts)"
+            " MAX(ts),"
+            " SUM(CASE WHEN closed_pnl_nanos < 0 THEN 1 ELSE 0 END),"
+            " (SELECT f2.account_value_nanos FROM hl_fills f2"
+            "   WHERE f2.wallet = f.wallet AND f2.ts >= ? AND f2.account_value_nanos > 0"
+            "   ORDER BY f2.ts ASC LIMIT 1)"
             " FROM hl_fills f WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
             " GROUP BY wallet"))
         return rows;
     sqlite3_bind_int64(s, 1, sinceMs);
+    sqlite3_bind_int64(s, 2, sinceMs);
 
     int stepRc;
     while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
@@ -115,14 +121,25 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.avgLeverage = sqlite3_column_double(s, 5);
         const double avgAccount = sqlite3_column_double(s, 6);
         r.lastTs = sqlite3_column_int64(s, 7);
+        const int losses = sqlite3_column_int(s, 8);
+        const double startAccount = static_cast<double>(sqlite3_column_int64(s, 9));
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
         const long long maxForWindow = std::max(1LL,
             (HL_MAX_CLOSED_TRADES_30D * windowSec + (30LL * 86400LL - 1)) / (30LL * 86400LL));
         if (r.closedTrades > maxForWindow) continue;
-        r.winRatePercent = static_cast<int>((100LL * wins) / r.closedTrades);
-        if (avgAccount > 0.0) {
-            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / avgAccount;
+        // Долю удачных показываем, только если в окне есть и убыточные
+        // закрытия. Иначе поток пришёл обрезанным, и сто процентов -
+        // не результат трейдера, а дыра в данных.
+        r.winRateKnown = (wins + losses) == r.closedTrades && losses > 0;
+        r.winRatePercent = r.winRateKnown
+            ? static_cast<int>((100LL * wins) / r.closedTrades) : 0;
+
+        // Доходность от счёта НА НАЧАЛО окна, как считает биржа. Среднее
+        // за период занижало её при росте счёта и завышало при выводе.
+        const double base = startAccount > 0.0 ? startAccount : avgAccount;
+        if (base > 0.0) {
+            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / base;
             r.roiKnown = true;
         }
         rows.push_back(r);
@@ -181,6 +198,7 @@ void sortByKind(std::vector<PerpRow>& rows, PerpKind kind) {
             break;
         case PerpKind::WINRATE:
             std::sort(rows.begin(), rows.end(), [](const PerpRow& a, const PerpRow& b) {
+                if (a.winRateKnown != b.winRateKnown) return a.winRateKnown;
                 if (a.winRatePercent != b.winRatePercent) return a.winRatePercent > b.winRatePercent;
                 return a.closedTrades > b.closedTrades;
             });
@@ -240,7 +258,8 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int
             text << dm << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
             if (r.roiKnown)
                 text << dm << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
-            text << dm << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
+            if (r.winRateKnown)
+                text << dm << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << dm << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
             if (r.avgLeverage > 0.0) {
                 text << dm << "\u2699\uFE0F <b>" << tr(lang, "hl_rk_leverage") << ":</b> "
@@ -378,6 +397,7 @@ std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree() {
         info.roiPercent = rows[i].roiPercent;
         info.roiKnown = rows[i].roiKnown;
         info.winRatePercent = rows[i].winRatePercent;
+        info.winRateKnown = rows[i].winRateKnown;
         info.closedTrades = rows[i].closedTrades;
         out.emplace_back(rows[i].wallet, info);
     }
@@ -402,6 +422,7 @@ bool perpRankOf(const std::string& wallet, PerpRankInfo& out) {
         out.roiPercent = rows[i].roiPercent;
         out.roiKnown = rows[i].roiKnown;
         out.winRatePercent = rows[i].winRatePercent;
+        out.winRateKnown = rows[i].winRateKnown;
         out.closedTrades = rows[i].closedTrades;
         return true;
     }
@@ -444,13 +465,20 @@ void rebuildRankCache() {
         markRankPresence("perp", top);
 }
 
-void invalidateRankCache() {
-    std::lock_guard<std::mutex> l(g_rankMutex);
-    for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
-        g_rankBuiltAt[i] = 0;
-        g_rankCache[i].clear();
-    }
 }
+
+// Сброс кэша рейтинга: следующий проход пересчитает всё заново.
+// Нужен после правки формулы или чистки списка - иначе люди увидят
+// старые цифры до конца обычного срока обновления.
+void invalidateRankCache() {
+    {
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        for (int i = 0; i < HL_RANK_WINDOWS_COUNT; i++) {
+            g_rankBuiltAt[i] = 0;
+            g_rankCache[i].clear();
+        }
+    }
+    std::cout << "[HL] рейтинг сброшен, пересчёт при следующем проходе" << std::endl;
 }
 
 HlMessage buildVenueMenu(const std::string& chatId) {
