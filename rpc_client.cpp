@@ -109,13 +109,14 @@ size_t usableEndpointFrom(size_t idx) {
     return idx % n;
 }
 
-enum class RpcRole { Logs = 0, Fill = 1, WsHttp = 2 };
-constexpr int kRoleCount = 3;
+enum class RpcRole { Logs = 0, Fill = 1, Price = 2, WsHttp = 3 };
+constexpr int kRoleCount = 4;
 
 const char* roleName(RpcRole r) {
     switch (r) {
         case RpcRole::Logs:   return "logs";
         case RpcRole::Fill:   return "fill";
+        case RpcRole::Price:  return "price";
         case RpcRole::WsHttp: return "ws-http";
     }
     return "?";
@@ -127,11 +128,13 @@ RpcRole roleForMethod(const std::string& m) {
         return RpcRole::Logs;
     if (m == "eth_blockNumber")
         return RpcRole::WsHttp;
+    if (m == "eth_call" || m == "eth_getBalance" || m == "eth_getCode")
+        return RpcRole::Price;
     return RpcRole::Fill;
 }
 
 std::mutex g_roleMutex;
-size_t g_holder[kRoleCount] = {0, 0, 0};
+size_t g_holder[kRoleCount] = {0, 0, 0, 0};
 size_t g_base = 0;
 time_t g_lastRotate = 0;
 
@@ -159,8 +162,9 @@ size_t pickEndpoint(size_t start, const std::vector<char>& used, bool allowShare
 void logHolders() {
     std::cerr << "[ROLE] logs=" << epLabel(g_holder[0])
               << "  fill=" << epLabel(g_holder[1])
-              << "  ws-http=" << epLabel(g_holder[2])
-              << " (idle until WS falls back to rpc)" << std::endl;
+              << "  price=" << epLabel(g_holder[2])
+              << "  ws-http=" << epLabel(g_holder[3])
+              << std::endl;
 }
 
 void assignRolesLocked() {
@@ -169,7 +173,7 @@ void assignRolesLocked() {
     std::vector<char> used(n, 0);
     for (int r = 0; r < kRoleCount; ++r) {
         size_t start = (g_base + static_cast<size_t>(r)) % n;
-        g_holder[r] = pickEndpoint(start, used, /*allowShare=*/n < 3);
+        g_holder[r] = pickEndpoint(start, used, /*allowShare=*/n < 4);
         if (g_holder[r] < n) used[g_holder[r]] = 1;
     }
     rpcIndex.store(g_holder[static_cast<int>(RpcRole::Fill)], std::memory_order_relaxed);
