@@ -1435,7 +1435,7 @@ bool initHyperliquid() {
         if (bErr) sqlite3_free(bErr);
     }
     sqlite3_exec(g_hlDb,
-        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 5 AND flat=0",
+        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 3 AND dir_code <= 8 AND flat=0",
         nullptr, nullptr, nullptr);
 
     sqlite3_stmt* probe = nullptr;
