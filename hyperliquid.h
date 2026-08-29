@@ -28,6 +28,7 @@ struct PerpRankInfo {
     double roiPercent = 0.0;
     bool roiKnown = false;
     int winRatePercent = 0;
+    bool winRateKnown = false;
     int closedTrades = 0;
 };
 
@@ -36,6 +37,7 @@ std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree();
 
 bool initHyperliquid();
 
+void invalidateRankCache();
 void startHyperliquidLoop();
 
 void stopHyperliquid();
