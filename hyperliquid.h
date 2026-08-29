@@ -1,8 +1,9 @@
 #pragma once
 
-#include <string>
-#include <vector>
 #include <cstdint>
+#include <string>
+#include <utility>
+#include <vector>
 
 std::vector<std::string> hlWatchedAddresses();
 
