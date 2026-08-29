@@ -615,6 +615,8 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
     return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang, windowDays);
 }
 
+}
+
 void rebuildAllRankings() {
     auto t0 = std::chrono::steady_clock::now();
     const long long now = static_cast<long long>(time(nullptr));
@@ -716,7 +718,6 @@ void rebuildAllRankings() {
     std::cout << "[RANKING] Cache rebuilt: " << entries.size() << " entrie(s), " << ms << "ms" << std::endl;
 }
 
-}
 
 std::string formatHoldTime(long long seconds, Lang lang) {
     if (seconds <= 0) return "—";
