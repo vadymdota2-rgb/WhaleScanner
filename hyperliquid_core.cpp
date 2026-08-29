@@ -1435,8 +1435,22 @@ bool initHyperliquid() {
         if (bErr) sqlite3_free(bErr);
     }
     sqlite3_exec(g_hlDb,
-        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 3 AND dir_code <= 8 AND flat=0",
+        "UPDATE hl_fills SET flat=1 WHERE flat=0 AND ("
+        " dir_code BETWEEN 3 AND 8"
+        " OR dir LIKE '%Close%'"
+        " OR dir LIKE '%Liquidat%'"
+        " OR dir LIKE '%ADL%'"
+        " OR dir LIKE '% > %')",
         nullptr, nullptr, nullptr);
+    {
+        sqlite3_stmt* c = nullptr;
+        int nflat = 0;
+        if (prepareOrLog(g_hlDb, &c, "SELECT COUNT(*) FROM hl_fills WHERE flat=1")) {
+            if (sqlite3_step(c) == SQLITE_ROW) nflat = sqlite3_column_int(c, 0);
+            sqlite3_finalize(c);
+        }
+        std::cout << "[HL] сделок-кругов в базе (flat): " << nflat << std::endl;
+    }
 
     sqlite3_stmt* probe = nullptr;
     if (sqlite3_prepare_v2(g_hlDb,
@@ -1457,6 +1471,7 @@ bool initHyperliquid() {
 void startHyperliquidLoop() {
     if (g_hlRunning.exchange(true)) return;
     reloadWatchedWallets();
+    rebuildRankCache();
     g_feedThread = std::thread(feedLoop);
     g_enrichThread = std::thread(enricherLoop);
 }
