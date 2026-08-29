@@ -93,25 +93,25 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     if (!prepareOrLog(g_hlDb, &s,
             "SELECT f.wallet,"
             " SUM(f.closed_pnl_nanos),"
-            " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos != 0 "
+            " COUNT(DISTINCT CASE WHEN f.flat=1 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos > 0 "
+            " COUNT(DISTINCT CASE WHEN f.flat=1 AND f.closed_pnl_nanos > 0 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
             " SUM(f.notional_nanos),"
             " AVG(CASE WHEN f.leverage > 0 THEN f.leverage END),"
             " MAX(f.ts),"
-            " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos < 0 "
+            " COUNT(DISTINCT CASE WHEN f.flat=1 AND f.closed_pnl_nanos < 0 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " (SELECT f2.account_value_nanos FROM hl_fills f2"
-            "   WHERE f2.wallet = f.wallet AND f2.ts >= ? AND f2.account_value_nanos > 0"
-            "   ORDER BY f2.ts ASC LIMIT 1)"
+            " SUM(CASE WHEN f.flat=1 THEN "
+            "   CASE WHEN f.margin_nanos > 0 THEN f.margin_nanos "
+            "        WHEN f.leverage > 0 THEN f.notional_nanos / f.leverage "
+            "        ELSE 0 END ELSE 0 END)"
             " FROM hl_fills f"
             " WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
             " GROUP BY f.wallet"))
         return rows;
     sqlite3_bind_int64(s, 1, sinceMs);
-    sqlite3_bind_int64(s, 2, sinceMs);
 
     int stepRc;
     while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
@@ -124,7 +124,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.avgLeverage = sqlite3_column_double(s, 5);
         r.lastTs = sqlite3_column_int64(s, 6);
         const int losses = sqlite3_column_int(s, 7);
-        const long long startAv = sqlite3_column_int64(s, 8);
+        const long long margin = sqlite3_column_int64(s, 8);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
         const long long maxForWindow = std::max(1LL,
@@ -135,8 +135,8 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.winRateKnown = decided > 0;
         r.winRatePercent = decided > 0 ? static_cast<int>((100LL * wins) / decided) : 0;
 
-        if (startAv > 0) {
-            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(startAv);
+        if (margin > 0) {
+            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(margin);
             r.roiKnown = true;
         }
         rows.push_back(r);
@@ -254,7 +254,7 @@ HlMessage renderPerpPage(const std::string& chatId, PerpKind kind, int page, int
             text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << dm << "\U0001F4B5 <b>PnL:</b> " << formatUsdNanosSigned(r.pnlNanos, true) << "\n";
             if (r.roiKnown)
-                text << dm << "\U0001F4C8 <b>" << tr(lang, "hl_rk_roi_account") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
+                text << dm << "\U0001F4C8 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercent(r.roiPercent, true) << "\n";
             if (r.winRateKnown)
                 text << dm << "\U0001F3AF <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << dm << "\U0001F504 <b>" << tr(lang, "rk_trades") << ":</b> " << r.closedTrades << "\n";
@@ -712,7 +712,7 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         t << " — #" << pr.rank << "\n"
           << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pr.pnlNanos, true) << "\n";
         if (pr.roiKnown)
-            t << dm << "\U0001F4C8 " << tr(lang, "hl_rk_roi_account") << ": "
+            t << dm << "\U0001F4C8 " << tr(lang, "rk_roi_per_trade") << ": "
               << formatPercent(pr.roiPercent, true) << "\n";
         t << dm << "\U0001F3AF " << tr(lang, "ws_winrate") << ": " << pr.winRatePercent << "%\n"
           << dm << "\U0001F504 " << tr(lang, "rk_trades") << ": " << pr.closedTrades << "\n";
