@@ -1948,6 +1948,11 @@ void telegramLoop() {
                             }
                         }
                     }
+                    else if (txt == "/rerank" && cid == OWNER_CHAT_ID) {
+                        invalidateRankCache();
+                        rebuildAllRankings();
+                        sendMsg(cid, "Рейтинг сброшен. Перпы пересчитаются в ближайшем проходе, спот уже пересобран.");
+                    }
                     else if (txt.rfind("/unban", 0) == 0) {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
