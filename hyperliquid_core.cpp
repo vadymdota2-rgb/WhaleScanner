@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -758,6 +759,102 @@ LedgerNet fetchLedgerNet(const std::string& wallet, long long startMs) {
     return out;
 }
 
+long long histNanos(const json& data, const char* key, bool last) {
+    if (!data.is_object() || !data.contains(key) || !data[key].is_array() || data[key].empty())
+        return 0;
+    const json& arr = data[key];
+    const json& pt = last ? arr.back() : arr.front();
+    if (!pt.is_array() || pt.size() < 2) return 0;
+    std::string v;
+    if (pt[1].is_string()) v = pt[1].get<std::string>();
+    else if (pt[1].is_number()) v = std::to_string(pt[1].get<double>());
+    long long n = 0;
+    parseDecimalToNanos(v, n);
+    return n;
+}
+
+void saveWalletPerfLocked(const std::string& wallet, const char* window,
+                          long long pnl, long long startAv, long long maxNet, long long vlm) {
+    if (!g_hlDb) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s,
+            "INSERT INTO hl_wallet_perf(wallet,window,pnl_nanos,start_av_nanos,"
+            "max_net_deposit_nanos,vlm_nanos,updated_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(wallet,window) DO UPDATE SET "
+            "pnl_nanos=excluded.pnl_nanos, start_av_nanos=excluded.start_av_nanos, "
+            "max_net_deposit_nanos=excluded.max_net_deposit_nanos, "
+            "vlm_nanos=excluded.vlm_nanos, updated_at=excluded.updated_at"))
+        return;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, window, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 3, pnl);
+    sqlite3_bind_int64(s, 4, startAv);
+    sqlite3_bind_int64(s, 5, maxNet);
+    sqlite3_bind_int64(s, 6, vlm);
+    sqlite3_bind_int64(s, 7, nowSec());
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
+bool perfIsFresh(const std::string& wallet) {
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s,
+            "SELECT updated_at FROM hl_wallet_perf WHERE wallet=? AND window='month'"))
+        return false;
+    sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+    bool fresh = false;
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        const long long ts = sqlite3_column_int64(s, 0);
+        fresh = ts > 0 && (nowSec() - ts) < 3 * 3600;
+    }
+    sqlite3_finalize(s);
+    return fresh;
+}
+
+void fetchAndSavePortfolio(const std::string& wallet, long long maxNetDeposit) {
+    json body;
+    body["type"] = "portfolio";
+    body["user"] = wallet;
+    json j = infoPost(body, HL_WEIGHT_LEDGER);
+    if (!j.is_array()) return;
+
+    struct Slot { const char* src; const char* dst; };
+    const Slot slots[] = {
+        {"perpDay", "day"}, {"perpWeek", "week"},
+        {"perpMonth", "month"}, {"perpAllTime", "allTime"},
+        {"day", "day"}, {"week", "week"},
+        {"month", "month"}, {"allTime", "allTime"},
+    };
+    bool have[4] = {false, false, false, false};
+    auto idxOf = [](const char* d) {
+        if (std::strcmp(d, "day") == 0) return 0;
+        if (std::strcmp(d, "week") == 0) return 1;
+        if (std::strcmp(d, "month") == 0) return 2;
+        return 3;
+    };
+
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    for (const auto& row : j) {
+        if (!row.is_array() || row.size() < 2 || !row[0].is_string() || !row[1].is_object())
+            continue;
+        const std::string period = row[0].get<std::string>();
+        const json& data = row[1];
+        for (const Slot& sl : slots) {
+            if (period != sl.src) continue;
+            const int idx = idxOf(sl.dst);
+            if (have[idx]) continue;
+            const long long startAv = histNanos(data, "accountValueHistory", false);
+            const long long pnl = histNanos(data, "pnlHistory", true);
+            long long vlm = 0;
+            parseDecimalToNanos(jstr(data, "vlm", "0"), vlm);
+            saveWalletPerfLocked(wallet, sl.dst, pnl, startAv, maxNetDeposit, vlm);
+            have[idx] = true;
+        }
+    }
+}
+
 bool banWallet(const std::string& wallet, int trades) {
     const std::string addr = toLower(wallet);
     bool saved = false;
@@ -1072,19 +1169,10 @@ void enrichWallet(const std::string& wallet) {
         }
     }
 
-    if (!fills.empty()) {
+    if (!fills.empty() && (!st.backfilled30d || !perfIsFresh(wallet))) {
         const LedgerNet led = fetchLedgerNet(wallet, windowStartMs);
-        const long long endAv = lastKnownAccountValue(wallet);
-        if (led.ok && endAv > 0) {
-            std::lock_guard<std::mutex> l(g_hlDbMutex);
-            const long long pnl30 = sumPnlInWindowLocked(wallet, windowStartMs);
-            long long startAv = endAv - pnl30 - led.netNanos;
-            if (startAv < 0) startAv = 0;
-            long long denom = startAv + led.maxNetNanos;
-            const long long floorDenom = 100 * NANOS_PER_UNIT;
-            if (denom < floorDenom) denom = floorDenom;
-            stampRoiBaseLocked(wallet, denom, windowStartMs);
-        }
+        fetchAndSavePortfolio(wallet, led.ok ? led.maxNetNanos : 0);
+        g_needRankRebuild.store(true, std::memory_order_relaxed);
     }
 
     if (liveAlerts && !freshRows.empty()) {
@@ -1467,7 +1555,16 @@ bool initHyperliquid() {
         "CREATE TABLE IF NOT EXISTS hl_banned ("
         "  wallet TEXT PRIMARY KEY,"
         "  banned_at INTEGER NOT NULL DEFAULT 0,"
-        "  trades INTEGER NOT NULL DEFAULT 0);";
+        "  trades INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS hl_wallet_perf ("
+        "  wallet TEXT NOT NULL,"
+        "  window TEXT NOT NULL,"
+        "  pnl_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  start_av_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  max_net_deposit_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  vlm_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  updated_at INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY(wallet, window));";
 
     char* err = nullptr;
     if (sqlite3_exec(g_hlDb, schema, nullptr, nullptr, &err) != SQLITE_OK) {
