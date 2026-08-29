@@ -617,10 +617,17 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
 
 }
 
+void requestRankingRebuild() {
+    for (int i = 0; i < RANK_WINDOWS_COUNT; i++)
+        g_rankWindowBuiltAt[i] = 0;
+    g_forceRebuild.store(true, std::memory_order_relaxed);
+    std::cout << "[RANKING] пересчёт запрошен, выполнится в фоне" << std::endl;
+}
+
 void rebuildAllRankings() {
     auto t0 = std::chrono::steady_clock::now();
     const long long now = static_cast<long long>(time(nullptr));
-    const bool force = g_forceRebuild.load(std::memory_order_relaxed);
+    const bool force = g_forceRebuild.exchange(false, std::memory_order_relaxed);
 
     std::vector<std::pair<std::string, std::string>> entries;
     bool anyOk = false;
@@ -1175,7 +1182,7 @@ void rankingCacheLoop() {
              running.load(std::memory_order_relaxed) && slept < REBUILD_INTERVAL_SECONDS;
              slept++) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
-            if (g_forceRebuild.exchange(false)) break;
+            if (g_forceRebuild.load(std::memory_order_relaxed)) break;
         }
     }
 }
