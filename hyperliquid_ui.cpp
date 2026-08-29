@@ -89,29 +89,28 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
 
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return rows;
-    const char* perfWin = (windowSec <= 30LL * 86400LL + 3600LL) ? "month" : "";
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
             "SELECT f.wallet,"
-            " COALESCE(MAX(p.pnl_nanos), SUM(f.closed_pnl_nanos)),"
+            " SUM(f.closed_pnl_nanos),"
             " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos != 0 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
             " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos > 0 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " COALESCE(MAX(p.vlm_nanos), SUM(f.notional_nanos)),"
+            " SUM(f.notional_nanos),"
             " AVG(CASE WHEN f.leverage > 0 THEN f.leverage END),"
             " MAX(f.ts),"
             " COUNT(DISTINCT CASE WHEN f.dir_code >= 3 AND f.closed_pnl_nanos < 0 "
             "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " MAX(p.start_av_nanos),"
-            " MAX(p.max_net_deposit_nanos)"
+            " (SELECT f2.account_value_nanos FROM hl_fills f2"
+            "   WHERE f2.wallet = f.wallet AND f2.ts >= ? AND f2.account_value_nanos > 0"
+            "   ORDER BY f2.ts ASC LIMIT 1)"
             " FROM hl_fills f"
-            " LEFT JOIN hl_wallet_perf p ON p.wallet = f.wallet AND p.window = ?"
             " WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
             " GROUP BY f.wallet"))
         return rows;
-    sqlite3_bind_text(s, 1, perfWin, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(s, 1, sinceMs);
     sqlite3_bind_int64(s, 2, sinceMs);
 
     int stepRc;
@@ -126,7 +125,6 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.lastTs = sqlite3_column_int64(s, 6);
         const int losses = sqlite3_column_int(s, 7);
         const long long startAv = sqlite3_column_int64(s, 8);
-        const long long maxNet = sqlite3_column_int64(s, 9);
 
         if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
         const long long maxForWindow = std::max(1LL,
@@ -137,12 +135,8 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.winRateKnown = decided > 0;
         r.winRatePercent = decided > 0 ? static_cast<int>((100LL * wins) / decided) : 0;
 
-        // HL: PnL / max(100, start AV + max net deposits). Пол $100 только если старт известен.
         if (startAv > 0) {
-            long long denom = startAv + (maxNet > 0 ? maxNet : 0);
-            const long long floorDenom = 100 * NANOS_PER_UNIT;
-            if (denom < floorDenom) denom = floorDenom;
-            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(denom);
+            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(startAv);
             r.roiKnown = true;
         }
         rows.push_back(r);
