@@ -8,9 +8,6 @@
 #include <ctime>
 #include <curl/curl.h>
 
-extern bool wsHeadsOk();
-extern int64_t wsHeadsLatest();
-
 std::vector<std::string> RPC_ENDPOINTS;
 std::atomic<size_t> rpcIndex{0};
 
@@ -73,8 +70,6 @@ std::string http(const std::string& url, const std::string& post, int timeout) {
 constexpr int ENDPOINT_FAIL_LIMIT = 5;
 constexpr long long ENDPOINT_COOLDOWN_SEC = 30;
 constexpr int ROLE_ROTATE_SEC = 1800;
-constexpr int WS_HTTP_TAKEOVER_SEC = 5;
-constexpr int HTTP_HEAD_STALE_SEC = 3;
 
 std::mutex g_healthMutex;
 std::vector<int> g_consecFails;
@@ -130,6 +125,8 @@ RpcRole roleForMethod(const std::string& m) {
     if (m == "eth_getLogs" || m == "eth_getFilterLogs" || m == "eth_getFilterChanges" ||
         m == "eth_getBlockReceipts" || m == "eth_getBlockByNumber" || m == "eth_getBlockByHash")
         return RpcRole::Logs;
+    if (m == "eth_blockNumber")
+        return RpcRole::WsHttp;
     return RpcRole::Fill;
 }
 
@@ -137,13 +134,6 @@ std::mutex g_roleMutex;
 size_t g_holder[kRoleCount] = {0, 0, 0};
 size_t g_base = 0;
 time_t g_lastRotate = 0;
-std::atomic<bool> g_wsHttpCovering{false};
-
-std::atomic<int64_t> g_httpHead{0};
-std::atomic<time_t> g_httpLastSeen{0};
-std::thread g_httpThread;
-std::atomic<bool> g_httpStop{false};
-std::atomic<bool> g_httpStarted{false};
 
 std::string epLabel(size_t idx) {
     if (idx >= RPC_ENDPOINTS.size()) return "?";
@@ -170,25 +160,14 @@ void logHolders() {
     std::cerr << "[ROLE] logs=" << epLabel(g_holder[0])
               << "  fill=" << epLabel(g_holder[1])
               << "  ws-http=" << epLabel(g_holder[2])
-              << (g_wsHttpCovering.load(std::memory_order_relaxed) ? " (COVERING)" : " (sleep)")
-              << std::endl;
+              << " (idle until WS falls back to rpc)" << std::endl;
 }
 
 void assignRolesLocked() {
     const size_t n = RPC_ENDPOINTS.size();
     if (n == 0) return;
     std::vector<char> used(n, 0);
-    const bool covering = g_wsHttpCovering.load(std::memory_order_relaxed);
-    size_t keepWs = static_cast<size_t>(-1);
-    if (covering && g_holder[2] < n && endpointUsable(g_holder[2]))
-        keepWs = g_holder[2];
-
     for (int r = 0; r < kRoleCount; ++r) {
-        if (r == static_cast<int>(RpcRole::WsHttp) && keepWs != static_cast<size_t>(-1)) {
-            g_holder[r] = keepWs;
-            if (keepWs < n) used[keepWs] = 1;
-            continue;
-        }
         size_t start = (g_base + static_cast<size_t>(r)) % n;
         g_holder[r] = pickEndpoint(start, used, /*allowShare=*/n < 3);
         if (g_holder[r] < n) used[g_holder[r]] = 1;
@@ -226,9 +205,6 @@ void failoverRole(RpcRole role, size_t failed) {
         if (r == static_cast<int>(role)) continue;
         if (g_holder[r] < n) used[g_holder[r]] = 1;
     }
-    const bool covering = g_wsHttpCovering.load(std::memory_order_relaxed);
-    if (role != RpcRole::WsHttp && covering && g_holder[2] < n)
-        used[g_holder[2]] = 1;
 
     size_t next = pickEndpoint(failed + 1, used, /*allowShare=*/false);
     if (next == failed || !endpointUsable(next))
@@ -249,6 +225,13 @@ void initRoles() {
         std::cerr << "[ROLE] init, " << RPC_ENDPOINTS.size() << " nodes" << std::endl;
         logHolders();
     }
+}
+
+void setRpcEndpoints(const std::vector<std::string>& endpoints) {
+    RPC_ENDPOINTS = endpoints;
+    rpcIndex.store(0, std::memory_order_relaxed);
+    initEndpointHealth();
+    initRoles();
 }
 
 json rpcOnEndpoint(size_t idx, const std::string& method, json params) {
@@ -330,106 +313,6 @@ json rpc(const std::string& method, json params, int maxRetries) {
 
 json rpcSpread(size_t /*seed*/, const std::string& method, json params) {
     return rpc(method, std::move(params), 3);
-}
-
-bool hexToI64(const std::string& h, int64_t& out) {
-    std::string s = h;
-    if (s.size() >= 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s = s.substr(2);
-    if (s.empty()) return false;
-    try {
-        out = static_cast<int64_t>(std::stoull(s, nullptr, 16));
-        return true;
-    } catch (...) {
-        return false;
-    }
-}
-
-void httpHeadLoop() {
-    time_t wsDeadSince = 0;
-    while (running.load(std::memory_order_relaxed) && !g_httpStop.load(std::memory_order_relaxed)) {
-        if (wsHeadsOk()) {
-            if (g_wsHttpCovering.exchange(false, std::memory_order_relaxed))
-                std::cerr << "[ROLE] HTTP head released, WS back" << std::endl;
-            wsDeadSince = 0;
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            continue;
-        }
-        const time_t now = time(nullptr);
-        if (wsDeadSince == 0) wsDeadSince = now;
-        if (now - wsDeadSince < WS_HTTP_TAKEOVER_SEC) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(400));
-            continue;
-        }
-        if (!g_wsHttpCovering.exchange(true, std::memory_order_relaxed))
-            std::cerr << "[ROLE] both WS down — HTTP head on " << epLabel(holderOf(RpcRole::WsHttp))
-                      << std::endl;
-
-        size_t idx = holderOf(RpcRole::WsHttp);
-        auto r = rpcOnEndpoint(idx, "eth_blockNumber", json::array());
-        const bool ok = r.is_string() || r.is_number_integer();
-        reportEndpoint(idx, ok);
-        if (!ok) {
-            failoverRole(RpcRole::WsHttp, idx);
-        } else {
-            int64_t n = 0;
-            bool parsed = false;
-            if (r.is_string()) parsed = hexToI64(r.get<std::string>(), n);
-            else { n = r.get<int64_t>(); parsed = n > 0; }
-            if (parsed && n > 0) {
-                int64_t prev = g_httpHead.load(std::memory_order_relaxed);
-                while (n > prev &&
-                       !g_httpHead.compare_exchange_weak(prev, n, std::memory_order_relaxed)) {}
-                g_httpLastSeen.store(time(nullptr), std::memory_order_relaxed);
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    }
-    g_wsHttpCovering.store(false, std::memory_order_relaxed);
-}
-
-void startRpcRoles() {
-    if (g_httpStarted.exchange(true, std::memory_order_relaxed)) return;
-    g_httpStop.store(false, std::memory_order_relaxed);
-    g_httpThread = std::thread(httpHeadLoop);
-    std::cerr << "[ROLE] HTTP head-watch started (takes over only if both WS die)" << std::endl;
-}
-
-void stopRpcRoles() {
-    g_httpStop.store(true, std::memory_order_relaxed);
-    if (g_httpThread.joinable()) g_httpThread.join();
-    g_httpStarted.store(false, std::memory_order_relaxed);
-    g_wsHttpCovering.store(false, std::memory_order_relaxed);
-}
-
-void setRpcEndpoints(const std::vector<std::string>& endpoints) {
-    RPC_ENDPOINTS = endpoints;
-    rpcIndex.store(0, std::memory_order_relaxed);
-    initEndpointHealth();
-    initRoles();
-    startRpcRoles();
-}
-
-int64_t chainHeadLatest() {
-    const int64_t w = wsHeadsLatest();
-    const int64_t h = g_httpHead.load(std::memory_order_relaxed);
-    if (wsHeadsOk()) return w;
-    return h > w ? h : w;
-}
-
-bool chainHeadOk() {
-    if (wsHeadsOk()) return true;
-    if (!g_wsHttpCovering.load(std::memory_order_relaxed)) return false;
-    time_t last = g_httpLastSeen.load(std::memory_order_relaxed);
-    return last > 0 && (time(nullptr) - last) <= HTTP_HEAD_STALE_SEC;
-}
-
-std::string rpcRolesStatus() {
-    std::lock_guard<std::mutex> l(g_roleMutex);
-    std::string s = "roles logs=" + epLabel(g_holder[0]) +
-                    " fill=" + epLabel(g_holder[1]) +
-                    " ws-http=" + epLabel(g_holder[2]);
-    if (g_wsHttpCovering.load(std::memory_order_relaxed)) s += " COVERING";
-    return s;
 }
 
 std::string rpcSlowSummary() {
