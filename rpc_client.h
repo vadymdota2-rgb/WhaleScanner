@@ -35,3 +35,9 @@ void setRpcFailureHandler(std::function<void()> handler);
 void setRpcGiveUpHandler(std::function<void()> handler);
 
 std::string rpcSlowSummary();
+
+std::string rpcRolesStatus();
+int64_t chainHeadLatest();
+bool chainHeadOk();
+void startRpcRoles();
+void stopRpcRoles();
