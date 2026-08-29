@@ -465,11 +465,6 @@ void rebuildRankCache() {
         markRankPresence("perp", top);
 }
 
-}
-
-// Сброс кэша рейтинга: следующий проход пересчитает всё заново.
-// Нужен после правки формулы или чистки списка - иначе люди увидят
-// старые цифры до конца обычного срока обновления.
 void invalidateRankCache() {
     {
         std::lock_guard<std::mutex> l(g_rankMutex);
@@ -479,6 +474,12 @@ void invalidateRankCache() {
         }
     }
     std::cout << "[HL] рейтинг сброшен, пересчёт при следующем проходе" << std::endl;
+}
+
+}
+
+void invalidateRankCache() {
+    hl::invalidateRankCache();
 }
 
 HlMessage buildVenueMenu(const std::string& chatId) {
