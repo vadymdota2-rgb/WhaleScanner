@@ -89,27 +89,44 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
 
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return rows;
+
+    int flats = 0;
+    {
+        sqlite3_stmt* c = nullptr;
+        if (prepareOrLog(g_hlDb, &c,
+                "SELECT COUNT(*) FROM hl_fills WHERE ts>=? AND flat=1")) {
+            sqlite3_bind_int64(c, 1, sinceMs);
+            if (sqlite3_step(c) == SQLITE_ROW) flats = sqlite3_column_int(c, 0);
+            sqlite3_finalize(c);
+        }
+    }
+    const bool byFlat = flats > 0;
+    const char* tradePred = byFlat
+        ? "f.flat=1"
+        : "f.dir_code>=3 AND f.closed_pnl_nanos!=0";
+
     sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(g_hlDb, &s,
-            "SELECT f.wallet,"
+    std::string sql =
+            std::string("SELECT f.wallet,"
             " SUM(f.closed_pnl_nanos),"
-            " COUNT(DISTINCT CASE WHEN f.flat=1 "
-            "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " COUNT(DISTINCT CASE WHEN f.flat=1 AND f.closed_pnl_nanos > 0 "
-            "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
+            " COUNT(DISTINCT CASE WHEN ") + tradePred +
+            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
+            " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos > 0 "
+            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
             " SUM(f.notional_nanos),"
             " AVG(CASE WHEN f.leverage > 0 THEN f.leverage END),"
             " MAX(f.ts),"
-            " COUNT(DISTINCT CASE WHEN f.flat=1 AND f.closed_pnl_nanos < 0 "
-            "       THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " SUM(CASE WHEN f.flat=1 THEN "
+            " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos < 0 "
+            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
+            " SUM(CASE WHEN " + tradePred + " THEN "
             "   CASE WHEN f.margin_nanos > 0 THEN f.margin_nanos "
             "        WHEN f.leverage > 0 THEN f.notional_nanos / f.leverage "
             "        ELSE 0 END ELSE 0 END)"
             " FROM hl_fills f"
             " WHERE f.ts >= ?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
-            " GROUP BY f.wallet"))
+            " GROUP BY f.wallet";
+    if (!prepareOrLog(g_hlDb, &s, sql.c_str()))
         return rows;
     sqlite3_bind_int64(s, 1, sinceMs);
 
