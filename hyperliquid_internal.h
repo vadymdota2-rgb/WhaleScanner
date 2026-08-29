@@ -64,6 +64,7 @@ extern std::atomic<unsigned long long> g_reconnects;
 extern std::atomic<int> g_subscribedCoins;
 extern std::mutex g_queueMutex;
 extern std::set<std::string> g_enrichQueue;
+extern std::set<std::string> g_urgentQueue;
 
 constexpr int HL_WEIGHT_CLEARINGHOUSE = 2;
 constexpr long long NANOS_PER_UNIT = 1000000000LL;
