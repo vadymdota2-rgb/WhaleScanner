@@ -62,12 +62,9 @@ constexpr int HL_RECONNECT_MAX_SEC = 60;
 constexpr int HL_BUDGET_PER_MINUTE = 1150;
 constexpr int HL_WEIGHT_USER_FILLS = 20;
 constexpr int HL_WEIGHT_META = 20;
-constexpr int HL_FILL_PAGES_MAX = 1;
 
 constexpr long long HL_USER_DEBOUNCE_SEC = 5;
 constexpr long long HL_SERVICE_DEBOUNCE_SEC = 30;
-
-constexpr long long HL_SEED_LOOKBACK_MS = 30LL * 86400LL * 1000LL;
 
 constexpr int HL_HYPERACTIVE_FILLS = 200;
 constexpr long long HL_HYPERACTIVE_DEBOUNCE_SEC = 600;
@@ -291,6 +288,7 @@ bool spendBudget(int weight, bool = false) {
     g_budgetSpent += weight;
     return true;
 }
+
 
 json infoPost(const json& body, int weight, bool slow) {
     if (!spendBudget(weight, slow)) {
@@ -636,8 +634,8 @@ int countFillsInWindow(const std::string& wallet) {
     if (!g_hlDb) return 0;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
-            "SELECT COUNT(DISTINCT CASE WHEN oid > 0 THEN oid ELSE tid END) FROM hl_fills"
-            " WHERE wallet=? AND ts >= ? AND dir_code >= 3 AND closed_pnl_nanos != 0")) return 0;
+            "SELECT COUNT(*) FROM hl_fills"
+            " WHERE wallet=? AND ts >= ? AND flat=1")) return 0;
     sqlite3_bind_text(s, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 2, (nowSec() - HL_RANK_WINDOW_SEC) * 1000LL);
     int n = 0;
@@ -646,47 +644,27 @@ int countFillsInWindow(const std::string& wallet) {
     return n;
 }
 
-json fetchFillsPage(const std::string& wallet, long long startMs, bool slow) {
+json fetchFillsPage(const std::string& wallet, long long startMs) {
     json body;
     body["type"] = "userFillsByTime";
     body["user"] = wallet;
     body["startTime"] = startMs;
     body["aggregateByTime"] = true;
-    return infoPost(body, HL_WEIGHT_USER_FILLS, slow);
+    return infoPost(body, HL_WEIGHT_USER_FILLS);
 }
 
-json fetchFillsRange(const std::string& wallet, long long startMs, long long& maxTs, bool& caughtUp,
-                     bool slow, int maxPages) {
-    json all = json::array();
-    caughtUp = false;
-    long long cursor = startMs;
-    if (maxPages < 1) maxPages = 1;
-    for (int page = 0; page < maxPages; ++page) {
-        json fills = fetchFillsPage(wallet, cursor, slow);
-        if (!fills.is_array()) {
-            if (page == 0) return json();
-            break;
-        }
-        if (fills.empty()) {
-            caughtUp = true;
-            break;
-        }
-        long long pageMax = cursor;
-        for (const auto& f : fills) {
-            all.push_back(f);
-            const long long ts = f.value("time", 0LL);
-            if (ts > pageMax) pageMax = ts;
-        }
-        if (pageMax > maxTs) maxTs = pageMax;
-        if (fills.size() < 2000) {
-            caughtUp = true;
-            break;
-        }
-        const long long next = pageMax + 1;
-        if (next <= cursor) break;
-        cursor = next;
-    }
-    return all;
+bool fillIsRoundTrip(const json& f, int code) {
+    if (code >= DIR_FLIP) return true;
+    if (code != DIR_CLOSE_LONG && code != DIR_CLOSE_SHORT) return false;
+    long long start = 0, sz = 0;
+    parseDecimalToNanos(jstr(f, "startPosition", "0"), start);
+    parseDecimalToNanos(jstr(f, "sz", "0"), sz);
+    if (sz < 0) sz = -sz;
+    const std::string side = jstr(f, "side");
+    const long long signedSz = (side == "B") ? sz : -sz;
+    const long long end = start + signedSz;
+    const long long eps = NANOS_PER_UNIT / 1000;
+    return std::llabs(end) <= eps;
 }
 
 bool banWallet(const std::string& wallet, int trades) {
@@ -745,8 +723,8 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     if (!prepareOrLog(g_hlDb, &s,
             "INSERT OR IGNORE INTO hl_fills"
             "(tid,wallet,coin,dir,side,px,sz,closed_pnl_nanos,fee_nanos,"
-            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash,dir_code) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash,dir_code,flat) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
@@ -756,6 +734,7 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     std::string px   = jstr(f, "px");
     std::string sz   = jstr(f, "sz");
     std::string hash = jstr(f, "hash");
+    const int code = dirCode(dir);
     sqlite3_bind_text(s, 3, coin.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 4, dir.c_str(),  -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(s, 5, side.c_str(), -1, SQLITE_TRANSIENT);
@@ -770,7 +749,8 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_int64(s, 14, accountValueNanos);
     sqlite3_bind_int64(s, 15, f.value("time", 0LL));
     sqlite3_bind_text(s,  16, hash.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(s, 17, dirCode(dir));
+    sqlite3_bind_int(s, 17, code);
+    sqlite3_bind_int(s, 18, fillIsRoundTrip(f, code) ? 1 : 0);
     bool ok = sqlite3_step(s) == SQLITE_DONE;
     int changed = sqlite3_changes(g_hlDb);
     sqlite3_finalize(s);
@@ -919,9 +899,7 @@ void enrichWallet(const std::string& wallet) {
         ? st.lastFillTs + 1
         : nowMs() - 120000LL;
 
-    bool caughtUp = false;
-    long long pageMaxTs = st.lastFillTs;
-    json fills = fetchFillsRange(wallet, startMs, pageMaxTs, caughtUp, false, 1);
+    json fills = fetchFillsPage(wallet, startMs);
     if (!fills.is_array()) {
         if (userWatch) queueUrgent(wallet);
         else queueWallet(wallet);
@@ -945,7 +923,7 @@ void enrichWallet(const std::string& wallet) {
     std::vector<Prepared> prepared;
     prepared.reserve(fills.size());
     size_t skippedNonPerp = 0;
-    long long maxTs = std::max(st.lastFillTs, pageMaxTs);
+    long long maxTs = st.lastFillTs;
 
     for (const auto& f : fills) {
         if (!f.is_object()) continue;
@@ -1373,7 +1351,8 @@ bool initHyperliquid() {
         "  oid INTEGER NOT NULL DEFAULT 0,"
         "  account_value_nanos INTEGER NOT NULL DEFAULT 0,"
         "  ts INTEGER NOT NULL DEFAULT 0,"
-        "  hash TEXT NOT NULL DEFAULT '');"
+        "  hash TEXT NOT NULL DEFAULT '',"
+        "  flat INTEGER NOT NULL DEFAULT 0);";
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         "CREATE TABLE IF NOT EXISTS hl_wallet_state ("
@@ -1405,6 +1384,7 @@ bool initHyperliquid() {
         "ALTER TABLE hl_fills ADD COLUMN oid INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN account_value_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_wallet_state ADD COLUMN backfilled_30d INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN flat INTEGER NOT NULL DEFAULT 0",
     };
     for (const char* sql : migrations) {
         char* mErr = nullptr;
@@ -1412,6 +1392,10 @@ bool initHyperliquid() {
             std::cout << "[HL] база обновлена: " << sql << std::endl;
         if (mErr) sqlite3_free(mErr);
     }
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET account_value_nanos=0"
+        " WHERE account_value_nanos > 0 AND account_value_nanos <= 100000000000",
+        nullptr, nullptr, nullptr);
 
     {
         char* iErr = nullptr;
@@ -1450,10 +1434,13 @@ bool initHyperliquid() {
         }
         if (bErr) sqlite3_free(bErr);
     }
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 5 AND flat=0",
+        nullptr, nullptr, nullptr);
 
     sqlite3_stmt* probe = nullptr;
     if (sqlite3_prepare_v2(g_hlDb,
-            "SELECT tid,notional_nanos,margin_nanos,leverage,oid,account_value_nanos"
+            "SELECT tid,notional_nanos,margin_nanos,leverage,oid,account_value_nanos,flat"
             " FROM hl_fills LIMIT 1",
             -1, &probe, nullptr) != SQLITE_OK) {
         logCritical(std::string("[HL] таблица сделок непригодна для записи: ")
