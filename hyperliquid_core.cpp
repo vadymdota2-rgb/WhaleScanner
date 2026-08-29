@@ -324,6 +324,7 @@ void setNextEnrich(const std::string& addr, long long at) {
     g_nextEnrichAt[addr] = at;
 }
 
+std::atomic<bool> g_needRankRebuild{false};
 std::atomic<bool> g_hlRunning{false};
 std::thread g_feedThread;
 std::thread g_enrichThread;
@@ -978,7 +979,7 @@ void enrichWallet(const std::string& wallet) {
     const bool known = loadWalletState(wallet, st);
     const long long now = nowSec();
 
-    if (known && now - st.lastEnriched < st.debounce) {
+    if (known && st.backfilled30d && now - st.lastEnriched < st.debounce) {
         setNextEnrich(wallet, st.lastEnriched + st.debounce);
         queueWallet(wallet);
         return;
@@ -1141,6 +1142,7 @@ void enrichWallet(const std::string& wallet) {
     st.seeded = true;
     if (!st.backfilled30d && caughtUp) {
         st.backfilled30d = true;
+        g_needRankRebuild.store(true, std::memory_order_relaxed);
         std::cout << "[HL] 30д догрузка закрыта: " << wallet << std::endl;
     }
     st.lastFillTs = maxTs;
@@ -1186,7 +1188,8 @@ void enricherLoop() {
             lastCleanup = nowSec();
         }
 
-        if (lastRank == 0 || nowSec() - lastRank >= HL_RANK_REBUILD_SEC) {
+        if (g_needRankRebuild.exchange(false, std::memory_order_relaxed) ||
+            lastRank == 0 || nowSec() - lastRank >= HL_RANK_REBUILD_SEC) {
             try { rebuildRankCache(); }
             catch (const std::exception& e) {
                 std::cerr << "[HL] сбой пересборки рейтинга: " << e.what() << std::endl;
@@ -1565,9 +1568,31 @@ bool initHyperliquid() {
     return true;
 }
 
+void queuePendingBackfills() {
+    std::vector<std::string> ws;
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (!g_hlDb) return;
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(g_hlDb, &s, "SELECT DISTINCT wallet FROM hl_fills")) return;
+        while (sqlite3_step(s) == SQLITE_ROW)
+            ws.push_back(safeColumnText(s, 0));
+        sqlite3_finalize(s);
+    }
+    for (const auto& w : ws) {
+        setNextEnrich(w, 0);
+        queueWallet(w);
+    }
+    if (!ws.empty()) {
+        g_needRankRebuild.store(true, std::memory_order_relaxed);
+        std::cout << "[HL] в очередь догрузки: " << ws.size() << " кошельков" << std::endl;
+    }
+}
+
 void startHyperliquidLoop() {
     if (g_hlRunning.exchange(true)) return;
     reloadWatchedWallets();
+    queuePendingBackfills();
     g_feedThread = std::thread(feedLoop);
     g_enrichThread = std::thread(enricherLoop);
 }
