@@ -118,11 +118,11 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
             " MAX(f.ts),"
             " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos < 0 "
             " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " SUM(CASE WHEN f.closed_pnl_nanos != 0 THEN "
+            " SUM(CASE WHEN " + tradePred + " THEN "
             "   CASE WHEN f.margin_nanos > 0 THEN f.margin_nanos "
             "        WHEN f.leverage > 0 THEN f.notional_nanos / f.leverage "
             "        ELSE 0 END ELSE 0 END),"
-            " SUM(CASE WHEN f.closed_pnl_nanos != 0 "
+            " SUM(CASE WHEN " + tradePred +
             "      AND (f.margin_nanos > 0 OR f.leverage > 0) "
             "     THEN f.closed_pnl_nanos ELSE 0 END)"
             " FROM hl_fills f"
