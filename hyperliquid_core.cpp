@@ -9,6 +9,7 @@
 #include <ctime>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -520,8 +521,10 @@ bool loadWalletState(const std::string& wallet, WalletState& out) {
         out.lastFillTs = sqlite3_column_int64(s, 1);
         out.lastEnriched = sqlite3_column_int64(s, 2);
         out.debounce = sqlite3_column_int64(s, 3);
-        if (out.debounce != HL_HYPERACTIVE_DEBOUNCE_SEC)
-            out.debounce = HL_USER_DEBOUNCE_SEC;
+        if (out.debounce != HL_HYPERACTIVE_DEBOUNCE_SEC &&
+            out.debounce != HL_USER_DEBOUNCE_SEC &&
+            out.debounce != HL_SERVICE_DEBOUNCE_SEC)
+            out.debounce = HL_SERVICE_DEBOUNCE_SEC;
         out.backfilled30d = sqlite3_column_int(s, 4) != 0;
         found = true;
     }
@@ -1352,7 +1355,7 @@ bool initHyperliquid() {
         "  account_value_nanos INTEGER NOT NULL DEFAULT 0,"
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '',"
-        "  flat INTEGER NOT NULL DEFAULT 0);";
+        "  flat INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         "CREATE TABLE IF NOT EXISTS hl_wallet_state ("
@@ -1435,12 +1438,24 @@ bool initHyperliquid() {
         if (bErr) sqlite3_free(bErr);
     }
     sqlite3_exec(g_hlDb,
-        "UPDATE hl_fills SET flat=1 WHERE flat=0 AND ("
-        " dir_code BETWEEN 3 AND 8"
-        " OR dir LIKE '%Close%'"
-        " OR dir LIKE '%Liquidat%'"
-        " OR dir LIKE '%ADL%'"
-        " OR dir LIKE '% > %')",
+        "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 5 AND flat=0",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET flat=CASE"
+        " WHEN NOT EXISTS ("
+        "   SELECT 1 FROM hl_fills n"
+        "   WHERE n.wallet=hl_fills.wallet AND n.coin=hl_fills.coin"
+        "     AND n.ts>hl_fills.ts AND n.dir_code >= 3"
+        "     AND NOT EXISTS ("
+        "       SELECT 1 FROM hl_fills m"
+        "       WHERE m.wallet=hl_fills.wallet AND m.coin=hl_fills.coin"
+        "         AND m.ts>hl_fills.ts AND m.ts<n.ts"
+        "         AND m.dir_code IN (1,2,5)))"
+        " THEN 1 ELSE 0 END"
+        " WHERE dir_code IN (3,4)",
         nullptr, nullptr, nullptr);
     {
         sqlite3_stmt* c = nullptr;
