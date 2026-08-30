@@ -1059,6 +1059,10 @@ void enrichWallet(const std::string& wallet) {
 void enricherLoop() {
     long long lastCleanup = 0;
     long long lastRank = 0;
+    try { rebuildRankCache(); lastRank = nowSec(); }
+    catch (const std::exception& e) {
+        std::cerr << "[HL] сбой пересборки рейтинга: " << e.what() << std::endl;
+    }
     while (keepGoing()) {
         std::set<std::string> batch;
         bool urgent = false;
@@ -1499,7 +1503,6 @@ bool initHyperliquid() {
 void startHyperliquidLoop() {
     if (g_hlRunning.exchange(true)) return;
     reloadWatchedWallets();
-    rebuildRankCache();
     g_feedThread = std::thread(feedLoop);
     g_enrichThread = std::thread(enricherLoop);
 }
