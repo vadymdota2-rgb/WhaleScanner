@@ -396,7 +396,10 @@ void saveFundingRates(long long hourTs,
         }
     }
     sqlite3_finalize(s);
-    sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+    if (sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[HL] saveFundingRates COMMIT: " << sqlite3_errmsg(g_hlDb) << std::endl;
+        sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+    }
 }
 
 void ingestUniverse(const json& universe, const json* ctxs, const std::string& dex,
@@ -1288,7 +1291,11 @@ void dripFundingHistory() {
         sqlite3_step(d);
         sqlite3_finalize(d);
     }
-    sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+    if (sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[HL] dripFundingHistory COMMIT: " << sqlite3_errmsg(g_hlDb) << std::endl;
+        sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+        return;
+    }
     std::cout << "[HL] фандинг " << pick << ": " << n << " часов" << std::endl;
 }
 
