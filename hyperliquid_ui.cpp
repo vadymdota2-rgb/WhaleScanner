@@ -123,7 +123,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     if (!prepareOrLog(g_hlDb, &s,
             "SELECT f.wallet,f.coin,f.ts,f.tid,f.oid,f.dir_code,f.flat,"
             " f.closed_pnl_nanos,f.margin_nanos,f.leverage,f.notional_nanos,"
-            " f.start_pos_nanos,f.sz,f.side,f.px"
+            " f.start_pos_nanos,f.sz,f.side,f.px,f.fee_nanos"
             " FROM hl_fills f"
             " WHERE f.ts>=?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet=f.wallet)"
@@ -134,6 +134,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     struct Acc {
         long long closedPnl = 0;
         long long funding = 0;
+        long long fees = 0;
         long long volume = 0;
         long long lastTs = 0;
         int trades = 0;
@@ -145,6 +146,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     };
     struct Series {
         long long pnl = 0;
+        long long fee = 0;
         long long margin = 0;
         int lev = 0;
         long long closeOid = 0;
@@ -164,8 +166,9 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     auto closeTrade = [&](Acc& a) {
         a.closedPnl += ser.pnl;
         a.trades++;
-        if (ser.pnl > 0) a.wins++;
-        else if (ser.pnl < 0) a.losses++;
+        const long long net = ser.pnl - ser.fee;
+        if (net > 0) a.wins++;
+        else if (net < 0) a.losses++;
         if (ser.lev > 0) { a.levSum += ser.lev; a.levN++; }
         if (ser.margin > 0) a.margin += ser.margin;
     };
@@ -213,6 +216,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         long long px = 0;
         parseDecimalToNanos(safeColumnText(s, 14), px);
         if (px < 0) px = -px;
+        const long long fee = sqlite3_column_int64(s, 15);
 
         if (w != curW || c != curC) {
             flushPos();
@@ -224,6 +228,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
 
         Acc& a = accs[w];
         a.volume += notional;
+        a.fees += fee;
         if (ts > a.lastTs) a.lastTs = ts;
 
         long long start = 0;
@@ -243,6 +248,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         }
 
         ser.pnl += pnl;
+        ser.fee += fee;
         if (margin > 0) {
             if (margin > ser.margin) ser.margin = margin;
         } else if (lev > 0 && notional > 0) {
@@ -261,6 +267,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
             ser.closeOid = id;
         }
         ser.pnl = 0;
+        ser.fee = 0;
         ser.margin = 0;
         ser.lev = 0;
     }
@@ -280,7 +287,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         if (a.trades > maxForWindow) continue;
         PerpRow r;
         r.wallet = kv.first;
-        r.pnlNanos = a.closedPnl + a.funding;
+        r.pnlNanos = a.closedPnl + a.funding - a.fees;
         r.volumeNanos = a.volume;
         r.lastTs = a.lastTs;
         r.closedTrades = a.trades;
