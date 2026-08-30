@@ -1056,11 +1056,50 @@ void enrichWallet(const std::string& wallet) {
     }
 }
 
+void backfillFlatFlags() {
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return;
+    sqlite3_stmt* c = nullptr;
+    bool have = false;
+    if (prepareOrLog(g_hlDb, &c, "SELECT 1 FROM hl_fills WHERE flat=1 LIMIT 1")) {
+        have = sqlite3_step(c) == SQLITE_ROW;
+        sqlite3_finalize(c);
+    }
+    if (have) return;
+
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 5 AND flat=0",
+        nullptr, nullptr, nullptr);
+    sqlite3_exec(g_hlDb,
+        "UPDATE hl_fills SET flat=CASE"
+        " WHEN NOT EXISTS ("
+        "   SELECT 1 FROM hl_fills n"
+        "   WHERE n.wallet=hl_fills.wallet AND n.coin=hl_fills.coin"
+        "     AND n.ts>hl_fills.ts AND n.dir_code >= 3"
+        "     AND NOT EXISTS ("
+        "       SELECT 1 FROM hl_fills m"
+        "       WHERE m.wallet=hl_fills.wallet AND m.coin=hl_fills.coin"
+        "         AND m.ts>hl_fills.ts AND m.ts<n.ts"
+        "         AND m.dir_code IN (1,2,5)))"
+        " THEN 1 ELSE 0 END"
+        " WHERE dir_code IN (3,4)",
+        nullptr, nullptr, nullptr);
+    int nflat = 0;
+    if (prepareOrLog(g_hlDb, &c, "SELECT COUNT(*) FROM hl_fills WHERE flat=1")) {
+        if (sqlite3_step(c) == SQLITE_ROW) nflat = sqlite3_column_int(c, 0);
+        sqlite3_finalize(c);
+    }
+    std::cout << "[HL] сделок-кругов в базе (flat): " << nflat << std::endl;
+}
+
 void enricherLoop() {
     long long lastCleanup = 0;
     long long lastRank = 0;
-    try { rebuildRankCache(); lastRank = nowSec(); }
-    catch (const std::exception& e) {
+    try {
+        backfillFlatFlags();
+        rebuildRankCache();
+        lastRank = nowSec();
+    } catch (const std::exception& e) {
         std::cerr << "[HL] сбой пересборки рейтинга: " << e.what() << std::endl;
     }
     while (keepGoing()) {
@@ -1457,32 +1496,6 @@ bool initHyperliquid() {
     sqlite3_exec(g_hlDb,
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)",
         nullptr, nullptr, nullptr);
-    sqlite3_exec(g_hlDb,
-        "UPDATE hl_fills SET flat=1 WHERE dir_code >= 5 AND flat=0",
-        nullptr, nullptr, nullptr);
-    sqlite3_exec(g_hlDb,
-        "UPDATE hl_fills SET flat=CASE"
-        " WHEN NOT EXISTS ("
-        "   SELECT 1 FROM hl_fills n"
-        "   WHERE n.wallet=hl_fills.wallet AND n.coin=hl_fills.coin"
-        "     AND n.ts>hl_fills.ts AND n.dir_code >= 3"
-        "     AND NOT EXISTS ("
-        "       SELECT 1 FROM hl_fills m"
-        "       WHERE m.wallet=hl_fills.wallet AND m.coin=hl_fills.coin"
-        "         AND m.ts>hl_fills.ts AND m.ts<n.ts"
-        "         AND m.dir_code IN (1,2,5)))"
-        " THEN 1 ELSE 0 END"
-        " WHERE dir_code IN (3,4)",
-        nullptr, nullptr, nullptr);
-    {
-        sqlite3_stmt* c = nullptr;
-        int nflat = 0;
-        if (prepareOrLog(g_hlDb, &c, "SELECT COUNT(*) FROM hl_fills WHERE flat=1")) {
-            if (sqlite3_step(c) == SQLITE_ROW) nflat = sqlite3_column_int(c, 0);
-            sqlite3_finalize(c);
-        }
-        std::cout << "[HL] сделок-кругов в базе (flat): " << nflat << std::endl;
-    }
 
     sqlite3_stmt* probe = nullptr;
     if (sqlite3_prepare_v2(g_hlDb,
