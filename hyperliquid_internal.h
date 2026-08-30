@@ -45,10 +45,6 @@ inline int dirCode(const std::string& dirRaw) {
     return DIR_UNKNOWN;
 }
 
-inline bool dirIsLiquidation(int c) { return c >= DIR_LIQ_LONG && c <= DIR_LIQ_OTHER; }
-inline bool dirIsOpen(int c)        { return c == DIR_OPEN_LONG || c == DIR_OPEN_SHORT; }
-inline bool dirIsLong(int c)        { return c == DIR_OPEN_LONG || c == DIR_CLOSE_LONG || c == DIR_LIQ_LONG; }
-
 namespace hl {
 
 extern sqlite3* g_hlDb;
