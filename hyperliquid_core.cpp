@@ -656,18 +656,24 @@ json fetchFillsPage(const std::string& wallet, long long startMs) {
     return infoPost(body, HL_WEIGHT_USER_FILLS);
 }
 
-bool fillIsRoundTrip(const json& f, int code) {
-    if (code >= DIR_FLIP) return true;
-    if (code != DIR_CLOSE_LONG && code != DIR_CLOSE_SHORT) return false;
-    long long start = 0, sz = 0;
+bool fillStartEnd(const json& f, long long& start, long long& end) {
+    start = 0;
+    long long sz = 0;
     parseDecimalToNanos(jstr(f, "startPosition", "0"), start);
     parseDecimalToNanos(jstr(f, "sz", "0"), sz);
     if (sz < 0) sz = -sz;
     const std::string side = jstr(f, "side");
     const long long signedSz = (side == "B") ? sz : -sz;
-    const long long end = start + signedSz;
-    const long long eps = NANOS_PER_UNIT / 1000;
-    return std::llabs(end) <= eps;
+    end = start + signedSz;
+    return true;
+}
+
+bool fillIsRoundTrip(const json& f, int code) {
+    if (code >= DIR_FLIP) return true;
+    if (code != DIR_CLOSE_LONG && code != DIR_CLOSE_SHORT) return false;
+    long long start = 0, end = 0;
+    fillStartEnd(f, start, end);
+    return std::llabs(end) <= NANOS_PER_UNIT / 1000;
 }
 
 bool banWallet(const std::string& wallet, int trades) {
@@ -768,12 +774,20 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     return ok && changed > 0;
 }
 
-std::string dirKey(const std::string& dir) {
-    switch (dirCode(dir)) {
-        case DIR_OPEN_LONG:   return "hl_open_long";
-        case DIR_OPEN_SHORT:  return "hl_open_short";
-        case DIR_CLOSE_LONG:  return "hl_close_long";
-        case DIR_CLOSE_SHORT: return "hl_close_short";
+std::string dirKey(const json& f) {
+    const int code = dirCode(jstr(f, "dir"));
+    long long start = 0, end = 0;
+    fillStartEnd(f, start, end);
+    const long long eps = NANOS_PER_UNIT / 1000;
+    switch (code) {
+        case DIR_OPEN_LONG:
+            return std::llabs(start) > eps ? "hl_add_long" : "hl_open_long";
+        case DIR_OPEN_SHORT:
+            return std::llabs(start) > eps ? "hl_add_short" : "hl_open_short";
+        case DIR_CLOSE_LONG:
+            return std::llabs(end) > eps ? "hl_partial_long" : "hl_close_long";
+        case DIR_CLOSE_SHORT:
+            return std::llabs(end) > eps ? "hl_partial_short" : "hl_close_short";
         case DIR_FLIP:        return "hl_flip";
         case DIR_LIQ_LONG:    return "hl_liq_long";
         case DIR_LIQ_SHORT:   return "hl_liq_short";
@@ -783,11 +797,24 @@ std::string dirKey(const std::string& dir) {
 }
 
 std::string dirEmoji(const std::string& key) {
-    if (key == "hl_open_long" || key == "hl_close_short") return "\U0001F7E2";
-    if (key == "hl_close_long" || key == "hl_open_short") return "\U0001F534";
+    if (key == "hl_open_long" || key == "hl_add_long" ||
+        key == "hl_close_short" || key == "hl_partial_short") return "\U0001F7E2";
+    if (key == "hl_close_long" || key == "hl_partial_long" ||
+        key == "hl_open_short" || key == "hl_add_short") return "\U0001F534";
     if (key == "hl_liquidated" || key == "hl_liq_long" || key == "hl_liq_short")
         return "\U0001F4A5";
     return "\u26A1";
+}
+
+std::string dirTitle(Lang lang, const std::string& key) {
+    std::string t = tr(lang, key);
+    if (t != key) return t;
+    const bool ru = (lang == Lang::RU);
+    if (key == "hl_add_long")      return ru ? "Добор лонга" : "Added to long";
+    if (key == "hl_add_short")     return ru ? "Добор шорта" : "Added to short";
+    if (key == "hl_partial_long")  return ru ? "Частичное закрытие лонга" : "Partial close long";
+    if (key == "hl_partial_short") return ru ? "Частичное закрытие шорта" : "Partial close short";
+    return t;
 }
 
 struct HlAlertData {
@@ -814,60 +841,58 @@ std::string buildHlAlert(const std::string& label, const HlAlertData& a, Lang la
 
     std::stringstream m;
     m << dm << "\U0001F4BC <b>" << safeString(label) << "</b>\n\n";
-    m << dm << dirEmoji(key) << " <b>" << tr(lang, key) << " " << coin << "</b>\n";
+    m << dm << dirEmoji(key) << " <b>" << dirTitle(lang, key) << " " << coin << "</b>"
+      << " \u00B7 <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
 
-    m << dm << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>" << fmtUsd(notionalNanosVal) << "</b>\n";
-
-    if (a.fillCount > 1) {
-        m << dm << "\U0001F522 " << tr(lang, "hl_fills_in_series") << ": <b>"
-          << a.fillCount << "</b>\n";
+    if (pos.known && pos.leverage > 0) {
+        m << dm << pos.leverage << "\u00D7 " << tr(lang, pos.isolated ? "hl_isolated" : "hl_cross");
+        if (a.fillCount > 1)
+            m << " \u00B7 " << a.fillCount << " " << tr(lang, "hl_fills_in_series");
+        m << "\n";
+    } else if (a.fillCount > 1) {
+        m << dm << tr(lang, "hl_fills_in_series") << ": " << a.fillCount << "\n";
     }
+
+    if (a.avgPxNanos > 0)
+        m << dm << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
+          << formatPriceNanos(a.avgPxNanos) << "</b>\n";
+    if (a.qtyNanos > 0)
+        m << dm << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
+          << formatQtyNanos(a.qtyNanos) << " " << coin << "</b>\n";
 
     if (pos.stillOpen && pos.positionValueNanos > 0) {
         m << dm << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
           << fmtUsd(pos.positionValueNanos) << "</b>\n";
     }
 
-    if (pos.known && pos.leverage > 0) {
-        m << dm << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>" << pos.leverage << "\u00D7 "
-          << tr(lang, pos.isolated ? "hl_isolated" : "hl_cross") << "</b>\n";
-    }
-
     if (pos.stillOpen && pos.marginUsedNanos > 0) {
-        m << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>" << fmtUsd(pos.marginUsedNanos) << "</b>";
+        m << dm << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
+          << fmtUsd(pos.marginUsedNanos) << "</b>";
         if (accountValueNanos > 0) {
             const double share = 100.0 * static_cast<double>(pos.marginUsedNanos)
-                                       / static_cast<double>(accountValueNanos);
-            m << " <i>(" << formatPercent(share, false) << " " << tr(lang, "hl_of_account") << ")</i>";
+                                        / static_cast<double>(accountValueNanos);
+            m << " \u00B7 " << formatPercent(share, false) << " " << tr(lang, "hl_of_account");
         }
         m << "\n";
     }
 
-    if (a.avgPxNanos > 0)
-        m << dm << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
-          << formatPriceNanos(a.avgPxNanos) << "</b>\n";
-
-    if (a.qtyNanos > 0)
-        m << dm << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
-          << formatQtyNanos(a.qtyNanos) << " " << coin << "</b>\n";
-
     if (closedPnlNanos != 0) {
-        m << dm << (closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") << tr(lang, "hl_pnl") << ": <b>"
+        m << dm << (closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+          << tr(lang, "hl_pnl") << ": <b>"
           << formatUsdNanosSigned(closedPnlNanos, true) << "</b>\n";
     }
 
     if (pos.stillOpen && pos.liquidationPxNanos > 0) {
         m << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
           << formatPriceNanos(pos.liquidationPxNanos) << "</b>\n";
-    } else if (pos.known && !pos.stillOpen && closedPnlNanos != 0) {
+    } else if (pos.known && !pos.stillOpen) {
         m << dm << "\u2705 " << tr(lang, "hl_position_closed") << "\n";
     }
     if (accountValueNanos > 0) {
-        m << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>" << fmtUsd(accountValueNanos) << "</b>\n";
+        m << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
+          << fmtUsd(accountValueNanos) << "</b>";
     }
 
-    m << "\n" << dm << HL_CARD_SEPARATOR << "\n";
-    m << dm << "\U0001F535 " << tr(lang, "hl_venue") << ": <b>Hyperliquid</b>";
     return m.str();
 }
 
@@ -992,7 +1017,7 @@ void enrichWallet(const std::string& wallet) {
         for (size_t i : freshRows) {
             const Prepared& p = prepared[i];
             const std::string coin = jstr(*p.fill, "coin");
-            const std::string dk = dirKey(jstr(*p.fill, "dir"));
+            const std::string dk = dirKey(*p.fill);
 
             HlAlertData& a = series[coin + "|" + dk];
             if (a.fillCount == 0) {
