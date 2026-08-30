@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <sqlite3.h>
@@ -81,19 +82,48 @@ std::mutex g_rankMutex;
 long long g_rankBuiltAt[4] = {0, 0, 0, 0};
 std::vector<PerpRow> g_rankCache[4];
 
+long long fundingPayment(long long pos, long long rate, long long mark) {
+    if (pos == 0 || rate == 0 || mark <= 0) return 0;
+    __int128 x = -static_cast<__int128>(pos) * mark;
+    x *= rate;
+    x /= static_cast<__int128>(NANOS_PER_UNIT);
+    x /= static_cast<__int128>(NANOS_PER_UNIT);
+    if (x > 9000000000000000000LL || x < -9000000000000000000LL) return 0;
+    return static_cast<long long>(x);
+}
+
 std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     ok = false;
     std::vector<PerpRow> rows;
     if (windowSec < 86400LL) windowSec = 86400LL;
     const long long sinceMs = (nowSec() - windowSec) * 1000LL;
+    const long long untilMs = nowSec() * 1000LL;
+    const long long sinceHour = (nowSec() - windowSec) / 3600LL * 3600LL;
 
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return rows;
 
+    using HourRate = std::pair<long long, long long>;
+    std::unordered_map<std::string, std::unordered_map<long long, HourRate>> rates;
+    {
+        sqlite3_stmt* r = nullptr;
+        if (prepareOrLog(g_hlDb, &r,
+                "SELECT coin,hour_ts,rate_nanos,mark_nanos FROM hl_funding_rate WHERE hour_ts>=?")) {
+            sqlite3_bind_int64(r, 1, sinceHour);
+            while (sqlite3_step(r) == SQLITE_ROW) {
+                const std::string coin = safeColumnText(r, 0);
+                rates[coin][sqlite3_column_int64(r, 1)] =
+                    {sqlite3_column_int64(r, 2), sqlite3_column_int64(r, 3)};
+            }
+            sqlite3_finalize(r);
+        }
+    }
+
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
             "SELECT f.wallet,f.coin,f.ts,f.tid,f.oid,f.dir_code,f.flat,"
-            " f.closed_pnl_nanos,f.margin_nanos,f.leverage,f.notional_nanos"
+            " f.closed_pnl_nanos,f.margin_nanos,f.leverage,f.notional_nanos,"
+            " f.start_pos_nanos,f.sz,f.side,f.px"
             " FROM hl_fills f"
             " WHERE f.ts>=?"
             " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet=f.wallet)"
@@ -103,6 +133,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
 
     struct Acc {
         long long closedPnl = 0;
+        long long funding = 0;
         long long volume = 0;
         long long lastTs = 0;
         int trades = 0;
@@ -118,10 +149,17 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         int lev = 0;
         long long closeOid = 0;
     };
+    struct PosWalk {
+        long long pos = 0;
+        long long lastTs = 0;
+        long long lastPx = 0;
+        bool known = false;
+    };
 
     std::unordered_map<std::string, Acc> accs;
     std::string curW, curC;
     Series ser;
+    PosWalk pw;
 
     auto closeTrade = [&](Acc& a) {
         a.closedPnl += ser.pnl;
@@ -130,6 +168,26 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         else if (ser.pnl < 0) a.losses++;
         if (ser.lev > 0) { a.levSum += ser.lev; a.levN++; }
         if (ser.margin > 0) a.margin += ser.margin;
+    };
+
+    auto applyHours = [&](Acc& a, const std::string& coin, long long pos, long long px,
+                          long long fromMs, long long toMs) {
+        if (pos == 0 || fromMs >= toMs) return;
+        auto rit = rates.find(coin);
+        if (rit == rates.end()) return;
+        const long long fromH = ((fromMs / 1000LL) / 3600LL + 1) * 3600LL;
+        const long long toH = (toMs / 1000LL) / 3600LL * 3600LL;
+        for (long long h = fromH; h <= toH; h += 3600LL) {
+            auto hit = rit->second.find(h);
+            if (hit == rit->second.end()) continue;
+            long long mark = hit->second.second > 0 ? hit->second.second : px;
+            a.funding += fundingPayment(pos, hit->second.first, mark);
+        }
+    };
+
+    auto flushPos = [&]() {
+        if (curW.empty() || !pw.known) return;
+        applyHours(accs[curW], curC, pw.pos, pw.lastPx, pw.lastTs, untilMs);
     };
 
     int stepRc;
@@ -145,9 +203,21 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         const long long margin = sqlite3_column_int64(s, 8);
         const int lev = sqlite3_column_int(s, 9);
         const long long notional = sqlite3_column_int64(s, 10);
+        const bool hasStart = sqlite3_column_type(s, 11) != SQLITE_NULL;
+        const long long startCol = hasStart ? sqlite3_column_int64(s, 11) : 0;
+        long long sz = 0;
+        parseDecimalToNanos(safeColumnText(s, 12), sz);
+        if (sz < 0) sz = -sz;
+        const std::string side = safeColumnText(s, 13);
+        const long long signedSz = (side == "B") ? sz : -sz;
+        long long px = 0;
+        parseDecimalToNanos(safeColumnText(s, 14), px);
+        if (px < 0) px = -px;
 
         if (w != curW || c != curC) {
+            flushPos();
             ser = Series{};
+            pw = PosWalk{};
             curW = w;
             curC = c;
         }
@@ -155,6 +225,22 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         Acc& a = accs[w];
         a.volume += notional;
         if (ts > a.lastTs) a.lastTs = ts;
+
+        long long start = 0;
+        bool startKnown = false;
+        if (hasStart) { start = startCol; startKnown = true; }
+        else if (pw.known) { start = pw.pos; startKnown = true; }
+        else if (flat == 1) { start = -signedSz; startKnown = true; }
+        else if (dir == DIR_OPEN_LONG || dir == DIR_OPEN_SHORT) { start = 0; startKnown = true; }
+
+        if (startKnown) {
+            const long long fromMs = pw.known ? pw.lastTs : sinceMs;
+            applyHours(a, c, start, px > 0 ? px : pw.lastPx, fromMs, ts);
+            pw.pos = start + signedSz;
+            pw.known = true;
+            pw.lastTs = ts;
+            if (px > 0) pw.lastPx = px;
+        }
 
         ser.pnl += pnl;
         if (margin > 0) {
@@ -183,6 +269,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         std::cerr << "[HL] рейтинг: чтение прервано, старый кэш сохранён" << std::endl;
         return {};
     }
+    flushPos();
 
     rows.reserve(accs.size());
     const long long maxForWindow = std::max(1LL,
@@ -193,7 +280,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         if (a.trades > maxForWindow) continue;
         PerpRow r;
         r.wallet = kv.first;
-        r.pnlNanos = a.closedPnl;
+        r.pnlNanos = a.closedPnl + a.funding;
         r.volumeNanos = a.volume;
         r.lastTs = a.lastTs;
         r.closedTrades = a.trades;
@@ -202,7 +289,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         r.winRatePercent = decided > 0 ? static_cast<int>((100LL * a.wins) / decided) : 0;
         r.avgLeverage = a.levN > 0 ? static_cast<double>(a.levSum) / a.levN : 0.0;
         if (a.margin > 0) {
-            r.roiPercent = 100.0 * static_cast<double>(a.closedPnl) / static_cast<double>(a.margin);
+            r.roiPercent = 100.0 * static_cast<double>(r.pnlNanos) / static_cast<double>(a.margin);
             r.roiKnown = true;
         }
         rows.push_back(std::move(r));
