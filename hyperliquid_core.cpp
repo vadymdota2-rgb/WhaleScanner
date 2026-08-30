@@ -746,8 +746,16 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_int64(s, 8, closedPnlNanos);
     sqlite3_bind_int64(s, 9, feeNanos);
     sqlite3_bind_int64(s, 10, notionalNanosVal);
-    sqlite3_bind_int64(s, 11, pos.known ? pos.marginUsedNanos : 0);
-    sqlite3_bind_int(s,   12, pos.known ? pos.leverage : 0);
+    long long margin = 0;
+    int lev = 0;
+    if (pos.known) {
+        margin = pos.marginUsedNanos;
+        lev = pos.leverage;
+    }
+    if (margin <= 0 && lev > 0 && notionalNanosVal > 0)
+        margin = notionalNanosVal / lev;
+    sqlite3_bind_int64(s, 11, margin);
+    sqlite3_bind_int(s,   12, lev);
     sqlite3_bind_int64(s, 13, f.value("oid", 0LL));
     sqlite3_bind_int64(s, 14, accountValueNanos);
     sqlite3_bind_int64(s, 15, f.value("time", 0LL));
@@ -914,7 +922,6 @@ void enrichWallet(const std::string& wallet) {
     const bool wasSeeded = known && st.seeded;
     const bool liveAlerts = wasSeeded || userWatch;
     const long long stateAt = nowSec();
-    if (!fills.empty() && liveAlerts) fetchAccountState(wallet);
 
     struct Prepared {
         const json* fill;
@@ -944,11 +951,17 @@ void enrichWallet(const std::string& wallet) {
         p.notional = 0;
         notionalNanos(jstr(f, "px", "0"), jstr(f, "sz", "0"), p.notional);
         p.pos = lastKnownPosition(wallet, jstr(f, "coin"));
-        p.pos.stillOpen = p.pos.known && p.pos.snapshotAt >= stateAt;
         prepared.push_back(std::move(p));
     }
 
+    if (!fills.empty() && liveAlerts) fetchAccountState(wallet);
+
     const long long accountValue = lastKnownAccountValue(wallet);
+    for (Prepared& p : prepared) {
+        PositionInfo now = lastKnownPosition(wallet, jstr(*p.fill, "coin"));
+        if (!p.pos.known) p.pos = now;
+        p.pos.stillOpen = now.known && now.snapshotAt >= stateAt;
+    }
 
     std::vector<size_t> freshRows;
     size_t stored = 0;
