@@ -90,83 +90,122 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return rows;
 
-    int flats = 0;
-    {
-        sqlite3_stmt* c = nullptr;
-        if (prepareOrLog(g_hlDb, &c,
-                "SELECT COUNT(*) FROM hl_fills WHERE ts>=? AND flat=1")) {
-            sqlite3_bind_int64(c, 1, sinceMs);
-            if (sqlite3_step(c) == SQLITE_ROW) flats = sqlite3_column_int(c, 0);
-            sqlite3_finalize(c);
-        }
-    }
-    const bool byFlat = flats > 0;
-    const char* tradePred = byFlat
-        ? "f.flat=1"
-        : "f.dir_code>=3 AND f.closed_pnl_nanos!=0";
-
     sqlite3_stmt* s = nullptr;
-    std::string sql =
-            std::string("SELECT f.wallet,"
-            " SUM(f.closed_pnl_nanos),"
-            " COUNT(DISTINCT CASE WHEN ") + tradePred +
-            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos > 0 "
-            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " SUM(f.notional_nanos),"
-            " AVG(CASE WHEN " + tradePred + " AND f.leverage > 0 THEN f.leverage END),"
-            " MAX(f.ts),"
-            " COUNT(DISTINCT CASE WHEN " + tradePred + " AND f.closed_pnl_nanos < 0 "
-            " THEN CASE WHEN f.oid > 0 THEN f.oid ELSE f.tid END END),"
-            " SUM(CASE WHEN " + tradePred + " THEN "
-            "   CASE WHEN f.margin_nanos > 0 THEN f.margin_nanos "
-            "        WHEN f.leverage > 0 THEN f.notional_nanos / f.leverage "
-            "        ELSE 0 END ELSE 0 END),"
-            " SUM(CASE WHEN " + tradePred +
-            "      AND (f.margin_nanos > 0 OR f.leverage > 0) "
-            "     THEN f.closed_pnl_nanos ELSE 0 END)"
+    if (!prepareOrLog(g_hlDb, &s,
+            "SELECT f.wallet,f.coin,f.ts,f.tid,f.oid,f.dir_code,f.flat,"
+            " f.closed_pnl_nanos,f.margin_nanos,f.leverage,f.notional_nanos"
             " FROM hl_fills f"
-            " WHERE f.ts >= ?"
-            " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)"
-            " GROUP BY f.wallet";
-    if (!prepareOrLog(g_hlDb, &s, sql.c_str()))
+            " WHERE f.ts>=?"
+            " AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet=f.wallet)"
+            " ORDER BY f.wallet,f.coin,f.ts,f.tid"))
         return rows;
     sqlite3_bind_int64(s, 1, sinceMs);
 
+    struct Acc {
+        long long closedPnl = 0;
+        long long volume = 0;
+        long long lastTs = 0;
+        int trades = 0;
+        int wins = 0;
+        int losses = 0;
+        long long margin = 0;
+        long long levSum = 0;
+        int levN = 0;
+    };
+    struct Series {
+        long long pnl = 0;
+        long long margin = 0;
+        int lev = 0;
+        long long closeOid = 0;
+    };
+
+    std::unordered_map<std::string, Acc> accs;
+    std::string curW, curC;
+    Series ser;
+
+    auto closeTrade = [&](Acc& a) {
+        a.closedPnl += ser.pnl;
+        a.trades++;
+        if (ser.pnl > 0) a.wins++;
+        else if (ser.pnl < 0) a.losses++;
+        if (ser.lev > 0) { a.levSum += ser.lev; a.levN++; }
+        if (ser.margin > 0) a.margin += ser.margin;
+    };
+
     int stepRc;
     while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
-        PerpRow r;
-        r.wallet = safeColumnText(s, 0);
-        r.pnlNanos = sqlite3_column_int64(s, 1);
-        r.closedTrades = sqlite3_column_int(s, 2);
-        const int wins = sqlite3_column_int(s, 3);
-        r.volumeNanos = sqlite3_column_int64(s, 4);
-        r.avgLeverage = sqlite3_column_double(s, 5);
-        r.lastTs = sqlite3_column_int64(s, 6);
-        const int losses = sqlite3_column_int(s, 7);
+        const std::string w = safeColumnText(s, 0);
+        const std::string c = safeColumnText(s, 1);
+        const long long ts = sqlite3_column_int64(s, 2);
+        const long long tid = sqlite3_column_int64(s, 3);
+        const long long oid = sqlite3_column_int64(s, 4);
+        const int dir = sqlite3_column_int(s, 5);
+        const int flat = sqlite3_column_int(s, 6);
+        const long long pnl = sqlite3_column_int64(s, 7);
         const long long margin = sqlite3_column_int64(s, 8);
+        const int lev = sqlite3_column_int(s, 9);
+        const long long notional = sqlite3_column_int64(s, 10);
 
-        if (r.closedTrades < HL_MIN_CLOSED_TRADES) continue;
-        const long long maxForWindow = std::max(1LL,
-            (HL_MAX_CLOSED_TRADES_30D * windowSec + (30LL * 86400LL - 1)) / (30LL * 86400LL));
-        if (r.closedTrades > maxForWindow) continue;
-
-        const int decided = wins + losses;
-        r.winRateKnown = decided > 0;
-        r.winRatePercent = decided > 0 ? static_cast<int>((100LL * wins) / decided) : 0;
-
-        const long long roiPnl = sqlite3_column_int64(s, 9);
-        if (margin > 0) {
-            r.roiPercent = 100.0 * static_cast<double>(roiPnl) / static_cast<double>(margin);
-            r.roiKnown = true;
+        if (w != curW || c != curC) {
+            ser = Series{};
+            curW = w;
+            curC = c;
         }
-        rows.push_back(r);
+
+        Acc& a = accs[w];
+        a.volume += notional;
+        if (ts > a.lastTs) a.lastTs = ts;
+
+        ser.pnl += pnl;
+        if (margin > 0) {
+            if (margin > ser.margin) ser.margin = margin;
+        } else if (lev > 0 && notional > 0) {
+            const long long m = notional / lev;
+            if (m > ser.margin) ser.margin = m;
+        }
+        if (lev > 0) ser.lev = lev;
+
+        if (flat != 1 && dir < 5) continue;
+
+        const long long id = oid > 0 ? oid : tid;
+        if (id != 0 && id == ser.closeOid) {
+            a.closedPnl += ser.pnl;
+        } else {
+            closeTrade(a);
+            ser.closeOid = id;
+        }
+        ser.pnl = 0;
+        ser.margin = 0;
+        ser.lev = 0;
     }
-    const bool complete = stepRc == SQLITE_DONE;
     sqlite3_finalize(s);
-    if (!complete) {
+    if (stepRc != SQLITE_DONE) {
         std::cerr << "[HL] рейтинг: чтение прервано, старый кэш сохранён" << std::endl;
         return {};
+    }
+
+    rows.reserve(accs.size());
+    const long long maxForWindow = std::max(1LL,
+        (HL_MAX_CLOSED_TRADES_30D * windowSec + (30LL * 86400LL - 1)) / (30LL * 86400LL));
+    for (auto& kv : accs) {
+        Acc& a = kv.second;
+        if (a.trades < HL_MIN_CLOSED_TRADES) continue;
+        if (a.trades > maxForWindow) continue;
+        PerpRow r;
+        r.wallet = kv.first;
+        r.pnlNanos = a.closedPnl;
+        r.volumeNanos = a.volume;
+        r.lastTs = a.lastTs;
+        r.closedTrades = a.trades;
+        const int decided = a.wins + a.losses;
+        r.winRateKnown = decided > 0;
+        r.winRatePercent = decided > 0 ? static_cast<int>((100LL * a.wins) / decided) : 0;
+        r.avgLeverage = a.levN > 0 ? static_cast<double>(a.levSum) / a.levN : 0.0;
+        if (a.margin > 0) {
+            r.roiPercent = 100.0 * static_cast<double>(a.closedPnl) / static_cast<double>(a.margin);
+            r.roiKnown = true;
+        }
+        rows.push_back(std::move(r));
     }
     ok = true;
     return rows;
