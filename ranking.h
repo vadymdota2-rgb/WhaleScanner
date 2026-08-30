@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "tx_analyzer.h"
 #include "ru.h"
 
@@ -33,7 +34,6 @@ void markRankPresence(const char* venue, const std::vector<std::string>& wallets
 int  rankPresenceDays(const char* venue, const std::string& wallet);
 
 void rebuildAllRankings();
-void requestRankingRebuild();
 void rankingCacheLoop();
 
 struct RankingMessage {
