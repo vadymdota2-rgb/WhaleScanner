@@ -257,7 +257,7 @@ void cleanupOldTrades() {
     int deleted = (rc1 == SQLITE_DONE) ? sqlite3_changes(db) : 0;
     if (rc1 != SQLITE_DONE) std::cerr << "[RANKING] trades cleanup DELETE failed: " << sqlite3_errmsg(db) << std::endl;
     sqlite3_finalize(s);
-    if (deleted > 0) std::cout << "[RANKING] Purged " << deleted << " trade(s) older than 30 days" << std::endl;
+    if (deleted > 0) std::cout << "[RANKING] Purged " << deleted << " trade(s) older than 365 days" << std::endl;
 
     if (prepareOrLog(db, &s, "DELETE FROM ignored_wallets WHERE permanent = 0 AND ignored_until <= ?")) {
         sqlite3_bind_int64(s, 1, static_cast<sqlite3_int64>(time(nullptr)));
@@ -366,6 +366,9 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
     std::vector<PnlRow> results;
     if (windowSeconds < 86400LL) windowSeconds = 86400LL;
     long long since = static_cast<long long>(time(nullptr)) - windowSeconds;
+    const long long histSince = static_cast<long long>(time(nullptr)) - RETENTION_SECONDS;
+    const long long maxForWindow = std::max(1LL,
+        (MAX_BOT_FILTER_TRADES * windowSeconds + (30LL * 86400LL - 1)) / (30LL * 86400LL));
 
     std::string curWallet, curToken;
     cpp_int heldQty = 0, heldCost = 0;
@@ -376,7 +379,7 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
 
     auto flush = [&]() {
         if (!curWallet.empty() && outerCompleted >= MIN_GLOBAL_COMPLETED_TRADES &&
-            outerCompleted <= MAX_BOT_FILTER_TRADES) {
+            outerCompleted <= maxForWindow) {
             PnlRow row;
             row.wallet = curWallet;
             row.pnlNanos = cppIntToClampedI64(outerPnl);
@@ -404,7 +407,7 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
         "WHERE t.timestamp>=? "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw WHERE iw.wallet=t.wallet AND iw.permanent=1) "
         "ORDER BY t.wallet ASC, t.token ASC, t.timestamp ASC, t.id ASC")) return results;
-    sqlite3_bind_int64(s, 1, since);
+    sqlite3_bind_int64(s, 1, histSince);
 
     int stepRc;
     while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
@@ -443,14 +446,16 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
             cpp_int timeOfMatched = (heldTimeWeighted * matchedQty) / heldQty;
             cpp_int proceedsMatched = (cpp_int(usdNanos) * matchedQty) / amount;
 
-            outerPnl += (proceedsMatched - costOfMatched);
-            outerCostDeployed += costOfMatched;
-            outerCompleted++;
-            if (proceedsMatched > costOfMatched) outerWinning++;
+            if (tradeTs >= since) {
+                outerPnl += (proceedsMatched - costOfMatched);
+                outerCostDeployed += costOfMatched;
+                outerCompleted++;
+                if (proceedsMatched > costOfMatched) outerWinning++;
 
-            cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
-            long long held = tradeTs - avgBuyTs.convert_to<long long>();
-            if (held > 0) outerHoldSeconds += held;
+                cpp_int avgBuyTs = matchedQty > 0 ? (timeOfMatched / matchedQty) : cpp_int(tradeTs);
+                long long held = tradeTs - avgBuyTs.convert_to<long long>();
+                if (held > 0) outerHoldSeconds += held;
+            }
 
             heldQty -= matchedQty;
             heldCost -= costOfMatched;
@@ -507,16 +512,6 @@ std::string globalTitle(GlobalRankKind kind, Lang lang) {
         case GlobalRankKind::ACTIVE: return tr(lang, "rk_btn_most_active");
     }
     return "🏆 " + tr(lang, "rk_top_traders_30d");
-}
-
-int countBscBannedBots() {
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s, "SELECT COUNT(*) FROM ignored_wallets WHERE permanent=1")) return 0;
-    int n = 0;
-    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
-    sqlite3_finalize(s);
-    return n;
 }
 
 RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& rows, int page,
@@ -615,13 +610,6 @@ RankingMessage buildGlobalFromCache(GlobalRankKind kind, int page, int maxRank, 
     return renderGlobalPage(kind, rows, page, maxRank, showUpgrade, lang, windowDays);
 }
 
-}
-
-void requestRankingRebuild() {
-    for (int i = 0; i < RANK_WINDOWS_COUNT; i++)
-        g_rankWindowBuiltAt[i] = 0;
-    g_forceRebuild.store(true, std::memory_order_relaxed);
-    std::cout << "[RANKING] пересчёт запрошен, выполнится в фоне" << std::endl;
 }
 
 void rebuildAllRankings() {
@@ -999,7 +987,8 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
             sqlite3_bind_text(h, 2, token.c_str(), -1, SQLITE_TRANSIENT);
             cpp_int pos = 0, cost = 0;
             int buys = 0;
-            while (sqlite3_step(h) == SQLITE_ROW) {
+            int stepRc;
+            while ((stepRc = sqlite3_step(h)) == SQLITE_ROW) {
                 const bool isBuy = sqlite3_column_int(h, 0) != 0;
                 const long long u = sqlite3_column_int64(h, 1);
                 const std::string a = safeColumnText(h, 2);
@@ -1015,6 +1004,7 @@ bool lastBuyOutcome(const std::string& walletArg, const std::string& tokenArg,
                 pos -= take;
             }
             sqlite3_finalize(h);
+            if (stepRc != SQLITE_DONE) return false;
             if (pos > 0 && cost > 0) {
                 const cpp_int avgBig = calcUnitPriceNanos(cost, pos, dec);
                 if (avgBig > 0 && avgBig <= cpp_int("1000000000000000"))
@@ -1067,7 +1057,8 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     cpp_int costBasis = 0;
     int buys = 0;
 
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    int stepRc;
+    while ((stepRc = sqlite3_step(s)) == SQLITE_ROW) {
         const bool isBuy = sqlite3_column_int(s, 0) != 0;
         const long long usd = sqlite3_column_int64(s, 1);
         const std::string amtStr = safeColumnText(s, 2);
@@ -1092,6 +1083,7 @@ bool sellOutcome(const std::string& walletArg, const std::string& tokenArg,
     }
     sqlite3_finalize(s);
 
+    if (stepRc != SQLITE_DONE) return false;
     if (buys == 0 || position <= 0 || costBasis <= 0) return false;
 
     const cpp_int take = selling < position ? selling : position;
