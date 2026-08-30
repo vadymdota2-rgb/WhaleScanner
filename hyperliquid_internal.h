@@ -4,6 +4,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <vector>
 #include <sqlite3.h>
 #include "json.hpp"
 #include "ru.h"
@@ -81,6 +82,7 @@ std::string formatPriceNanos(long long nanos);
 bool parseDecimalToNanos(const std::string& s, long long& out);
 std::string jstr(const nlohmann::json& j, const char* key, const char* def = "");
 nlohmann::json infoPost(const nlohmann::json& body, int weight);
+std::vector<std::string> perpDexNames();
 size_t watchedCount();
 
 }
