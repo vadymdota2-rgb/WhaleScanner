@@ -1045,6 +1045,15 @@ void enrichWallet(const std::string& wallet) {
         p.fee = 0;
         parseDecimalToNanos(jstr(f, "closedPnl", "0"), p.closedPnl);
         parseDecimalToNanos(jstr(f, "fee", "0"), p.fee);
+        const std::string feeToken = jstr(f, "feeToken", "USDC");
+        if (!feeToken.empty() && feeToken != "USDC") {
+            long long px = 0;
+            parseDecimalToNanos(jstr(f, "px", "0"), px);
+            if (px > 0) {
+                const __int128 usd = static_cast<__int128>(p.fee) * px / NANOS_PER_UNIT;
+                p.fee = static_cast<long long>(usd);
+            }
+        }
         p.notional = 0;
         notionalNanos(jstr(f, "px", "0"), jstr(f, "sz", "0"), p.notional);
         p.pos = lastKnownPosition(wallet, jstr(f, "coin"));
