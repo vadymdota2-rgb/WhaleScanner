@@ -708,57 +708,66 @@ struct OpenPosition {
 bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out,
                        long long& accountValueNanos) {
     accountValueNanos = 0;
-    json body;
-    body["type"] = "clearinghouseState";
-    body["user"] = wallet;
-    body["dex"] = "";
-    json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
-    if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
-        return false;
+    bool any = false;
+    for (const std::string& dex : perpDexNames()) {
+        json body;
+        body["type"] = "clearinghouseState";
+        body["user"] = wallet;
+        body["dex"] = dex;
+        json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
+        if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
+            continue;
+        any = true;
 
-    if (j.contains("marginSummary") && j["marginSummary"].is_object())
-        parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), accountValueNanos);
-
-    for (const auto& ap : j["assetPositions"]) {
-        if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
-        const json& p = ap["position"];
-
-        OpenPosition op;
-        op.wallet = wallet;
-        op.coin = jstr(p, "coin");
-        if (op.coin.empty()) continue;
-
-        long long szi = 0;
-        parseDecimalToNanos(jstr(p, "szi", "0"), szi);
-        if (szi == 0) continue;
-        op.isLong = szi > 0;
-        op.sizeNanos = szi < 0 ? -szi : szi;
-
-        parseDecimalToNanos(jstr(p, "entryPx", "0"), op.entryPxNanos);
-
-        long long posValue = 0;
-        if (parseDecimalToNanos(jstr(p, "positionValue", "0"), posValue) &&
-            posValue > 0 && op.sizeNanos > 0) {
-            const __int128 num = static_cast<__int128>(posValue) * NANOS_PER_UNIT;
-            op.markPxNanos = static_cast<long long>(num / op.sizeNanos);
+        if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
+            long long v = 0;
+            parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), v);
+            if (v > 0) accountValueNanos += v;
         }
-        parseDecimalToNanos(jstr(p, "liquidationPx", "0"), op.liqPxNanos);
-        parseDecimalToNanos(jstr(p, "marginUsed", "0"), op.marginNanos);
-        parseDecimalToNanos(jstr(p, "unrealizedPnl", "0"), op.unrealizedNanos);
 
-        long long roe = 0;
-        if (parseDecimalToNanos(jstr(p, "returnOnEquity", "0"), roe))
-            op.roePercent = 100.0 * static_cast<double>(roe) / static_cast<double>(NANOS_PER_UNIT);
+        for (const auto& ap : j["assetPositions"]) {
+            if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
+            const json& p = ap["position"];
 
-        if (p.contains("leverage") && p["leverage"].is_object()) {
-            const json& lev = p["leverage"];
-            if (lev.contains("value") && lev["value"].is_number())
-                op.leverage = lev["value"].get<int>();
-            op.isolated = jstr(lev, "type") == "isolated";
+            OpenPosition op;
+            op.wallet = wallet;
+            op.coin = jstr(p, "coin");
+            if (op.coin.empty()) continue;
+            if (!dex.empty() && op.coin.find(':') == std::string::npos)
+                op.coin = dex + ":" + op.coin;
+
+            long long szi = 0;
+            parseDecimalToNanos(jstr(p, "szi", "0"), szi);
+            if (szi == 0) continue;
+            op.isLong = szi > 0;
+            op.sizeNanos = szi < 0 ? -szi : szi;
+
+            parseDecimalToNanos(jstr(p, "entryPx", "0"), op.entryPxNanos);
+
+            long long posValue = 0;
+            if (parseDecimalToNanos(jstr(p, "positionValue", "0"), posValue) &&
+                posValue > 0 && op.sizeNanos > 0) {
+                const __int128 num = static_cast<__int128>(posValue) * NANOS_PER_UNIT;
+                op.markPxNanos = static_cast<long long>(num / op.sizeNanos);
+            }
+            parseDecimalToNanos(jstr(p, "liquidationPx", "0"), op.liqPxNanos);
+            parseDecimalToNanos(jstr(p, "marginUsed", "0"), op.marginNanos);
+            parseDecimalToNanos(jstr(p, "unrealizedPnl", "0"), op.unrealizedNanos);
+
+            long long roe = 0;
+            if (parseDecimalToNanos(jstr(p, "returnOnEquity", "0"), roe))
+                op.roePercent = 100.0 * static_cast<double>(roe) / static_cast<double>(NANOS_PER_UNIT);
+
+            if (p.contains("leverage") && p["leverage"].is_object()) {
+                const json& lev = p["leverage"];
+                if (lev.contains("value") && lev["value"].is_number())
+                    op.leverage = lev["value"].get<int>();
+                op.isolated = jstr(lev, "type") == "isolated";
+            }
+            out.push_back(std::move(op));
         }
-        out.push_back(std::move(op));
     }
-    return true;
+    return any;
 }
 
 HlMessage buildPositionsLocked(Lang lang) {
