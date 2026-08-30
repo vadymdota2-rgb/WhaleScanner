@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <poll.h>
@@ -63,6 +64,7 @@ constexpr int HL_RECONNECT_MAX_SEC = 60;
 constexpr int HL_BUDGET_PER_MINUTE = 1150;
 constexpr int HL_WEIGHT_USER_FILLS = 20;
 constexpr int HL_WEIGHT_META = 20;
+constexpr int HL_WEIGHT_FUNDING_HIST = 80;
 
 constexpr long long HL_USER_DEBOUNCE_SEC = 5;
 constexpr long long HL_SERVICE_DEBOUNCE_SEC = 30;
@@ -290,6 +292,13 @@ bool spendBudget(int weight, bool = false) {
     return true;
 }
 
+int budgetLeft() {
+    std::lock_guard<std::mutex> l(g_budgetMutex);
+    long long minute = nowSec() / 60;
+    if (minute != g_budgetWindow) { g_budgetWindow = minute; g_budgetSpent = 0; }
+    return HL_BUDGET_PER_MINUTE - g_budgetSpent;
+}
+
 
 json infoPost(const json& body, int weight, bool slow) {
     if (!spendBudget(weight, slow)) {
@@ -349,15 +358,46 @@ void interruptibleSleep(int seconds) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
-bool fetchDexUniverse(const std::string& dex, std::vector<std::string>& subscribe,
-                      std::vector<std::string>& all) {
-    json body;
-    body["type"] = "meta";
-    body["dex"] = dex;
-    json j = infoPost(body, HL_WEIGHT_META);
-    if (!j.is_object() || !j.contains("universe") || !j["universe"].is_array())
-        return false;
-    for (const auto& u : j["universe"]) {
+long long hourFloorSec(long long sec) {
+    if (sec < 0) return 0;
+    return (sec / 3600LL) * 3600LL;
+}
+
+void saveFundingRates(long long hourTs,
+                      const std::vector<std::pair<std::string, std::pair<long long, long long>>>& rows) {
+    if (rows.empty() || hourTs <= 0) return;
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return;
+    sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(g_hlDb, &s,
+            "INSERT OR REPLACE INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos) VALUES(?,?,?,?)")) {
+        sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+        return;
+    }
+    for (const auto& row : rows) {
+        sqlite3_reset(s);
+        sqlite3_clear_bindings(s);
+        sqlite3_bind_text(s, 1, row.first.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, hourTs);
+        sqlite3_bind_int64(s, 3, row.second.first);
+        sqlite3_bind_int64(s, 4, row.second.second);
+        if (sqlite3_step(s) != SQLITE_DONE) {
+            sqlite3_finalize(s);
+            sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+            return;
+        }
+    }
+    sqlite3_finalize(s);
+    sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+}
+
+void ingestUniverse(const json& universe, const json* ctxs, const std::string& dex,
+                    std::vector<std::string>& subscribe, std::vector<std::string>& all,
+                    std::vector<std::pair<std::string, std::pair<long long, long long>>>& rates) {
+    if (!universe.is_array()) return;
+    for (size_t i = 0; i < universe.size(); i++) {
+        const auto& u = universe[i];
         if (!u.is_object() || !u.contains("name") || !u["name"].is_string()) continue;
         std::string name = u["name"].get<std::string>();
         if (name.empty()) continue;
@@ -366,7 +406,36 @@ bool fetchDexUniverse(const std::string& dex, std::vector<std::string>& subscrib
             coin = dex + ":" + name;
         all.push_back(coin);
         if (!u.value("isDelisted", false)) subscribe.push_back(coin);
+        if (!ctxs || i >= ctxs->size() || !(*ctxs)[i].is_object()) continue;
+        const json& ctx = (*ctxs)[i];
+        long long rate = 0, mark = 0;
+        parseDecimalToNanos(jstr(ctx, "funding", "0"), rate);
+        parseDecimalToNanos(jstr(ctx, "markPx", "0"), mark);
+        rates.emplace_back(coin, std::make_pair(rate, mark));
     }
+}
+
+bool fetchDexUniverse(const std::string& dex, std::vector<std::string>& subscribe,
+                      std::vector<std::string>& all) {
+    json body;
+    body["type"] = "metaAndAssetCtxs";
+    if (!dex.empty()) body["dex"] = dex;
+    json j = infoPost(body, HL_WEIGHT_META);
+    std::vector<std::pair<std::string, std::pair<long long, long long>>> rates;
+    if (j.is_array() && j.size() >= 2 && j[0].is_object() &&
+        j[0].contains("universe") && j[0]["universe"].is_array() && j[1].is_array()) {
+        ingestUniverse(j[0]["universe"], &j[1], dex, subscribe, all, rates);
+        saveFundingRates(hourFloorSec(nowSec()), rates);
+        return true;
+    }
+
+    json meta;
+    meta["type"] = "meta";
+    if (!dex.empty()) meta["dex"] = dex;
+    json m = infoPost(meta, HL_WEIGHT_META);
+    if (!m.is_object() || !m.contains("universe") || !m["universe"].is_array())
+        return false;
+    ingestUniverse(m["universe"], nullptr, dex, subscribe, all, rates);
     return true;
 }
 
@@ -732,8 +801,8 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     if (!prepareOrLog(g_hlDb, &s,
             "INSERT OR IGNORE INTO hl_fills"
             "(tid,wallet,coin,dir,side,px,sz,closed_pnl_nanos,fee_nanos,"
-            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash,dir_code,flat) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "notional_nanos,margin_nanos,leverage,oid,account_value_nanos,ts,hash,dir_code,flat,start_pos_nanos) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return false;
     sqlite3_bind_int64(s, 1, tid);
     sqlite3_bind_text(s, 2, wallet.c_str(), -1, SQLITE_TRANSIENT);
@@ -768,6 +837,9 @@ bool saveFillLocked(const std::string& wallet, const json& f, long long closedPn
     sqlite3_bind_text(s,  16, hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(s, 17, code);
     sqlite3_bind_int(s, 18, fillIsRoundTrip(f, code) ? 1 : 0);
+    long long startPos = 0;
+    parseDecimalToNanos(jstr(f, "startPosition", "0"), startPos);
+    sqlite3_bind_int64(s, 19, startPos);
     bool ok = sqlite3_step(s) == SQLITE_DONE;
     int changed = sqlite3_changes(g_hlDb);
     sqlite3_finalize(s);
@@ -1117,6 +1189,81 @@ void backfillFlatFlags() {
     std::cout << "[HL] сделок-кругов в базе (flat): " << nflat << std::endl;
 }
 
+void dripFundingHistory() {
+    if (budgetLeft() < HL_WEIGHT_FUNDING_HIST + 40) return;
+    std::vector<std::string> coins;
+    {
+        std::lock_guard<std::mutex> l(g_coinsMutex);
+        coins.assign(g_perpCoins.begin(), g_perpCoins.end());
+    }
+    if (coins.empty()) return;
+
+    std::string pick;
+    {
+        std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (!g_hlDb) return;
+        sqlite3_stmt* s = nullptr;
+        std::set<std::string> done;
+        if (prepareOrLog(g_hlDb, &s, "SELECT coin FROM hl_funding_backfill WHERE done=1")) {
+            while (sqlite3_step(s) == SQLITE_ROW) done.insert(safeColumnText(s, 0));
+            sqlite3_finalize(s);
+        }
+        for (const auto& c : coins) {
+            if (!done.count(c)) { pick = c; break; }
+        }
+    }
+    if (pick.empty()) return;
+
+    json body;
+    body["type"] = "fundingHistory";
+    body["coin"] = pick;
+    body["startTime"] = (nowSec() - 30LL * 86400LL) * 1000LL;
+    json j = infoPost(body, HL_WEIGHT_FUNDING_HIST);
+    if (!j.is_array()) return;
+
+    std::lock_guard<std::mutex> l(g_hlDbMutex);
+    if (!g_hlDb) return;
+    sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
+    sqlite3_stmt* ins = nullptr;
+    if (!prepareOrLog(g_hlDb, &ins,
+            "INSERT OR REPLACE INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos) VALUES(?,?,?,?)")) {
+        sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+        return;
+    }
+    int n = 0;
+    for (const auto& row : j) {
+        if (!row.is_object()) continue;
+        std::string coin = jstr(row, "coin", pick.c_str());
+        if (coin.empty()) coin = pick;
+        long long rate = 0;
+        parseDecimalToNanos(jstr(row, "fundingRate", "0"), rate);
+        long long tms = row.value("time", 0LL);
+        if (tms <= 0) continue;
+        const long long hour = hourFloorSec(tms / 1000LL);
+        sqlite3_reset(ins);
+        sqlite3_clear_bindings(ins);
+        sqlite3_bind_text(ins, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(ins, 2, hour);
+        sqlite3_bind_int64(ins, 3, rate);
+        sqlite3_bind_int64(ins, 4, 0);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            sqlite3_finalize(ins);
+            sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
+            return;
+        }
+        n++;
+    }
+    sqlite3_finalize(ins);
+    sqlite3_stmt* d = nullptr;
+    if (prepareOrLog(g_hlDb, &d, "INSERT OR REPLACE INTO hl_funding_backfill(coin,done) VALUES(?,1)")) {
+        sqlite3_bind_text(d, 1, pick.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(d);
+        sqlite3_finalize(d);
+    }
+    sqlite3_exec(g_hlDb, "COMMIT", nullptr, nullptr, nullptr);
+    std::cout << "[HL] фандинг " << pick << ": " << n << " часов" << std::endl;
+}
+
 void enricherLoop() {
     long long lastCleanup = 0;
     long long lastRank = 0;
@@ -1161,6 +1308,7 @@ void enricherLoop() {
                 rollbackIfOpen();
             }
         }
+        if (!urgent) dripFundingHistory();
         if (perpCoinsLoaded() &&
             (lastCleanup == 0 || nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC)) {
             purgeNonPerpFills();
@@ -1436,7 +1584,8 @@ bool initHyperliquid() {
         "  account_value_nanos INTEGER NOT NULL DEFAULT 0,"
         "  ts INTEGER NOT NULL DEFAULT 0,"
         "  hash TEXT NOT NULL DEFAULT '',"
-        "  flat INTEGER NOT NULL DEFAULT 0);"
+        "  flat INTEGER NOT NULL DEFAULT 0,"
+        "  start_pos_nanos INTEGER);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_wallet_ts ON hl_fills(wallet, ts);"
         "CREATE INDEX IF NOT EXISTS idx_hl_fills_ts ON hl_fills(ts);"
         "CREATE TABLE IF NOT EXISTS hl_wallet_state ("
@@ -1449,7 +1598,16 @@ bool initHyperliquid() {
         "CREATE TABLE IF NOT EXISTS hl_banned ("
         "  wallet TEXT PRIMARY KEY,"
         "  banned_at INTEGER NOT NULL DEFAULT 0,"
-        "  trades INTEGER NOT NULL DEFAULT 0);";
+        "  trades INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE IF NOT EXISTS hl_funding_rate ("
+        "  coin TEXT NOT NULL,"
+        "  hour_ts INTEGER NOT NULL,"
+        "  rate_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  mark_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY (coin, hour_ts));"
+        "CREATE TABLE IF NOT EXISTS hl_funding_backfill ("
+        "  coin TEXT PRIMARY KEY,"
+        "  done INTEGER NOT NULL DEFAULT 0);";
 
     char* err = nullptr;
     if (sqlite3_exec(g_hlDb, schema, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -1469,6 +1627,7 @@ bool initHyperliquid() {
         "ALTER TABLE hl_fills ADD COLUMN account_value_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_wallet_state ADD COLUMN backfilled_30d INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN flat INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_fills ADD COLUMN start_pos_nanos INTEGER",
     };
     for (const char* sql : migrations) {
         char* mErr = nullptr;
