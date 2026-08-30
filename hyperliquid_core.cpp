@@ -186,6 +186,7 @@ std::string formatPriceNanos(long long nanos) {
 
 std::mutex g_coinsMutex;
 std::set<std::string> g_perpCoins;
+std::vector<std::string> g_perpDexes{""};
 
 bool perpCoinsLoaded() {
     std::lock_guard<std::mutex> l(g_coinsMutex);
@@ -203,6 +204,12 @@ void setPerpCoins(const std::vector<std::string>& coins) {
     std::set<std::string> fresh(coins.begin(), coins.end());
     std::lock_guard<std::mutex> l(g_coinsMutex);
     g_perpCoins.swap(fresh);
+}
+
+std::vector<std::string> perpDexNames() {
+    std::lock_guard<std::mutex> l(g_coinsMutex);
+    if (g_perpDexes.empty()) return {""};
+    return g_perpDexes;
 }
 
 using AddressSet = std::set<std::string>;
@@ -461,6 +468,18 @@ bool fetchPerpCoins(std::vector<std::string>& subscribe, std::vector<std::string
     }
     if (extra > 0)
         std::cout << "[HL] HIP-3 рынков: " << extra << ", всего: " << all.size() << std::endl;
+    {
+        std::vector<std::string> dexes{""};
+        for (const auto& d : dexs) {
+            std::string name;
+            if (d.is_null()) continue;
+            if (d.is_string()) name = d.get<std::string>();
+            else if (d.is_object()) name = d.value("name", "");
+            if (!name.empty()) dexes.push_back(name);
+        }
+        std::lock_guard<std::mutex> l(g_coinsMutex);
+        g_perpDexes.swap(dexes);
+    }
     return !all.empty();
 }
 
@@ -491,32 +510,37 @@ std::string posKey(const std::string& wallet, const std::string& coin) {
 }
 
 void fetchAccountState(const std::string& wallet) {
-    json body;
-    body["type"] = "clearinghouseState";
-    body["user"] = wallet;
-    body["dex"] = "";
-    json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
-    if (!j.is_object()) return;
-
-    long long accountValue = 0;
-    if (j.contains("marginSummary") && j["marginSummary"].is_object())
-        parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), accountValue);
-
-    {
-        std::lock_guard<std::mutex> l(g_posMutex);
-        if (accountValue > 0) g_accountValue[wallet] = accountValue;
-    }
-
-    if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) return;
-
     std::set<std::string> openNow;
-    for (const auto& ap : j["assetPositions"]) {
-        if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
-        const std::string c = jstr(ap["position"], "coin");
-        if (!c.empty()) openNow.insert(c);
+    std::vector<std::pair<std::string, json>> posRows;
+    long long accountValue = 0;
+
+    for (const std::string& dex : perpDexNames()) {
+        json body;
+        body["type"] = "clearinghouseState";
+        body["user"] = wallet;
+        body["dex"] = dex;
+        json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
+        if (!j.is_object()) continue;
+        if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
+            long long v = 0;
+            parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), v);
+            if (v > 0) accountValue += v;
+        }
+        if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) continue;
+        for (const auto& ap : j["assetPositions"]) {
+            if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
+            json p = ap["position"];
+            std::string coin = jstr(p, "coin");
+            if (coin.empty()) continue;
+            if (!dex.empty() && coin.find(':') == std::string::npos)
+                coin = dex + ":" + coin;
+            openNow.insert(coin);
+            posRows.emplace_back(std::move(coin), std::move(p));
+        }
     }
 
     std::lock_guard<std::mutex> l(g_posMutex);
+    if (accountValue > 0) g_accountValue[wallet] = accountValue;
 
     const std::string prefix = posKey(wallet, "");
     for (auto it = g_lastPositions.begin(); it != g_lastPositions.end(); ) {
@@ -532,12 +556,8 @@ void fetchAccountState(const std::string& wallet) {
         std::cout << "[HL] кэш позиций сброшен по достижении предела" << std::endl;
     }
 
-    for (const auto& ap : j["assetPositions"]) {
-        if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
-        const json& p = ap["position"];
-        std::string coin = jstr(p, "coin");
-        if (coin.empty()) continue;
-
+    for (auto& row : posRows) {
+        const json& p = row.second;
         PositionInfo info;
         info.known = true;
         info.snapshotAt = nowSec();
@@ -550,8 +570,7 @@ void fetchAccountState(const std::string& wallet) {
         parseDecimalToNanos(jstr(p, "marginUsed", "0"), info.marginUsedNanos);
         parseDecimalToNanos(jstr(p, "positionValue", "0"), info.positionValueNanos);
         parseDecimalToNanos(jstr(p, "liquidationPx", "0"), info.liquidationPxNanos);
-
-        g_lastPositions[posKey(wallet, coin)] = info;
+        g_lastPositions[posKey(wallet, row.first)] = info;
     }
 }
 
