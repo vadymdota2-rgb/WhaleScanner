@@ -1,6 +1,7 @@
 #include "message_queue.h"
 #include <set>
 #include "premium.h"
+#include "alert_settings.h"
 
 #include <sqlite3.h>
 #include <mutex>
