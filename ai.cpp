@@ -213,6 +213,7 @@ void loadWeightSet(bool perp) {
 void ensureSchema() {
     if (g_schemaOk) return;
     std::lock_guard<std::mutex> lock(dbMutex);
+    if (g_schemaOk) return;
     if (!db) return;
     const char* sql =
         "CREATE TABLE IF NOT EXISTS ai_events ("
@@ -466,7 +467,8 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
                 "SELECT token,wallet,is_buy,usd_nanos,timestamp FROM trades WHERE timestamp>=?"))
             return {};
         sqlite3_bind_int64(s, 1, since);
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             const std::string token = toLower(safeColumnText(s, 0));
             const std::string wallet = toLower(safeColumnText(s, 1));
             if (token.empty() || wallet.empty() || ban.count(wallet)) continue;
@@ -475,6 +477,7 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
                    top.count(wallet) != 0);
         }
         sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) return {};
     }
     const auto names = tokenSymbols();
     std::vector<Row> out;
@@ -488,7 +491,8 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
         }
         name = safeString(name, 16);
         Row r = toRow(p.first, name, p.second, false);
-        if (r.score != 0) out.push_back(std::move(r));
+        if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
+            out.push_back(std::move(r));
     }
     return out;
 }
@@ -509,7 +513,8 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
                 "WHERE ts>=? AND dir_code IN (1,2,6,7,8)"))
             return {};
         sqlite3_bind_int64(s, 1, sinceMs);
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             const std::string coin = safeColumnText(s, 0);
             const std::string wallet = toLower(safeColumnText(s, 1));
             if (coin.empty() || wallet.empty() || ban.count(wallet)) continue;
@@ -523,20 +528,25 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
             }
             addVol(m[coin], wallet, notional, dir == DIR_OPEN_LONG, ts, t6, t24,
                    top.count(wallet) != 0);
-            const int lev = sqlite3_column_int(s, 5);
+            int lev = sqlite3_column_int(s, 5);
             if (lev > 0) {
+                if (lev > 100) lev = 100;
                 long long a = notional < 0 ? -notional : notional;
+                const long long lim = 90000000000000000LL / lev;
+                if (a > lim) a = lim;
                 m[coin].levWeight += a;
-                m[coin].levNotional += a * lev;
+                m[coin].levNotional += a * static_cast<long long>(lev);
             }
         }
         sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) return {};
     }
     std::vector<Row> out;
     out.reserve(m.size());
     for (const auto& p : m) {
         Row r = toRow(p.first, p.first, p.second, true);
-        if (r.score != 0) out.push_back(std::move(r));
+        if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
+            out.push_back(std::move(r));
     }
     return out;
 }
