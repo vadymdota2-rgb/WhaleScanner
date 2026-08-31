@@ -600,7 +600,7 @@ void fillOutcomes() {
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(db, &s,
                 "SELECT id,token,venue,ts,price_then,filled_6h,filled_at FROM ai_events "
-                "WHERE (filled_6h=0 AND ts<=?) OR (filled_at=0 AND ts<=?) LIMIT 20"))
+                "WHERE (filled_6h=0 AND ts<=?) OR (filled_at=0 AND ts<=?) LIMIT 80"))
             return;
         sqlite3_bind_int64(s, 1, now - AI_HORIZON_6H);
         sqlite3_bind_int64(s, 2, now - AI_HORIZON_24H);
@@ -776,6 +776,32 @@ void cleanupEvents() {
     sqlite3_finalize(s);
 }
 
+std::vector<Row> collectPassing(int days) {
+    const long long since = hl::nowSec() - static_cast<long long>(days) * 86400LL;
+    auto spot = loadSpot(since, bannedSpot());
+    auto perp = loadPerp(since, bannedHl());
+    enrichPerpFunding(perp);
+    for (auto& r : perp) finish(r);
+    spot.insert(spot.end(), perp.begin(), perp.end());
+    return spot;
+}
+
+void snapshotHour() {
+    ensureSchema();
+    static long long lastSlot = 0;
+    const long long slot = hl::nowSec() / 3600;
+    if (slot == lastSlot) return;
+    lastSlot = slot;
+    auto rows = collectPassing(1);
+    if (rows.size() > 400) {
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+            return std::fabs(a.score) > std::fabs(b.score);
+        });
+        rows.resize(400);
+    }
+    recordRows(1, rows);
+}
+
 }
 
 AiMessage buildAiSignals(const std::string& chatId, int days) {
@@ -809,17 +835,16 @@ AiMessage buildAiSignals(const std::string& chatId, int days) {
     auto perp = loadPerp(since, bannedHl());
     enrichPerpFunding(perp);
     for (auto& r : perp) finish(r);
+    if (days == 1) {
+        std::vector<Row> logged;
+        logged.reserve(spot.size() + perp.size());
+        logged.insert(logged.end(), spot.begin(), spot.end());
+        logged.insert(logged.end(), perp.begin(), perp.end());
+        recordRows(1, logged);
+    }
     std::vector<Row> spotBuy, spotAvoid, perpBuy, perpAvoid;
     takeSides(spot, spotBuy, spotAvoid);
     takeSides(perp, perpBuy, perpAvoid);
-
-    std::vector<Row> logged;
-    logged.reserve(spotBuy.size() + spotAvoid.size() + perpBuy.size() + perpAvoid.size());
-    logged.insert(logged.end(), spotBuy.begin(), spotBuy.end());
-    logged.insert(logged.end(), spotAvoid.begin(), spotAvoid.end());
-    logged.insert(logged.end(), perpBuy.begin(), perpBuy.end());
-    logged.insert(logged.end(), perpAvoid.begin(), perpAvoid.end());
-    recordRows(days, logged);
 
     std::ostringstream t;
     t << "\U0001F916 <b>" << tr(lang, "ai_title") << "</b> · " << windowLabel(days, lang) << "\n\n";
@@ -889,6 +914,7 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
 
 void aiTick() {
     fillOutcomes();
+    snapshotHour();
     trainWeights();
     static int n = 0;
     if (++n % 60 == 0) cleanupEvents();
