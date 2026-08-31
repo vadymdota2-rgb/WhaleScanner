@@ -188,7 +188,8 @@ void loadWeightSet(bool perp) {
     if (prepareOrLog(db, &s, "SELECT k,v FROM ai_weights WHERE k>=? AND k<?")) {
         sqlite3_bind_int(s, 1, wKey(perp, 0));
         sqlite3_bind_int(s, 2, wKey(perp, AI_NF));
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             const int k = sqlite3_column_int(s, 0) - wKey(perp, 0);
             if (k >= 0 && k < AI_NF) {
                 w[static_cast<size_t>(k)] = sqlite3_column_double(s, 1);
@@ -196,6 +197,7 @@ void loadWeightSet(bool perp) {
             }
         }
         sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) got = 0;
     }
     long long nSamp = 0;
     if (prepareOrLog(db, &s, "SELECT v FROM ai_weights WHERE k=?")) {
@@ -344,11 +346,13 @@ std::unordered_set<std::string> bannedSpot() {
             "SELECT wallet FROM ignored_wallets WHERE permanent=1 OR ignored_until>?"))
         return out;
     sqlite3_bind_int64(s, 1, now);
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
         std::string w = toLower(safeColumnText(s, 0));
         if (!w.empty()) out.insert(std::move(w));
     }
     sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) out.clear();
     return out;
 }
 
@@ -358,11 +362,13 @@ std::unordered_set<std::string> bannedHl() {
     if (!hl::g_hlDb) return out;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(hl::g_hlDb, &s, "SELECT wallet FROM hl_banned")) return out;
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
         std::string w = toLower(safeColumnText(s, 0));
         if (!w.empty()) out.insert(std::move(w));
     }
     sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) out.clear();
     return out;
 }
 
@@ -372,12 +378,14 @@ std::unordered_map<std::string, std::string> tokenSymbols() {
     if (!db) return out;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s, "SELECT address,symbol FROM token_cache")) return out;
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
         std::string addr = toLower(safeColumnText(s, 0));
         std::string sym = safeColumnText(s, 1);
         if (!addr.empty() && !sym.empty()) out[addr] = std::move(sym);
     }
     sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) out.clear();
     return out;
 }
 
