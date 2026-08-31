@@ -11,6 +11,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -551,6 +552,26 @@ std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree() {
         info.winRateKnown = rows[i].winRateKnown;
         info.closedTrades = rows[i].closedTrades;
         out.emplace_back(rows[i].wallet, info);
+    }
+    return out;
+}
+
+std::unordered_set<std::string> hlTopPnlWallets(int n) {
+    std::unordered_set<std::string> out;
+    if (n <= 0) return out;
+    std::vector<PerpRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_rankMutex);
+        rows = g_rankCache[0];
+    }
+    if (rows.empty()) return out;
+    std::sort(rows.begin(), rows.end(),
+              [](const PerpRow& a, const PerpRow& b) { return a.pnlNanos > b.pnlNanos; });
+    const int lim = std::min(n, static_cast<int>(rows.size()));
+    out.reserve(static_cast<size_t>(lim));
+    for (int i = 0; i < lim; i++) {
+        std::string w = toLower(rows[static_cast<size_t>(i)].wallet);
+        if (!w.empty()) out.insert(std::move(w));
     }
     return out;
 }
