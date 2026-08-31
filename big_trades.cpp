@@ -466,7 +466,7 @@ void refreshFundingCache() {
 BigTradesMessage buildBigMenu(const std::string& chatId) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
     std::ostringstream t;
-    t << "\U0001F525 <b>" << tr(lang, "big_title") << "</b>\n\n"
+    t << "\U0001F4CA <b>" << tr(lang, "big_title") << "</b>\n\n"
       << tr(lang, "big_menu_hint");
 
     json kb;
@@ -498,7 +498,7 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
     return {t.str(), kb.dump()};
 }
 
-constexpr int FLOW_MAX_ROWS = 100;
+constexpr int FLOW_MAX_ROWS = 2000;
 constexpr int FLOW_PER_PAGE = 10;
 
 BigTradesMessage buildFlowList(const std::string& chatId, const std::string& window, int page) {
@@ -508,10 +508,6 @@ BigTradesMessage buildFlowList(const std::string& chatId, const std::string& win
     std::ostringstream t;
     json kb;
     kb["inline_keyboard"] = json::array();
-
-    t << "\U0001F525 <b>" << tr(lang, "flow_title") << "</b> \u00B7 "
-      << tr(lang, windowKey(window)) << "\n"
-      << "<i>" << tr(lang, "flow_hint") << "</i>\n\n";
 
     std::vector<FlowRow> rows;
     {
@@ -533,6 +529,20 @@ BigTradesMessage buildFlowList(const std::string& chatId, const std::string& win
     if (named.size() > static_cast<size_t>(FLOW_MAX_ROWS))
         named.resize(static_cast<size_t>(FLOW_MAX_ROWS));
 
+    // Итог по всему окну, а не по странице: сколько денег вообще прошло
+    // через отслеживаемые кошельки за период.
+    long long totalBought = 0, totalSold = 0;
+    for (const auto& r : named) { totalBought += r.boughtNanos; totalSold += r.soldNanos; }
+
+    t << "\U0001F433 <b>" << tr(lang, "flow_title") << "</b> \u00B7 "
+      << tr(lang, windowKey(window)) << "\n"
+      << tr(lang, "flow_hint") << " "
+      << compactUsd(static_cast<double>(totalBought) / 1e9) << " "
+      << tr(lang, "flow_total_buys") << " \u00B7 "
+      << compactUsd(static_cast<double>(totalSold) / 1e9) << " "
+      << tr(lang, "flow_total_sells") << " \u00B7 "
+      << named.size() << " " << tr(lang, "flow_coins") << "\n\n";
+
     const int total = static_cast<int>(named.size());
     const int pages = std::max(1, (total + FLOW_PER_PAGE - 1) / FLOW_PER_PAGE);
     if (page < 1) page = 1;
@@ -552,13 +562,13 @@ BigTradesMessage buildFlowList(const std::string& chatId, const std::string& win
               << " <b>" << spotAssetLabel(r.token) << "</b>  <code>"
               << (inflow ? "+" : "\u2212") << formatUsd(cpp_int(net < 0 ? -net : net))
               << "</code>\n"
-              << "   <i>" << tr(lang, "flow_bought") << " "
+              << "   " << tr(lang, "flow_bought") << " "
               << compactUsd(static_cast<double>(r.boughtNanos) / 1e9)
               << " \u00B7 " << tr(lang, "flow_sold") << " "
-              << compactUsd(static_cast<double>(r.soldNanos) / 1e9) << "</i>\n"
-              << "   <i>" << r.buys << " " << tr(lang, "flow_buys") << " / "
+              << compactUsd(static_cast<double>(r.soldNanos) / 1e9) << "\n"
+              << "   " << r.buys << " " << tr(lang, "flow_buys") << " / "
               << r.sells << " " << tr(lang, "flow_sells") << " \u00B7 "
-              << r.wallets << " " << tr(lang, "flow_wallets") << "</i>\n\n";
+              << r.wallets << " " << tr(lang, "flow_wallets") << "\n\n";
         }
     }
 
@@ -583,7 +593,75 @@ BigTradesMessage buildFlowList(const std::string& chatId, const std::string& win
     }
     kb["inline_keyboard"].push_back(winRow);
 
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "flow_search_btn")}, {"callback_data", "bg_find:" + window}}
+    }));
     kb["inline_keyboard"].push_back(backRow(lang, "menu:big"));
+    return {t.str(), kb.dump()};
+}
+
+// Поиск по тикеру: список тот же, из кэша, отбор по подстроке.
+BigTradesMessage buildFlowSearch(const std::string& chatId,
+                                 const std::string& window,
+                                 const std::string& query) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    const long long since = static_cast<long long>(time(nullptr)) - windowSeconds(window);
+
+    std::vector<FlowRow> rows;
+    {
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        auto it = g_flowCache.byWindow.find(window);
+        if (it != g_flowCache.byWindow.end() &&
+            time(nullptr) - it->second.first < cacheTtlFor(window))
+            rows = it->second.second;
+    }
+    if (rows.empty()) {
+        rows = flowRows(since, FLOW_MAX_ROWS);
+        std::lock_guard<std::mutex> l(g_listCacheMutex);
+        g_flowCache.byWindow[window] = {time(nullptr), rows};
+    }
+
+    std::string needle;
+    for (char c : query)
+        needle += (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+
+    std::ostringstream t;
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    t << "\U0001F50D <b>" << safeString(query, 24) << "</b> \u00B7 "
+      << tr(lang, windowKey(window)) << "\n\n";
+
+    int shown = 0;
+    for (const auto& r : rows) {
+        if (!hasKnownSymbol(r.token)) continue;
+        std::string sym = spotAssetLabel(r.token);
+        std::string up;
+        for (char c : sym) up += (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+        if (up.find(needle) == std::string::npos) continue;
+
+        const long long net = r.boughtNanos - r.soldNanos;
+        const bool inflow = net >= 0;
+        t << "<b>" << (++shown) << ".</b> " << (inflow ? "\U0001F7E2" : "\U0001F534")
+          << " <b>" << sym << "</b>  <code>"
+          << (inflow ? "+" : "\u2212") << formatUsd(cpp_int(net < 0 ? -net : net))
+          << "</code>\n"
+          << "   " << tr(lang, "flow_bought") << " "
+          << compactUsd(static_cast<double>(r.boughtNanos) / 1e9)
+          << " \u00B7 " << tr(lang, "flow_sold") << " "
+          << compactUsd(static_cast<double>(r.soldNanos) / 1e9) << "\n"
+          << "   " << r.buys << " " << tr(lang, "flow_buys") << " / "
+          << r.sells << " " << tr(lang, "flow_sells") << " \u00B7 "
+          << r.wallets << " " << tr(lang, "flow_wallets") << "\n\n";
+        if (shown >= 10) break;
+    }
+    if (shown == 0) t << tr(lang, "flow_search_none");
+
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "flow_search_btn")}, {"callback_data", "bg_find:" + window}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "bg_open:flow:" + window}}
+    }));
     return {t.str(), kb.dump()};
 }
 
@@ -619,7 +697,7 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
     }
 
     t << "\U0001F4A2 <b>" << tr(lang, "fund_title") << "</b>\n"
-      << "<i>" << tr(lang, "fund_hint") << "</i>\n\n";
+      << "" << tr(lang, "fund_hint") << "\n\n";
 
     if (rows.empty()) {
         t << tr(lang, at > 0 ? "fund_empty" : "fund_loading");
@@ -638,7 +716,7 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
             t << "<b>" << (++n) << ".</b> " << (longsPay ? "\U0001F4C8" : "\U0001F4C9")
               << " <b>" << safeString(r.symbol, 16) << "</b>  <code>" << buf << "</code>"
               << " \u00B7 " << tr(lang, longsPay ? "fund_longs_pay" : "fund_shorts_pay") << "\n"
-              << "   <i>" << tr(lang, "fund_apr") << " " << aprBuf << "</i>\n";
+              << "   " << tr(lang, "fund_apr") << " " << aprBuf << "\n";
 
             if (r.oiUsd > 0.0 || r.volUsd > 0.0) {
                 t << "   ";
@@ -653,8 +731,8 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
         }
         if (at > 0) {
             const long long mins = (static_cast<long long>(time(nullptr)) - at) / 60;
-            t << "<i>" << tr(lang, "fund_updated") << " " << mins << " "
-              << tr(lang, "fund_min_ago") << "</i>";
+            t << "" << tr(lang, "fund_updated") << " " << mins << " "
+              << tr(lang, "fund_min_ago") << "";
         }
     }
 
@@ -671,7 +749,8 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
 
     if (perp && !liq && !premium) {
         std::ostringstream t;
-        t << "\U0001F525 <b>" << tr(lang, liq ? "big_liq_title" : "big_perp_title") << "</b>\n\n"
+        t << (liq ? "\U0001F480 " : "\U0001F535 ")
+          << "<b>" << tr(lang, liq ? "big_liq_title" : "big_perp_title") << "</b>\n\n"
           << "\U0001F512 " << tr(lang, "hl_locked_body");
         json kb;
         kb["inline_keyboard"] = json::array();
@@ -714,8 +793,9 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
         rows.resize(static_cast<size_t>(maxRows));
 
     std::ostringstream t;
-    t << "\U0001F525 <b>" << tr(lang, liq ? "big_liq_title" : perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
-      << "<i>" << tr(lang, windowKey(window)) << "</i>\n\n";
+    t << (liq ? "\U0001F480 " : perp ? "\U0001F535 " : "\U0001F7E1 ")
+      << "<b>" << tr(lang, liq ? "big_liq_title" : perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
+      << "" << tr(lang, windowKey(window)) << "\n\n";
 
     json kb;
     kb["inline_keyboard"] = json::array();
@@ -775,8 +855,8 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                         if (r.accountValueNanos > 0) {
                             const double share = 100.0 * static_cast<double>(r.marginNanos)
                                                        / static_cast<double>(r.accountValueNanos);
-                            t << " <i>(" << formatPercent(share, false) << " "
-                              << tr(lang, "hl_of_account") << ")</i>";
+                            t << " (" << formatPercent(share, false) << " "
+                              << tr(lang, "hl_of_account") << ")";
                         }
                         t << "\n";
                     }
@@ -878,6 +958,18 @@ bool renderBigTradesView(const std::string& chatId, const std::string& action,
             return true;
         }
         out = buildBigList(chatId, param.substr(0, sep), param.substr(sep + 1), 1);
+        return true;
+    }
+    if (action == "bg_find") {
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        g_sessionManager.setState(chatId, UserState::AWAITING_FLOW_SEARCH, param);
+        out.text = tr(lang, "flow_search_prompt");
+        json kb;
+        kb["inline_keyboard"] = json::array();
+        kb["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "back_button")}, {"callback_data", "bg_open:flow:" + param}}
+        }));
+        out.keyboard = kb.dump();
         return true;
     }
     if (action == "bg_page") {
