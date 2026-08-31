@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdio>
 #include <ctime>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <sstream>
