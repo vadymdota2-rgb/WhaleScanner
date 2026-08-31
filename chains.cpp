@@ -88,6 +88,9 @@ ChainContext makeBscContext() {
     "https://bsc-dataseed.nariox.org",
     "https://bsc.nodereal.io",
     "https://bsc-dataseed1.defibit.io",
+        "https://bsc.publicnode.com",
+        "https://bsc-mainnet.public.blastapi.io",
+        "https://bsc.meowrpc.com",
     };
 
     c.dexscreenerChainId = "bsc";
