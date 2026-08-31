@@ -49,7 +49,7 @@ std::map<int, AiCacheEntry> g_aiCache;
 constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
-constexpr int AI_NF = 10;
+constexpr int AI_NF = 13;
 constexpr int AI_MIN_TRAIN = 400;
 constexpr int AI_TOP_WALLETS = 100;
 constexpr long long AI_HORIZON_6H = 6LL * 3600;
@@ -98,6 +98,9 @@ struct Row {
     long long liqFillNanos = 0;
     int bothVenues = 0;
     double topShare = 0;
+    double rsi = 0;
+    long long oiNanos = 0;
+    long long mktVolNanos = 0;
 };
 
 std::mutex g_wMutex;
@@ -139,8 +142,15 @@ void featuresOf(const Row& r, std::array<double, AI_NF>& f) {
     f[5] = n > 0 ? static_cast<double>(r.nBuy) / static_cast<double>(n) : 0.5;
     f[6] = accelOf(r.net6h, r.netPrior);
     f[7] = std::tanh(static_cast<double>(r.fundingNanos) / 10000000.0);
-    f[8] = r.perp ? 0.5 : std::min(1.0, std::log1p(std::max(0.0, r.liqUsd)) / std::log1p(5000000.0));
+    f[8] = r.perp
+        ? std::min(1.0, static_cast<double>(r.levBp) / 5000.0)
+        : std::min(1.0, std::log1p(std::max(0.0, r.liqUsd)) / std::log1p(5000000.0));
     f[9] = r.topShare;
+    f[10] = r.rsi != 0.0 ? (r.rsi - 50.0) / 50.0 : 0;
+    f[11] = std::log1p(static_cast<double>(std::max(0LL, r.mktVolNanos)) / 1000000000.0)
+            / std::log1p(1000000000.0);
+    f[12] = std::log1p(static_cast<double>(std::max(0LL, r.oiNanos)) / 1000000000.0)
+            / std::log1p(1000000000.0);
 }
 
 double heuristicScore(const Row& r) {
@@ -246,6 +256,9 @@ void ensureSchema() {
         "  liq_fill_nanos INTEGER NOT NULL DEFAULT 0,"
         "  both_venues INTEGER NOT NULL DEFAULT 0,"
         "  top_share_bp INTEGER NOT NULL DEFAULT 0,"
+        "  rsi_bp INTEGER NOT NULL DEFAULT 0,"
+        "  oi_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  mkt_vol_nanos INTEGER NOT NULL DEFAULT 0,"
         "  UNIQUE(token, venue, window_days, hour_slot)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_ai_events_fill ON ai_events(filled_at, ts);"
@@ -270,6 +283,9 @@ void ensureSchema() {
         "ALTER TABLE ai_events ADD COLUMN liq_fill_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN both_venues INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN top_share_bp INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN rsi_bp INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN oi_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN mkt_vol_nanos INTEGER NOT NULL DEFAULT 0",
         nullptr
     };
     for (int i = 0; alts[i]; i++) {
@@ -334,6 +350,86 @@ long long priceNowOf(bool perp, const std::string& id) {
     if (perp) return perpMarkNow(id);
     const uint64_t n = getPriceNanos(id);
     return n > 0 ? static_cast<long long>(n) : 0;
+}
+
+double rsi14(const std::vector<long long>& px) {
+    if (px.size() < 15) return 0;
+    double gain = 0, loss = 0;
+    for (size_t i = px.size() - 14; i < px.size(); i++) {
+        const double d = static_cast<double>(px[i] - px[i - 1]);
+        if (d > 0) gain += d;
+        else loss -= d;
+    }
+    gain /= 14.0;
+    loss /= 14.0;
+    if (gain + loss < 1) return 0;
+    if (loss < 1) return 100;
+    return 100.0 - 100.0 / (1.0 + gain / loss);
+}
+
+double spotRsi(const std::string& token, long long asOf) {
+    std::vector<long long> px;
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return 0;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT price_nanos FROM token_price_history "
+            "WHERE address=? AND ts<=? AND price_nanos>0 ORDER BY ts DESC LIMIT 15"))
+        return 0;
+    sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, asOf);
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+        const long long v = sqlite3_column_int64(s, 0);
+        if (v > 0) px.push_back(v);
+    }
+    sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) return 0;
+    std::reverse(px.begin(), px.end());
+    return rsi14(px);
+}
+
+void fillPerpCtx(Row& r, long long asOf) {
+    std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
+    if (!hl::g_hlDb) return;
+    sqlite3_stmt* s = nullptr;
+    if (prepareOrLog(hl::g_hlDb, &s,
+            "SELECT mark_nanos FROM hl_funding_rate "
+            "WHERE coin=? AND hour_ts<=? AND mark_nanos>0 ORDER BY hour_ts DESC LIMIT 15")) {
+        sqlite3_bind_text(s, 1, r.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, asOf);
+        std::vector<long long> px;
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+            const long long v = sqlite3_column_int64(s, 0);
+            if (v > 0) px.push_back(v);
+        }
+        sqlite3_finalize(s);
+        if (rc == SQLITE_DONE) {
+            std::reverse(px.begin(), px.end());
+            r.rsi = rsi14(px);
+        }
+    }
+    if (prepareOrLog(hl::g_hlDb, &s,
+            "SELECT oi_nanos,day_vlm_nanos FROM hl_funding_rate "
+            "WHERE coin=? AND hour_ts<=? AND (oi_nanos>0 OR day_vlm_nanos>0) "
+            "ORDER BY hour_ts DESC LIMIT 1")) {
+        sqlite3_bind_text(s, 1, r.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, asOf);
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            r.oiNanos = sqlite3_column_int64(s, 0);
+            r.mktVolNanos = sqlite3_column_int64(s, 1);
+        }
+        sqlite3_finalize(s);
+    }
+}
+
+void enrichIndicators(std::vector<Row>& rows, long long asOf) {
+    for (auto& r : rows) {
+        if (r.perp) fillPerpCtx(r, asOf);
+        else r.rsi = spotRsi(r.id, asOf);
+        finish(r);
+    }
 }
 
 std::unordered_set<std::string> bannedSpot() {
@@ -415,7 +511,7 @@ void addVol(Bucket& b, const std::string& wallet, long long usd, bool isBuy,
     else if (ts >= t24) b.netPrior += signedUsd;
 }
 
-Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool perp) {
+Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool perp, bool fetchLiq) {
     Row r;
     r.id = id;
     r.name = name;
@@ -437,25 +533,26 @@ Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool 
     }
     r.oneShare = tot > 0 ? static_cast<double>(mx) / static_cast<double>(tot) : 1;
     r.topShare = tot > 0 ? static_cast<double>(b.topVol) / static_cast<double>(tot) : 0;
-    if (!perp) r.liqUsd = getPoolLiquidityUsd(id);
+    if (!perp && fetchLiq) r.liqUsd = getPoolLiquidityUsd(id);
     finish(r);
     return r;
 }
 
-std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>& ban,
+std::vector<Row> loadSpot(long long asOf, long long since, const std::unordered_set<std::string>& ban,
                           const std::unordered_set<std::string>& top) {
     std::map<std::string, Bucket> m;
-    const long long now = hl::nowSec();
-    const long long t6 = now - AI_HORIZON_6H;
-    const long long t24 = now - AI_HORIZON_24H;
+    const long long t6 = asOf - AI_HORIZON_6H;
+    const long long t24 = asOf - AI_HORIZON_24H;
     {
         std::lock_guard<std::mutex> lock(dbMutex);
         if (!db) return {};
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(db, &s,
-                "SELECT token,wallet,is_buy,usd_nanos,timestamp FROM trades WHERE timestamp>=?"))
+                "SELECT token,wallet,is_buy,usd_nanos,timestamp FROM trades "
+                "WHERE timestamp>=? AND timestamp<=?"))
             return {};
         sqlite3_bind_int64(s, 1, since);
+        sqlite3_bind_int64(s, 2, asOf);
         int rc = SQLITE_DONE;
         while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             const std::string token = toLower(safeColumnText(s, 0));
@@ -479,19 +576,19 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
             else continue;
         }
         name = safeString(name, 16);
-        Row r = toRow(p.first, name, p.second, false);
+        Row r = toRow(p.first, name, p.second, false, true);
         if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
             out.push_back(std::move(r));
     }
     return out;
 }
 
-std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>& ban,
+std::vector<Row> loadPerp(long long asOf, long long since, const std::unordered_set<std::string>& ban,
                           const std::unordered_set<std::string>& top) {
     std::map<std::string, Bucket> m;
-    const long long nowMs = hl::nowSec() * 1000;
-    const long long t6 = nowMs - AI_HORIZON_6H * 1000;
-    const long long t24 = nowMs - AI_HORIZON_24H * 1000;
+    const long long asOfMs = asOf * 1000;
+    const long long t6 = asOfMs - AI_HORIZON_6H * 1000;
+    const long long t24 = asOfMs - AI_HORIZON_24H * 1000;
     const long long sinceMs = since * 1000;
     {
         std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
@@ -499,9 +596,10 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(hl::g_hlDb, &s,
                 "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage FROM hl_fills "
-                "WHERE ts>=? AND dir_code IN (1,2,6,7,8)"))
+                "WHERE ts>=? AND ts<=? AND dir_code IN (1,2,6,7,8)"))
             return {};
         sqlite3_bind_int64(s, 1, sinceMs);
+        sqlite3_bind_int64(s, 2, asOfMs);
         int rc = SQLITE_DONE;
         while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             const std::string coin = safeColumnText(s, 0);
@@ -533,7 +631,7 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
     std::vector<Row> out;
     out.reserve(m.size());
     for (const auto& p : m) {
-        Row r = toRow(p.first, p.first, p.second, true);
+        Row r = toRow(p.first, p.first, p.second, true, false);
         if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
             out.push_back(std::move(r));
     }
@@ -579,8 +677,9 @@ void recordRows(int days, const std::vector<Row>& rows) {
             "INSERT OR IGNORE INTO ai_events("
             "ts,hour_slot,window_days,venue,token,name,"
             "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
-            "net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,liq_fill_nanos,both_venues,top_share_bp)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,liq_fill_nanos,both_venues,top_share_bp,"
+            "rsi_bp,oi_nanos,mkt_vol_nanos)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     for (size_t i = 0; i < rows.size(); i++) {
         const auto& r = rows[i];
@@ -608,6 +707,9 @@ void recordRows(int days, const std::vector<Row>& rows) {
         sqlite3_bind_int64(s, 20, r.liqFillNanos);
         sqlite3_bind_int(s, 21, r.bothVenues);
         sqlite3_bind_int(s, 22, static_cast<int>(r.topShare * 10000.0 + 0.5));
+        sqlite3_bind_int(s, 23, static_cast<int>(r.rsi * 100.0 + 0.5));
+        sqlite3_bind_int64(s, 24, r.oiNanos);
+        sqlite3_bind_int64(s, 25, r.mktVolNanos);
         sqlite3_step(s);
     }
     sqlite3_finalize(s);
@@ -771,7 +873,8 @@ void trainOne(bool perp) {
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
-                "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp "
+                "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp,"
+                "rsi_bp,oi_nanos,mkt_vol_nanos "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
                 "AND window_days=1 AND venue=? "
                 "AND NOT EXISTS ("
@@ -795,6 +898,9 @@ void trainOne(bool perp) {
             r.liqUsd = static_cast<double>(sqlite3_column_int64(s, 9)) / 1000000000.0;
             r.perp = perp;
             r.topShare = sqlite3_column_int(s, 12) / 10000.0;
+            r.rsi = sqlite3_column_int(s, 13) / 100.0;
+            r.oiNanos = sqlite3_column_int64(s, 14);
+            r.mktVolNanos = sqlite3_column_int64(s, 15);
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
@@ -888,17 +994,252 @@ int countReady(bool perp) {
     return n;
 }
 
-std::vector<Row> collectPassing(int days) {
-    const long long since = hl::nowSec() - static_cast<long long>(days) * 86400LL;
+std::vector<Row> collectPassing(int days, long long asOf) {
+    if (asOf <= 0) asOf = hl::nowSec();
+    const long long since = asOf - static_cast<long long>(days) * 86400LL;
     const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
     const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
-    auto spot = loadSpot(since, bannedSpot(), topS);
-    auto perp = loadPerp(since, bannedHl(), topP);
+    auto spot = loadSpot(asOf, since, bannedSpot(), topS);
+    auto perp = loadPerp(asOf, since, bannedHl(), topP);
     enrichPerpFunding(perp);
-    for (auto& r : perp) finish(r);
     markBothVenues(spot, perp);
+    enrichIndicators(spot, asOf);
+    enrichIndicators(perp, asOf);
     spot.insert(spot.end(), perp.begin(), perp.end());
     return spot;
+}
+
+long long pxFromUsdRaw(__int128 usd, __int128 raw, int dec) {
+    if (usd <= 0 || raw <= 0 || dec < 0 || dec > 18) return 0;
+    __int128 scale = 1;
+    for (int i = 0; i < dec; i++) scale *= 10;
+    __int128 v = usd * scale / raw;
+    if (v <= 0 || v > 9000000000000000000LL) return 0;
+    return static_cast<long long>(v);
+}
+
+void insertLabeled(const Row& r, long long ts, long long slot, long long thenPx, long long laterPx) {
+    if (thenPx <= 0 || laterPx <= 0) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "INSERT OR IGNORE INTO ai_events("
+            "ts,hour_slot,window_days,venue,token,name,"
+            "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
+            "price_24h,filled_at,net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,"
+            "liq_fill_nanos,both_venues,top_share_bp,rsi_bp,oi_nanos,mkt_vol_nanos) "
+            "VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+        return;
+    sqlite3_bind_int64(s, 1, ts);
+    sqlite3_bind_int64(s, 2, slot);
+    sqlite3_bind_int(s, 3, r.perp ? 1 : 0);
+    sqlite3_bind_text(s, 4, r.id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 5, r.name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 6, r.buy);
+    sqlite3_bind_int64(s, 7, r.sell);
+    sqlite3_bind_int(s, 8, r.nBuy);
+    sqlite3_bind_int(s, 9, r.nSell);
+    sqlite3_bind_int(s, 10, r.wallets);
+    sqlite3_bind_int(s, 11, static_cast<int>(r.oneShare * 10000.0 + 0.5));
+    sqlite3_bind_double(s, 12, r.score);
+    sqlite3_bind_int64(s, 13, thenPx);
+    sqlite3_bind_int64(s, 14, laterPx);
+    sqlite3_bind_int64(s, 15, ts + AI_HORIZON_24H);
+    sqlite3_bind_int64(s, 16, r.net6h);
+    sqlite3_bind_int64(s, 17, r.netPrior);
+    sqlite3_bind_int64(s, 18, r.fundingNanos);
+    sqlite3_bind_int64(s, 19, static_cast<long long>(std::min(r.liqUsd, 1000000000.0) * 1000000000.0));
+    sqlite3_bind_int(s, 20, r.levBp);
+    sqlite3_bind_int64(s, 21, r.liqFillNanos);
+    sqlite3_bind_int(s, 22, r.bothVenues);
+    sqlite3_bind_int(s, 23, static_cast<int>(r.topShare * 10000.0 + 0.5));
+    sqlite3_bind_int(s, 24, static_cast<int>(r.rsi * 100.0 + 0.5));
+    sqlite3_bind_int64(s, 25, r.oiNanos);
+    sqlite3_bind_int64(s, 26, r.mktVolNanos);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
+void backfillJournal() {
+    static bool done = false;
+    if (done) return;
+    ensureSchema();
+    const long long now = hl::nowSec();
+    const long long oldest = now - AI_EVENT_TTL_SEC;
+    const auto banS = bannedSpot();
+    const auto banP = bannedHl();
+    const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
+    const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
+    const auto names = tokenSymbols();
+
+    struct DayAgg {
+        Bucket b;
+        __int128 usd = 0;
+        __int128 raw = 0;
+        __int128 pxUsd = 0;
+        __int128 pxW = 0;
+    };
+    std::map<std::string, std::map<long long, DayAgg>> spot;
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) { done = true; return; }
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(db, &s,
+                "SELECT token,wallet,is_buy,usd_nanos,token_amount,timestamp FROM trades "
+                "WHERE timestamp>=?")) {
+            done = true;
+            return;
+        }
+        sqlite3_bind_int64(s, 1, oldest);
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+            const std::string token = toLower(safeColumnText(s, 0));
+            const std::string wallet = toLower(safeColumnText(s, 1));
+            if (token.empty() || wallet.empty() || banS.count(wallet)) continue;
+            const long long ts = sqlite3_column_int64(s, 5);
+            const long long day = ts / 86400;
+            const long long usd = sqlite3_column_int64(s, 3);
+            DayAgg& a = spot[token][day];
+            addVol(a.b, wallet, usd, sqlite3_column_int(s, 2) != 0, ts,
+                   (day + 1) * 86400 - AI_HORIZON_6H, (day + 1) * 86400 - AI_HORIZON_24H,
+                   topS.count(wallet) != 0);
+            if (usd > 0) {
+                a.usd += usd;
+                try {
+                    const long long raw = std::stoll(safeColumnText(s, 4));
+                    if (raw > 0) a.raw += raw;
+                } catch (...) {}
+            }
+        }
+        sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) { done = true; return; }
+    }
+
+    std::map<std::string, std::map<long long, DayAgg>> perp;
+    {
+        std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
+        if (hl::g_hlDb) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(hl::g_hlDb, &s,
+                    "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage,px FROM hl_fills "
+                    "WHERE ts>=? AND dir_code IN (1,2,6,7,8)")) {
+                sqlite3_bind_int64(s, 1, oldest * 1000);
+                int rc = SQLITE_DONE;
+                while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+                    const std::string coin = safeColumnText(s, 0);
+                    const std::string wallet = toLower(safeColumnText(s, 1));
+                    if (coin.empty() || wallet.empty() || banP.count(wallet)) continue;
+                    const int dir = sqlite3_column_int(s, 2);
+                    const long long notional = sqlite3_column_int64(s, 3);
+                    const long long tsMs = sqlite3_column_int64(s, 4);
+                    const long long day = (tsMs / 1000) / 86400;
+                    DayAgg& a = perp[coin][day];
+                    if (dir == DIR_LIQ_LONG || dir == DIR_LIQ_SHORT || dir == DIR_LIQ_OTHER) {
+                        long long x = notional < 0 ? -notional : notional;
+                        a.b.liqFill += x;
+                        continue;
+                    }
+                    addVol(a.b, wallet, notional, dir == DIR_OPEN_LONG, tsMs,
+                           ((day + 1) * 86400 - AI_HORIZON_6H) * 1000,
+                           ((day + 1) * 86400 - AI_HORIZON_24H) * 1000,
+                           topP.count(wallet) != 0);
+                    int lev = sqlite3_column_int(s, 5);
+                    if (lev > 0) {
+                        if (lev > 100) lev = 100;
+                        long long x = notional < 0 ? -notional : notional;
+                        const long long lim = 90000000000000000LL / lev;
+                        if (x > lim) x = lim;
+                        a.b.levWeight += x;
+                        a.b.levNotional += x * static_cast<long long>(lev);
+                    }
+                    long long px = 0;
+                    if (hl::parseDecimalToNanos(safeColumnText(s, 6), px) && px > 0) {
+                        __int128 w = notional < 0 ? -notional : notional;
+                        if (w <= 0) w = 1;
+                        a.pxUsd += static_cast<__int128>(px) * w;
+                        a.pxW += w;
+                    }
+                }
+                sqlite3_finalize(s);
+                if (rc != SQLITE_DONE) { done = true; return; }
+            }
+        }
+    }
+
+    int nS = 0, nP = 0;
+    struct Labeled {
+        Row r;
+        long long ts = 0;
+        long long slot = 0;
+        long long thenPx = 0;
+        long long laterPx = 0;
+    };
+    std::vector<Labeled> labeled;
+    for (auto& tk : spot) {
+        std::string name = getSymbol(tk.first);
+        if (name.empty() || name == "UNKNOWN") {
+            auto it = names.find(tk.first);
+            if (it == names.end()) continue;
+            name = it->second;
+        }
+        name = safeString(name, 16);
+        const int dec = getDecimals(tk.first);
+        for (auto& d : tk.second) {
+            auto nxt = tk.second.find(d.first + 1);
+            if (nxt == tk.second.end()) continue;
+            Row r = toRow(tk.first, name, d.second.b, false, false);
+            if (r.wallets < AI_MIN_WALLETS || (r.buy + r.sell) <= 0 || r.oneShare > AI_MAX_ONE_SHARE)
+                continue;
+            const long long thenPx = pxFromUsdRaw(d.second.usd, d.second.raw, dec);
+            const long long laterPx = pxFromUsdRaw(nxt->second.usd, nxt->second.raw, dec);
+            if (thenPx <= 0 || laterPx <= 0) continue;
+            std::vector<long long> series;
+            for (long long day = d.first - 14; day <= d.first; day++) {
+                auto it = tk.second.find(day);
+                if (it == tk.second.end()) continue;
+                const long long p = pxFromUsdRaw(it->second.usd, it->second.raw, dec);
+                if (p > 0) series.push_back(p);
+            }
+            r.rsi = rsi14(series);
+            labeled.push_back({std::move(r), d.first * 86400, d.first * 24, thenPx, laterPx});
+        }
+    }
+    for (auto& ck : perp) {
+        for (auto& d : ck.second) {
+            auto nxt = ck.second.find(d.first + 1);
+            if (nxt == ck.second.end()) continue;
+            Row r = toRow(ck.first, ck.first, d.second.b, true, false);
+            if (r.wallets < AI_MIN_WALLETS || (r.buy + r.sell) <= 0 || r.oneShare > AI_MAX_ONE_SHARE)
+                continue;
+            if (d.second.pxW <= 0 || nxt->second.pxW <= 0) continue;
+            const __int128 tpx = d.second.pxUsd / d.second.pxW;
+            const __int128 lpx = nxt->second.pxUsd / nxt->second.pxW;
+            if (tpx <= 0 || lpx <= 0 || tpx > 9000000000000000000LL || lpx > 9000000000000000000LL) continue;
+            const long long thenPx = static_cast<long long>(tpx);
+            const long long laterPx = static_cast<long long>(lpx);
+            std::vector<long long> series;
+            for (long long day = d.first - 14; day <= d.first; day++) {
+                auto it = ck.second.find(day);
+                if (it == ck.second.end() || it->second.pxW <= 0) continue;
+                const __int128 p = it->second.pxUsd / it->second.pxW;
+                if (p > 0 && p <= 9000000000000000000LL) series.push_back(static_cast<long long>(p));
+            }
+            r.rsi = rsi14(series);
+            fillPerpCtx(r, d.first * 86400);
+            if (r.rsi == 0) r.rsi = rsi14(series);
+            labeled.push_back({std::move(r), d.first * 86400, d.first * 24, thenPx, laterPx});
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) { done = true; return; }
+        for (const auto& x : labeled) {
+            insertLabeled(x.r, x.ts, x.slot, x.thenPx, x.laterPx);
+            if (x.r.perp) nP++;
+            else nS++;
+        }
+    }
+    done = true;
+    std::cout << "[AI] backfill labeled " << nS << " spot · " << nP << " perp days" << std::endl;
 }
 
 void snapshotHour() {
@@ -906,13 +1247,7 @@ void snapshotHour() {
     static long long lastSlot = 0;
     const long long slot = hl::nowSec() / 3600;
     if (slot == lastSlot) return;
-    auto rows = collectPassing(1);
-    if (rows.size() > 400) {
-        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
-            return std::fabs(a.score) > std::fabs(b.score);
-        });
-        rows.resize(400);
-    }
+    auto rows = collectPassing(1, hl::nowSec());
     recordRows(1, rows);
     lastSlot = slot;
 }
@@ -964,11 +1299,13 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
 
     const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
     const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
-    auto spot = loadSpot(since, bannedSpot(), topS);
-    auto perp = loadPerp(since, bannedHl(), topP);
+    const long long asOf = hl::nowSec();
+    auto spot = loadSpot(asOf, since, bannedSpot(), topS);
+    auto perp = loadPerp(asOf, since, bannedHl(), topP);
     enrichPerpFunding(perp);
-    for (auto& r : perp) finish(r);
     markBothVenues(spot, perp);
+    enrichIndicators(spot, asOf);
+    enrichIndicators(perp, asOf);
     if (days == 1) {
         std::vector<Row> logged;
         logged.reserve(spot.size() + perp.size());
@@ -1056,6 +1393,7 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
 }
 
 void aiTick() {
+    backfillJournal();
     fillOutcomes();
     snapshotHour();
     trainWeights();
