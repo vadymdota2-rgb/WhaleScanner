@@ -1400,8 +1400,24 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
     if (action == "ai_open") {
         if (chatId != OWNER_CHAT_ID) return TelegramUI::buildMainMenu(chatId);
         int days = 1;
-        try { days = std::stoi(param); } catch (...) {}
-        auto r = buildAiSignals(chatId, days);
+        int venue = 0;
+        int side = 0;
+        const size_t sep1 = param.find(':');
+        try {
+            days = std::stoi(sep1 == std::string::npos ? param : param.substr(0, sep1));
+        } catch (...) { days = 1; }
+        if (sep1 != std::string::npos) {
+            const std::string rest = param.substr(sep1 + 1);
+            if (!rest.empty()) {
+                if (rest[0] == 'p' || rest[0] == '1') venue = 1;
+                const size_t sep2 = rest.find(':');
+                if (sep2 != std::string::npos && sep2 + 1 < rest.size()) {
+                    const char s = rest[sep2 + 1];
+                    if (s == 'a' || s == '1') side = 1;
+                }
+            }
+        }
+        auto r = buildAiSignals(chatId, days, venue, side);
         return {r.text, r.keyboard};
     }
     {
