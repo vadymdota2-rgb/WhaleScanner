@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <iostream>
 
-#include "alert_settings.h"
 #include "utils.h"
 
 extern sqlite3* db;
@@ -147,6 +146,7 @@ void SafeMessageQueue::senderLoop() {
         bool aborted=false;
         size_t sent=0;
         for (auto& [did,cid,msg]:batch) {
+            throttleSend();
             ++sent;
             try {
                 auto res=sendMsg(cid,msg);
@@ -172,16 +172,15 @@ void SafeMessageQueue::senderLoop() {
                     }
                 }
                 else {
-                    scheduleRetry(did);
+                    if (scheduleRetry(did) == RetryResult::Error) releaseClaimed(did);
                 }
             } catch (const std::exception& e) {
                 std::cerr << "[QUEUE] Delivery #" << did << " threw: " << e.what() << std::endl;
-                scheduleRetry(did);
+                if (scheduleRetry(did) == RetryResult::Error) releaseClaimed(did);
             } catch (...) {
                 std::cerr << "[QUEUE] Delivery #" << did << " threw unknown exception" << std::endl;
-                scheduleRetry(did);
+                if (scheduleRetry(did) == RetryResult::Error) releaseClaimed(did);
             }
-            throttleSend();
         }
         if (aborted) {
             size_t k=0;
