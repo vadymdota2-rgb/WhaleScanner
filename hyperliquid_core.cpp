@@ -369,25 +369,40 @@ long long hourFloorSec(long long sec) {
     return (sec / 3600LL) * 3600LL;
 }
 
-void saveFundingRates(long long hourTs,
-                      const std::vector<std::pair<std::string, std::pair<long long, long long>>>& rows) {
+struct CtxSnap {
+    std::string coin;
+    long long rate = 0;
+    long long mark = 0;
+    long long oi = 0;
+    long long dayVlm = 0;
+};
+
+void saveFundingRates(long long hourTs, const std::vector<CtxSnap>& rows) {
     if (rows.empty() || hourTs <= 0) return;
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return;
-    sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
+    if (sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) return;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(g_hlDb, &s,
-            "INSERT OR REPLACE INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos) VALUES(?,?,?,?)")) {
+            "INSERT INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos,oi_nanos,day_vlm_nanos) "
+            "VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(coin,hour_ts) DO UPDATE SET "
+            "rate_nanos=excluded.rate_nanos,"
+            "mark_nanos=CASE WHEN excluded.mark_nanos>0 THEN excluded.mark_nanos ELSE hl_funding_rate.mark_nanos END,"
+            "oi_nanos=CASE WHEN excluded.oi_nanos>0 THEN excluded.oi_nanos ELSE hl_funding_rate.oi_nanos END,"
+            "day_vlm_nanos=CASE WHEN excluded.day_vlm_nanos>0 THEN excluded.day_vlm_nanos ELSE hl_funding_rate.day_vlm_nanos END")) {
         sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
         return;
     }
     for (const auto& row : rows) {
         sqlite3_reset(s);
         sqlite3_clear_bindings(s);
-        sqlite3_bind_text(s, 1, row.first.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 1, row.coin.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 2, hourTs);
-        sqlite3_bind_int64(s, 3, row.second.first);
-        sqlite3_bind_int64(s, 4, row.second.second);
+        sqlite3_bind_int64(s, 3, row.rate);
+        sqlite3_bind_int64(s, 4, row.mark);
+        sqlite3_bind_int64(s, 5, row.oi);
+        sqlite3_bind_int64(s, 6, row.dayVlm);
         if (sqlite3_step(s) != SQLITE_DONE) {
             sqlite3_finalize(s);
             sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -403,7 +418,7 @@ void saveFundingRates(long long hourTs,
 
 void ingestUniverse(const json& universe, const json* ctxs, const std::string& dex,
                     std::vector<std::string>& subscribe, std::vector<std::string>& all,
-                    std::vector<std::pair<std::string, std::pair<long long, long long>>>& rates) {
+                    std::vector<CtxSnap>& rates) {
     if (!universe.is_array()) return;
     for (size_t i = 0; i < universe.size(); i++) {
         const auto& u = universe[i];
@@ -417,10 +432,19 @@ void ingestUniverse(const json& universe, const json* ctxs, const std::string& d
         if (!u.value("isDelisted", false)) subscribe.push_back(coin);
         if (!ctxs || i >= ctxs->size() || !(*ctxs)[i].is_object()) continue;
         const json& ctx = (*ctxs)[i];
-        long long rate = 0, mark = 0;
-        parseDecimalToNanos(jstr(ctx, "funding", "0"), rate);
-        parseDecimalToNanos(jstr(ctx, "markPx", "0"), mark);
-        rates.emplace_back(coin, std::make_pair(rate, mark));
+        CtxSnap snap;
+        snap.coin = coin;
+        parseDecimalToNanos(jstr(ctx, "funding", "0"), snap.rate);
+        parseDecimalToNanos(jstr(ctx, "markPx", "0"), snap.mark);
+        parseDecimalToNanos(jstr(ctx, "dayNtlVlm", "0"), snap.dayVlm);
+        if (snap.dayVlm < 0) snap.dayVlm = 0;
+        long long oiCoins = 0;
+        parseDecimalToNanos(jstr(ctx, "openInterest", "0"), oiCoins);
+        if (oiCoins > 0 && snap.mark > 0) {
+            const __int128 x = static_cast<__int128>(oiCoins) * snap.mark / NANOS_PER_UNIT;
+            if (x > 0 && x <= 9000000000000000000LL) snap.oi = static_cast<long long>(x);
+        }
+        rates.push_back(std::move(snap));
     }
 }
 
@@ -430,7 +454,7 @@ bool fetchDexUniverse(const std::string& dex, std::vector<std::string>& subscrib
     body["type"] = "metaAndAssetCtxs";
     if (!dex.empty()) body["dex"] = dex;
     json j = infoPost(body, HL_WEIGHT_META);
-    std::vector<std::pair<std::string, std::pair<long long, long long>>> rates;
+    std::vector<CtxSnap> rates;
     if (j.is_array() && j.size() >= 2 && j[0].is_object() &&
         j[0].contains("universe") && j[0]["universe"].is_array() && j[1].is_array()) {
         ingestUniverse(j[0]["universe"], &j[1], dex, subscribe, all, rates);
@@ -1352,10 +1376,14 @@ void dripFundingHistory() {
 
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (!g_hlDb) return;
-    sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
+    if (sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) return;
     sqlite3_stmt* ins = nullptr;
     if (!prepareOrLog(g_hlDb, &ins,
-            "INSERT OR REPLACE INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos) VALUES(?,?,?,?)")) {
+            "INSERT INTO hl_funding_rate(coin,hour_ts,rate_nanos,mark_nanos,oi_nanos,day_vlm_nanos) "
+            "VALUES(?,?,?,?,0,0) "
+            "ON CONFLICT(coin,hour_ts) DO UPDATE SET "
+            "rate_nanos=excluded.rate_nanos,"
+            "mark_nanos=CASE WHEN excluded.mark_nanos>0 THEN excluded.mark_nanos ELSE hl_funding_rate.mark_nanos END")) {
         sqlite3_exec(g_hlDb, "ROLLBACK", nullptr, nullptr, nullptr);
         return;
     }
@@ -1739,6 +1767,8 @@ bool initHyperliquid() {
         "  hour_ts INTEGER NOT NULL,"
         "  rate_nanos INTEGER NOT NULL DEFAULT 0,"
         "  mark_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  oi_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  day_vlm_nanos INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY (coin, hour_ts));"
         "CREATE TABLE IF NOT EXISTS hl_funding_backfill ("
         "  coin TEXT PRIMARY KEY,"
@@ -1763,6 +1793,8 @@ bool initHyperliquid() {
         "ALTER TABLE hl_wallet_state ADD COLUMN backfilled_30d INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN flat INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE hl_fills ADD COLUMN start_pos_nanos INTEGER",
+        "ALTER TABLE hl_funding_rate ADD COLUMN oi_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE hl_funding_rate ADD COLUMN day_vlm_nanos INTEGER NOT NULL DEFAULT 0",
     };
     for (const char* sql : migrations) {
         char* mErr = nullptr;
