@@ -62,7 +62,7 @@ std::string compactUsd(long long nanos) {
     const double usd = static_cast<double>(a) / 1000000000.0;
     char buf[32];
     if (usd >= 1000000000.0) std::snprintf(buf, sizeof(buf), "$%.1fB", usd / 1000000000.0);
-    else if (usd >= 1000000.0) std::snprintf(buf, sizeof(buf), "$%.1fM", usd / 1000000000.0);
+    else if (usd >= 1000000.0) std::snprintf(buf, sizeof(buf), "$%.1fM", usd / 1000000.0);
     else if (usd >= 10000.0) std::snprintf(buf, sizeof(buf), "$%.0fK", usd / 1000.0);
     else if (usd >= 1000.0) std::snprintf(buf, sizeof(buf), "$%.1fK", usd / 1000.0);
     else std::snprintf(buf, sizeof(buf), "$%.0f", usd);
