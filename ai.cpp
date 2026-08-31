@@ -280,37 +280,34 @@ void ensureSchema() {
     g_schemaOk = true;
 }
 
-long long perpMark(const std::string& coin, long long beforeTs) {
+long long perpMarkNow(const std::string& coin) {
     std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
     if (!hl::g_hlDb) return 0;
+    const long long now = hl::nowSec();
     sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(hl::g_hlDb, &s,
+            "SELECT mark_nanos,hour_ts FROM hl_funding_rate WHERE coin=? "
+            "ORDER BY hour_ts DESC LIMIT 1"))
+        return 0;
+    sqlite3_bind_text(s, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
     long long mark = 0;
-    if (beforeTs > 0) {
-        if (!prepareOrLog(hl::g_hlDb, &s,
-                "SELECT mark_nanos FROM hl_funding_rate WHERE coin=? AND hour_ts<=? "
-                "ORDER BY hour_ts DESC LIMIT 1"))
-            return 0;
-        sqlite3_bind_text(s, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(s, 2, beforeTs);
-    } else {
-        if (!prepareOrLog(hl::g_hlDb, &s,
-                "SELECT mark_nanos FROM hl_funding_rate WHERE coin=? "
-                "ORDER BY hour_ts DESC LIMIT 1"))
-            return 0;
-        sqlite3_bind_text(s, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        const long long at = sqlite3_column_int64(s, 1);
+        const long long v = sqlite3_column_int64(s, 0);
+        if (v > 0 && now - at >= 0 && now - at <= 7200) mark = v;
     }
-    if (sqlite3_step(s) == SQLITE_ROW) mark = sqlite3_column_int64(s, 0);
     sqlite3_finalize(s);
     if (mark > 0) return mark;
     if (!prepareOrLog(hl::g_hlDb, &s,
-            "SELECT px FROM hl_fills WHERE coin=? AND ts<=? AND px!='' "
-            "ORDER BY ts DESC LIMIT 1"))
+            "SELECT px,ts FROM hl_fills WHERE coin=? AND px!='' ORDER BY ts DESC LIMIT 1"))
         return 0;
     sqlite3_bind_text(s, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, beforeTs > 0 ? beforeTs * 1000 : hl::nowSec() * 1000);
     if (sqlite3_step(s) == SQLITE_ROW) {
+        const long long fts = sqlite3_column_int64(s, 1);
         long long px = 0;
-        if (hl::parseDecimalToNanos(safeColumnText(s, 0), px) && px > 0) mark = px;
+        if (now * 1000 - fts >= 0 && now * 1000 - fts <= 7200LL * 1000 &&
+            hl::parseDecimalToNanos(safeColumnText(s, 0), px) && px > 0)
+            mark = px;
     }
     sqlite3_finalize(s);
     return mark;
@@ -331,24 +328,8 @@ long long perpFunding(const std::string& coin) {
     return v;
 }
 
-long long spotThen(const std::string& token, long long ts) {
-    std::lock_guard<std::mutex> lock(dbMutex);
-    if (!db) return 0;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s,
-            "SELECT price_nanos FROM token_price_history WHERE address=? AND ts<=? "
-            "ORDER BY ts DESC LIMIT 1"))
-        return 0;
-    sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, ts);
-    long long p = 0;
-    if (sqlite3_step(s) == SQLITE_ROW) p = sqlite3_column_int64(s, 0);
-    sqlite3_finalize(s);
-    return p;
-}
-
 long long priceNowOf(bool perp, const std::string& id) {
-    if (perp) return perpMark(id, 0);
+    if (perp) return perpMarkNow(id);
     const uint64_t n = getPriceNanos(id);
     return n > 0 ? static_cast<long long>(n) : 0;
 }
@@ -622,6 +603,21 @@ void recordRows(int days, const std::vector<Row>& rows) {
         sqlite3_step(s);
     }
     sqlite3_finalize(s);
+    sqlite3_stmt* h = nullptr;
+    if (!prepareOrLog(db, &h,
+            "INSERT OR IGNORE INTO token_price_history(address,ts,price_nanos) VALUES(?,?,?)"))
+        return;
+    const long long histTs = slot * 3600;
+    for (size_t i = 0; i < rows.size(); i++) {
+        if (rows[i].perp || px[i] <= 0) continue;
+        sqlite3_reset(h);
+        sqlite3_clear_bindings(h);
+        sqlite3_bind_text(h, 1, rows[i].id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(h, 2, histTs);
+        sqlite3_bind_int64(h, 3, px[i]);
+        sqlite3_step(h);
+    }
+    sqlite3_finalize(h);
 }
 
 void writeCard(std::ostringstream& t, int i, const Row& r) {
@@ -683,20 +679,16 @@ void fillOutcomes() {
         sqlite3_finalize(s);
     }
     for (auto& p : batch) {
-        long long then = p.priceThen;
-        if (then <= 0)
-            then = p.venue ? perpMark(p.token, p.ts) : spotThen(p.token, p.ts);
         const bool due6 = p.filled6 == 0 && p.ts <= now - AI_HORIZON_6H;
         const bool due24 = p.filled24 == 0 && p.ts <= now - AI_HORIZON_24H;
         if (!due6 && !due24) continue;
-        long long px6 = 0;
-        long long px24 = 0;
-        if (due6) px6 = p.venue ? perpMark(p.token, p.ts + AI_HORIZON_6H)
-                                : spotThen(p.token, p.ts + AI_HORIZON_6H);
-        if (due24) px24 = p.venue ? perpMark(p.token, p.ts + AI_HORIZON_24H)
-                                  : spotThen(p.token, p.ts + AI_HORIZON_24H);
         const bool stale6 = now - p.ts > AI_HORIZON_6H + 3600;
         const bool stale24 = now - p.ts > AI_HORIZON_24H + 3600;
+        long long then = p.priceThen;
+        long long px6 = 0;
+        long long px24 = 0;
+        if (due6 && !stale6) px6 = priceNowOf(p.venue != 0, p.token);
+        if (due24 && !stale24) px24 = priceNowOf(p.venue != 0, p.token);
         if (due6 && px6 <= 0 && !stale6) continue;
         if (due24 && px24 <= 0 && !stale24) continue;
         std::lock_guard<std::mutex> lock(dbMutex);
@@ -780,7 +772,8 @@ void trainOne(bool perp) {
                 "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id)"))
             return;
         sqlite3_bind_int(s, 1, perp ? 1 : 0);
-        while (sqlite3_step(s) == SQLITE_ROW) {
+        int rc = SQLITE_DONE;
+        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
             Row r;
             r.buy = sqlite3_column_int64(s, 0);
             r.sell = sqlite3_column_int64(s, 1);
@@ -807,6 +800,7 @@ void trainOne(bool perp) {
             xs.push_back(sm);
         }
         sqlite3_finalize(s);
+        if (rc != SQLITE_DONE) return;
     }
     if (static_cast<int>(xs.size()) < AI_MIN_TRAIN) return;
 
@@ -904,7 +898,6 @@ void snapshotHour() {
     static long long lastSlot = 0;
     const long long slot = hl::nowSec() / 3600;
     if (slot == lastSlot) return;
-    lastSlot = slot;
     auto rows = collectPassing(1);
     if (rows.size() > 400) {
         std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
@@ -913,6 +906,7 @@ void snapshotHour() {
         rows.resize(400);
     }
     recordRows(1, rows);
+    lastSlot = slot;
 }
 
 }
