@@ -18,7 +18,9 @@
 #include <sqlite3.h>
 #include "json.hpp"
 #include "alert_settings.h"
+#include "hyperliquid.h"
 #include "hyperliquid_internal.h"
+#include "ranking.h"
 #include "ru.h"
 #include "token_prices.h"
 #include "utils.h"
@@ -45,10 +47,11 @@ std::mutex g_aiCacheMutex;
 std::map<int, AiCacheEntry> g_aiCache;
 
 constexpr int AI_MIN_WALLETS = 3;
-constexpr int AI_TOP_N = 5;
+constexpr int AI_TOP_N = 10;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
-constexpr int AI_NF = 9;
-constexpr int AI_MIN_TRAIN = 80;
+constexpr int AI_NF = 10;
+constexpr int AI_MIN_TRAIN = 400;
+constexpr int AI_TOP_WALLETS = 100;
 constexpr long long AI_HORIZON_6H = 6LL * 3600;
 constexpr long long AI_HORIZON_24H = 86400;
 constexpr long long AI_EVENT_TTL_SEC = 90LL * 86400LL;
@@ -91,6 +94,10 @@ struct Row {
     long long netPrior = 0;
     long long fundingNanos = 0;
     double liqUsd = 0;
+    int levBp = 0;
+    long long liqFillNanos = 0;
+    int bothVenues = 0;
+    double topShare = 0;
 };
 
 std::mutex g_wMutex;
@@ -133,6 +140,7 @@ void featuresOf(const Row& r, std::array<double, AI_NF>& f) {
     f[6] = accelOf(r.net6h, r.netPrior);
     f[7] = std::tanh(static_cast<double>(r.fundingNanos) / 10000000.0);
     f[8] = r.perp ? 0.5 : std::min(1.0, std::log1p(std::max(0.0, r.liqUsd)) / std::log1p(5000000.0));
+    f[9] = r.topShare;
 }
 
 double heuristicScore(const Row& r) {
@@ -231,6 +239,10 @@ void ensureSchema() {
         "  net_prior INTEGER NOT NULL DEFAULT 0,"
         "  funding_nanos INTEGER NOT NULL DEFAULT 0,"
         "  liq_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  lev_bp INTEGER NOT NULL DEFAULT 0,"
+        "  liq_fill_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  both_venues INTEGER NOT NULL DEFAULT 0,"
+        "  top_share_bp INTEGER NOT NULL DEFAULT 0,"
         "  UNIQUE(token, venue, window_days, hour_slot)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_ai_events_fill ON ai_events(filled_at, ts);"
@@ -251,6 +263,10 @@ void ensureSchema() {
         "ALTER TABLE ai_events ADD COLUMN net_prior INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN funding_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN liq_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN lev_bp INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN liq_fill_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN both_venues INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN top_share_bp INTEGER NOT NULL DEFAULT 0",
         nullptr
     };
     for (int i = 0; alts[i]; i++) {
@@ -390,16 +406,21 @@ struct Bucket {
     int nSell = 0;
     long long net6h = 0;
     long long netPrior = 0;
+    long long levNotional = 0;
+    long long levWeight = 0;
+    long long liqFill = 0;
+    long long topVol = 0;
     std::map<std::string, long long> vol;
 };
 
 void addVol(Bucket& b, const std::string& wallet, long long usd, bool isBuy,
-            long long ts, long long t6, long long t24) {
+            long long ts, long long t6, long long t24, bool fromTop) {
     if (usd < 0) usd = -usd;
     const long long signedUsd = isBuy ? usd : -usd;
     if (isBuy) { b.buy += usd; b.nBuy++; }
     else { b.sell += usd; b.nSell++; }
     b.vol[wallet] += usd;
+    if (fromTop) b.topVol += usd;
     if (ts >= t6) b.net6h += signedUsd;
     else if (ts >= t24) b.netPrior += signedUsd;
 }
@@ -416,18 +437,23 @@ Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool 
     r.perp = perp;
     r.net6h = b.net6h;
     r.netPrior = b.netPrior;
+    r.liqFillNanos = b.liqFill;
+    if (b.levWeight > 0)
+        r.levBp = static_cast<int>((b.levNotional * 100) / b.levWeight);
     long long mx = 0, tot = 0;
     for (const auto& p : b.vol) {
         tot += p.second;
         if (p.second > mx) mx = p.second;
     }
     r.oneShare = tot > 0 ? static_cast<double>(mx) / static_cast<double>(tot) : 1;
+    r.topShare = tot > 0 ? static_cast<double>(b.topVol) / static_cast<double>(tot) : 0;
     if (!perp) r.liqUsd = getPoolLiquidityUsd(id);
     finish(r);
     return r;
 }
 
-std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>& ban) {
+std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>& ban,
+                          const std::unordered_set<std::string>& top) {
     std::map<std::string, Bucket> m;
     const long long now = hl::nowSec();
     const long long t6 = now - AI_HORIZON_6H;
@@ -445,7 +471,8 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
             const std::string wallet = toLower(safeColumnText(s, 1));
             if (token.empty() || wallet.empty() || ban.count(wallet)) continue;
             addVol(m[token], wallet, sqlite3_column_int64(s, 3),
-                   sqlite3_column_int(s, 2) != 0, sqlite3_column_int64(s, 4), t6, t24);
+                   sqlite3_column_int(s, 2) != 0, sqlite3_column_int64(s, 4), t6, t24,
+                   top.count(wallet) != 0);
         }
         sqlite3_finalize(s);
     }
@@ -466,7 +493,8 @@ std::vector<Row> loadSpot(long long since, const std::unordered_set<std::string>
     return out;
 }
 
-std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>& ban) {
+std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>& ban,
+                          const std::unordered_set<std::string>& top) {
     std::map<std::string, Bucket> m;
     const long long nowMs = hl::nowSec() * 1000;
     const long long t6 = nowMs - AI_HORIZON_6H * 1000;
@@ -477,8 +505,8 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
         if (!hl::g_hlDb) return {};
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(hl::g_hlDb, &s,
-                "SELECT coin,wallet,dir_code,notional_nanos,ts FROM hl_fills "
-                "WHERE ts>=? AND dir_code IN (1,2)"))
+                "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage FROM hl_fills "
+                "WHERE ts>=? AND dir_code IN (1,2,6,7,8)"))
             return {};
         sqlite3_bind_int64(s, 1, sinceMs);
         while (sqlite3_step(s) == SQLITE_ROW) {
@@ -486,8 +514,21 @@ std::vector<Row> loadPerp(long long since, const std::unordered_set<std::string>
             const std::string wallet = toLower(safeColumnText(s, 1));
             if (coin.empty() || wallet.empty() || ban.count(wallet)) continue;
             const int dir = sqlite3_column_int(s, 2);
-            addVol(m[coin], wallet, sqlite3_column_int64(s, 3),
-                   dir == DIR_OPEN_LONG, sqlite3_column_int64(s, 4), t6, t24);
+            const long long notional = sqlite3_column_int64(s, 3);
+            const long long ts = sqlite3_column_int64(s, 4);
+            if (dir == DIR_LIQ_LONG || dir == DIR_LIQ_SHORT || dir == DIR_LIQ_OTHER) {
+                long long a = notional < 0 ? -notional : notional;
+                m[coin].liqFill += a;
+                continue;
+            }
+            addVol(m[coin], wallet, notional, dir == DIR_OPEN_LONG, ts, t6, t24,
+                   top.count(wallet) != 0);
+            const int lev = sqlite3_column_int(s, 5);
+            if (lev > 0) {
+                long long a = notional < 0 ? -notional : notional;
+                m[coin].levWeight += a;
+                m[coin].levNotional += a * lev;
+            }
         }
         sqlite3_finalize(s);
     }
@@ -508,6 +549,14 @@ void takeSides(std::vector<Row>& rows, std::vector<Row>& buys, std::vector<Row>&
         if (r.score > 0 && static_cast<int>(buys.size()) < AI_TOP_N) buys.push_back(std::move(r));
         else if (r.score < 0 && static_cast<int>(avoids.size()) < AI_TOP_N) avoids.push_back(std::move(r));
     }
+}
+
+void markBothVenues(std::vector<Row>& spot, std::vector<Row>& perp) {
+    std::unordered_set<std::string> sn, pn;
+    for (const auto& r : spot) sn.insert(toLower(r.name));
+    for (const auto& r : perp) pn.insert(toLower(r.name));
+    for (auto& r : spot) if (pn.count(toLower(r.name))) r.bothVenues = 1;
+    for (auto& r : perp) if (sn.count(toLower(r.name))) r.bothVenues = 1;
 }
 
 void enrichPerpFunding(std::vector<Row>& rows) {
@@ -531,8 +580,8 @@ void recordRows(int days, const std::vector<Row>& rows) {
             "INSERT OR IGNORE INTO ai_events("
             "ts,hour_slot,window_days,venue,token,name,"
             "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
-            "net_6h,net_prior,funding_nanos,liq_nanos)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,liq_fill_nanos,both_venues,top_share_bp)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     for (size_t i = 0; i < rows.size(); i++) {
         const auto& r = rows[i];
@@ -556,6 +605,10 @@ void recordRows(int days, const std::vector<Row>& rows) {
         sqlite3_bind_int64(s, 16, r.netPrior);
         sqlite3_bind_int64(s, 17, r.fundingNanos);
         sqlite3_bind_int64(s, 18, static_cast<long long>(std::min(r.liqUsd, 1000000000.0) * 1000000000.0));
+        sqlite3_bind_int(s, 19, r.levBp);
+        sqlite3_bind_int64(s, 20, r.liqFillNanos);
+        sqlite3_bind_int(s, 21, r.bothVenues);
+        sqlite3_bind_int(s, 22, static_cast<int>(r.topShare * 10000.0 + 0.5));
         sqlite3_step(s);
     }
     sqlite3_finalize(s);
@@ -708,7 +761,7 @@ void trainOne(bool perp) {
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
-                "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h "
+                "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
                 "AND window_days=1 AND venue=? "
                 "AND NOT EXISTS ("
@@ -730,6 +783,7 @@ void trainOne(bool perp) {
             r.fundingNanos = sqlite3_column_int64(s, 8);
             r.liqUsd = static_cast<double>(sqlite3_column_int64(s, 9)) / 1000000000.0;
             r.perp = perp;
+            r.topShare = sqlite3_column_int(s, 12) / 10000.0;
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
@@ -801,12 +855,36 @@ void cleanupEvents() {
     sqlite3_finalize(s);
 }
 
+int countReady(bool perp) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return 0;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT COUNT(*) FROM ai_events e "
+            "WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
+            "AND window_days=1 AND venue=? AND buy_nanos!=sell_nanos "
+            "AND ABS(price_24h-price_then)*50>=price_then "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
+            "  AND e2.window_days=1 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
+            "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id)"))
+        return 0;
+    sqlite3_bind_int(s, 1, perp ? 1 : 0);
+    int n = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int(s, 0);
+    sqlite3_finalize(s);
+    return n;
+}
+
 std::vector<Row> collectPassing(int days) {
     const long long since = hl::nowSec() - static_cast<long long>(days) * 86400LL;
-    auto spot = loadSpot(since, bannedSpot());
-    auto perp = loadPerp(since, bannedHl());
+    const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
+    const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
+    auto spot = loadSpot(since, bannedSpot(), topS);
+    auto perp = loadPerp(since, bannedHl(), topP);
     enrichPerpFunding(perp);
     for (auto& r : perp) finish(r);
+    markBothVenues(spot, perp);
     spot.insert(spot.end(), perp.begin(), perp.end());
     return spot;
 }
@@ -829,37 +907,56 @@ void snapshotHour() {
 
 }
 
-AiMessage buildAiSignals(const std::string& chatId, int days) {
+AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int side) {
     days = clampDays(days);
+    if (venue != 1) venue = 0;
+    if (side != 1) side = 0;
     ensureSchema();
     const Lang lang = langFromCode(getUserLanguage(chatId));
     const long long since = hl::nowSec() - static_cast<long long>(days) * 86400LL;
+    auto aiCb = [](int d, int v, int s) {
+        std::string out = "ai_open:" + std::to_string(d);
+        out += v ? ":p" : ":s";
+        out += s ? ":a" : ":b";
+        return out;
+    };
 
-    json kbCached;
-    kbCached["inline_keyboard"] = json::array();
-    kbCached["inline_keyboard"].push_back(json::array({
-        json{{"text", std::string(days == 1 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", "ai_open:1"}},
-        json{{"text", std::string(days == 7 ? "\u2022 " : "") + tr(lang, "ai_w7")},  {"callback_data", "ai_open:7"}},
-        json{{"text", std::string(days == 30 ? "\u2022 " : "") + tr(lang, "ai_w30")}, {"callback_data", "ai_open:30"}}
+    json kbBase;
+    kbBase["inline_keyboard"] = json::array();
+    kbBase["inline_keyboard"].push_back(json::array({
+        json{{"text", std::string(venue == 0 ? "\u2022 " : "") + tr(lang, "ai_spot")}, {"callback_data", aiCb(days, 0, side)}},
+        json{{"text", std::string(venue == 1 ? "\u2022 " : "") + tr(lang, "ai_perp")}, {"callback_data", aiCb(days, 1, side)}}
     }));
-    kbCached["inline_keyboard"].push_back(json::array({
+    kbBase["inline_keyboard"].push_back(json::array({
+        json{{"text", std::string(side == 0 ? "\u2022 " : "") + "🟢 " + tr(lang, "ai_buy")}, {"callback_data", aiCb(days, venue, 0)}},
+        json{{"text", std::string(side == 1 ? "\u2022 " : "") + "🔴 " + tr(lang, "ai_avoid")}, {"callback_data", aiCb(days, venue, 1)}}
+    }));
+    kbBase["inline_keyboard"].push_back(json::array({
+        json{{"text", std::string(days == 1 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", aiCb(1, venue, side)}},
+        json{{"text", std::string(days == 7 ? "\u2022 " : "") + tr(lang, "ai_w7")},  {"callback_data", aiCb(7, venue, side)}},
+        json{{"text", std::string(days == 30 ? "\u2022 " : "") + tr(lang, "ai_w30")}, {"callback_data", aiCb(30, venue, side)}}
+    }));
+    kbBase["inline_keyboard"].push_back(json::array({
         json{{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
     }));
 
     const int slot = cacheSlot(days);
-    const int key = slot * 100 + static_cast<int>(lang);
+    const int key = slot * 10000 + venue * 1000 + side * 100 + static_cast<int>(lang);
     {
         std::lock_guard<std::mutex> l(g_aiCacheMutex);
         auto it = g_aiCache.find(key);
         if (it != g_aiCache.end() &&
             time(nullptr) - it->second.at < AI_CACHE_TTL_SEC[slot])
-            return {it->second.text, kbCached.dump()};
+            return {it->second.text, kbBase.dump()};
     }
 
-    auto spot = loadSpot(since, bannedSpot());
-    auto perp = loadPerp(since, bannedHl());
+    const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
+    const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
+    auto spot = loadSpot(since, bannedSpot(), topS);
+    auto perp = loadPerp(since, bannedHl(), topP);
     enrichPerpFunding(perp);
     for (auto& r : perp) finish(r);
+    markBothVenues(spot, perp);
     if (days == 1) {
         std::vector<Row> logged;
         logged.reserve(spot.size() + perp.size());
@@ -872,53 +969,45 @@ AiMessage buildAiSignals(const std::string& chatId, int days) {
     takeSides(perp, perpBuy, perpAvoid);
 
     std::ostringstream t;
-    t << "\U0001F916 <b>" << tr(lang, "ai_title") << "</b> · " << windowLabel(days, lang) << "\n\n";
+    t << "\U0001F916 <b>" << tr(lang, "ai_title") << "</b> · "
+      << tr(lang, venue ? "ai_perp" : "ai_spot") << " · "
+      << windowLabel(days, lang) << "\n\n";
     t << "<i>" << tr(lang, "ai_hint") << "</i>\n";
-
-    const bool empty = spotBuy.empty() && spotAvoid.empty() && perpBuy.empty() && perpAvoid.empty();
-    if (empty) {
-        t << "\n" << tr(lang, "ai_empty");
-    } else {
-        auto dump = [&](const char* headKey, const std::vector<Row>& buys, const std::vector<Row>& avoids) {
-            if (buys.empty() && avoids.empty()) return;
-            t << "\n━━━━━━━━━━━━━━━━━━━━\n<b>" << tr(lang, headKey) << "</b>\n";
-            if (!buys.empty()) {
-                t << "\n🟢 " << tr(lang, "ai_buy") << "\n";
-                for (size_t i = 0; i < buys.size(); i++) {
-                    if (i) t << "\n";
-                    writeCard(t, static_cast<int>(i), buys[i]);
-                }
-            }
-            if (!avoids.empty()) {
-                t << "\n🔴 " << tr(lang, "ai_avoid") << "\n";
-                for (size_t i = 0; i < avoids.size(); i++) {
-                    if (i) t << "\n";
-                    writeCard(t, static_cast<int>(i), avoids[i]);
-                }
-            }
-        };
-        dump("ai_spot", spotBuy, spotAvoid);
-        dump("ai_perp", perpBuy, perpAvoid);
+    {
+        const int ns = countReady(false);
+        const int np = countReady(true);
+        bool ts = false, tp = false;
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            ts = g_trainedSpot;
+            tp = g_trainedPerp;
+        }
+        t << "\n<code>";
+        t << tr(lang, "ai_spot") << " " << (ts ? "✓" : std::to_string(ns) + "/" + std::to_string(AI_MIN_TRAIN));
+        t << " · ";
+        t << tr(lang, "ai_perp") << " " << (tp ? "✓" : std::to_string(np) + "/" + std::to_string(AI_MIN_TRAIN));
+        t << "</code>\n";
     }
 
-    json kb;
-    kb["inline_keyboard"] = json::array();
-    const std::string m24 = std::string(days == 1 ? "• " : "") + tr(lang, "ai_w24");
-    const std::string m7  = std::string(days == 7 ? "• " : "") + tr(lang, "ai_w7");
-    const std::string m30 = std::string(days == 30 ? "• " : "") + tr(lang, "ai_w30");
-    kb["inline_keyboard"].push_back(json::array({
-        json{{"text", m24}, {"callback_data", "ai_open:1"}},
-        json{{"text", m7},  {"callback_data", "ai_open:7"}},
-        json{{"text", m30}, {"callback_data", "ai_open:30"}}
-    }));
-    kb["inline_keyboard"].push_back(json::array({
-        json{{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
-    }));
+    const std::vector<Row>& rows = venue
+        ? (side ? perpAvoid : perpBuy)
+        : (side ? spotAvoid : spotBuy);
+    if (rows.empty()) {
+        t << "\n" << tr(lang, "ai_empty");
+    } else {
+        t << "\n" << (side ? "🔴 " : "🟢 ") << tr(lang, side ? "ai_avoid" : "ai_buy") << "\n";
+        const int n = std::min(static_cast<int>(rows.size()), AI_TOP_N);
+        for (int i = 0; i < n; i++) {
+            if (i) t << "\n";
+            writeCard(t, i, rows[static_cast<size_t>(i)]);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> l(g_aiCacheMutex);
         g_aiCache[key] = {time(nullptr), t.str()};
     }
-    return {t.str(), kb.dump()};
+    return {t.str(), kbBase.dump()};
 }
 
 bool handleAiCallback(const std::string& chatId, const std::string& action,
@@ -927,10 +1016,27 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
     if (action != "ai_open") return false;
     if (chatId != OWNER_CHAT_ID) return true;
     int days = 1;
-    try { days = std::stoi(param); } catch (...) { days = 1; }
+    int venue = 0;
+    int side = 0;
+    std::string rest = param;
+    const size_t sep1 = rest.find(':');
+    try {
+        days = std::stoi(sep1 == std::string::npos ? rest : rest.substr(0, sep1));
+    } catch (...) { days = 1; }
     days = clampDays(days);
-    rememberView(chatId, "ai_open:" + std::to_string(days));
-    auto msg = buildAiSignals(chatId, days);
+    if (sep1 != std::string::npos) {
+        rest = rest.substr(sep1 + 1);
+        if (!rest.empty()) {
+            if (rest[0] == 'p' || rest[0] == '1') venue = 1;
+            const size_t sep2 = rest.find(':');
+            if (sep2 != std::string::npos && sep2 + 1 < rest.size()) {
+                const char s = rest[sep2 + 1];
+                if (s == 'a' || s == '1') side = 1;
+            }
+        }
+    }
+    rememberView(chatId, "ai_open:" + std::to_string(days) + (venue ? ":p" : ":s") + (side ? ":a" : ":b"));
+    auto msg = buildAiSignals(chatId, days, venue, side);
     replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     (void)data;
     (void)callbackQueryId;
