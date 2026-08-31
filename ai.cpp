@@ -48,6 +48,7 @@ std::map<int, AiCacheEntry> g_aiCache;
 
 constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
+constexpr int AI_TRADE_N = 5;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
 constexpr int AI_NF = 13;
 constexpr int AI_MIN_TRAIN = 400;
@@ -767,19 +768,93 @@ void recordRows(int days, const std::vector<Row>& rows) {
     sqlite3_finalize(h);
 }
 
-void writeCard(std::ostringstream& t, int i, const Row& r) {
+int confPct(const Row& r, bool trained, bool wantLong) {
+    if (trained) {
+        std::array<double, AI_NF> w{};
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            w = r.perp ? g_wPerp : g_wSpot;
+        }
+        std::array<double, AI_NF> f{};
+        featuresOf(r, f);
+        double z = 0;
+        for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * f[static_cast<size_t>(i)];
+        const double p = sigmoid(z);
+        const double c = wantLong ? p : (1.0 - p);
+        int v = static_cast<int>(c * 100.0 + 0.5);
+        if (v < 1) v = 1;
+        if (v > 99) v = 99;
+        return v;
+    }
+    const double a = std::fabs(heuristicScore(r));
+    int v = 40 + static_cast<int>(std::min(40.0, a * 5.0));
+    if (v < 35) v = 35;
+    if (v > 80) v = 80;
+    return v;
+}
+
+void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool wantLong) {
+    std::vector<std::pair<double, const char*>> xs;
+    if (trained) {
+        std::array<double, AI_NF> w{};
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            w = r.perp ? g_wPerp : g_wSpot;
+        }
+        std::array<double, AI_NF> f{};
+        featuresOf(r, f);
+        const double sign = wantLong ? 1.0 : -1.0;
+        const char* keys[13] = {};
+        keys[1] = "ai_why_flow";
+        keys[2] = "ai_why_breadth";
+        keys[3] = "ai_why_share";
+        keys[8] = r.perp ? "ai_why_lev" : "ai_why_liq";
+        keys[9] = "ai_why_top";
+        keys[10] = "ai_why_rsi";
+        keys[11] = "ai_why_vol";
+        keys[12] = "ai_why_oi";
+        for (int i = 1; i < AI_NF; i++) {
+            if (!keys[i]) continue;
+            const double c = w[static_cast<size_t>(i)] * f[static_cast<size_t>(i)] * sign;
+            if (c > 0.02) xs.push_back({c, keys[i]});
+        }
+    } else {
+        const long long vol = r.buy + r.sell;
+        const double dir = vol > 0 ? static_cast<double>(r.buy - r.sell) / static_cast<double>(vol) : 0;
+        if ((wantLong && dir > 0.15) || (!wantLong && dir < -0.15)) xs.push_back({std::fabs(dir), "ai_why_flow"});
+        if (r.wallets >= 8) xs.push_back({static_cast<double>(r.wallets) / 50.0, "ai_why_breadth"});
+        if (r.oneShare <= 0.45) xs.push_back({1.0 - r.oneShare, "ai_why_share"});
+        if (r.topShare >= 0.12) xs.push_back({r.topShare, "ai_why_top"});
+        if (r.rsi > 0) {
+            if (wantLong && r.rsi <= 60) xs.push_back({(60.0 - r.rsi) / 60.0, "ai_why_rsi"});
+            if (!wantLong && r.rsi >= 40) xs.push_back({(r.rsi - 40.0) / 60.0, "ai_why_rsi"});
+        }
+        if (r.perp && r.mktVolNanos > 0) xs.push_back({0.2, "ai_why_vol"});
+        if (r.perp && r.oiNanos > 0) xs.push_back({0.15, "ai_why_oi"});
+    }
+    std::sort(xs.begin(), xs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    if (xs.empty()) return;
+    t << tr(lang, "ai_why") << ": ";
+    const int n = std::min(static_cast<int>(xs.size()), 3);
+    for (int i = 0; i < n; i++) {
+        if (i) t << " · ";
+        t << tr(lang, xs[static_cast<size_t>(i)].second);
+    }
+    t << "\n";
+}
+
+void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong) {
     const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
     const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
-    t << medal << num << "<b>" << r.name << "</b>\n";
-    t << "<b>" << signedCompact(r.buy - r.sell) << "</b>\n";
-    if (r.buy > 0) t << "🟢 " << compactUsd(r.buy);
-    if (r.buy > 0 && r.sell > 0) t << "   ";
-    if (r.sell > 0) t << "🔴 " << compactUsd(r.sell);
-    t << "\n";
-    if (r.nBuy > 0) t << r.nBuy << " ↗";
-    if (r.nBuy > 0 && r.nSell > 0) t << "   ";
-    if (r.nSell > 0) t << r.nSell << " ↘";
-    t << "   ·   " << r.wallets << "\n";
+    t << medal << num;
+    t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, wantLong ? "ai_long" : "ai_short");
+    t << " · <b>" << r.name << "</b>\n";
+    t << tr(lang, "ai_horizon") << " · " << tr(lang, "ai_conf") << " "
+      << confPct(r, trained, wantLong) << "%\n";
+    t << tr(lang, "ai_market") << "\n";
+    t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
+    t << " · " << r.wallets << "\n";
+    writeWhy(t, r, lang, trained, wantLong);
 }
 
 std::string windowLabel(int days, Lang lang) {
@@ -1315,8 +1390,8 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         json{{"text", std::string(venue == 1 ? "\u2022 " : "") + tr(lang, "ai_perp")}, {"callback_data", aiCb(days, 1, side)}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
-        json{{"text", std::string(side == 0 ? "\u2022 " : "") + "🟢 " + tr(lang, "ai_buy")}, {"callback_data", aiCb(days, venue, 0)}},
-        json{{"text", std::string(side == 1 ? "\u2022 " : "") + "🔴 " + tr(lang, "ai_avoid")}, {"callback_data", aiCb(days, venue, 1)}}
+        json{{"text", std::string(side == 0 ? "\u2022 " : "") + "🟢 " + tr(lang, "ai_long")}, {"callback_data", aiCb(days, venue, 0)}},
+        json{{"text", std::string(side == 1 ? "\u2022 " : "") + "🔴 " + tr(lang, "ai_short")}, {"callback_data", aiCb(days, venue, 1)}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
         json{{"text", std::string(days == 1 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", aiCb(1, venue, side)}},
@@ -1361,11 +1436,11 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
     t << "\U0001F916 <b>" << tr(lang, "ai_title") << "</b> · "
       << tr(lang, venue ? "ai_perp" : "ai_spot") << " · "
       << windowLabel(days, lang) << "\n\n";
-    t << "<i>" << tr(lang, "ai_hint") << "</i>\n";
+    t << "<i>" << tr(lang, "ai_trade_hint") << "</i>\n";
+    bool ts = false, tp = false;
     {
         const int ns = countReady(false);
         const int np = countReady(true);
-        bool ts = false, tp = false;
         {
             std::lock_guard<std::mutex> l(g_wMutex);
             ts = g_trainedSpot;
@@ -1376,19 +1451,23 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         t << " · ";
         t << tr(lang, "ai_perp") << " " << (tp ? "✓" : std::to_string(np) + "/" + std::to_string(AI_MIN_TRAIN));
         t << "</code>\n";
+        const bool trainedHere = venue ? tp : ts;
+        t << "<i>" << tr(lang, trainedHere ? "ai_mode_model" : "ai_mode_formula") << "</i>\n";
     }
 
     const std::vector<Row>& rows = venue
         ? (side ? perpAvoid : perpBuy)
         : (side ? spotAvoid : spotBuy);
+    const bool trainedHere = venue ? tp : ts;
+    const bool wantLong = side == 0;
     if (rows.empty()) {
         t << "\n" << tr(lang, "ai_empty");
     } else {
-        t << "\n" << (side ? "🔴 " : "🟢 ") << tr(lang, side ? "ai_avoid" : "ai_buy") << "\n";
-        const int n = std::min(static_cast<int>(rows.size()), AI_TOP_N);
+        t << "\n";
+        const int n = std::min(static_cast<int>(rows.size()), AI_TRADE_N);
         for (int i = 0; i < n; i++) {
             if (i) t << "\n";
-            writeCard(t, i, rows[static_cast<size_t>(i)]);
+            writeTrade(t, i, rows[static_cast<size_t>(i)], lang, trainedHere, wantLong);
         }
     }
 
