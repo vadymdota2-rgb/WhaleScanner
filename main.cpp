@@ -27,6 +27,7 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ranking.h"
+#include "ai.h"
 #include "token_prices.h"
 #include "big_trades.h"
 #include "alert_settings.h"
@@ -724,6 +725,11 @@ UIMessage buildMainMenu(const std::string& chatId) {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
+    if (chatId == OWNER_CHAT_ID) {
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "ai_btn")}, {"callback_data", "ai_open:1"}}
+        }));
+    }
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
@@ -1302,6 +1308,7 @@ constexpr size_t VIEW_STACK_MAX = 12;
 std::string pagingRoot(const std::string& data) {
     if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
+    if (data.rfind("ai_open:", 0) == 0) return data;
     if (data.rfind("bg_page:", 0) == 0) {
         const size_t a = data.find(':'), b = data.find(':', a + 1);
         const size_t c = b == std::string::npos ? std::string::npos : data.find(':', b + 1);
@@ -1389,6 +1396,13 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
         if (param == "help") return TelegramUI::buildHelpMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
+    }
+    if (action == "ai_open") {
+        if (chatId != OWNER_CHAT_ID) return TelegramUI::buildMainMenu(chatId);
+        int days = 1;
+        try { days = std::stoi(param); } catch (...) {}
+        auto r = buildAiSignals(chatId, days);
+        return {r.text, r.keyboard};
     }
     {
         HlMessage hl;
@@ -1617,6 +1631,10 @@ void handleCallbackQuery(const json& callbackQuery) {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
+    else if (action == "ai_open") {
+        if (chatId == OWNER_CHAT_ID)
+            handleAiCallback(chatId, action, param, data, messageId, callbackQueryId);
+    }
     else if (action == "bg_open" || action == "bg_page" || action == "bg_noop") {
         handleBigTradesCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
@@ -1654,6 +1672,7 @@ void dbMaintenanceLoop() {
         std::this_thread::sleep_for(std::chrono::minutes(1));
         try {
             cleanupTokenPricesPeriodic();
+            aiTick();
             bool doTruncate = std::chrono::duration_cast<std::chrono::minutes>(
                 std::chrono::steady_clock::now() - lastTruncate).count() >= 30;
             walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);
