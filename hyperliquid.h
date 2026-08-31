@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -34,6 +35,7 @@ struct PerpRankInfo {
 };
 
 bool perpRankOf(const std::string& wallet, PerpRankInfo& out);
+std::unordered_set<std::string> hlTopPnlWallets(int n = 100);
 std::vector<std::pair<std::string, PerpRankInfo>> perpTopThree();
 
 bool initHyperliquid();
