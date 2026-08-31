@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "tx_analyzer.h"
 #include "ru.h"
@@ -29,6 +30,7 @@ struct SpotRankInfo {
 };
 
 bool spotRankOf(const std::string& wallet, SpotRankInfo& out);
+std::unordered_set<std::string> spotTopPnlWallets(int n = 100);
 
 void markRankPresence(const char* venue, const std::vector<std::string>& wallets);
 int  rankPresenceDays(const char* venue, const std::string& wallet);
