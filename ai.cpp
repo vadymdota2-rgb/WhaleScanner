@@ -411,23 +411,60 @@ void fillPerpCtx(Row& r, long long asOf) {
         }
     }
     if (prepareOrLog(hl::g_hlDb, &s,
-            "SELECT oi_nanos,day_vlm_nanos FROM hl_funding_rate "
-            "WHERE coin=? AND hour_ts<=? AND (oi_nanos>0 OR day_vlm_nanos>0) "
+            "SELECT oi_nanos FROM hl_funding_rate "
+            "WHERE coin=? AND hour_ts<=? AND oi_nanos>0 "
             "ORDER BY hour_ts DESC LIMIT 1")) {
         sqlite3_bind_text(s, 1, r.id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 2, asOf);
         if (sqlite3_step(s) == SQLITE_ROW) {
-            r.oiNanos = sqlite3_column_int64(s, 0);
-            r.mktVolNanos = sqlite3_column_int64(s, 1);
+            const long long oi = sqlite3_column_int64(s, 0);
+            if (oi > 0) r.oiNanos = oi;
+        }
+        sqlite3_finalize(s);
+    }
+    if (prepareOrLog(hl::g_hlDb, &s,
+            "SELECT day_vlm_nanos FROM hl_funding_rate "
+            "WHERE coin=? AND hour_ts<=? AND day_vlm_nanos>0 "
+            "ORDER BY hour_ts DESC LIMIT 1")) {
+        sqlite3_bind_text(s, 1, r.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, asOf);
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            const long long vlm = sqlite3_column_int64(s, 0);
+            if (vlm > 0) r.mktVolNanos = vlm;
         }
         sqlite3_finalize(s);
     }
 }
 
+void fillSpotCtx(Row& r, long long asOf) {
+    if (r.mktVolNanos <= 0) r.mktVolNanos = (r.buy > 0 ? r.buy : 0) + (r.sell > 0 ? r.sell : 0);
+    r.rsi = spotRsi(r.id, asOf);
+    std::string coin = r.name;
+    for (char& c : coin) {
+        if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+    }
+    if (coin.empty()) return;
+    std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
+    if (!hl::g_hlDb) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(hl::g_hlDb, &s,
+            "SELECT oi_nanos FROM hl_funding_rate "
+            "WHERE coin=? AND hour_ts<=? AND oi_nanos>0 "
+            "ORDER BY hour_ts DESC LIMIT 1"))
+        return;
+    sqlite3_bind_text(s, 1, coin.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, asOf);
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        const long long oi = sqlite3_column_int64(s, 0);
+        if (oi > 0) r.oiNanos = oi;
+    }
+    sqlite3_finalize(s);
+}
+
 void enrichIndicators(std::vector<Row>& rows, long long asOf) {
     for (auto& r : rows) {
         if (r.perp) fillPerpCtx(r, asOf);
-        else r.rsi = spotRsi(r.id, asOf);
+        else fillSpotCtx(r, asOf);
         finish(r);
     }
 }
@@ -1200,6 +1237,9 @@ void backfillJournal() {
                 if (p > 0) series.push_back(p);
             }
             r.rsi = rsi14(series);
+            r.mktVolNanos = (r.buy > 0 ? r.buy : 0) + (r.sell > 0 ? r.sell : 0);
+            fillSpotCtx(r, d.first * 86400);
+            if (r.rsi == 0) r.rsi = rsi14(series);
             labeled.push_back({std::move(r), d.first * 86400, d.first * 24, thenPx, laterPx});
         }
     }
