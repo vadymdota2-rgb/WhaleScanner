@@ -11,6 +11,7 @@ struct BigTradesMessage {
 void refreshFundingCache();
 
 BigTradesMessage buildBigMenu(const std::string& chatId);
+BigTradesMessage buildFlowSearch(const std::string& chatId, const std::string& window, const std::string& query);
 BigTradesMessage buildBigList(const std::string& chatId, const std::string& venue,
                               const std::string& window, int page);
 
