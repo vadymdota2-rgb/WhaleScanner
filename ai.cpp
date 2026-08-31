@@ -8,6 +8,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -233,6 +234,7 @@ void ensureSchema() {
         "  UNIQUE(token, venue, window_days, hour_slot)"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_ai_events_fill ON ai_events(filled_at, ts);"
+        "CREATE INDEX IF NOT EXISTS idx_ai_events_fill6 ON ai_events(filled_6h, ts);"
         "CREATE TABLE IF NOT EXISTS ai_weights ("
         "  k INTEGER PRIMARY KEY,"
         "  v REAL NOT NULL"
@@ -553,7 +555,7 @@ void recordRows(int days, const std::vector<Row>& rows) {
         sqlite3_bind_int64(s, 15, r.net6h);
         sqlite3_bind_int64(s, 16, r.netPrior);
         sqlite3_bind_int64(s, 17, r.fundingNanos);
-        sqlite3_bind_int64(s, 18, static_cast<long long>(r.liqUsd * 1000000000.0));
+        sqlite3_bind_int64(s, 18, static_cast<long long>(std::min(r.liqUsd, 1000000000.0) * 1000000000.0));
         sqlite3_step(s);
     }
     sqlite3_finalize(s);
@@ -621,37 +623,47 @@ void fillOutcomes() {
         long long then = p.priceThen;
         if (then <= 0)
             then = p.venue ? perpMark(p.token, p.ts) : spotThen(p.token, p.ts);
-        long long nowPx = priceNowOf(p.venue != 0, p.token);
-        if (then <= 0 || nowPx <= 0) continue;
         const bool due6 = p.filled6 == 0 && p.ts <= now - AI_HORIZON_6H;
         const bool due24 = p.filled24 == 0 && p.ts <= now - AI_HORIZON_24H;
+        if (!due6 && !due24) continue;
+        long long px6 = 0;
+        long long px24 = 0;
+        if (due6) px6 = p.venue ? perpMark(p.token, p.ts + AI_HORIZON_6H)
+                                : spotThen(p.token, p.ts + AI_HORIZON_6H);
+        if (due24) px24 = p.venue ? perpMark(p.token, p.ts + AI_HORIZON_24H)
+                                  : spotThen(p.token, p.ts + AI_HORIZON_24H);
+        const bool stale6 = now - p.ts > AI_HORIZON_6H + 3600;
+        const bool stale24 = now - p.ts > AI_HORIZON_24H + 3600;
+        if (due6 && px6 <= 0 && !stale6) continue;
+        if (due24 && px24 <= 0 && !stale24) continue;
         std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
         sqlite3_stmt* s = nullptr;
         if (due6 && due24) {
             if (!prepareOrLog(db, &s,
-                    "UPDATE ai_events SET price_then=?, price_6h=?, filled_6h=?, "
-                    "price_24h=?, filled_at=? WHERE id=?"))
-                return;
+                    "UPDATE ai_events SET price_then=?, price_6h=?, filled_6h=?,"
+                    " price_24h=?, filled_at=? WHERE id=?"))
+                continue;
             sqlite3_bind_int64(s, 1, then);
-            sqlite3_bind_int64(s, 2, nowPx);
+            sqlite3_bind_int64(s, 2, px6);
             sqlite3_bind_int64(s, 3, now);
-            sqlite3_bind_int64(s, 4, nowPx);
+            sqlite3_bind_int64(s, 4, px24);
             sqlite3_bind_int64(s, 5, now);
             sqlite3_bind_int64(s, 6, p.id);
         } else if (due24) {
             if (!prepareOrLog(db, &s,
                     "UPDATE ai_events SET price_then=?, price_24h=?, filled_at=? WHERE id=?"))
-                return;
+                continue;
             sqlite3_bind_int64(s, 1, then);
-            sqlite3_bind_int64(s, 2, nowPx);
+            sqlite3_bind_int64(s, 2, px24);
             sqlite3_bind_int64(s, 3, now);
             sqlite3_bind_int64(s, 4, p.id);
         } else {
             if (!prepareOrLog(db, &s,
                     "UPDATE ai_events SET price_then=?, price_6h=?, filled_6h=? WHERE id=?"))
-                return;
+                continue;
             sqlite3_bind_int64(s, 1, then);
-            sqlite3_bind_int64(s, 2, nowPx);
+            sqlite3_bind_int64(s, 2, px6);
             sqlite3_bind_int64(s, 3, now);
             sqlite3_bind_int64(s, 4, p.id);
         }
@@ -697,8 +709,12 @@ void trainOne(bool perp) {
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
                 "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h "
-                "FROM ai_events WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
-                "AND window_days=1 AND venue=?"))
+                "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
+                "AND window_days=1 AND venue=? "
+                "AND NOT EXISTS ("
+                "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
+                "  AND e2.window_days=1 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
+                "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id)"))
             return;
         sqlite3_bind_int(s, 1, perp ? 1 : 0);
         while (sqlite3_step(s) == SQLITE_ROW) {
@@ -730,6 +746,9 @@ void trainOne(bool perp) {
     }
     if (static_cast<int>(xs.size()) < AI_MIN_TRAIN) return;
 
+    std::mt19937 rng(static_cast<unsigned>(hl::nowSec() ^ (perp ? 0x9e3779b9u : 0u)));
+    std::shuffle(xs.begin(), xs.end(), rng);
+
     std::array<double, AI_NF> w{};
     const double lr = 0.05;
     const double l2 = 0.01;
@@ -760,8 +779,14 @@ void trainOne(bool perp) {
 }
 
 void trainWeights() {
-    if (hl::nowSec() - g_lastTrain < 86400) return;
-    g_lastTrain = hl::nowSec();
+    const long long now = hl::nowSec();
+    bool both = false;
+    {
+        std::lock_guard<std::mutex> l(g_wMutex);
+        both = g_trainedSpot && g_trainedPerp;
+    }
+    if (now - g_lastTrain < (both ? 86400 : 3600)) return;
+    g_lastTrain = now;
     trainOne(false);
     trainOne(true);
 }
