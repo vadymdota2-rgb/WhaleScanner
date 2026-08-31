@@ -6,6 +6,7 @@ using boost::multiprecision::cpp_int;
 #include <sqlite3.h>
 #include <mutex>
 #include <map>
+#include <unordered_set>
 #include <vector>
 #include <sstream>
 #include <iostream>
@@ -1159,6 +1160,22 @@ bool spotRankOf(const std::string& wallet, SpotRankInfo& out) {
         return true;
     }
     return false;
+}
+
+std::unordered_set<std::string> spotTopPnlWallets(int n) {
+    std::unordered_set<std::string> out;
+    if (n <= 0) return out;
+    std::string payload;
+    if (!loadCachedPayload("global_pnl", payload)) return out;
+    std::vector<PnlRow> rows;
+    if (!rowsFromJson(payload, rows) || rows.empty()) return out;
+    const int lim = std::min(n, static_cast<int>(rows.size()));
+    out.reserve(static_cast<size_t>(lim));
+    for (int i = 0; i < lim; i++) {
+        std::string w = toLower(rows[static_cast<size_t>(i)].wallet);
+        if (!w.empty()) out.insert(std::move(w));
+    }
+    return out;
 }
 
 void rankingCacheLoop() {
