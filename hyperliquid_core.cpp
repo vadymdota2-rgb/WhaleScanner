@@ -306,7 +306,6 @@ int budgetLeft() {
     return HL_BUDGET_PER_MINUTE - g_budgetSpent;
 }
 
-
 json infoPost(const json& body, int weight, bool slow) {
     if (!spendBudget(weight, slow)) {
         g_budgetSkips.fetch_add(1, std::memory_order_relaxed);
@@ -955,8 +954,9 @@ std::string buildHlAlert(const std::string& label, const HlAlertData& a, Lang la
           << formatQtyNanos(a.qtyNanos) << " " << coin << "</b>\n";
 
     if (pos.stillOpen && pos.positionValueNanos > 0) {
-        m << dm << "\U0001F4CA " << tr(lang, "hl_position_size") << ": <b>"
-          << fmtUsd(pos.positionValueNanos) << "</b>\n";
+        const bool leftover = a.dirKey == "hl_partial_long" || a.dirKey == "hl_partial_short";
+        m << dm << "\U0001F4CA " << tr(lang, leftover ? "hl_position_left" : "hl_position_size")
+          << ": <b>" << fmtUsd(pos.positionValueNanos) << "</b>\n";
     }
 
     if (pos.stillOpen && pos.marginUsedNanos > 0) {
@@ -990,6 +990,53 @@ std::string buildHlAlert(const std::string& label, const HlAlertData& a, Lang la
     return m.str();
 }
 
+constexpr long long HL_ALERT_IDLE_SEC = 12;
+constexpr long long HL_ALERT_AGGREGATION_SEC = 60;
+
+struct PendingHlAlert {
+    std::string wallet;
+    HlAlertData data;
+    long long firstSeen = 0;
+    long long lastSeen = 0;
+};
+
+std::mutex g_hlAlertMutex;
+std::map<std::string, PendingHlAlert> g_hlPendingAlerts;
+
+struct AlertCycle {
+    int gen = 0;
+    std::string lastGroup;
+};
+std::map<std::string, AlertCycle> g_hlAlertCycle;
+
+std::string alertGroupOf(const std::string& dirKey) {
+    if (dirKey == "hl_partial_long"  || dirKey == "hl_close_long")  return "close_long";
+    if (dirKey == "hl_partial_short" || dirKey == "hl_close_short") return "close_short";
+    if (dirKey == "hl_add_long"  || dirKey == "hl_open_long")  return "open_long";
+    if (dirKey == "hl_add_short" || dirKey == "hl_open_short") return "open_short";
+    return dirKey;
+}
+
+bool isOpenGroup(const std::string& g) {
+    return g == "open_long" || g == "open_short";
+}
+
+bool isCloseGroup(const std::string& g) {
+    return g == "close_long" || g == "close_short"
+        || g == "hl_flip" || g == "hl_liq_long" || g == "hl_liq_short"
+        || g == "hl_liquidated";
+}
+
+int alertTitleRank(const std::string& k) {
+    if (k == "hl_liq_long" || k == "hl_liq_short" || k == "hl_liquidated") return 6;
+    if (k == "hl_flip") return 5;
+    if (k == "hl_close_long" || k == "hl_close_short") return 4;
+    if (k == "hl_partial_long" || k == "hl_partial_short") return 3;
+    if (k == "hl_open_long" || k == "hl_open_short") return 2;
+    if (k == "hl_add_long" || k == "hl_add_short") return 1;
+    return 0;
+}
+
 void dispatchHlAlert(const std::string& wallet, const HlAlertData& a) {
     const long long notionalNanosVal = a.notionalNanos;
     if (notionalNanosVal <= 0) return;
@@ -1010,6 +1057,64 @@ void dispatchHlAlert(const std::string& wallet, const HlAlertData& a) {
         std::string msg = buildHlAlert(entry.first.first, a, entry.first.second);
         if (g_msgQueue.enqueueToRecipients(msg, entry.second))
             g_alertsSent.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void bufferHlAlert(const std::string& wallet, const HlAlertData& a) {
+    const std::string group = alertGroupOf(a.dirKey);
+    const std::string cycleKey = wallet + "|" + a.coin;
+    std::lock_guard<std::mutex> l(g_hlAlertMutex);
+    AlertCycle& c = g_hlAlertCycle[cycleKey];
+    if (isOpenGroup(group) && isCloseGroup(c.lastGroup)) c.gen++;
+    c.lastGroup = group;
+    const std::string key = cycleKey + "|" + group + "|" + std::to_string(c.gen);
+    const long long now = nowSec();
+    auto it = g_hlPendingAlerts.find(key);
+    if (it == g_hlPendingAlerts.end()) {
+        g_hlPendingAlerts.emplace(key, PendingHlAlert{wallet, a, now, now});
+        return;
+    }
+    HlAlertData& acc = it->second.data;
+    if (alertTitleRank(a.dirKey) >= alertTitleRank(acc.dirKey))
+        acc.dirKey = a.dirKey;
+    acc.fillCount      += a.fillCount;
+    acc.notionalNanos  += a.notionalNanos;
+    acc.closedPnlNanos += a.closedPnlNanos;
+    acc.qtyNanos       += a.qtyNanos;
+    acc.pos = a.pos;
+    acc.accountValueNanos = a.accountValueNanos;
+    it->second.lastSeen = now;
+}
+
+void flushHlAlerts(bool force) {
+    std::vector<PendingHlAlert> ready;
+    {
+        std::lock_guard<std::mutex> l(g_hlAlertMutex);
+        const long long now = nowSec();
+        for (auto it = g_hlPendingAlerts.begin(); it != g_hlPendingAlerts.end(); ) {
+            if (force
+                || now - it->second.lastSeen >= HL_ALERT_IDLE_SEC
+                || now - it->second.firstSeen >= HL_ALERT_AGGREGATION_SEC) {
+                ready.push_back(std::move(it->second));
+                it = g_hlPendingAlerts.erase(it);
+            } else ++it;
+        }
+    }
+    // Чистим память циклов: запись нужна только пока по монете идёт серия.
+    // Без этого карта растёт с каждым новым кошельком и монетой навсегда.
+    {
+        std::lock_guard<std::mutex> l(g_hlAlertMutex);
+        if (g_hlPendingAlerts.empty() && g_hlAlertCycle.size() > 20000)
+            g_hlAlertCycle.clear();
+    }
+
+    for (PendingHlAlert& p : ready) {
+        HlAlertData& a = p.data;
+        if (a.qtyNanos > 0) {
+            const __int128 num = static_cast<__int128>(a.notionalNanos) * NANOS_PER_UNIT;
+            a.avgPxNanos = static_cast<long long>(num / a.qtyNanos);
+        }
+        dispatchHlAlert(p.wallet, a);
     }
 }
 
@@ -1139,14 +1244,7 @@ void enrichWallet(const std::string& wallet) {
             a.accountValueNanos = accountValue;
         }
 
-        for (auto& kv : series) {
-            HlAlertData& a = kv.second;
-            if (a.qtyNanos > 0) {
-                const __int128 num = static_cast<__int128>(a.notionalNanos) * NANOS_PER_UNIT;
-                a.avgPxNanos = static_cast<long long>(num / a.qtyNanos);
-            }
-            dispatchHlAlert(wallet, a);
-        }
+        for (auto& kv : series) bufferHlAlert(wallet, kv.second);
     }
 
     if (!fills.empty() && skippedNonPerp == fills.size()) {
@@ -1343,6 +1441,7 @@ void enricherLoop() {
                 rollbackIfOpen();
             }
         }
+        flushHlAlerts(false);
         if (!urgent) dripFundingHistory();
         if (perpCoinsLoaded() &&
             (lastCleanup == 0 || nowSec() - lastCleanup >= HL_CLEANUP_INTERVAL_SEC)) {
@@ -1363,6 +1462,7 @@ void enricherLoop() {
         for (int i = 0; i < 20 && keepGoing(); i++)
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+    flushHlAlerts(true);
     std::cout << "[HL] дозагрузчик остановлен" << std::endl;
 }
 
@@ -1743,6 +1843,7 @@ void stopHyperliquid() {
     g_hlRunning.store(false);
     if (g_feedThread.joinable()) g_feedThread.join();
     if (g_enrichThread.joinable()) g_enrichThread.join();
+    flushHlAlerts(true);
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (g_hlDb) {
         sqlite3_close(g_hlDb);
