@@ -736,10 +736,9 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
         json body;
         body["type"] = "clearinghouseState";
         body["user"] = wallet;
-        body["dex"] = dex;
+        if (!dex.empty()) body["dex"] = dex;
         json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
-        if (!j.is_object() || !j.contains("assetPositions") || !j["assetPositions"].is_array())
-            continue;
+        if (!j.is_object()) continue;
         any = true;
 
         if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
@@ -747,6 +746,9 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
             parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), v);
             if (v > 0) accountValueNanos += v;
         }
+
+        if (!j.contains("assetPositions") || !j["assetPositions"].is_array())
+            continue;
 
         for (const auto& ap : j["assetPositions"]) {
             if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
