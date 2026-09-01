@@ -2102,6 +2102,10 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
       << tr(lang, venue ? "ai_perp" : "ai_spot") << " · "
       << windowLabel(days, lang) << "\n\n";
     t << "<i>" << tr(lang, "ai_trade_hint") << "</i>\n";
+    // Развёрнутое описание только на первом экране: дальше оно занимало бы
+    // место, которое нужно самим сигналам.
+    if (days == 24 && venue == 0 && side == 0)
+        t << "<i>" << tr(lang, "ai_hint") << "</i>\n";
     // Точность на отложенных примерах: видно, стоит ли доверять модели.
     {
         const double acc = venue ? g_accPerp : g_accSpot;
