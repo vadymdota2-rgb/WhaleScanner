@@ -725,7 +725,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
-    if (chatId == OWNER_CHAT_ID) {
+    if (aiHasAccess(chatId)) {
         keyboard["inline_keyboard"].push_back(json::array({
             {{"text", tr(lang, "ai_btn")}, {"callback_data", "ai_open:1"}}
         }));
@@ -1400,7 +1400,7 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         return TelegramUI::buildMainMenu(chatId);
     }
     if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
-        if (chatId != OWNER_CHAT_ID) return TelegramUI::buildMainMenu(chatId);
+        if (!aiHasAccess(chatId)) return TelegramUI::buildMainMenu(chatId);
         int days = 1;
         int venue = 0;
         int side = 0;
@@ -1650,7 +1650,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         handleThresholdCallback(chatId, param, messageId);
     }
     else if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
-        if (chatId == OWNER_CHAT_ID)
+        if (aiHasAccess(chatId))
             handleAiCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
     else if (action == "bg_open" || action == "bg_page" || action == "bg_noop") {
@@ -1984,6 +1984,27 @@ void telegramLoop() {
                                 sendMsg(cid, rep.str());
                             }
                         }
+                    }
+                    else if (txt.rfind("/ai_grant", 0) == 0 && cid == OWNER_CHAT_ID) {
+                        const size_t sp = txt.find(' ');
+                        const std::string who = sp == std::string::npos ? "" : trim(txt.substr(sp + 1));
+                        if (who.empty()) sendMsg(cid, "Использование: /ai_grant <chat_id>");
+                        else if (aiGrantAccess(who)) sendMsg(cid, "Доступ к Aladdin открыт: " + who);
+                        else sendMsg(cid, "Не удалось открыть доступ.");
+                    }
+                    else if (txt.rfind("/ai_revoke", 0) == 0 && cid == OWNER_CHAT_ID) {
+                        const size_t sp = txt.find(' ');
+                        const std::string who = sp == std::string::npos ? "" : trim(txt.substr(sp + 1));
+                        if (who.empty()) sendMsg(cid, "Использование: /ai_revoke <chat_id>");
+                        else if (aiRevokeAccess(who)) sendMsg(cid, "Доступ к Aladdin закрыт: " + who);
+                        else sendMsg(cid, "Такого доступа нет.");
+                    }
+                    else if (txt == "/ai_list" && cid == OWNER_CHAT_ID) {
+                        const auto lst = aiAccessList();
+                        std::string out = "Доступ к Aladdin (" + std::to_string(lst.size()) + "):\n";
+                        for (const auto& c : lst) out += c + "\n";
+                        if (lst.empty()) out += "только владелец";
+                        sendMsg(cid, out);
                     }
                     else if (txt.rfind("/unban", 0) == 0) {
                         if (cid != OWNER_CHAT_ID) {
