@@ -117,6 +117,7 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
                     {sqlite3_column_int64(r, 2), sqlite3_column_int64(r, 3)};
             }
             sqlite3_finalize(r);
+            if (rcRates != SQLITE_DONE) return rows;
         }
     }
 
