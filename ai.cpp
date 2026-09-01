@@ -34,10 +34,7 @@ extern const std::string OWNER_CHAT_ID;
 
 // Доступ к Aladdin: владелец плюс те, кому он открыл вручную.
 // Список в базе, а не в памяти: переживает перезапуск.
-bool aiHasAccess(const std::string& chatId);
-bool aiGrantAccess(const std::string& chatId);
-bool aiRevokeAccess(const std::string& chatId);
-std::vector<std::string> aiAccessList();
+
 
 std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
@@ -322,13 +319,11 @@ void ensureSchema() {
         "CREATE TABLE IF NOT EXISTS ai_weights ("
         "  k INTEGER PRIMARY KEY,"
         "  v REAL NOT NULL"
-        ");
-
-    sqlite3_exec(db,
+        ");"
         "CREATE TABLE IF NOT EXISTS ai_access("
         "  chat_id TEXT PRIMARY KEY,"
-        "  granted_at INTEGER NOT NULL DEFAULT 0);",
-        nullptr, nullptr, nullptr);";
+        "  granted_at INTEGER NOT NULL DEFAULT 0"
+        ");";
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         if (err) sqlite3_free(err);
@@ -371,65 +366,7 @@ void ensureSchema() {
     g_schemaOk = true;
 }
 
-bool aiHasAccess(const std::string& chatId) {
-    if (chatId == OWNER_CHAT_ID) return true;
-    ensureSchema();
-    std::lock_guard<std::mutex> lock(dbMutex);
-    if (!db) return false;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s, "SELECT 1 FROM ai_access WHERE chat_id=? LIMIT 1"))
-        return false;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    const bool ok = sqlite3_step(s) == SQLITE_ROW;
-    sqlite3_finalize(s);
-    return ok;
-}
 
-bool aiGrantAccess(const std::string& chatId) {
-    ensureSchema();
-    std::lock_guard<std::mutex> lock(dbMutex);
-    if (!db) return false;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s,
-            "INSERT OR IGNORE INTO ai_access(chat_id,granted_at) VALUES(?,?)"))
-        return false;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, hl::nowSec());
-    const bool ok = sqlite3_step(s) == SQLITE_DONE;
-    sqlite3_finalize(s);
-    return ok;
-}
-
-bool aiRevokeAccess(const std::string& chatId) {
-    ensureSchema();
-    std::lock_guard<std::mutex> lock(dbMutex);
-    if (!db) return false;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s, "DELETE FROM ai_access WHERE chat_id=?")) return false;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    const bool ok = sqlite3_step(s) == SQLITE_DONE;
-    const int changed = sqlite3_changes(db);
-    sqlite3_finalize(s);
-    return ok && changed > 0;
-}
-
-std::vector<std::string> aiAccessList() {
-    std::vector<std::string> out;
-    ensureSchema();
-    std::lock_guard<std::mutex> lock(dbMutex);
-    if (!db) return out;
-    sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s, "SELECT chat_id FROM ai_access ORDER BY granted_at"))
-        return out;
-    int rc = SQLITE_DONE;
-    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
-        std::string c = safeColumnText(s, 0);
-        if (!c.empty()) out.push_back(std::move(c));
-    }
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) out.clear();
-    return out;
-}
 
 long long perpMarkNow(const std::string& coin) {
     std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
@@ -1523,7 +1460,11 @@ void trainWeights() {
         std::lock_guard<std::mutex> l(g_wMutex);
         both = g_trainedSpot && g_trainedPerp;
     }
-    if (now - g_lastTrain < (both ? 86400 : 3600)) return;
+    // Раз в 4 часа, а не в сутки: рынок меняет режим быстрее, чем
+    // переобучение. Веса вчерашнего дня после каскада ликвидаций или
+    // листинга уже не про этот рынок.
+    // Пока модели нет - пробуем каждый час, чтобы не ждать лишнего.
+    if (now - g_lastTrain < (both ? 4 * 3600 : 3600)) return;
     g_lastTrain = now;
     trainOne(false);
     trainOne(true);
@@ -1832,6 +1773,67 @@ void snapshotHour() {
     lastSlot = slot;
 }
 
+}
+
+
+bool aiHasAccess(const std::string& chatId) {
+    if (chatId == OWNER_CHAT_ID) return true;
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "SELECT 1 FROM ai_access WHERE chat_id=? LIMIT 1"))
+        return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_finalize(s);
+    return ok;
+}
+
+bool aiGrantAccess(const std::string& chatId) {
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "INSERT OR IGNORE INTO ai_access(chat_id,granted_at) VALUES(?,?)"))
+        return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, hl::nowSec());
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_finalize(s);
+    return ok;
+}
+
+bool aiRevokeAccess(const std::string& chatId) {
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "DELETE FROM ai_access WHERE chat_id=?")) return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    const int changed = sqlite3_changes(db);
+    sqlite3_finalize(s);
+    return ok && changed > 0;
+}
+
+std::vector<std::string> aiAccessList() {
+    std::vector<std::string> out;
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return out;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "SELECT chat_id FROM ai_access ORDER BY granted_at"))
+        return out;
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+        std::string c = safeColumnText(s, 0);
+        if (!c.empty()) out.push_back(std::move(c));
+    }
+    sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) out.clear();
+    return out;
 }
 
 // История: что вышло из прошлых сигналов. Смотрим события с известным
