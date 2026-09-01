@@ -1112,7 +1112,7 @@ void trainOne(bool perp) {
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
                 "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp,"
-                "rsi_bp,oi_nanos,mkt_vol_nanos,e.ts "
+                "rsi_bp,oi_nanos,mkt_vol_nanos,e.ts,lev_bp "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
                 "AND window_days=24 AND venue=? "
                 "AND NOT EXISTS ("
@@ -1140,6 +1140,9 @@ void trainOne(bool perp) {
             r.oiNanos = sqlite3_column_int64(s, 14);
             r.mktVolNanos = sqlite3_column_int64(s, 15);
             const long long evTs = sqlite3_column_int64(s, 16);
+            // Плечо китов: без него признак риска на перпах при обучении
+            // был бы нулём, хотя в живом расчёте он есть.
+            r.levBp = sqlite3_column_int(s, 17);
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
