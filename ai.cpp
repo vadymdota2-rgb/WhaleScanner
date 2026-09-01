@@ -115,6 +115,12 @@ std::array<double, AI_NF> g_wPerp{};
 bool g_trainedSpot = false;
 bool g_trainedPerp = false;
 double g_accSpot = 0.0;
+double g_calSpot = 1.0;
+double g_calPerp = 1.0;
+long long g_trainAtSpot = 0;
+long long g_trainAtPerp = 0;
+long long g_trainNSpot = 0;
+long long g_trainNPerp = 0;
 double g_accPerp = 0.0;
 long long g_lastTrain = 0;
 bool g_schemaOk = false;
@@ -226,6 +232,8 @@ void loadWeightSet(bool perp) {
     if (got == AI_NF && nSamp >= AI_MIN_TRAIN) {
         std::lock_guard<std::mutex> l(g_wMutex);
         if (perp) { g_wPerp = w; g_trainedPerp = true; }
+        if (perp) { g_trainAtPerp = hl::nowSec(); g_trainNPerp = static_cast<long long>(xs.size()); }
+        else       { g_trainAtSpot = hl::nowSec(); g_trainNSpot = static_cast<long long>(xs.size()); }
         else { g_wSpot = w; g_trainedSpot = true; }
     }
 }
@@ -407,7 +415,6 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
     t.isLong = isLong;
     t.entry = px;
 
-    // Стоп: два с половиной обычных хода, но не ближе 1.5% и не дальше 15%.
     double stopPct = vol * 2.5;
     if (stopPct < 0.015) stopPct = 0.015;
     if (stopPct > 0.15)  stopPct = 0.15;
@@ -420,14 +427,14 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
 
     // Плечо подбирается так, чтобы потеря на стопе была заданной долей
     // депозита. Уверенность модели и её точность задают эту долю:
-    // от 2% при слабом сигнале до 8% при сильном и проверенном.
+    // от 2% при слабом сигнале до 15% при сильном и проверенном.
     const double confidence = std::max(0.0, std::min(1.0, (prob - 0.5) * 2.5));
     const double quality = acc > 0 ? std::min(1.0, std::max(0.0, (acc - 0.5) * 4.0)) : 0.25;
-    const double riskBudget = 0.02 + 0.06 * confidence * quality;
+    const double riskBudget = 0.02 + 0.13 * confidence * quality;
 
     double lev = riskBudget / stopPct;
     if (lev < 1) lev = 1;
-    if (lev > 20) lev = 20;
+    if (lev > 10) lev = 10;
     t.leverage = static_cast<int>(lev + 0.5);
 
     t.valid = true;
@@ -866,7 +873,12 @@ int confPct(const Row& r, bool trained, bool wantLong) {
         featuresOf(r, f);
         double z = 0;
         for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * f[static_cast<size_t>(i)];
-        const double p = sigmoid(z);
+        // Поправка на калибровку: сырой выход сигмоиды систематически
+        // смещён, коэффициент измерен на отложенных примерах.
+        const double k = r.perp ? g_calPerp : g_calSpot;
+        double p = sigmoid(z) * k;
+        if (p > 0.99) p = 0.99;
+        if (p < 0.01) p = 0.01;
         const double c = wantLong ? p : (1.0 - p);
         int v = static_cast<int>(c * 100.0 + 0.5);
         if (v < 1) v = 1;
@@ -953,8 +965,6 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
     t << " · " << r.wallets << "\n";
 
-    // Уровни сделки. Считаются от типичного хода цены, а не от круглых
-    // чисел; плечо подбирается под заданную потерю на стопе.
     const double px = static_cast<double>(priceNowOf(r.id, r.perp)) / 1000000000.0;
     const double vol = volatilityOf(r.id, r.perp);
     const double acc = r.perp ? g_accPerp : g_accSpot;
@@ -966,6 +976,8 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
           << " (" << std::fixed << std::setprecision(1) << tp.riskPct << "%)\n";
         t << tr(lang, "ai_take") << " <code>" << fmtPx(tp.take1) << "</code>"
           << " / <code>" << fmtPx(tp.take2) << "</code>\n";
+        // Модель предсказывает на сутки: дальше сигнал ничего не значит.
+        t << tr(lang, "ai_expire") << "\n";
         t.unsetf(std::ios::fixed);
     }
 
@@ -1090,6 +1102,7 @@ void saveWeights(bool perp, const std::array<double, AI_NF>& w, long long nSamp)
 
 void trainOne(bool perp) {
     struct Sample {
+    long long ts = 0;
         std::array<double, AI_NF> f{};
         double y = 0;
     };
@@ -1101,7 +1114,7 @@ void trainOne(bool perp) {
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
                 "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp,"
-                "rsi_bp,oi_nanos,mkt_vol_nanos "
+                "rsi_bp,oi_nanos,mkt_vol_nanos,e.ts "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
                 "AND window_days=24 AND venue=? "
                 "AND NOT EXISTS ("
@@ -1128,6 +1141,7 @@ void trainOne(bool perp) {
             r.rsi = sqlite3_column_int(s, 13) / 100.0;
             r.oiNanos = sqlite3_column_int64(s, 14);
             r.mktVolNanos = sqlite3_column_int64(s, 15);
+            sm.ts = sqlite3_column_int64(s, 16);
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
@@ -1146,11 +1160,12 @@ void trainOne(bool perp) {
     if (static_cast<int>(xs.size()) < AI_MIN_TRAIN) return;
 
     std::mt19937 rng(static_cast<unsigned>(hl::nowSec() ^ (perp ? 0x9e3779b9u : 0u)));
-    std::shuffle(xs.begin(), xs.end(), rng);
+    // Проверяем на САМЫХ СВЕЖИХ примерах, а не на случайных. Со случайным
+    // разбиением модель учится на будущем и проверяется на прошлом - в бою
+    // так не бывает, и точность выходит завышенной.
+    std::sort(xs.begin(), xs.end(),
+              [](const Sample& a, const Sample& b) { return a.ts < b.ts; });
 
-    // Пятую часть примеров откладываем и НЕ учим на них. Иначе точность
-    // мерилась бы на том же, чему учились - модель всегда выглядела бы
-    // умной, даже когда просто запомнила шум.
     const size_t holdN = xs.size() / 5;
     std::vector<Sample> hold(xs.end() - static_cast<long>(holdN), xs.end());
     xs.resize(xs.size() - holdN);
@@ -1191,6 +1206,26 @@ void trainOne(bool perp) {
         return;
     }
     if (perp) g_accPerp = acc; else g_accSpot = acc;
+
+    // Калибровка: выход сигмоиды - это не вероятность. Меряем по
+    // отложенным, как часто сбывается каждый уровень уверенности, и
+    // считаем поправку. Иначе «71%» может значить и 55%, и 80%.
+    {
+        double sumP = 0, sumY = 0;
+        for (const auto& sm : hold) {
+            double z = 0;
+            for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * sm.f[static_cast<size_t>(i)];
+            sumP += sigmoid(z);
+            sumY += sm.y;
+        }
+        double k = 1.0;
+        if (holdN >= 40 && sumP > 1.0) {
+            k = sumY / sumP;
+            if (k < 0.5) k = 0.5;
+            if (k > 1.5) k = 1.5;
+        }
+        if (perp) g_calPerp = k; else g_calSpot = k;
+    }
     saveWeights(perp, w, static_cast<long long>(xs.size()));
     {
         std::lock_guard<std::mutex> l(g_wMutex);
@@ -1532,7 +1567,8 @@ std::vector<HistItem> loadHistory(int venue, int limit) {
         return out;
     sqlite3_bind_int(s, 1, venue);
     sqlite3_bind_int(s, 2, limit);
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
         HistItem h;
         h.name  = safeColumnText(s, 0);
         h.perp  = sqlite3_column_int(s, 1) != 0;
@@ -1548,6 +1584,10 @@ std::vector<HistItem> loadHistory(int venue, int limit) {
         out.push_back(std::move(h));
     }
     sqlite3_finalize(s);
+    // Обрыв чтения дал бы неполную выборку, а доля угаданных
+    // считается по ней и показывается человеку как факт.
+    if (rc != SQLITE_DONE) out.clear();
+    
     return out;
 }
 
@@ -1601,6 +1641,81 @@ AiMessage buildAiHistory(const std::string& chatId, int venue) {
     return {t.str(), kb.dump()};
 }
 
+// Состояние модели: всё, что происходит внутри, одним экраном.
+// Без этого обучение — чёрный ящик: непонятно, работает ли оно вообще.
+AiMessage buildAiStatus(const std::string& chatId) {
+    ensureSchema();
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+
+    std::ostringstream t;
+    t << "\U0001F9E0 <b>" << tr(lang, "ai_st_title") << "</b>\n\n";
+
+    const char* fname[AI_NF] = {
+        "bias", "flow", "wallets", "spread", "volume", "buy share",
+        "accel", "funding", "risk", "top wallets", "RSI", "market vol", "OI"
+    };
+
+    for (int v = 0; v < 2; v++) {
+        const bool perp = v == 1;
+        bool trained;
+        std::array<double, AI_NF> w{};
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            trained = perp ? g_trainedPerp : g_trainedSpot;
+            w = perp ? g_wPerp : g_wSpot;
+        }
+        const int ready = countReady(perp);
+        const double acc = perp ? g_accPerp : g_accSpot;
+        const double cal = perp ? g_calPerp : g_calSpot;
+        const long long at = perp ? g_trainAtPerp : g_trainAtSpot;
+        const long long ns = perp ? g_trainNPerp : g_trainNSpot;
+
+        t << "<b>" << tr(lang, perp ? "ai_perp" : "ai_spot") << "</b>\n";
+        t << tr(lang, "ai_st_ready") << " <b>" << ready << "</b> / " << AI_MIN_TRAIN << "\n";
+
+        if (!trained) {
+            t << tr(lang, "ai_st_untrained") << "\n\n";
+            continue;
+        }
+
+        t << tr(lang, "ai_st_acc") << " <b>" << static_cast<int>(acc * 100.0 + 0.5) << "%</b>"
+          << " \u00B7 " << tr(lang, "ai_st_samples") << " " << ns << "\n";
+        t << tr(lang, "ai_st_cal") << " <b>" << std::fixed << std::setprecision(2) << cal << "</b>";
+        t.unsetf(std::ios::fixed);
+        if (at > 0) {
+            const long long ago = (hl::nowSec() - at) / 3600;
+            t << " \u00B7 " << ago << tr(lang, "ai_hist_hours");
+        }
+        t << "\n";
+
+        // Три признака с наибольшим влиянием: видно, на что модель смотрит.
+        std::vector<std::pair<double, int>> ranked;
+        for (int i = 1; i < AI_NF; i++)
+            ranked.emplace_back(std::fabs(w[static_cast<size_t>(i)]), i);
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const std::pair<double,int>& a, const std::pair<double,int>& b) {
+                      return a.first > b.first;
+                  });
+        t << tr(lang, "ai_st_top") << " ";
+        for (int i = 0; i < 3 && i < static_cast<int>(ranked.size()); i++) {
+            if (i) t << " \u00B7 ";
+            const int idx = ranked[static_cast<size_t>(i)].second;
+            const double val = w[static_cast<size_t>(idx)];
+            t << fname[idx] << " <code>" << (val >= 0 ? "+" : "")
+              << std::fixed << std::setprecision(2) << val << "</code>";
+            t.unsetf(std::ios::fixed);
+        }
+        t << "\n\n";
+    }
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        json{{"text", tr(lang, "back_button")}, {"callback_data", "ai_open:24:s:b"}}
+    }));
+    return {t.str(), kb.dump()};
+}
+
 AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int side) {
     days = clampDays(days);
     if (venue != 1) venue = 0;
@@ -1638,7 +1753,8 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         json{{"text", std::string(days == 24 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", aiCb(24, venue, side)}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
-        json{{"text", tr(lang, "ai_hist_btn")}, {"callback_data", venue ? "ai_hist:p" : "ai_hist:s"}}
+        json{{"text", tr(lang, "ai_hist_btn")}, {"callback_data", venue ? "ai_hist:p" : "ai_hist:s"}},
+        json{{"text", tr(lang, "ai_st_btn")}, {"callback_data", "ai_stat:x"}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
         json{{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
@@ -1738,11 +1854,18 @@ bool handleAiHistoryCallback(const std::string& chatId, const std::string& param
 bool handleAiCallback(const std::string& chatId, const std::string& action,
                       const std::string& param, const std::string& data,
                       long long messageId, const std::string& callbackQueryId) {
-    if (action != "ai_open" && action != "ai_hist") return false;
+    if (action != "ai_open" && action != "ai_hist" && action != "ai_stat") return false;
     if (chatId != OWNER_CHAT_ID) return true;
 
     if (action == "ai_hist")
         return handleAiHistoryCallback(chatId, param, messageId);
+
+    if (action == "ai_stat") {
+        const AiMessage m = buildAiStatus(chatId);
+        if (messageId > 0) replyInPlace(chatId, messageId, m.text, m.keyboard);
+        else sendMsg(chatId, m.text, m.keyboard);
+        return true;
+    }
 
     int days = 1;
     int venue = 0;
