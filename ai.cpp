@@ -691,7 +691,7 @@ std::map<std::string, FrozenEntry> g_freeze;
 bool keepSignal(const Row& r, bool wantLong, long long live) {
     if (live <= 0) return false;
     const long long slot = hl::nowSec() / 3600;
-    const std::string key = (r.perp ? "p:" : "s:") + (wantLong ? "l:" : "h:") + r.id;
+    const std::string key = std::string(r.perp ? "p:" : "s:") + (wantLong ? "l:" : "h:") + r.id;
     long long first = 0;
     {
         std::lock_guard<std::mutex> l(g_freezeMutex);
