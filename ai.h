@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 struct AiMessage {
     std::string text;
@@ -16,3 +17,9 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
                       long long messageId, const std::string& callbackQueryId);
 
 void aiTick();
+
+// Доступ к Aladdin: владелец плюс те, кому он открыл командой.
+bool aiHasAccess(const std::string& chatId);
+bool aiGrantAccess(const std::string& chatId);
+bool aiRevokeAccess(const std::string& chatId);
+std::vector<std::string> aiAccessList();
