@@ -551,7 +551,7 @@ void fetchAccountState(const std::string& wallet) {
         json body;
         body["type"] = "clearinghouseState";
         body["user"] = wallet;
-        body["dex"] = dex;
+        if (!dex.empty()) body["dex"] = dex;
         json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
         if (!j.is_object()) continue;
         if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
