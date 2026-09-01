@@ -736,14 +736,9 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
     accountValueNanos = 0;
     dexAccounts.clear();
     bool any = false;
-    for (const std::string& dex : perpDexNames()) {
-        json body;
-        body["type"] = "clearinghouseState";
-        body["user"] = wallet;
-        if (!dex.empty()) body["dex"] = dex;
-        json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
-        if (!j.is_object()) continue;
-        any = true;
+
+    auto ingest = [&](const std::string& dex, const json& j) -> bool {
+        if (!j.is_object()) return false;
 
         long long dexAv = 0;
         if (j.contains("marginSummary") && j["marginSummary"].is_object())
@@ -751,12 +746,17 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
         if (dexAv <= 0 && j.contains("crossMarginSummary") && j["crossMarginSummary"].is_object())
             dexAv = jsonDecimalNanos(j["crossMarginSummary"], "accountValue");
         if (dexAv > 0) {
-            accountValueNanos += dexAv;
-            dexAccounts.emplace_back(dex, dexAv);
+            bool have = false;
+            for (const auto& d : dexAccounts)
+                if (d.first == dex) { have = true; break; }
+            if (!have) {
+                accountValueNanos += dexAv;
+                dexAccounts.emplace_back(dex, dexAv);
+            }
         }
 
         if (!j.contains("assetPositions") || !j["assetPositions"].is_array())
-            continue;
+            return true;
 
         for (const auto& ap : j["assetPositions"]) {
             if (!ap.is_object() || !ap.contains("position") || !ap["position"].is_object()) continue;
@@ -770,6 +770,11 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
             if (op.coin.empty()) continue;
             if (!dex.empty() && op.coin.find(':') == std::string::npos)
                 op.coin = dex + ":" + op.coin;
+
+            bool dup = false;
+            for (const auto& e : out)
+                if (e.coin == op.coin) { dup = true; break; }
+            if (dup) continue;
 
             long long szi = 0;
             parseDecimalToNanos(jstr(p, "szi", "0"), szi);
@@ -801,6 +806,32 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
             }
             out.push_back(std::move(op));
         }
+        return true;
+    };
+
+    std::vector<std::string> dexes = perpDexNames();
+    dexes.erase(std::remove(dexes.begin(), dexes.end(), std::string()), dexes.end());
+    dexes.insert(dexes.begin(), "");
+
+    for (const std::string& dex : dexes) {
+        json body;
+        body["type"] = "clearinghouseState";
+        body["user"] = wallet;
+        if (!dex.empty()) body["dex"] = dex;
+        if (ingest(dex, infoPost(body, 0))) any = true;
+    }
+
+    bool gotMain = false;
+    for (const auto& d : dexAccounts)
+        if (d.first.empty()) { gotMain = true; break; }
+    if (!gotMain) {
+        json w2;
+        w2["type"] = "webData2";
+        w2["user"] = wallet;
+        json j = infoPost(w2, 0);
+        if (j.is_object() && j.contains("clearinghouseState") &&
+            ingest("", j["clearinghouseState"]))
+            any = true;
     }
     return any;
 }
