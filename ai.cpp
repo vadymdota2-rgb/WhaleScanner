@@ -1281,9 +1281,11 @@ int countReady(bool perp) {
     return n;
 }
 
-std::vector<Row> collectPassing(int days, long long asOf) {
+// Окно в ЧАСАХ, как и на экране. Раньше здесь были дни, а обучение искало
+// window_days=24 - события с такой пометкой не появлялись никогда.
+std::vector<Row> collectPassing(int hours, long long asOf) {
     if (asOf <= 0) asOf = hl::nowSec();
-    const long long since = asOf - static_cast<long long>(days) * 86400LL;
+    const long long since = asOf - static_cast<long long>(hours) * 3600LL;
     const auto topS = spotTopPnlWallets(AI_TOP_WALLETS);
     const auto topP = hlTopPnlWallets(AI_TOP_WALLETS);
     auto spot = loadSpot(asOf, since, bannedSpot(), topS);
@@ -1537,8 +1539,8 @@ void snapshotHour() {
     static long long lastSlot = 0;
     const long long slot = hl::nowSec() / 3600;
     if (slot == lastSlot) return;
-    auto rows = collectPassing(1, hl::nowSec());
-    recordRows(1, rows);
+    auto rows = collectPassing(24, hl::nowSec());
+    recordRows(24, rows);
     lastSlot = slot;
 }
 
@@ -1785,7 +1787,7 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         logged.reserve(spot.size() + perp.size());
         logged.insert(logged.end(), spot.begin(), spot.end());
         logged.insert(logged.end(), perp.begin(), perp.end());
-        recordRows(1, logged);
+        recordRows(24, logged);
     }
     std::vector<Row> spotBuy, spotAvoid, perpBuy, perpAvoid;
     takeSides(spot, spotBuy, spotAvoid);
