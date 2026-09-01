@@ -204,6 +204,18 @@ void finish(Row& r) { r.score = rowScore(r); }
 int wKey(bool perp, int i) { return perp ? 200 + i : i; }
 int nKey(bool perp) { return perp ? 300 : 100; }
 int tKey(bool perp) { return perp ? 301 : 101; }
+int accKey(bool perp) { return perp ? 302 : 102; }
+int calKey(bool perp) { return perp ? 303 : 103; }
+
+double readWeightKV(int k, double def) {
+    sqlite3_stmt* s = nullptr;
+    double v = def;
+    if (!prepareOrLog(db, &s, "SELECT v FROM ai_weights WHERE k=?")) return def;
+    sqlite3_bind_int(s, 1, k);
+    if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_double(s, 0);
+    sqlite3_finalize(s);
+    return v;
+}
 
 void loadWeightSet(bool perp) {
     sqlite3_stmt* s = nullptr;
@@ -223,16 +235,21 @@ void loadWeightSet(bool perp) {
         sqlite3_finalize(s);
         if (rc != SQLITE_DONE) got = 0;
     }
-    long long nSamp = 0;
-    if (prepareOrLog(db, &s, "SELECT v FROM ai_weights WHERE k=?")) {
-        sqlite3_bind_int(s, 1, nKey(perp));
-        if (sqlite3_step(s) == SQLITE_ROW) nSamp = static_cast<long long>(sqlite3_column_double(s, 0));
-        sqlite3_finalize(s);
-    }
+    long long nSamp = static_cast<long long>(readWeightKV(nKey(perp), 0));
+    const double acc = readWeightKV(accKey(perp), 0);
+    double cal = readWeightKV(calKey(perp), 1);
+    if (cal < 0.5) cal = 0.5;
+    if (cal > 1.5) cal = 1.5;
+    const long long at = static_cast<long long>(readWeightKV(tKey(perp), 0));
     if (got == AI_NF && nSamp >= AI_MIN_TRAIN) {
         std::lock_guard<std::mutex> l(g_wMutex);
-        if (perp) { g_wPerp = w; g_trainedPerp = true; g_trainNPerp = nSamp; }
-        else      { g_wSpot = w; g_trainedSpot = true; g_trainNSpot = nSamp; }
+        if (perp) {
+            g_wPerp = w; g_trainedPerp = true; g_trainNPerp = nSamp;
+            g_accPerp = acc; g_calPerp = cal; g_trainAtPerp = at;
+        } else {
+            g_wSpot = w; g_trainedSpot = true; g_trainNSpot = nSamp;
+            g_accSpot = acc; g_calSpot = cal; g_trainAtSpot = at;
+        }
     }
 }
 
@@ -307,6 +324,13 @@ void ensureSchema() {
         sqlite3_exec(db, alts[i], nullptr, nullptr, &aerr);
         if (aerr) sqlite3_free(aerr);
     }
+    sqlite3_exec(db,
+        "DELETE FROM ai_events WHERE window_days=1 AND EXISTS ("
+        "  SELECT 1 FROM ai_events e2 WHERE e2.token=ai_events.token"
+        "  AND e2.venue=ai_events.venue AND e2.hour_slot=ai_events.hour_slot"
+        "  AND e2.window_days=24);"
+        "UPDATE ai_events SET window_days=24 WHERE window_days=1;",
+        nullptr, nullptr, nullptr);
     loadWeightSet(false);
     loadWeightSet(true);
     g_schemaOk = true;
@@ -378,12 +402,18 @@ double volatilityOf(const std::string& token, bool perp) {
                                       : (hl::nowSec() - 86400LL));
         long long prev = 0;
         while (sqlite3_step(s) == SQLITE_ROW) {
-            const long long p = sqlite3_column_int64(s, 0);
-            if (p > 0 && prev > 0) {
+            long long p = 0;
+            if (perp) {
+                if (!hl::parseDecimalToNanos(safeColumnText(s, 0), p) || p <= 0) continue;
+            } else {
+                p = sqlite3_column_int64(s, 0);
+                if (p <= 0) continue;
+            }
+            if (prev > 0) {
                 const double d = std::fabs(static_cast<double>(p - prev)) / static_cast<double>(prev);
                 if (d > 0 && d < 0.5) steps.push_back(d);
             }
-            if (p > 0) prev = p;
+            prev = p;
         }
         sqlite3_finalize(s);
     }
@@ -863,17 +893,16 @@ void recordRows(int days, const std::vector<Row>& rows) {
 int confPct(const Row& r, bool trained, bool wantLong) {
     if (trained) {
         std::array<double, AI_NF> w{};
+        double k = 1;
         {
             std::lock_guard<std::mutex> l(g_wMutex);
             w = r.perp ? g_wPerp : g_wSpot;
+            k = r.perp ? g_calPerp : g_calSpot;
         }
         std::array<double, AI_NF> f{};
         featuresOf(r, f);
         double z = 0;
         for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * f[static_cast<size_t>(i)];
-        // Поправка на калибровку: сырой выход сигмоиды систематически
-        // смещён, коэффициент измерен на отложенных примерах.
-        const double k = r.perp ? g_calPerp : g_calSpot;
         double p = sigmoid(z) * k;
         if (p > 0.99) p = 0.99;
         if (p < 0.01) p = 0.01;
@@ -965,16 +994,20 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
 
     const double px = static_cast<double>(priceNowOf(r.perp, r.id)) / 1000000000.0;
     const double vol = volatilityOf(r.id, r.perp);
-    const double acc = r.perp ? g_accPerp : g_accSpot;
+    double acc = 0;
+    {
+        std::lock_guard<std::mutex> l(g_wMutex);
+        acc = r.perp ? g_accPerp : g_accSpot;
+    }
     const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc);
     if (tp.valid) {
-        t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>"
-          << " · " << tp.leverage << "x\n";
+        t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>";
+        if (r.perp) t << " · " << tp.leverage << "x";
+        t << "\n";
         t << tr(lang, "ai_stop") << " <code>" << fmtPx(tp.stop) << "</code>"
           << " (" << std::fixed << std::setprecision(1) << tp.riskPct << "%)\n";
         t << tr(lang, "ai_take") << " <code>" << fmtPx(tp.take1) << "</code>"
           << " / <code>" << fmtPx(tp.take2) << "</code>\n";
-        // Модель предсказывает на сутки: дальше сигнал ничего не значит.
         t << tr(lang, "ai_expire") << "\n";
         t.unsetf(std::ios::fixed);
     }
@@ -1074,7 +1107,7 @@ void fillOutcomes() {
     }
 }
 
-void saveWeights(bool perp, const std::array<double, AI_NF>& w, long long nSamp) {
+void saveWeights(bool perp, const std::array<double, AI_NF>& w, long long nSamp, double acc, double cal) {
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return;
@@ -1093,6 +1126,8 @@ void saveWeights(bool perp, const std::array<double, AI_NF>& w, long long nSamp)
     for (int i = 0; i < AI_NF && ok; i++) ok = bindKV(wKey(perp, i), w[static_cast<size_t>(i)]);
     if (ok) ok = bindKV(nKey(perp), static_cast<double>(nSamp));
     if (ok) ok = bindKV(tKey(perp), static_cast<double>(hl::nowSec()));
+    if (ok) ok = bindKV(accKey(perp), acc);
+    if (ok) ok = bindKV(calKey(perp), cal);
     sqlite3_finalize(s);
     if (!ok || sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
@@ -1207,12 +1242,9 @@ void trainOne(bool perp) {
                   << "% - веса не применяем" << std::endl;
         return;
     }
-    if (perp) g_accPerp = acc; else g_accSpot = acc;
 
-    // Калибровка: выход сигмоиды - это не вероятность. Меряем по
-    // отложенным, как часто сбывается каждый уровень уверенности, и
-    // считаем поправку. Иначе «71%» может значить и 55%, и 80%.
-    {
+    double k = 1.0;
+    if (holdN >= 40) {
         double sumP = 0, sumY = 0;
         for (const auto& sm : hold) {
             double z = 0;
@@ -1220,22 +1252,26 @@ void trainOne(bool perp) {
             sumP += sigmoid(z);
             sumY += sm.y;
         }
-        double k = 1.0;
-        if (holdN >= 40 && sumP > 1.0) {
+        if (sumP > 1.0) {
             k = sumY / sumP;
             if (k < 0.5) k = 0.5;
             if (k > 1.5) k = 1.5;
         }
-        if (perp) g_calPerp = k; else g_calSpot = k;
     }
-    saveWeights(perp, w, static_cast<long long>(xs.size()));
+    saveWeights(perp, w, static_cast<long long>(xs.size()), acc, k);
+    const long long at = hl::nowSec();
     {
         std::lock_guard<std::mutex> l(g_wMutex);
-        if (perp) { g_wPerp = w; g_trainedPerp = true; }
-        else { g_wSpot = w; g_trainedSpot = true; }
+        if (perp) {
+            g_wPerp = w; g_trainedPerp = true;
+            g_accPerp = acc; g_calPerp = k;
+            g_trainAtPerp = at; g_trainNPerp = static_cast<long long>(xs.size());
+        } else {
+            g_wSpot = w; g_trainedSpot = true;
+            g_accSpot = acc; g_calSpot = k;
+            g_trainAtSpot = at; g_trainNSpot = static_cast<long long>(xs.size());
+        }
     }
-    if (perp) { g_trainAtPerp = hl::nowSec(); g_trainNPerp = static_cast<long long>(xs.size()); }
-    else      { g_trainAtSpot = hl::nowSec(); g_trainNSpot = static_cast<long long>(xs.size()); }
     std::cout << "[AI] trained " << (perp ? "perp" : "spot")
               << " on " << xs.size() << " 24h outcomes" << std::endl;
 }
@@ -1319,7 +1355,7 @@ void insertLabeled(const Row& r, long long ts, long long slot, long long thenPx,
             "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
             "price_24h,filled_at,net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,"
             "liq_fill_nanos,both_venues,top_share_bp,rsi_bp,oi_nanos,mkt_vol_nanos) "
-            "VALUES(?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "VALUES(?,?,24,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int64(s, 1, ts);
     sqlite3_bind_int64(s, 2, slot);
@@ -1785,13 +1821,6 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
     markBothVenues(spot, perp);
     enrichIndicators(spot, asOf);
     enrichIndicators(perp, asOf);
-    if (days == 1) {
-        std::vector<Row> logged;
-        logged.reserve(spot.size() + perp.size());
-        logged.insert(logged.end(), spot.begin(), spot.end());
-        logged.insert(logged.end(), perp.begin(), perp.end());
-        recordRows(24, logged);
-    }
     std::vector<Row> spotBuy, spotAvoid, perpBuy, perpAvoid;
     takeSides(spot, spotBuy, spotAvoid);
     takeSides(perp, perpBuy, perpAvoid);
