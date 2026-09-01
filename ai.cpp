@@ -32,6 +32,13 @@ extern sqlite3* db;
 extern std::mutex dbMutex;
 extern const std::string OWNER_CHAT_ID;
 
+// Доступ к Aladdin: владелец плюс те, кому он открыл вручную.
+// Список в базе, а не в памяти: переживает перезапуск.
+bool aiHasAccess(const std::string& chatId);
+bool aiGrantAccess(const std::string& chatId);
+bool aiRevokeAccess(const std::string& chatId);
+std::vector<std::string> aiAccessList();
+
 std::string getUserLanguage(const std::string& chatId);
 void rememberView(const std::string& chatId, const std::string& data);
 
@@ -51,7 +58,7 @@ constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
 constexpr int AI_TRADE_N = 5;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
-constexpr int AI_NF = 13;
+constexpr int AI_NF = 16;
 constexpr int AI_MIN_TRAIN = 400;
 constexpr int AI_TOP_WALLETS = 100;
 constexpr long long AI_HORIZON_6H = 6LL * 3600;
@@ -102,11 +109,16 @@ struct Row {
     double liqUsd = 0;
     int levBp = 0;
     long long liqFillNanos = 0;
+    long long liqLongNanos = 0;    // вынесло лонги
+    long long liqShortNanos = 0;   // вынесло шорты
     int bothVenues = 0;
     double topShare = 0;
+    double topDir = 0;         // -1 топ продаёт, +1 топ покупает
     double rsi = 0;
     long long oiNanos = 0;
     long long mktVolNanos = 0;
+    double regime = 0;         // 0 спокойно, 1 всплеск волатильности
+    long long asOf = 0;          // момент, на который посчитан сигнал
 };
 
 std::mutex g_wMutex;
@@ -116,6 +128,10 @@ bool g_trainedSpot = false;
 bool g_trainedPerp = false;
 double g_accSpot = 0.0;
 double g_calSpot = 1.0;
+std::array<double, AI_NF> g_prevSpot{};
+std::array<double, AI_NF> g_prevPerp{};
+std::array<bool, AI_NF> g_stableSpot{};
+std::array<bool, AI_NF> g_stablePerp{};
 double g_calPerp = 1.0;
 long long g_trainAtSpot = 0;
 long long g_trainAtPerp = 0;
@@ -165,6 +181,15 @@ void featuresOf(const Row& r, std::array<double, AI_NF>& f) {
             / std::log1p(1000000000.0);
     f[12] = std::log1p(static_cast<double>(std::max(0LL, r.oiNanos)) / 1000000000.0)
             / std::log1p(1000000000.0);
+    f[13] = r.topDir;
+    {
+        const long long lq = r.liqLongNanos, sq = r.liqShortNanos;
+        const long long tq = lq + sq;
+        f[14] = tq > 0 ? static_cast<double>(sq - lq) / static_cast<double>(tq) : 0.0;
+    }
+    // Режим рынка: линейная модель усредняет тренд, флэт и каскад в одни
+    // веса. Пусть хотя бы знает, в каком режиме считает.
+    f[15] = r.regime;
 }
 
 double heuristicScore(const Row& r) {
@@ -297,7 +322,13 @@ void ensureSchema() {
         "CREATE TABLE IF NOT EXISTS ai_weights ("
         "  k INTEGER PRIMARY KEY,"
         "  v REAL NOT NULL"
-        ");";
+        ");
+
+    sqlite3_exec(db,
+        "CREATE TABLE IF NOT EXISTS ai_access("
+        "  chat_id TEXT PRIMARY KEY,"
+        "  granted_at INTEGER NOT NULL DEFAULT 0);",
+        nullptr, nullptr, nullptr);";
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         if (err) sqlite3_free(err);
@@ -311,6 +342,10 @@ void ensureSchema() {
         "ALTER TABLE ai_events ADD COLUMN funding_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN liq_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN lev_bp INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN top_dir_bp INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN liq_long_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN liq_short_nanos INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_events ADD COLUMN regime_bp INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN liq_fill_nanos INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN both_venues INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE ai_events ADD COLUMN top_share_bp INTEGER NOT NULL DEFAULT 0",
@@ -334,6 +369,66 @@ void ensureSchema() {
     loadWeightSet(false);
     loadWeightSet(true);
     g_schemaOk = true;
+}
+
+bool aiHasAccess(const std::string& chatId) {
+    if (chatId == OWNER_CHAT_ID) return true;
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "SELECT 1 FROM ai_access WHERE chat_id=? LIMIT 1"))
+        return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(s) == SQLITE_ROW;
+    sqlite3_finalize(s);
+    return ok;
+}
+
+bool aiGrantAccess(const std::string& chatId) {
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "INSERT OR IGNORE INTO ai_access(chat_id,granted_at) VALUES(?,?)"))
+        return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, hl::nowSec());
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_finalize(s);
+    return ok;
+}
+
+bool aiRevokeAccess(const std::string& chatId) {
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return false;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "DELETE FROM ai_access WHERE chat_id=?")) return false;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    const int changed = sqlite3_changes(db);
+    sqlite3_finalize(s);
+    return ok && changed > 0;
+}
+
+std::vector<std::string> aiAccessList() {
+    std::vector<std::string> out;
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return out;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s, "SELECT chat_id FROM ai_access ORDER BY granted_at"))
+        return out;
+    int rc = SQLITE_DONE;
+    while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+        std::string c = safeColumnText(s, 0);
+        if (!c.empty()) out.push_back(std::move(c));
+    }
+    sqlite3_finalize(s);
+    if (rc != SQLITE_DONE) out.clear();
+    return out;
 }
 
 long long perpMarkNow(const std::string& coin) {
@@ -422,6 +517,48 @@ double volatilityOf(const std::string& token, bool perp) {
     return steps[steps.size() / 2];
 }
 
+// Всплеск волатильности: последний час против обычного за сутки. Линейная
+// модель усредняет режимы - пусть хотя бы знает, что рынок разогнался.
+double regimeOf(const std::string& token, bool perp) {
+    std::vector<long long> px;
+    {
+        std::lock_guard<std::mutex> lock(perp ? hl::g_hlDbMutex : dbMutex);
+        sqlite3* h = perp ? hl::g_hlDb : db;
+        if (!h) return 0.0;
+        sqlite3_stmt* s = nullptr;
+        const char* q = perp
+            ? "SELECT px FROM hl_fills WHERE coin=? AND ts>=? ORDER BY ts ASC LIMIT 400"
+            : "SELECT price_nanos FROM token_price_history WHERE address=? AND ts>=? ORDER BY ts ASC LIMIT 400";
+        if (!prepareOrLog(h, &s, q)) return 0.0;
+        sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, perp ? (hl::nowSec() - 86400LL) * 1000LL
+                                      : (hl::nowSec() - 86400LL));
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const long long p = sqlite3_column_int64(s, 0);
+            if (p > 0) px.push_back(p);
+        }
+        sqlite3_finalize(s);
+    }
+    if (px.size() < 10) return 0.0;
+
+    std::vector<double> steps;
+    for (size_t i = 1; i < px.size(); i++) {
+        const double d = std::fabs(static_cast<double>(px[i] - px[i - 1]))
+                       / static_cast<double>(px[i - 1]);
+        if (d > 0 && d < 0.5) steps.push_back(d);
+    }
+    if (steps.size() < 8) return 0.0;
+
+    const double last = steps.back();
+    std::vector<double> sorted = steps;
+    std::sort(sorted.begin(), sorted.end());
+    const double med = sorted[sorted.size() / 2];
+    if (med <= 0) return 0.0;
+
+    const double ratio = last / med;
+    return std::min(1.0, std::max(0.0, (ratio - 1.0) / 3.0));
+}
+
 struct TradePlan {
     bool valid = false;
     bool isLong = true;
@@ -436,7 +573,8 @@ struct TradePlan {
 
 // Уровни считаются от типичного хода цены за сутки, а не от круглых
 // чисел. Стоп за пределом обычного шума, цели кратно риску.
-TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
+TradePlan planOf(double px, double vol, double prob, bool isLong, double acc,
+                 bool isPerp, bool thinLiq) {
     TradePlan t;
     if (px <= 0 || vol <= 0) return t;
 
@@ -458,7 +596,14 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
     // от 2% при слабом сигнале до 15% при сильном и проверенном.
     const double confidence = std::max(0.0, std::min(1.0, (prob - 0.5) * 2.5));
     const double quality = acc > 0 ? std::min(1.0, std::max(0.0, (acc - 0.5) * 4.0)) : 0.25;
-    const double riskBudget = 0.02 + 0.13 * confidence * quality;
+    // Точность меряется по ЗНАКУ движения, а не по судьбе плана: сигнал
+    // может быть прав по направлению и всё равно выбит стопом на откате.
+    // Пока метки плана нет, верх риска зажат - сильнее там, где выход
+    // дороже: спот и тонкая ликвидность.
+    double cap = 0.15;
+    if (!isPerp)      cap = 0.06;          // на споте нет плеча, риск = размер позиции
+    if (thinLiq)      cap = std::min(cap, 0.04);
+    const double riskBudget = std::min(cap, 0.02 + 0.13 * confidence * quality);
 
     double lev = riskBudget / stopPct;
     if (lev < 1) lev = 1;
@@ -467,6 +612,23 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
 
     t.valid = true;
     return t;
+}
+
+// Возраст последней записи цены. Разметка по цене недельной давности -
+// не разметка, а шум: событие лучше не писать вовсе.
+long long priceAgeOf(const std::string& token, bool perp) {
+    if (perp) return 0;                    // на перпах цена из отметки, всегда свежая
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return -1;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT ts FROM token_price_history WHERE address=? ORDER BY ts DESC LIMIT 1"))
+        return -1;
+    sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    long long ts = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) ts = sqlite3_column_int64(s, 0);
+    sqlite3_finalize(s);
+    return ts > 0 ? (hl::nowSec() - ts) : -1;
 }
 
 long long priceNowOf(bool perp, const std::string& id) {
@@ -655,7 +817,10 @@ struct Bucket {
     long long levNotional = 0;
     long long levWeight = 0;
     long long liqFill = 0;
+    long long liqLong = 0;
+    long long liqShort = 0;
     long long topVol = 0;
+    long long topNet = 0;      // знак потока топовых: покупают или продают
     std::map<std::string, long long> vol;
 };
 
@@ -666,7 +831,7 @@ void addVol(Bucket& b, const std::string& wallet, long long usd, bool isBuy,
     if (isBuy) { b.buy += usd; b.nBuy++; }
     else { b.sell += usd; b.nSell++; }
     b.vol[wallet] += usd;
-    if (fromTop) b.topVol += usd;
+    if (fromTop) { b.topVol += usd; b.topNet += signedUsd; }
     if (ts >= t6) b.net6h += signedUsd;
     else if (ts >= t24) b.netPrior += signedUsd;
 }
@@ -684,6 +849,8 @@ Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool 
     r.net6h = b.net6h;
     r.netPrior = b.netPrior;
     r.liqFillNanos = b.liqFill;
+    r.liqLongNanos = b.liqLong;
+    r.liqShortNanos = b.liqShort;
     if (b.levWeight > 0)
         r.levBp = static_cast<int>((b.levNotional * 100) / b.levWeight);
     long long mx = 0, tot = 0;
@@ -693,6 +860,8 @@ Row toRow(const std::string& id, const std::string& name, const Bucket& b, bool 
     }
     r.oneShare = tot > 0 ? static_cast<double>(mx) / static_cast<double>(tot) : 1;
     r.topShare = tot > 0 ? static_cast<double>(b.topVol) / static_cast<double>(tot) : 0;
+    // Доля без знака ничего не говорит: топ в плюсе может и продавать.
+    r.topDir = b.topVol > 0 ? static_cast<double>(b.topNet) / static_cast<double>(b.topVol) : 0;
     if (!perp && fetchLiq) r.liqUsd = getPoolLiquidityUsd(id);
     finish(r);
     return r;
@@ -737,6 +906,8 @@ std::vector<Row> loadSpot(long long asOf, long long since, const std::unordered_
         }
         name = safeString(name, 16);
         Row r = toRow(p.first, name, p.second, false, true);
+        r.asOf = asOf;
+        r.regime = regimeOf(r.id, r.perp);
         if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
             out.push_back(std::move(r));
     }
@@ -771,6 +942,10 @@ std::vector<Row> loadPerp(long long asOf, long long since, const std::unordered_
             if (dir == DIR_LIQ_LONG || dir == DIR_LIQ_SHORT || dir == DIR_LIQ_OTHER) {
                 long long a = notional < 0 ? -notional : notional;
                 m[coin].liqFill += a;
+                // Каскад в одну сторону - другой режим, чем просто много
+                // ликвидаций: вынесло лонги или вынесло шорты.
+                if (dir == DIR_LIQ_LONG)       m[coin].liqLong += a;
+                else if (dir == DIR_LIQ_SHORT) m[coin].liqShort += a;
                 continue;
             }
             addVol(m[coin], wallet, notional, dir == DIR_OPEN_LONG, ts, t6, t24,
@@ -792,6 +967,8 @@ std::vector<Row> loadPerp(long long asOf, long long since, const std::unordered_
     out.reserve(m.size());
     for (const auto& p : m) {
         Row r = toRow(p.first, p.first, p.second, true, false);
+        r.asOf = asOf;
+        r.regime = regimeOf(r.id, r.perp);
         if (r.wallets >= AI_MIN_WALLETS && (r.buy + r.sell) > 0 && r.oneShare <= AI_MAX_ONE_SHARE)
             out.push_back(std::move(r));
     }
@@ -830,6 +1007,11 @@ void recordRows(int days, const std::vector<Row>& rows) {
     std::vector<long long> px;
     px.reserve(rows.size());
     for (const auto& r : rows) px.push_back(priceNowOf(r.perp, r.id));
+    // Возраст цены собираем ДО замка: функция читает базу и взяла бы его
+    // повторно. Та же ловушка, что была в истории.
+    std::vector<long long> age;
+    age.reserve(rows.size());
+    for (const auto& r : rows) age.push_back(priceAgeOf(r.id, r.perp));
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return;
     sqlite3_stmt* s = nullptr;
@@ -838,11 +1020,14 @@ void recordRows(int days, const std::vector<Row>& rows) {
             "ts,hour_slot,window_days,venue,token,name,"
             "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
             "net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,liq_fill_nanos,both_venues,top_share_bp,"
-            "rsi_bp,oi_nanos,mkt_vol_nanos)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "rsi_bp,oi_nanos,mkt_vol_nanos,top_dir_bp,liq_long_nanos,liq_short_nanos,regime_bp)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     for (size_t i = 0; i < rows.size(); i++) {
         const auto& r = rows[i];
+        // Цена старше часа делает разметку шумом: через сутки сравнивать
+        // будет не с чем. Такие события в журнал не пишем.
+        if (age[i] < 0 || age[i] > 3600) continue;
         sqlite3_reset(s);
         sqlite3_clear_bindings(s);
         sqlite3_bind_int64(s, 1, now);
@@ -870,6 +1055,10 @@ void recordRows(int days, const std::vector<Row>& rows) {
         sqlite3_bind_int(s, 23, static_cast<int>(r.rsi * 100.0 + 0.5));
         sqlite3_bind_int64(s, 24, r.oiNanos);
         sqlite3_bind_int64(s, 25, r.mktVolNanos);
+        sqlite3_bind_int(s, 26, static_cast<int>(r.topDir * 10000.0));
+        sqlite3_bind_int64(s, 27, r.liqLongNanos);
+        sqlite3_bind_int64(s, 28, r.liqShortNanos);
+        sqlite3_bind_int(s, 29, static_cast<int>(r.regime * 10000.0));
         sqlite3_step(s);
     }
     sqlite3_finalize(s);
@@ -930,17 +1119,27 @@ void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool
         std::array<double, AI_NF> f{};
         featuresOf(r, f);
         const double sign = wantLong ? 1.0 : -1.0;
-        const char* keys[13] = {};
+        std::array<bool, AI_NF> stable{};
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            stable = r.perp ? g_stablePerp : g_stableSpot;
+        }
+        const char* keys[AI_NF] = {};
         keys[1] = "ai_why_flow";
         keys[2] = "ai_why_breadth";
         keys[3] = "ai_why_share";
         keys[8] = r.perp ? "ai_why_lev" : "ai_why_liq";
         keys[9] = "ai_why_top";
         keys[10] = "ai_why_rsi";
+        keys[13] = "ai_why_topdir";
+        keys[14] = r.perp ? "ai_why_liqskew" : nullptr;
         keys[11] = "ai_why_vol";
         keys[12] = "ai_why_oi";
         for (int i = 1; i < AI_NF; i++) {
             if (!keys[i]) continue;
+            // Признак с прыгающим знаком не объясняет ничего: сегодня
+            // «широкий приток», завтра он же против.
+            if (!stable[static_cast<size_t>(i)]) continue;
             const double c = w[static_cast<size_t>(i)] * f[static_cast<size_t>(i)] * sign;
             if (c > 0.02) xs.push_back({c, keys[i]});
         }
@@ -984,7 +1183,9 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
     const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
     t << medal << num;
-    t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, wantLong ? "ai_long" : "ai_short");
+    const char* sideKey = r.perp ? (wantLong ? "ai_long" : "ai_short")
+                                : (wantLong ? "ai_buy"  : "ai_sell");
+    t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, sideKey);
     t << " · <b>" << r.name << "</b>\n";
     t << tr(lang, "ai_horizon") << " · " << tr(lang, "ai_conf") << " "
       << confPct(r, trained, wantLong) << "%\n";
@@ -999,16 +1200,30 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
         std::lock_guard<std::mutex> l(g_wMutex);
         acc = r.perp ? g_accPerp : g_accSpot;
     }
-    const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc);
+    const bool thinLiq = !r.perp && r.liqUsd > 0 && r.liqUsd < 200000.0;
+    const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc,
+                                r.perp, thinLiq);
     if (tp.valid) {
         t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>";
-        if (r.perp) t << " · " << tp.leverage << "x";
+        if (r.perp) {
+            const double budget = tp.riskPct * tp.leverage;
+            t << " \u00B7 " << tr(lang, "ai_risk") << " "
+              << std::fixed << std::setprecision(1) << budget << "%"
+              << " (" << tp.leverage << "x)";
+            t.unsetf(std::ios::fixed);
+        }
         t << "\n";
         t << tr(lang, "ai_stop") << " <code>" << fmtPx(tp.stop) << "</code>"
           << " (" << std::fixed << std::setprecision(1) << tp.riskPct << "%)\n";
         t << tr(lang, "ai_take") << " <code>" << fmtPx(tp.take1) << "</code>"
           << " / <code>" << fmtPx(tp.take2) << "</code>\n";
-        t << tr(lang, "ai_expire") << "\n";
+        const long long left = 24 * 3600 - (hl::nowSec() - r.asOf);
+        if (left <= 0) {
+            t << tr(lang, "ai_expired") << "\n";
+        } else {
+            t << tr(lang, "ai_expire") << " " << (left / 3600) << tr(lang, "unit_hour")
+              << " " << ((left % 3600) / 60) << tr(lang, "unit_min") << "\n";
+        }
         t.unsetf(std::ios::fixed);
     }
 
@@ -1147,7 +1362,8 @@ void trainOne(bool perp) {
         if (!prepareOrLog(db, &s,
                 "SELECT buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,"
                 "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp,"
-                "rsi_bp,oi_nanos,mkt_vol_nanos,e.ts,lev_bp "
+                "rsi_bp,oi_nanos,mkt_vol_nanos,e.ts,lev_bp,"
+                "top_dir_bp,liq_long_nanos,liq_short_nanos,regime_bp "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
                 "AND window_days=24 AND venue=? "
                 "AND NOT EXISTS ("
@@ -1178,6 +1394,10 @@ void trainOne(bool perp) {
             // Плечо китов: без него признак риска на перпах при обучении
             // был бы нулём, хотя в живом расчёте он есть.
             r.levBp = sqlite3_column_int(s, 17);
+            r.topDir        = sqlite3_column_int(s, 18) / 10000.0;
+            r.liqLongNanos  = sqlite3_column_int64(s, 19);
+            r.liqShortNanos = sqlite3_column_int64(s, 20);
+            r.regime        = sqlite3_column_int(s, 21) / 10000.0;
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
@@ -1210,14 +1430,26 @@ void trainOne(bool perp) {
     std::array<double, AI_NF> w{};
     const double lr = 0.05;
     const double l2 = 0.01;
+    // Затухание по времени: свежие дни весят больше. Включаем только при
+    // большой выборке - на четырёхстах примерах оно отберёт вес у и так
+    // небольшого набора.
+    const bool useDecay = xs.size() >= 1000;
+    const long long newest = xs.empty() ? 0 : xs.back().ts;
+
     for (int ep = 0; ep < 80; ep++) {
         for (const auto& sm : xs) {
+            double wgt = 1.0;
+            if (useDecay && newest > 0) {
+                const double ageDays = static_cast<double>(newest - sm.ts) / 86400.0;
+                wgt = std::exp(-ageDays / 30.0);   // за месяц вес падает втрое
+                if (wgt < 0.1) wgt = 0.1;
+            }
             double z = 0;
             for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * sm.f[static_cast<size_t>(i)];
             const double p = sigmoid(z);
             const double err = p - sm.y;
             for (int i = 0; i < AI_NF; i++) {
-                double g = err * sm.f[static_cast<size_t>(i)];
+                double g = err * wgt * sm.f[static_cast<size_t>(i)];
                 if (i > 0) g += l2 * w[static_cast<size_t>(i)];
                 w[static_cast<size_t>(i)] -= lr * g;
             }
@@ -1262,6 +1494,14 @@ void trainOne(bool perp) {
     const long long at = hl::nowSec();
     {
         std::lock_guard<std::mutex> l(g_wMutex);
+        auto& prev = perp ? g_prevPerp : g_prevSpot;
+        auto& stable = perp ? g_stablePerp : g_stableSpot;
+        const bool hadPrev = perp ? g_trainedPerp : g_trainedSpot;
+        for (int i = 0; i < AI_NF; i++) {
+            const size_t u = static_cast<size_t>(i);
+            stable[u] = hadPrev && prev[u] * w[u] > 0 && std::fabs(w[u]) > 0.05;
+            prev[u] = w[u];
+        }
         if (perp) {
             g_wPerp = w; g_trainedPerp = true;
             g_accPerp = acc; g_calPerp = k;
@@ -1354,8 +1594,9 @@ void insertLabeled(const Row& r, long long ts, long long slot, long long thenPx,
             "ts,hour_slot,window_days,venue,token,name,"
             "buy_nanos,sell_nanos,n_buy,n_sell,wallets,one_share_bp,score,price_then,"
             "price_24h,filled_at,net_6h,net_prior,funding_nanos,liq_nanos,lev_bp,"
-            "liq_fill_nanos,both_venues,top_share_bp,rsi_bp,oi_nanos,mkt_vol_nanos) "
-            "VALUES(?,?,24,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "liq_fill_nanos,both_venues,top_share_bp,rsi_bp,oi_nanos,mkt_vol_nanos,"
+            "top_dir_bp,liq_long_nanos,liq_short_nanos,regime_bp) "
+            "VALUES(?,?,24,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int64(s, 1, ts);
     sqlite3_bind_int64(s, 2, slot);
@@ -1383,6 +1624,10 @@ void insertLabeled(const Row& r, long long ts, long long slot, long long thenPx,
     sqlite3_bind_int(s, 24, static_cast<int>(r.rsi * 100.0 + 0.5));
     sqlite3_bind_int64(s, 25, r.oiNanos);
     sqlite3_bind_int64(s, 26, r.mktVolNanos);
+    sqlite3_bind_int(s, 27, static_cast<int>(r.topDir * 10000.0));
+    sqlite3_bind_int64(s, 28, r.liqLongNanos);
+    sqlite3_bind_int64(s, 29, r.liqShortNanos);
+    sqlite3_bind_int(s, 30, static_cast<int>(r.regime * 10000.0));
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
@@ -1515,6 +1760,8 @@ void backfillJournal() {
             auto nxt = tk.second.find(d.first + 1);
             if (nxt == tk.second.end()) continue;
             Row r = toRow(tk.first, name, d.second.b, false, false);
+            r.asOf = hl::nowSec();
+            r.regime = regimeOf(r.id, r.perp);
             if (r.wallets < AI_MIN_WALLETS || (r.buy + r.sell) <= 0 || r.oneShare > AI_MAX_ONE_SHARE)
                 continue;
             const long long thenPx = pxFromUsdRaw(d.second.usd, d.second.raw, dec);
@@ -1539,6 +1786,8 @@ void backfillJournal() {
             auto nxt = ck.second.find(d.first + 1);
             if (nxt == ck.second.end()) continue;
             Row r = toRow(ck.first, ck.first, d.second.b, true, false);
+            r.asOf = hl::nowSec();
+            r.regime = regimeOf(r.id, r.perp);
             if (r.wallets < AI_MIN_WALLETS || (r.buy + r.sell) <= 0 || r.oneShare > AI_MAX_ONE_SHARE)
                 continue;
             if (d.second.pxW <= 0 || nxt->second.pxW <= 0) continue;
@@ -1588,22 +1837,25 @@ void snapshotHour() {
 // История: что вышло из прошлых сигналов. Смотрим события с известным
 // исходом, считаем, угадала ли модель направление.
 struct HistItem {
+    std::string id;
     std::string name;
     bool perp = false;
     bool wasLong = true;
     double retPct = 0;
     long long ts = 0;
     bool win = false;
+    int plan = 0;      // 1 цель взята, -1 стоп выбит, 0 ни то ни другое
 };
 
 std::vector<HistItem> loadHistory(int venue, int limit) {
     std::vector<HistItem> out;
     ensureSchema();
+    {
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return out;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
-            "SELECT name,venue,buy_nanos,sell_nanos,price_then,price_24h,ts "
+            "SELECT name,venue,buy_nanos,sell_nanos,price_then,price_24h,ts,token "
             "FROM ai_events WHERE window_days=24 AND venue=? AND filled_at>0 "
             "AND price_then>0 AND price_24h>0 ORDER BY ts DESC LIMIT ?"))
         return out;
@@ -1619,6 +1871,7 @@ std::vector<HistItem> loadHistory(int venue, int limit) {
         const long long then = sqlite3_column_int64(s, 4);
         const long long later = sqlite3_column_int64(s, 5);
         h.ts = sqlite3_column_int64(s, 6);
+        h.id = safeColumnText(s, 7);
         if (buy == sell || then <= 0) continue;
         h.wasLong = buy > sell;
         h.retPct = 100.0 * static_cast<double>(later - then) / static_cast<double>(then);
@@ -1629,6 +1882,19 @@ std::vector<HistItem> loadHistory(int venue, int limit) {
     // Обрыв чтения дал бы неполную выборку, а доля угаданных
     // считается по ней и показывается человеку как факт.
     if (rc != SQLITE_DONE) out.clear();
+    }
+
+    // Волатильность читает базу и берёт тот же замок - считать план можно
+    // только ПОСЛЕ его освобождения, иначе поток встанет намертво.
+    for (auto& h : out) {
+        const double vol = volatilityOf(h.id, h.perp);
+        double stopPct = vol > 0 ? vol * 2.5 : 0.03;
+        if (stopPct < 0.015) stopPct = 0.015;
+        if (stopPct > 0.15)  stopPct = 0.15;
+        const double moved = h.wasLong ? h.retPct : -h.retPct;
+        if (moved >= stopPct * 1.5 * 100.0)  h.plan = 1;
+        else if (moved <= -stopPct * 100.0)  h.plan = -1;
+    }
     
     return out;
 }
@@ -1653,8 +1919,14 @@ AiMessage buildAiHistory(const std::string& chatId, int venue) {
             sum += h.wasLong ? h.retPct : -h.retPct;
         }
         const int rate = static_cast<int>(100.0 * wins / items.size() + 0.5);
+        int tp = 0, sl = 0;
+        for (const auto& h : items) { if (h.plan == 1) tp++; else if (h.plan == -1) sl++; }
+
         t << tr(lang, "ai_hist_rate") << " <b>" << rate << "%</b> ("
           << wins << "/" << items.size() << ")\n"
+          << tr(lang, "ai_hist_plans") << " <b>" << tp << "</b> "
+          << tr(lang, "ai_hist_tp") << " \u00B7 <b>" << sl << "</b> "
+          << tr(lang, "ai_hist_sl") << "\n"
           << tr(lang, "ai_hist_avg") << " <b>" << std::fixed << std::setprecision(1)
           << (sum / items.size()) << "%</b>\n\n";
         t.unsetf(std::ios::fixed);
@@ -1890,7 +2162,7 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
                       const std::string& param, const std::string& data,
                       long long messageId, const std::string& callbackQueryId) {
     if (action != "ai_open" && action != "ai_hist" && action != "ai_stat") return false;
-    if (chatId != OWNER_CHAT_ID) return true;
+    if (!aiHasAccess(chatId)) return true;
 
     if (action == "ai_hist")
         return handleAiHistoryCallback(chatId, param, messageId);
