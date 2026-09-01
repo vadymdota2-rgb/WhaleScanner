@@ -231,10 +231,8 @@ void loadWeightSet(bool perp) {
     }
     if (got == AI_NF && nSamp >= AI_MIN_TRAIN) {
         std::lock_guard<std::mutex> l(g_wMutex);
-        if (perp) { g_wPerp = w; g_trainedPerp = true; }
-        if (perp) { g_trainAtPerp = hl::nowSec(); g_trainNPerp = static_cast<long long>(xs.size()); }
-        else       { g_trainAtSpot = hl::nowSec(); g_trainNSpot = static_cast<long long>(xs.size()); }
-        else { g_wSpot = w; g_trainedSpot = true; }
+        if (perp) { g_wPerp = w; g_trainedPerp = true; g_trainNPerp = nSamp; }
+        else      { g_wSpot = w; g_trainedSpot = true; g_trainNSpot = nSamp; }
     }
 }
 
@@ -965,7 +963,7 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
     t << " · " << r.wallets << "\n";
 
-    const double px = static_cast<double>(priceNowOf(r.id, r.perp)) / 1000000000.0;
+    const double px = static_cast<double>(priceNowOf(r.perp, r.id)) / 1000000000.0;
     const double vol = volatilityOf(r.id, r.perp);
     const double acc = r.perp ? g_accPerp : g_accSpot;
     const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc);
@@ -1141,7 +1139,7 @@ void trainOne(bool perp) {
             r.rsi = sqlite3_column_int(s, 13) / 100.0;
             r.oiNanos = sqlite3_column_int64(s, 14);
             r.mktVolNanos = sqlite3_column_int64(s, 15);
-            sm.ts = sqlite3_column_int64(s, 16);
+            const long long evTs = sqlite3_column_int64(s, 16);
             const long long then = sqlite3_column_int64(s, 10);
             const long long later = sqlite3_column_int64(s, 11);
             if (then <= 0 || later <= 0) continue;
@@ -1150,6 +1148,7 @@ void trainOne(bool perp) {
             const long long net = r.buy - r.sell;
             if (net == 0) continue;
             Sample sm;
+            sm.ts = evTs;
             featuresOf(r, sm.f);
             sm.y = ((net > 0) == (ret > 0)) ? 1.0 : 0.0;
             xs.push_back(sm);
@@ -1232,6 +1231,8 @@ void trainOne(bool perp) {
         if (perp) { g_wPerp = w; g_trainedPerp = true; }
         else { g_wSpot = w; g_trainedSpot = true; }
     }
+    if (perp) { g_trainAtPerp = hl::nowSec(); g_trainNPerp = static_cast<long long>(xs.size()); }
+    else      { g_trainAtSpot = hl::nowSec(); g_trainNSpot = static_cast<long long>(xs.size()); }
     std::cout << "[AI] trained " << (perp ? "perp" : "spot")
               << " on " << xs.size() << " 24h outcomes" << std::endl;
 }
