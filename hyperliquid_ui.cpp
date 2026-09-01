@@ -716,6 +716,7 @@ struct OpenPosition {
     std::string wallet;
     std::string label;
     std::string coin;
+    std::string dex;
     bool isLong = false;
     long long sizeNanos = 0;
     long long entryPxNanos = 0;
@@ -723,14 +724,17 @@ struct OpenPosition {
     long long liqPxNanos = 0;
     long long marginNanos = 0;
     long long unrealizedNanos = 0;
+    long long dexAccountNanos = 0;
     double roePercent = 0.0;
     int leverage = 0;
     bool isolated = false;
 };
 
 bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out,
-                       long long& accountValueNanos) {
+                       long long& accountValueNanos,
+                       std::vector<std::pair<std::string, long long>>& dexAccounts) {
     accountValueNanos = 0;
+    dexAccounts.clear();
     bool any = false;
     for (const std::string& dex : perpDexNames()) {
         json body;
@@ -741,10 +745,14 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
         if (!j.is_object()) continue;
         any = true;
 
-        if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
-            long long v = 0;
-            parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), v);
-            if (v > 0) accountValueNanos += v;
+        long long dexAv = 0;
+        if (j.contains("marginSummary") && j["marginSummary"].is_object())
+            dexAv = jsonDecimalNanos(j["marginSummary"], "accountValue");
+        if (dexAv <= 0 && j.contains("crossMarginSummary") && j["crossMarginSummary"].is_object())
+            dexAv = jsonDecimalNanos(j["crossMarginSummary"], "accountValue");
+        if (dexAv > 0) {
+            accountValueNanos += dexAv;
+            dexAccounts.emplace_back(dex, dexAv);
         }
 
         if (!j.contains("assetPositions") || !j["assetPositions"].is_array())
@@ -756,6 +764,8 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
 
             OpenPosition op;
             op.wallet = wallet;
+            op.dex = dex;
+            op.dexAccountNanos = dexAv;
             op.coin = jstr(p, "coin");
             if (op.coin.empty()) continue;
             if (!dex.empty() && op.coin.find(':') == std::string::npos)
@@ -912,10 +922,23 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
 
     std::vector<OpenPosition> pos;
     long long accountValue = 0;
-    if (!fetchOpenPositions(addr, pos, accountValue)) {
+    std::vector<std::pair<std::string, long long>> dexAccounts;
+    if (!fetchOpenPositions(addr, pos, accountValue, dexAccounts)) {
         t << dm << tr(lang, "generic_error_retry");
         return {t.str(), kb.dump()};
     }
+
+    if (!dexAccounts.empty()) {
+        t << dm << "\U0001F3E6 <b>" << tr(lang, "hl_account") << "</b>\n";
+        for (const auto& d : dexAccounts) {
+            t << dm << (d.first.empty() ? "Perps" : d.first) << ": <b>"
+              << fmtUsd(d.second) << "</b>\n";
+        }
+        if (dexAccounts.size() > 1 && accountValue > 0)
+            t << dm << "\u03A3 <b>" << fmtUsd(accountValue) << "</b>\n";
+        t << "\n";
+    }
+
     if (pos.empty()) {
         t << dm << tr(lang, "hl_no_open_positions");
         return {t.str(), kb.dump()};
@@ -965,11 +988,12 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.liqPxNanos > 0)
             t << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
               << formatPriceNanos(p.liqPxNanos) << "</b>\n";
-        if (accountValue > 0 && p.marginNanos > 0) {
+        const long long av = p.dexAccountNanos > 0 ? p.dexAccountNanos : accountValue;
+        if (av > 0 && p.marginNanos > 0) {
             const double share = 100.0 * static_cast<double>(p.marginNanos)
-                                        / static_cast<double>(accountValue);
-            t << dm << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
-              << fmtUsd(accountValue) << "</b> — "
+                                        / static_cast<double>(av);
+            t << dm << "\U0001F3E6 " << (p.dex.empty() ? "Perps" : p.dex) << ": <b>"
+              << fmtUsd(av) << "</b> — "
               << formatPercent(share, false) << " " << tr(lang, "hl_in_position") << "\n";
         }
     }
