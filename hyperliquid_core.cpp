@@ -237,14 +237,14 @@ std::set<std::string> loadBannedWallets() {
         if (g_hlDb) {
             sqlite3_stmt* s = nullptr;
             if (prepareOrLog(g_hlDb, &s, "SELECT wallet FROM hl_banned")) {
+                std::set<std::string> part;
                 int rc = SQLITE_DONE;
-        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+                while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
                     std::string w = safeColumnText(s, 0);
-                    if (!w.empty()) out.insert(toLower(w));
+                    if (!w.empty()) part.insert(toLower(w));
                 }
                 sqlite3_finalize(s);
-    // Неполный список пустил бы забаненных ботов в рейтинг.
-    if (rc != SQLITE_DONE) out.clear();
+                if (rc == SQLITE_DONE) out.swap(part);
             }
         }
     }
@@ -254,12 +254,15 @@ std::set<std::string> loadBannedWallets() {
             sqlite3_stmt* s = nullptr;
             if (prepareOrLog(db, &s,
                     "SELECT wallet FROM ignored_wallets WHERE permanent=1")) {
+                std::set<std::string> part;
                 int rc = SQLITE_DONE;
-        while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
+                while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
                     std::string w = safeColumnText(s, 0);
-                    if (!w.empty()) out.insert(toLower(w));
+                    if (!w.empty()) part.insert(toLower(w));
                 }
                 sqlite3_finalize(s);
+                if (rc == SQLITE_DONE)
+                    out.insert(part.begin(), part.end());
             }
         }
     }
