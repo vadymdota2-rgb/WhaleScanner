@@ -111,7 +111,8 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         if (prepareOrLog(g_hlDb, &r,
                 "SELECT coin,hour_ts,rate_nanos,mark_nanos FROM hl_funding_rate WHERE hour_ts>=?")) {
             sqlite3_bind_int64(r, 1, sinceHour);
-            while (sqlite3_step(r) == SQLITE_ROW) {
+            int rcRates = SQLITE_DONE;
+            while ((rcRates = sqlite3_step(r)) == SQLITE_ROW) {
                 const std::string coin = safeColumnText(r, 0);
                 rates[coin][sqlite3_column_int64(r, 1)] =
                     {sqlite3_column_int64(r, 2), sqlite3_column_int64(r, 3)};
