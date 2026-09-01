@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <ctime>
@@ -25,6 +26,8 @@
 #include "ru.h"
 #include "token_prices.h"
 #include "utils.h"
+#include "rpc_client.h"
+#include "chains.h"
 
 using json = nlohmann::json;
 
@@ -41,7 +44,7 @@ void rememberView(const std::string& chatId, const std::string& data);
 
 namespace {
 
-constexpr long long AI_CACHE_TTL_SEC[] = { 120, 600, 1800 };
+constexpr long long AI_CACHE_TTL_SEC[] = { 60, 60, 60 };
 int cacheSlot(int hours) { return hours == 1 ? 0 : (hours == 6 ? 1 : 2); }
 
 struct AiCacheEntry {
@@ -268,9 +271,13 @@ void loadWeightSet(bool perp) {
         if (perp) {
             g_wPerp = w; g_trainedPerp = true; g_trainNPerp = nSamp;
             g_accPerp = acc; g_calPerp = cal; g_trainAtPerp = at;
+            g_prevPerp = w;
+            g_stablePerp.fill(true);
         } else {
             g_wSpot = w; g_trainedSpot = true; g_trainNSpot = nSamp;
             g_accSpot = acc; g_calSpot = cal; g_trainAtSpot = at;
+            g_prevSpot = w;
+            g_stableSpot.fill(true);
         }
     }
 }
@@ -572,6 +579,137 @@ long long priceNowOf(bool perp, const std::string& id) {
     if (perp) return perpMarkNow(id);
     const uint64_t n = getPriceNanos(id);
     return n > 0 ? static_cast<long long>(n) : 0;
+}
+
+long long usdToNanos(double usd) {
+    if (!(usd > 0) || usd > 1e12) return 0;
+    return static_cast<long long>(usd * 1000000000.0 + 0.5);
+}
+
+long long dexUsdByToken(const std::string& addr) {
+    if (addr.empty()) return 0;
+    const auto body = http("https://api.dexscreener.com/latest/dex/tokens/" + addr, "", 3);
+    if (body.empty()) return 0;
+    try {
+        const auto j = json::parse(body);
+        if (!j.contains("pairs") || !j["pairs"].is_array()) return 0;
+        const std::string want = chainCtx().dexscreenerChainId;
+        double bestLiq = -1, bestPx = 0;
+        for (const auto& p : j["pairs"]) {
+            if (!p.is_object()) continue;
+            if (!want.empty() && p.value("chainId", std::string()) != want) continue;
+            if (!p.contains("priceUsd") || !p["priceUsd"].is_string()) continue;
+            double liq = 0;
+            if (p.contains("liquidity") && p["liquidity"].is_object() &&
+                p["liquidity"].contains("usd") && p["liquidity"]["usd"].is_number())
+                liq = p["liquidity"]["usd"].get<double>();
+            double px = 0;
+            try { px = std::stod(p["priceUsd"].get<std::string>()); } catch (...) { continue; }
+            if (!(px > 0) || !std::isfinite(px)) continue;
+            if (liq > bestLiq) { bestLiq = liq; bestPx = px; }
+        }
+        return usdToNanos(bestPx);
+    } catch (...) { return 0; }
+}
+
+long long dexUsdBySymbol(const std::string& raw) {
+    std::string sym = raw;
+    const size_t col = sym.rfind(':');
+    if (col != std::string::npos) sym = sym.substr(col + 1);
+    if (sym.empty()) return 0;
+    std::string q;
+    for (unsigned char c : sym) {
+        if (std::isalnum(c) || c == '-' || c == '_') q += static_cast<char>(c);
+    }
+    if (q.empty()) return 0;
+    const auto body = http("https://api.dexscreener.com/latest/dex/search?q=" + q, "", 3);
+    if (body.empty()) return 0;
+    try {
+        const auto j = json::parse(body);
+        if (!j.contains("pairs") || !j["pairs"].is_array()) return 0;
+        std::string want = q;
+        for (char& c : want) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        double bestLiq = -1, bestPx = 0;
+        for (const auto& p : j["pairs"]) {
+            if (!p.is_object()) continue;
+            std::string base;
+            if (p.contains("baseToken") && p["baseToken"].is_object())
+                base = p["baseToken"].value("symbol", std::string());
+            for (char& c : base) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            if (base != want) continue;
+            if (!p.contains("priceUsd") || !p["priceUsd"].is_string()) continue;
+            double liq = 0;
+            if (p.contains("liquidity") && p["liquidity"].is_object() &&
+                p["liquidity"].contains("usd") && p["liquidity"]["usd"].is_number())
+                liq = p["liquidity"]["usd"].get<double>();
+            double px = 0;
+            try { px = std::stod(p["priceUsd"].get<std::string>()); } catch (...) { continue; }
+            if (!(px > 0) || !std::isfinite(px)) continue;
+            if (liq > bestLiq) { bestLiq = liq; bestPx = px; }
+        }
+        return usdToNanos(bestPx);
+    } catch (...) { return 0; }
+}
+
+struct LivePx {
+    long long nanos = 0;
+    time_t at = 0;
+};
+std::mutex g_livePxMutex;
+std::map<std::string, LivePx> g_livePx;
+
+long long livePriceOf(const Row& r) {
+    const std::string key = (r.perp ? "p:" : "s:") + r.id;
+    const time_t now = time(nullptr);
+    {
+        std::lock_guard<std::mutex> l(g_livePxMutex);
+        auto it = g_livePx.find(key);
+        if (it != g_livePx.end() && it->second.nanos > 0 && now - it->second.at < 60)
+            return it->second.nanos;
+    }
+    long long px = r.perp ? dexUsdBySymbol(r.id) : dexUsdByToken(r.id);
+    if (px <= 0) px = priceNowOf(r.perp, r.id);
+    if (px > 0) {
+        std::lock_guard<std::mutex> l(g_livePxMutex);
+        g_livePx[key] = {px, now};
+        if (g_livePx.size() > 400) {
+            for (auto it = g_livePx.begin(); it != g_livePx.end(); )
+                if (now - it->second.at > 300) it = g_livePx.erase(it);
+                else ++it;
+        }
+    }
+    return px;
+}
+
+struct FrozenEntry {
+    long long px = 0;
+    long long slot = 0;
+};
+std::mutex g_freezeMutex;
+std::map<std::string, FrozenEntry> g_freeze;
+
+bool keepSignal(const Row& r, bool wantLong, long long live) {
+    if (live <= 0) return false;
+    const long long slot = hl::nowSec() / 3600;
+    const std::string key = (r.perp ? "p:" : "s:") + (wantLong ? "l:" : "h:") + r.id;
+    long long first = 0;
+    {
+        std::lock_guard<std::mutex> l(g_freezeMutex);
+        auto& f = g_freeze[key];
+        if (f.slot != slot || f.px <= 0) { f.px = live; f.slot = slot; }
+        first = f.px;
+        if (g_freeze.size() > 400) {
+            for (auto it = g_freeze.begin(); it != g_freeze.end(); )
+                if (it->second.slot < slot) it = g_freeze.erase(it);
+                else ++it;
+        }
+    }
+    if (first <= 0) return true;
+    const double move = static_cast<double>(live - first) / static_cast<double>(first);
+    if (std::fabs(move) >= 0.02) return false;
+    if (wantLong && move <= -0.005) return false;
+    if (!wantLong && move >= 0.005) return false;
+    return true;
 }
 
 double rsi14(const std::vector<long long>& px) {
@@ -1116,7 +1254,8 @@ std::string fmtPx(double v) {
     return b;
 }
 
-void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong) {
+void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong,
+                long long livePx) {
     const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
     const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
     t << medal << num;
@@ -1130,7 +1269,7 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
     t << " · " << r.wallets << "\n";
 
-    const double px = static_cast<double>(priceNowOf(r.perp, r.id)) / 1000000000.0;
+    const double px = static_cast<double>(livePx) / 1000000000.0;
     const double vol = volatilityOf(r.id, r.perp);
     double acc = 0;
     {
@@ -1154,13 +1293,6 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
           << " (" << std::fixed << std::setprecision(1) << tp.riskPct << "%)\n";
         t << tr(lang, "ai_take") << " <code>" << fmtPx(tp.take1) << "</code>"
           << " / <code>" << fmtPx(tp.take2) << "</code>\n";
-        const long long left = 24 * 3600 - (hl::nowSec() - r.asOf);
-        if (left <= 0) {
-            t << tr(lang, "ai_expired") << "\n";
-        } else {
-            t << tr(lang, "ai_expire") << " " << (left / 3600) << tr(lang, "unit_hour")
-              << " " << ((left % 3600) / 60) << tr(lang, "unit_min") << "\n";
-        }
         t.unsetf(std::ios::fixed);
     }
 
@@ -1968,7 +2100,8 @@ AiMessage buildAiStatus(const std::string& chatId) {
 
     const char* fname[AI_NF] = {
         "bias", "flow", "wallets", "spread", "volume", "buy share",
-        "accel", "funding", "risk", "top wallets", "RSI", "market vol", "OI"
+        "accel", "funding", "risk", "top wallets", "RSI", "market vol", "OI",
+        "top dir", "liq skew", "regime"
     };
 
     for (int v = 0; v < 2; v++) {
@@ -2142,11 +2275,16 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         t << "\n" << tr(lang, "ai_empty");
     } else {
         t << "\n";
-        const int n = std::min(static_cast<int>(rows.size()), AI_TRADE_N);
-        for (int i = 0; i < n; i++) {
-            if (i) t << "\n";
-            writeTrade(t, i, rows[static_cast<size_t>(i)], lang, trainedHere, wantLong);
+        int shown = 0;
+        for (const auto& r : rows) {
+            if (shown >= AI_TRADE_N) break;
+            const long long live = livePriceOf(r);
+            if (!keepSignal(r, wantLong, live)) continue;
+            if (shown) t << "\n";
+            writeTrade(t, shown, r, lang, trainedHere, wantLong, live);
+            shown++;
         }
+        if (shown == 0) t << tr(lang, "ai_empty");
     }
 
     {
@@ -2180,14 +2318,14 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
         return true;
     }
 
-    int days = 1;
+    int days = 24;
     int venue = 0;
     int side = 0;
     std::string rest = param;
     const size_t sep1 = rest.find(':');
     try {
         days = std::stoi(sep1 == std::string::npos ? rest : rest.substr(0, sep1));
-    } catch (...) { days = 1; }
+    } catch (...) { days = 24; }
     days = clampDays(days);
     if (sep1 != std::string::npos) {
         rest = rest.substr(sep1 + 1);
