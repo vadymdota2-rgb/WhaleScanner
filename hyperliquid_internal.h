@@ -76,6 +76,7 @@ const char* dirMark(Lang lang);
 std::string fmtUsd(long long nanos);
 std::string formatPriceNanos(long long nanos);
 bool parseDecimalToNanos(const std::string& s, long long& out);
+long long jsonDecimalNanos(const nlohmann::json& j, const char* key);
 std::string jstr(const nlohmann::json& j, const char* key, const char* def = "");
 nlohmann::json infoPost(const nlohmann::json& body, int weight);
 std::vector<std::string> perpDexNames();
