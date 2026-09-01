@@ -58,7 +58,7 @@ constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
 constexpr int AI_TRADE_N = 5;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
-constexpr int AI_NF = 16;
+constexpr int AI_NF = 11;
 constexpr int AI_MIN_TRAIN = 400;
 constexpr int AI_TOP_WALLETS = 100;
 constexpr long long AI_HORIZON_6H = 6LL * 3600;
@@ -163,33 +163,23 @@ void featuresOf(const Row& r, std::array<double, AI_NF>& f) {
     const double dir = vol > 0 ? static_cast<double>(r.buy - r.sell) / static_cast<double>(vol) : 0;
     const double usd = static_cast<double>(vol) / 1000000000.0;
     const double scaled = r.perp ? usd / 10.0 : usd;
-    const int n = r.nBuy + r.nSell;
     f[0] = 1;
     f[1] = dir;
     f[2] = std::log1p(static_cast<double>(r.wallets)) / std::log1p(50.0);
     f[3] = 1.0 - r.oneShare;
     f[4] = std::log1p(scaled) / std::log1p(1000000.0);
-    f[5] = n > 0 ? static_cast<double>(r.nBuy) / static_cast<double>(n) : 0.5;
-    f[6] = accelOf(r.net6h, r.netPrior);
-    f[7] = std::tanh(static_cast<double>(r.fundingNanos) / 10000000.0);
-    f[8] = r.perp
+    f[5] = accelOf(r.net6h, r.netPrior);
+    f[6] = std::tanh(static_cast<double>(r.fundingNanos) / 10000000.0);
+    f[7] = r.perp
         ? std::min(1.0, static_cast<double>(r.levBp) / 5000.0)
         : std::min(1.0, std::log1p(std::max(0.0, r.liqUsd)) / std::log1p(5000000.0));
-    f[9] = r.topShare;
-    f[10] = r.rsi != 0.0 ? (r.rsi - 50.0) / 50.0 : 0;
-    f[11] = std::log1p(static_cast<double>(std::max(0LL, r.mktVolNanos)) / 1000000000.0)
-            / std::log1p(1000000000.0);
-    f[12] = std::log1p(static_cast<double>(std::max(0LL, r.oiNanos)) / 1000000000.0)
-            / std::log1p(1000000000.0);
-    f[13] = r.topDir;
+    f[8] = r.topShare;
+    f[9] = r.rsi != 0.0 ? (r.rsi - 50.0) / 50.0 : 0;
     {
         const long long lq = r.liqLongNanos, sq = r.liqShortNanos;
         const long long tq = lq + sq;
-        f[14] = tq > 0 ? static_cast<double>(sq - lq) / static_cast<double>(tq) : 0.0;
+        f[10] = tq > 0 ? static_cast<double>(sq - lq) / static_cast<double>(tq) : 0.0;
     }
-    // Режим рынка: линейная модель усредняет тренд, флэт и каскад в одни
-    // веса. Пусть хотя бы знает, в каком режиме считает.
-    f[15] = r.regime;
 }
 
 double heuristicScore(const Row& r) {
@@ -226,7 +216,7 @@ double rowScore(const Row& r) {
 
 void finish(Row& r) { r.score = rowScore(r); }
 
-int wKey(bool perp, int i) { return perp ? 200 + i : i; }
+int wKey(bool perp, int i) { return perp ? 500 + i : 400 + i; }
 int nKey(bool perp) { return perp ? 300 : 100; }
 int tKey(bool perp) { return perp ? 301 : 101; }
 int accKey(bool perp) { return perp ? 302 : 102; }
@@ -612,43 +602,37 @@ long long dexUsdByToken(const std::string& addr) {
     } catch (...) { return 0; }
 }
 
-long long dexUsdBySymbol(const std::string& raw) {
-    std::string sym = raw;
-    const size_t col = sym.rfind(':');
-    if (col != std::string::npos) sym = sym.substr(col + 1);
-    if (sym.empty()) return 0;
-    std::string q;
-    for (unsigned char c : sym) {
-        if (std::isalnum(c) || c == '-' || c == '_') q += static_cast<char>(c);
-    }
-    if (q.empty()) return 0;
-    const auto body = http("https://api.dexscreener.com/latest/dex/search?q=" + q, "", 3);
-    if (body.empty()) return 0;
-    try {
-        const auto j = json::parse(body);
-        if (!j.contains("pairs") || !j["pairs"].is_array()) return 0;
-        std::string want = q;
-        for (char& c : want) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        double bestLiq = -1, bestPx = 0;
-        for (const auto& p : j["pairs"]) {
-            if (!p.is_object()) continue;
-            std::string base;
-            if (p.contains("baseToken") && p["baseToken"].is_object())
-                base = p["baseToken"].value("symbol", std::string());
-            for (char& c : base) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-            if (base != want) continue;
-            if (!p.contains("priceUsd") || !p["priceUsd"].is_string()) continue;
-            double liq = 0;
-            if (p.contains("liquidity") && p["liquidity"].is_object() &&
-                p["liquidity"].contains("usd") && p["liquidity"]["usd"].is_number())
-                liq = p["liquidity"]["usd"].get<double>();
-            double px = 0;
-            try { px = std::stod(p["priceUsd"].get<std::string>()); } catch (...) { continue; }
-            if (!(px > 0) || !std::isfinite(px)) continue;
-            if (liq > bestLiq) { bestLiq = liq; bestPx = px; }
+std::mutex g_midsMutex;
+std::map<std::string, long long> g_mids;
+time_t g_midsAt = 0;
+
+long long hlMidNow(const std::string& coin) {
+    const time_t now = time(nullptr);
+    {
+        std::lock_guard<std::mutex> l(g_midsMutex);
+        if (now - g_midsAt < 60 && !g_mids.empty()) {
+            auto it = g_mids.find(coin);
+            if (it != g_mids.end()) return it->second;
         }
-        return usdToNanos(bestPx);
-    } catch (...) { return 0; }
+    }
+    const json j = hl::infoPost(json{{"type", "allMids"}}, 2);
+    std::map<std::string, long long> fresh;
+    if (j.is_object()) {
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (!it.value().is_string()) continue;
+            long long px = 0;
+            if (hl::parseDecimalToNanos(it.value().get<std::string>(), px) && px > 0)
+                fresh[it.key()] = px;
+        }
+    }
+    long long hit = 0;
+    {
+        std::lock_guard<std::mutex> l(g_midsMutex);
+        if (!fresh.empty()) { g_mids.swap(fresh); g_midsAt = now; }
+        auto it = g_mids.find(coin);
+        if (it != g_mids.end()) hit = it->second;
+    }
+    return hit;
 }
 
 struct LivePx {
@@ -659,7 +643,7 @@ std::mutex g_livePxMutex;
 std::map<std::string, LivePx> g_livePx;
 
 long long livePriceOf(const Row& r) {
-    const std::string key = (r.perp ? "p:" : "s:") + r.id;
+    const std::string key = std::string(r.perp ? "p:" : "s:") + r.id;
     const time_t now = time(nullptr);
     {
         std::lock_guard<std::mutex> l(g_livePxMutex);
@@ -667,8 +651,14 @@ long long livePriceOf(const Row& r) {
         if (it != g_livePx.end() && it->second.nanos > 0 && now - it->second.at < 60)
             return it->second.nanos;
     }
-    long long px = r.perp ? dexUsdBySymbol(r.id) : dexUsdByToken(r.id);
-    if (px <= 0) px = priceNowOf(r.perp, r.id);
+    long long px = 0;
+    if (r.perp) {
+        px = hlMidNow(r.id);
+        if (px <= 0) px = perpMarkNow(r.id);
+    } else {
+        px = dexUsdByToken(r.id);
+        if (px <= 0) px = priceNowOf(false, r.id);
+    }
     if (px > 0) {
         std::lock_guard<std::mutex> l(g_livePxMutex);
         g_livePx[key] = {px, now};
@@ -691,7 +681,8 @@ std::map<std::string, FrozenEntry> g_freeze;
 bool keepSignal(const Row& r, bool wantLong, long long live) {
     if (live <= 0) return false;
     const long long slot = hl::nowSec() / 3600;
-    const std::string key = std::string(r.perp ? "p:" : "s:") + (wantLong ? "l:" : "h:") + r.id;
+    const std::string key = std::string(r.perp ? "p:" : "s:")
+                          + (wantLong ? "l:" : "h:") + r.id;
     long long first = 0;
     {
         std::lock_guard<std::mutex> l(g_freezeMutex);
@@ -1203,13 +1194,10 @@ void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool
         keys[1] = "ai_why_flow";
         keys[2] = "ai_why_breadth";
         keys[3] = "ai_why_share";
-        keys[8] = r.perp ? "ai_why_lev" : "ai_why_liq";
-        keys[9] = "ai_why_top";
-        keys[10] = "ai_why_rsi";
-        keys[13] = "ai_why_topdir";
-        keys[14] = r.perp ? "ai_why_liqskew" : nullptr;
-        keys[11] = "ai_why_vol";
-        keys[12] = "ai_why_oi";
+        keys[7] = r.perp ? "ai_why_lev" : "ai_why_liq";
+        keys[8] = "ai_why_top";
+        keys[9] = "ai_why_rsi";
+        keys[10] = r.perp ? "ai_why_liqskew" : nullptr;
         for (int i = 1; i < AI_NF; i++) {
             if (!keys[i]) continue;
             // Признак с прыгающим знаком не объясняет ничего: сегодня
@@ -1229,8 +1217,8 @@ void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool
             if (wantLong && r.rsi <= 60) xs.push_back({(60.0 - r.rsi) / 60.0, "ai_why_rsi"});
             if (!wantLong && r.rsi >= 40) xs.push_back({(r.rsi - 40.0) / 60.0, "ai_why_rsi"});
         }
-        if (r.perp && r.mktVolNanos > 0) xs.push_back({0.2, "ai_why_vol"});
-        if (r.perp && r.oiNanos > 0) xs.push_back({0.15, "ai_why_oi"});
+        if (r.perp && r.liqLongNanos + r.liqShortNanos > 0)
+            xs.push_back({0.15, "ai_why_liqskew"});
     }
     std::sort(xs.begin(), xs.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
     if (xs.empty()) return;
@@ -2099,9 +2087,8 @@ AiMessage buildAiStatus(const std::string& chatId) {
     t << "\U0001F9E0 <b>" << tr(lang, "ai_st_title") << "</b>\n\n";
 
     const char* fname[AI_NF] = {
-        "bias", "flow", "wallets", "spread", "volume", "buy share",
-        "accel", "funding", "risk", "top wallets", "RSI", "market vol", "OI",
-        "top dir", "liq skew", "regime"
+        "bias", "flow", "wallets", "spread", "volume",
+        "accel", "funding", "risk", "top wallets", "RSI", "liq skew"
     };
 
     for (int v = 0; v < 2; v++) {
