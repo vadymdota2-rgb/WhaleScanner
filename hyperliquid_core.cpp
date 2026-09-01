@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -125,6 +126,23 @@ bool parseDecimalToNanos(const std::string& s, long long& out) {
     out = intPart * NANOS_PER_UNIT + frac;
     if (neg) out = -out;
     return true;
+}
+
+long long jsonDecimalNanos(const json& j, const char* key) {
+    if (!j.is_object() || !key) return 0;
+    auto it = j.find(key);
+    if (it == j.end()) return 0;
+    long long v = 0;
+    if (it->is_string()) {
+        parseDecimalToNanos(it->get<std::string>(), v);
+        return v;
+    }
+    if (it->is_number()) {
+        const double d = it->get<double>();
+        if (!std::isfinite(d) || d > 1e12 || d < -1e12) return 0;
+        return static_cast<long long>(d * static_cast<double>(NANOS_PER_UNIT) + (d >= 0 ? 0.5 : -0.5));
+    }
+    return 0;
 }
 
 bool notionalNanos(const std::string& pxStr, const std::string& szStr, long long& out) {
@@ -555,8 +573,7 @@ void fetchAccountState(const std::string& wallet) {
         json j = infoPost(body, HL_WEIGHT_CLEARINGHOUSE);
         if (!j.is_object()) continue;
         if (j.contains("marginSummary") && j["marginSummary"].is_object()) {
-            long long v = 0;
-            parseDecimalToNanos(jstr(j["marginSummary"], "accountValue", "0"), v);
+            const long long v = jsonDecimalNanos(j["marginSummary"], "accountValue");
             if (v > 0) accountValue += v;
         }
         if (!j.contains("assetPositions") || !j["assetPositions"].is_array()) continue;
