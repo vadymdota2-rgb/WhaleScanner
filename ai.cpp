@@ -9,6 +9,7 @@
 #include <map>
 #include <mutex>
 #include <random>
+#include <iomanip>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -37,7 +38,7 @@ void rememberView(const std::string& chatId, const std::string& data);
 namespace {
 
 constexpr long long AI_CACHE_TTL_SEC[] = { 120, 600, 1800 };
-int cacheSlot(int days) { return days == 30 ? 2 : (days == 7 ? 1 : 0); }
+int cacheSlot(int hours) { return hours == 1 ? 0 : (hours == 6 ? 1 : 2); }
 
 struct AiCacheEntry {
     time_t at = 0;
@@ -57,9 +58,13 @@ constexpr long long AI_HORIZON_6H = 6LL * 3600;
 constexpr long long AI_HORIZON_24H = 86400;
 constexpr long long AI_EVENT_TTL_SEC = 90LL * 86400LL;
 
-int clampDays(int days) {
-    if (days == 7 || days == 30) return days;
-    return 1;
+// Окна в ЧАСАХ, не днях: модель предсказывает движение на 6 и 24 часа,
+// значит и приток осмысленно смотреть на том же горизонте. Приток за
+// месяц размазан - киты могли выйти три недели назад.
+// Поле window_days в базе оставлено под тем же именем, хранит часы.
+int clampDays(int hours) {
+    if (hours == 1 || hours == 6) return hours;
+    return 24;
 }
 
 std::string compactUsd(long long nanos) {
@@ -109,6 +114,8 @@ std::array<double, AI_NF> g_wSpot{};
 std::array<double, AI_NF> g_wPerp{};
 bool g_trainedSpot = false;
 bool g_trainedPerp = false;
+double g_accSpot = 0.0;
+double g_accPerp = 0.0;
 long long g_lastTrain = 0;
 bool g_schemaOk = false;
 
@@ -345,6 +352,86 @@ long long perpFunding(const std::string& coin) {
     if (sqlite3_step(s) == SQLITE_ROW) v = sqlite3_column_int64(s, 0);
     sqlite3_finalize(s);
     return v;
+}
+
+// Типичный ход цены за сутки: медиана часовых изменений по модулю.
+// Медиана, а не среднее - один выброс не должен раздувать стоп.
+double volatilityOf(const std::string& token, bool perp) {
+    std::vector<double> steps;
+    {
+        std::lock_guard<std::mutex> lock(perp ? hl::g_hlDbMutex : dbMutex);
+        sqlite3* h = perp ? hl::g_hlDb : db;
+        if (!h) return 0;
+        sqlite3_stmt* s = nullptr;
+        const char* q = perp
+            ? "SELECT px FROM hl_fills WHERE coin=? AND ts>=? ORDER BY ts ASC LIMIT 400"
+            : "SELECT price_nanos FROM token_price_history WHERE address=? AND ts>=? ORDER BY ts ASC LIMIT 400";
+        if (!prepareOrLog(h, &s, q)) return 0;
+        sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, perp ? (hl::nowSec() - 86400LL) * 1000LL
+                                      : (hl::nowSec() - 86400LL));
+        long long prev = 0;
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const long long p = sqlite3_column_int64(s, 0);
+            if (p > 0 && prev > 0) {
+                const double d = std::fabs(static_cast<double>(p - prev)) / static_cast<double>(prev);
+                if (d > 0 && d < 0.5) steps.push_back(d);
+            }
+            if (p > 0) prev = p;
+        }
+        sqlite3_finalize(s);
+    }
+    if (steps.size() < 8) return 0;
+    std::sort(steps.begin(), steps.end());
+    return steps[steps.size() / 2];
+}
+
+struct TradePlan {
+    bool valid = false;
+    bool isLong = true;
+    double entry = 0;
+    double stop = 0;
+    double take1 = 0;
+    double take2 = 0;
+    int leverage = 1;
+    double riskPct = 0;      // насколько далеко стоп, в процентах
+    double rr = 0;           // отношение прибыли к риску до первой цели
+};
+
+// Уровни считаются от типичного хода цены за сутки, а не от круглых
+// чисел. Стоп за пределом обычного шума, цели кратно риску.
+TradePlan planOf(double px, double vol, double prob, bool isLong, double acc) {
+    TradePlan t;
+    if (px <= 0 || vol <= 0) return t;
+
+    t.isLong = isLong;
+    t.entry = px;
+
+    // Стоп: два с половиной обычных хода, но не ближе 1.5% и не дальше 15%.
+    double stopPct = vol * 2.5;
+    if (stopPct < 0.015) stopPct = 0.015;
+    if (stopPct > 0.15)  stopPct = 0.15;
+
+    t.stop  = isLong ? px * (1.0 - stopPct) : px * (1.0 + stopPct);
+    t.take1 = isLong ? px * (1.0 + stopPct * 1.5) : px * (1.0 - stopPct * 1.5);
+    t.take2 = isLong ? px * (1.0 + stopPct * 3.0) : px * (1.0 - stopPct * 3.0);
+    t.riskPct = stopPct * 100.0;
+    t.rr = 1.5;
+
+    // Плечо подбирается так, чтобы потеря на стопе была заданной долей
+    // депозита. Уверенность модели и её точность задают эту долю:
+    // от 2% при слабом сигнале до 8% при сильном и проверенном.
+    const double confidence = std::max(0.0, std::min(1.0, (prob - 0.5) * 2.5));
+    const double quality = acc > 0 ? std::min(1.0, std::max(0.0, (acc - 0.5) * 4.0)) : 0.25;
+    const double riskBudget = 0.02 + 0.06 * confidence * quality;
+
+    double lev = riskBudget / stopPct;
+    if (lev < 1) lev = 1;
+    if (lev > 20) lev = 20;
+    t.leverage = static_cast<int>(lev + 0.5);
+
+    t.valid = true;
+    return t;
 }
 
 long long priceNowOf(bool perp, const std::string& id) {
@@ -843,6 +930,17 @@ void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool
     t << "\n";
 }
 
+// Цена монеты может быть и 60000, и 0.0000012 - знаков нужно разное число.
+std::string fmtPx(double v) {
+    char b[48];
+    const double a = v < 0 ? -v : v;
+    if (a >= 1000)      std::snprintf(b, sizeof(b), "%.2f", v);
+    else if (a >= 1)    std::snprintf(b, sizeof(b), "%.4f", v);
+    else if (a >= 0.01) std::snprintf(b, sizeof(b), "%.6f", v);
+    else                std::snprintf(b, sizeof(b), "%.9f", v);
+    return b;
+}
+
 void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong) {
     const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
     const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
@@ -854,12 +952,29 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     t << tr(lang, "ai_market") << "\n";
     t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
     t << " · " << r.wallets << "\n";
+
+    // Уровни сделки. Считаются от типичного хода цены, а не от круглых
+    // чисел; плечо подбирается под заданную потерю на стопе.
+    const double px = static_cast<double>(priceNowOf(r.id, r.perp)) / 1000000000.0;
+    const double vol = volatilityOf(r.id, r.perp);
+    const double acc = r.perp ? g_accPerp : g_accSpot;
+    const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc);
+    if (tp.valid) {
+        t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>"
+          << " · " << tp.leverage << "x\n";
+        t << tr(lang, "ai_stop") << " <code>" << fmtPx(tp.stop) << "</code>"
+          << " (" << std::fixed << std::setprecision(1) << tp.riskPct << "%)\n";
+        t << tr(lang, "ai_take") << " <code>" << fmtPx(tp.take1) << "</code>"
+          << " / <code>" << fmtPx(tp.take2) << "</code>\n";
+        t.unsetf(std::ios::fixed);
+    }
+
     writeWhy(t, r, lang, trained, wantLong);
 }
 
-std::string windowLabel(int days, Lang lang) {
-    if (days == 7) return tr(lang, "ai_w7");
-    if (days == 30) return tr(lang, "ai_w30");
+std::string windowLabel(int hours, Lang lang) {
+    if (hours == 1) return tr(lang, "ai_w1h");
+    if (hours == 6) return tr(lang, "ai_w6h");
     return tr(lang, "ai_w24");
 }
 
@@ -988,10 +1103,10 @@ void trainOne(bool perp) {
                 "net_6h,net_prior,funding_nanos,liq_nanos,price_then,price_24h,top_share_bp,"
                 "rsi_bp,oi_nanos,mkt_vol_nanos "
                 "FROM ai_events e WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
-                "AND window_days=1 AND venue=? "
+                "AND window_days=24 AND venue=? "
                 "AND NOT EXISTS ("
                 "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
-                "  AND e2.window_days=1 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
+                "  AND e2.window_days=24 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
                 "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id)"))
             return;
         sqlite3_bind_int(s, 1, perp ? 1 : 0);
@@ -1033,6 +1148,13 @@ void trainOne(bool perp) {
     std::mt19937 rng(static_cast<unsigned>(hl::nowSec() ^ (perp ? 0x9e3779b9u : 0u)));
     std::shuffle(xs.begin(), xs.end(), rng);
 
+    // Пятую часть примеров откладываем и НЕ учим на них. Иначе точность
+    // мерилась бы на том же, чему учились - модель всегда выглядела бы
+    // умной, даже когда просто запомнила шум.
+    const size_t holdN = xs.size() / 5;
+    std::vector<Sample> hold(xs.end() - static_cast<long>(holdN), xs.end());
+    xs.resize(xs.size() - holdN);
+
     std::array<double, AI_NF> w{};
     const double lr = 0.05;
     const double l2 = 0.01;
@@ -1052,6 +1174,23 @@ void trainOne(bool perp) {
     for (double v : w) {
         if (!std::isfinite(v)) return;
     }
+
+    // Точность на отложенных: сколько раз знак предсказания совпал с тем,
+    // что вышло. Ниже 55% модель не лучше монетки - веса не применяем.
+    int hit = 0;
+    for (const auto& sm : hold) {
+        double z = 0;
+        for (int i = 0; i < AI_NF; i++) z += w[static_cast<size_t>(i)] * sm.f[static_cast<size_t>(i)];
+        if ((sigmoid(z) > 0.5) == (sm.y > 0.5)) hit++;
+    }
+    const double acc = holdN > 0 ? static_cast<double>(hit) / static_cast<double>(holdN) : 0.0;
+    if (holdN >= 40 && acc < 0.55) {
+        std::cout << "[AI] " << (perp ? "perp" : "spot")
+                  << ": точность на отложенных " << static_cast<int>(acc * 100)
+                  << "% - веса не применяем" << std::endl;
+        return;
+    }
+    if (perp) g_accPerp = acc; else g_accSpot = acc;
     saveWeights(perp, w, static_cast<long long>(xs.size()));
     {
         std::lock_guard<std::mutex> l(g_wMutex);
@@ -1092,11 +1231,11 @@ int countReady(bool perp) {
     if (!prepareOrLog(db, &s,
             "SELECT COUNT(*) FROM ai_events e "
             "WHERE filled_at>0 AND price_then>0 AND price_24h>0 "
-            "AND window_days=1 AND venue=? AND buy_nanos!=sell_nanos "
+            "AND window_days=24 AND venue=? AND buy_nanos!=sell_nanos "
             "AND ABS(price_24h-price_then)*50>=price_then "
             "AND NOT EXISTS ("
             "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
-            "  AND e2.window_days=1 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
+            "  AND e2.window_days=24 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
             "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id)"))
         return 0;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
@@ -1369,13 +1508,109 @@ void snapshotHour() {
 
 }
 
+// История: что вышло из прошлых сигналов. Смотрим события с известным
+// исходом, считаем, угадала ли модель направление.
+struct HistItem {
+    std::string name;
+    bool perp = false;
+    bool wasLong = true;
+    double retPct = 0;
+    long long ts = 0;
+    bool win = false;
+};
+
+std::vector<HistItem> loadHistory(int venue, int limit) {
+    std::vector<HistItem> out;
+    ensureSchema();
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return out;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT name,venue,buy_nanos,sell_nanos,price_then,price_24h,ts "
+            "FROM ai_events WHERE window_days=24 AND venue=? AND filled_at>0 "
+            "AND price_then>0 AND price_24h>0 ORDER BY ts DESC LIMIT ?"))
+        return out;
+    sqlite3_bind_int(s, 1, venue);
+    sqlite3_bind_int(s, 2, limit);
+    while (sqlite3_step(s) == SQLITE_ROW) {
+        HistItem h;
+        h.name  = safeColumnText(s, 0);
+        h.perp  = sqlite3_column_int(s, 1) != 0;
+        const long long buy  = sqlite3_column_int64(s, 2);
+        const long long sell = sqlite3_column_int64(s, 3);
+        const long long then = sqlite3_column_int64(s, 4);
+        const long long later = sqlite3_column_int64(s, 5);
+        h.ts = sqlite3_column_int64(s, 6);
+        if (buy == sell || then <= 0) continue;
+        h.wasLong = buy > sell;
+        h.retPct = 100.0 * static_cast<double>(later - then) / static_cast<double>(then);
+        h.win = h.wasLong ? (h.retPct > 0) : (h.retPct < 0);
+        out.push_back(std::move(h));
+    }
+    sqlite3_finalize(s);
+    return out;
+}
+
+AiMessage buildAiHistory(const std::string& chatId, int venue) {
+    ensureSchema();
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    if (venue != 1) venue = 0;
+
+    std::ostringstream t;
+    t << "\U0001F4DC <b>" << tr(lang, "ai_hist_title") << "</b> \u00B7 "
+      << tr(lang, venue ? "ai_perp" : "ai_spot") << "\n\n";
+
+    const auto items = loadHistory(venue, 20);
+    if (items.empty()) {
+        t << tr(lang, "ai_hist_empty") << "\n";
+    } else {
+        int wins = 0;
+        double sum = 0;
+        for (const auto& h : items) {
+            if (h.win) wins++;
+            sum += h.wasLong ? h.retPct : -h.retPct;
+        }
+        const int rate = static_cast<int>(100.0 * wins / items.size() + 0.5);
+        t << tr(lang, "ai_hist_rate") << " <b>" << rate << "%</b> ("
+          << wins << "/" << items.size() << ")\n"
+          << tr(lang, "ai_hist_avg") << " <b>" << std::fixed << std::setprecision(1)
+          << (sum / items.size()) << "%</b>\n\n";
+        t.unsetf(std::ios::fixed);
+
+        for (const auto& h : items) {
+            const long long ago = (hl::nowSec() - h.ts) / 3600;
+            t << (h.win ? "\u2705 " : "\u274C ")
+              << (h.wasLong ? "\U0001F7E2 " : "\U0001F534 ")
+              << "<b>" << h.name << "</b> "
+              << std::fixed << std::setprecision(1)
+              << (h.retPct >= 0 ? "+" : "") << h.retPct << "%"
+              << "  <i>" << ago << tr(lang, "ai_hist_hours") << "</i>\n";
+            t.unsetf(std::ios::fixed);
+        }
+    }
+
+    json kb;
+    kb["inline_keyboard"] = json::array();
+    kb["inline_keyboard"].push_back(json::array({
+        json{{"text", std::string(venue == 0 ? "\u2022 " : "") + tr(lang, "ai_spot")}, {"callback_data", "ai_hist:s"}},
+        json{{"text", std::string(venue == 1 ? "\u2022 " : "") + tr(lang, "ai_perp")}, {"callback_data", "ai_hist:p"}}
+    }));
+    kb["inline_keyboard"].push_back(json::array({
+        json{{"text", tr(lang, "back_button")}, {"callback_data", "ai_open:24:s:b"}}
+    }));
+    return {t.str(), kb.dump()};
+}
+
 AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int side) {
     days = clampDays(days);
     if (venue != 1) venue = 0;
     if (side != 1) side = 0;
+    // Спот всегда лонг: шортить нечего. Старая ссылка на шорт по споту
+    // не должна показать пустой экран.
+    if (venue == 0) side = 0;
     ensureSchema();
     const Lang lang = langFromCode(getUserLanguage(chatId));
-    const long long since = hl::nowSec() - static_cast<long long>(days) * 86400LL;
+    const long long since = hl::nowSec() - static_cast<long long>(days) * 3600LL;
     auto aiCb = [](int d, int v, int s) {
         std::string out = "ai_open:" + std::to_string(d);
         out += v ? ":p" : ":s";
@@ -1389,14 +1624,21 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         json{{"text", std::string(venue == 0 ? "\u2022 " : "") + tr(lang, "ai_spot")}, {"callback_data", aiCb(days, 0, side)}},
         json{{"text", std::string(venue == 1 ? "\u2022 " : "") + tr(lang, "ai_perp")}, {"callback_data", aiCb(days, 1, side)}}
     }));
+    // На споте шорта нет: продать можно только то, что уже купил.
+    // Кнопки выбора стороны показываем только на перпах.
+    if (venue == 1) {
+        kbBase["inline_keyboard"].push_back(json::array({
+            json{{"text", std::string(side == 0 ? "\u2022 " : "") + "🟢 " + tr(lang, "ai_long")}, {"callback_data", aiCb(days, venue, 0)}},
+            json{{"text", std::string(side == 1 ? "\u2022 " : "") + "🔴 " + tr(lang, "ai_short")}, {"callback_data", aiCb(days, venue, 1)}}
+        }));
+    }
     kbBase["inline_keyboard"].push_back(json::array({
-        json{{"text", std::string(side == 0 ? "\u2022 " : "") + "🟢 " + tr(lang, "ai_long")}, {"callback_data", aiCb(days, venue, 0)}},
-        json{{"text", std::string(side == 1 ? "\u2022 " : "") + "🔴 " + tr(lang, "ai_short")}, {"callback_data", aiCb(days, venue, 1)}}
+        json{{"text", std::string(days == 1 ? "\u2022 " : "") + tr(lang, "ai_w1h")}, {"callback_data", aiCb(1, venue, side)}},
+        json{{"text", std::string(days == 6 ? "\u2022 " : "") + tr(lang, "ai_w6h")}, {"callback_data", aiCb(6, venue, side)}},
+        json{{"text", std::string(days == 24 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", aiCb(24, venue, side)}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
-        json{{"text", std::string(days == 1 ? "\u2022 " : "") + tr(lang, "ai_w24")}, {"callback_data", aiCb(1, venue, side)}},
-        json{{"text", std::string(days == 7 ? "\u2022 " : "") + tr(lang, "ai_w7")},  {"callback_data", aiCb(7, venue, side)}},
-        json{{"text", std::string(days == 30 ? "\u2022 " : "") + tr(lang, "ai_w30")}, {"callback_data", aiCb(30, venue, side)}}
+        json{{"text", tr(lang, "ai_hist_btn")}, {"callback_data", venue ? "ai_hist:p" : "ai_hist:s"}}
     }));
     kbBase["inline_keyboard"].push_back(json::array({
         json{{"text", tr(lang, "back_button")}, {"callback_data", "menu:main"}}
@@ -1437,6 +1679,13 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
       << tr(lang, venue ? "ai_perp" : "ai_spot") << " · "
       << windowLabel(days, lang) << "\n\n";
     t << "<i>" << tr(lang, "ai_trade_hint") << "</i>\n";
+    // Точность на отложенных примерах: видно, стоит ли доверять модели.
+    {
+        const double acc = venue ? g_accPerp : g_accSpot;
+        if (acc > 0)
+            t << "<i>" << tr(lang, "ai_acc") << ": "
+              << static_cast<int>(acc * 100.0 + 0.5) << "%</i>\n";
+    }
     bool ts = false, tp = false;
     {
         const int ns = countReady(false);
@@ -1478,11 +1727,23 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
     return {t.str(), kbBase.dump()};
 }
 
+bool handleAiHistoryCallback(const std::string& chatId, const std::string& param,
+                            long long messageId) {
+    const AiMessage m = buildAiHistory(chatId, param == "p" ? 1 : 0);
+    if (messageId > 0) replyInPlace(chatId, messageId, m.text, m.keyboard);
+    else sendMsg(chatId, m.text, m.keyboard);
+    return true;
+}
+
 bool handleAiCallback(const std::string& chatId, const std::string& action,
                       const std::string& param, const std::string& data,
                       long long messageId, const std::string& callbackQueryId) {
-    if (action != "ai_open") return false;
+    if (action != "ai_open" && action != "ai_hist") return false;
     if (chatId != OWNER_CHAT_ID) return true;
+
+    if (action == "ai_hist")
+        return handleAiHistoryCallback(chatId, param, messageId);
+
     int days = 1;
     int venue = 0;
     int side = 0;
