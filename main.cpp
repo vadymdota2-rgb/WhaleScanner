@@ -1310,6 +1310,7 @@ std::string pagingRoot(const std::string& data) {
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
     if (data.rfind("ai_open:", 0) == 0) return data;
     if (data.rfind("ai_hist:", 0) == 0) return data;
+    if (data.rfind("ai_stat:", 0) == 0) return data;
     if (data.rfind("bg_page:", 0) == 0) {
         const size_t a = data.find(':'), b = data.find(':', a + 1);
         const size_t c = b == std::string::npos ? std::string::npos : data.find(':', b + 1);
@@ -1398,7 +1399,7 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         if (param == "help") return TelegramUI::buildHelpMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
     }
-    if (action == "ai_open" || action == "ai_hist") {
+    if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
         if (chatId != OWNER_CHAT_ID) return TelegramUI::buildMainMenu(chatId);
         int days = 1;
         int venue = 0;
@@ -1648,7 +1649,7 @@ void handleCallbackQuery(const json& callbackQuery) {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
-    else if (action == "ai_open" || action == "ai_hist") {
+    else if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
         if (chatId == OWNER_CHAT_ID)
             handleAiCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
