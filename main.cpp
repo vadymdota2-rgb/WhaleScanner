@@ -727,7 +727,7 @@ UIMessage buildMainMenu(const std::string& chatId) {
     }));
     if (aiHasAccess(chatId)) {
         keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "ai_btn")}, {"callback_data", "ai_open:1"}}
+            {{"text", tr(lang, "ai_btn")}, {"callback_data", "ai_open:24"}}
         }));
     }
     keyboard["inline_keyboard"].push_back(json::array({
