@@ -730,12 +730,72 @@ struct OpenPosition {
     bool isolated = false;
 };
 
+namespace {
+
+bool usdStableCoin(const std::string& coin) {
+    const std::string c = toLower(coin);
+    return c == "usdc" || c == "usdt" || c == "usdt0" || c == "usde" ||
+           c == "usdh" || c == "usdhl" || c == "fdusd" || c == "dai" ||
+           c == "pyusd" || c == "usd" || c == "ush";
+}
+
+int leverageValue(const json& lev) {
+    if (!lev.is_object() || !lev.contains("value")) return 0;
+    const auto& v = lev["value"];
+    if (v.is_number_integer()) return v.get<int>();
+    if (v.is_number()) {
+        const double d = v.get<double>();
+        if (d <= 0.0 || d > 1000.0) return 0;
+        return static_cast<int>(d + 0.5);
+    }
+    if (v.is_string()) {
+        try {
+            const int n = std::stoi(v.get<std::string>());
+            return n > 0 && n <= 1000 ? n : 0;
+        } catch (...) {}
+    }
+    return 0;
+}
+
+long long spotEquityNanos(const json& spot, const json& mids) {
+    if (!spot.is_object() || !spot.contains("balances") || !spot["balances"].is_array())
+        return 0;
+    long long sum = 0;
+    for (const auto& b : spot["balances"]) {
+        if (!b.is_object()) continue;
+        const long long total = jsonDecimalNanos(b, "total");
+        if (total <= 0) continue;
+        const std::string coin = jstr(b, "coin");
+        if (coin.empty()) continue;
+        if (usdStableCoin(coin)) {
+            sum += total;
+            continue;
+        }
+        long long px = 0;
+        if (mids.is_object()) {
+            auto it = mids.find(coin);
+            if (it != mids.end() && it->is_string())
+                parseDecimalToNanos(it->get<std::string>(), px);
+        }
+        if (px <= 0) continue;
+        const __int128 x = static_cast<__int128>(total) * px / NANOS_PER_UNIT;
+        if (x <= 0 || x > 9000000000000000000LL) continue;
+        sum += static_cast<long long>(x);
+    }
+    return sum;
+}
+
+}
+
 bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& out,
                        long long& accountValueNanos,
                        std::vector<std::pair<std::string, long long>>& dexAccounts) {
     accountValueNanos = 0;
     dexAccounts.clear();
     bool any = false;
+    bool gotMain = false;
+    long long mainAv = 0;
+    long long hip3Pnl = 0;
 
     auto ingest = [&](const std::string& dex, const json& j) -> bool {
         if (!j.is_object()) return false;
@@ -745,14 +805,16 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
             dexAv = jsonDecimalNanos(j["marginSummary"], "accountValue");
         if (dexAv <= 0 && j.contains("crossMarginSummary") && j["crossMarginSummary"].is_object())
             dexAv = jsonDecimalNanos(j["crossMarginSummary"], "accountValue");
-        if (dexAv > 0) {
+
+        if (dex.empty()) {
+            gotMain = true;
+            mainAv = dexAv;
+            if (dexAv > 0) dexAccounts.emplace_back(dex, dexAv);
+        } else if (dexAv > 0) {
             bool have = false;
             for (const auto& d : dexAccounts)
                 if (d.first == dex) { have = true; break; }
-            if (!have) {
-                accountValueNanos += dexAv;
-                dexAccounts.emplace_back(dex, dexAv);
-            }
+            if (!have) dexAccounts.emplace_back(dex, dexAv);
         }
 
         if (!j.contains("assetPositions") || !j["assetPositions"].is_array())
@@ -800,10 +862,10 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
 
             if (p.contains("leverage") && p["leverage"].is_object()) {
                 const json& lev = p["leverage"];
-                if (lev.contains("value") && lev["value"].is_number())
-                    op.leverage = lev["value"].get<int>();
+                op.leverage = leverageValue(lev);
                 op.isolated = jstr(lev, "type") == "isolated";
             }
+            if (!dex.empty()) hip3Pnl += op.unrealizedNanos;
             out.push_back(std::move(op));
         }
         return true;
@@ -821,19 +883,54 @@ bool fetchOpenPositions(const std::string& wallet, std::vector<OpenPosition>& ou
         if (ingest(dex, infoPost(body, 0))) any = true;
     }
 
-    bool gotMain = false;
-    for (const auto& d : dexAccounts)
-        if (d.first.empty()) { gotMain = true; break; }
+    json web;
     if (!gotMain) {
         json w2;
         w2["type"] = "webData2";
         w2["user"] = wallet;
-        json j = infoPost(w2, 0);
-        if (j.is_object() && j.contains("clearinghouseState") &&
-            ingest("", j["clearinghouseState"]))
+        web = infoPost(w2, 0);
+        if (web.is_object() && web.contains("clearinghouseState") &&
+            ingest("", web["clearinghouseState"]))
             any = true;
     }
-    return any;
+
+    json spot;
+    if (web.is_object() && web.contains("spotState"))
+        spot = web["spotState"];
+    else {
+        json sb;
+        sb["type"] = "spotClearinghouseState";
+        sb["user"] = wallet;
+        spot = infoPost(sb, 0);
+    }
+
+    json mids;
+    bool needMids = false;
+    if (spot.is_object() && spot.contains("balances") && spot["balances"].is_array()) {
+        for (const auto& b : spot["balances"]) {
+            if (!b.is_object()) continue;
+            if (jsonDecimalNanos(b, "total") <= 0) continue;
+            if (!usdStableCoin(jstr(b, "coin"))) { needMids = true; break; }
+        }
+    }
+    if (needMids)
+        mids = infoPost(json{{"type", "allMids"}}, 0);
+
+    const long long spotUsd = spotEquityNanos(spot, mids);
+    if (spotUsd > 0) any = true;
+
+    long long vault = 0;
+    if (web.is_object())
+        vault = jsonDecimalNanos(web, "totalVaultEquity");
+
+    accountValueNanos = spotUsd + mainAv + hip3Pnl + vault;
+    if (spotUsd <= 0 && mainAv <= 0) {
+        long long dexSum = 0;
+        for (const auto& d : dexAccounts) dexSum += d.second;
+        if (dexSum > 0) accountValueNanos = dexSum;
+    }
+    if (accountValueNanos < 0) accountValueNanos = 0;
+    return any || accountValueNanos > 0 || !out.empty();
 }
 
 HlMessage buildPositionsLocked(Lang lang) {
@@ -959,15 +1056,9 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         return {t.str(), kb.dump()};
     }
 
-    if (!dexAccounts.empty()) {
-        t << dm << "\U0001F3E6 <b>" << tr(lang, "hl_account") << "</b>\n";
-        for (const auto& d : dexAccounts) {
-            t << dm << (d.first.empty() ? "Perps" : d.first) << ": <b>"
-              << fmtUsd(d.second) << "</b>\n";
-        }
-        if (dexAccounts.size() > 1 && accountValue > 0)
-            t << dm << "\u03A3 <b>" << fmtUsd(accountValue) << "</b>\n";
-        t << "\n";
+    if (accountValue > 0) {
+        t << dm << "\U0001F3E6 <b>" << tr(lang, "hl_account") << ":</b> "
+          << fmtUsd(accountValue) << "\n\n";
     }
 
     if (pos.empty()) {
@@ -1019,13 +1110,11 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
         if (p.liqPxNanos > 0)
             t << dm << "\u2620\uFE0F " << tr(lang, "hl_liq") << ": <b>"
               << formatPriceNanos(p.liqPxNanos) << "</b>\n";
-        const long long av = p.dexAccountNanos > 0 ? p.dexAccountNanos : accountValue;
-        if (av > 0 && p.marginNanos > 0) {
+        if (accountValue > 0 && p.marginNanos > 0) {
             const double share = 100.0 * static_cast<double>(p.marginNanos)
-                                        / static_cast<double>(av);
-            t << dm << "\U0001F3E6 " << (p.dex.empty() ? "Perps" : p.dex) << ": <b>"
-              << fmtUsd(av) << "</b> — "
-              << formatPercent(share, false) << " " << tr(lang, "hl_in_position") << "\n";
+                                        / static_cast<double>(accountValue);
+            t << dm << "\U0001F3E6 " << formatPercent(share, false) << " "
+              << tr(lang, "hl_in_position") << "\n";
         }
     }
     return {t.str(), kb.dump()};
