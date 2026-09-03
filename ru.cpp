@@ -82,6 +82,7 @@ const std::unordered_map<std::string, Entry>& table() {
 
         {"menu_title", {"🚨 <b>Wallet Tracker</b>", "🚨 <b>Wallet Tracker</b>"}},
         {"menu_add_wallet", {"➕ Add Wallet", "➕ Добавить кошелёк"}},
+        {"menu_open_app", {"📱 Open App", "📱 Открыть приложение"}},
         {"menu_my_wallets", {"💼 My Wallets", "💼 Мои кошельки"}},
         {"menu_alert_threshold", {"💰 Alert Threshold", "💰 Порог алертов"}},
         {"menu_account", {"👤 My Account", "👤 Мой аккаунт"}},
