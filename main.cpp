@@ -713,6 +713,12 @@ UIMessage buildMainMenu(const std::string& chatId) {
 
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
+    const char* miniUrl = std::getenv("WHALE_MINIAPP_URL");
+    if (miniUrl && *miniUrl) {
+        keyboard["inline_keyboard"].push_back(json::array({
+            {{"text", tr(lang, "menu_open_app")}, {"web_app", {{"url", std::string(miniUrl)}}}}
+        }));
+    }
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
     }));
