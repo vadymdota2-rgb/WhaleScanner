@@ -10,3 +10,6 @@ coins/
 # логи и резервные копии
 *.log
 *.bak*
+whale_api.py
+fetch_logos.py
+coins_manifest.json
