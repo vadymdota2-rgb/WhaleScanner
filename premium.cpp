@@ -687,6 +687,12 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     return wasAlreadyActive ? PaymentApplyResult::Extended : PaymentApplyResult::Activated;
 }
 
+void premiumForgetChat(const std::string& chatId) {
+    // Карта живёт в памяти и удаление строк в базе её не касается.
+    std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
+    g_lastInvoiceMsgId.erase(chatId);
+}
+
 size_t premiumMaxWallets(const std::string& chatId) {
     return isPremium(chatId) ? PREMIUM_MAX_WALLETS : FREE_MAX_WALLETS;
 }

@@ -463,6 +463,42 @@ size_t countUsers() {
     if (!prepareOrLog(db,&s,"SELECT COUNT(*) FROM users")) return 0;
     size_t n=0; if (sqlite3_step(s)==SQLITE_ROW) n=sqlite3_column_int64(s,0); sqlite3_finalize(s); return n;
 }
+/**
+ * Короткий слепок всего, от чего зависит таблица наблюдателей.
+ *
+ * Мини-апп пишет в ту же базу своим процессом: добавил кошелёк, сменил
+ * порог, удалил себя по /api/forget. Бот об этом не узнаёт — таблица
+ * наблюдателей перестраивается только по явному вызову внутри самого бота.
+ * До этой проверки правки из приложения вступали в силу лишь тогда, когда
+ * кто-то другой случайно дёргал перестройку, а удалённый пользователь всё
+ * это время продолжал получать алерты.
+ *
+ * Две суммирующие выборки по маленьким таблицам раз в минуту дешевле, чем
+ * безусловная перестройка, и ловят любое изменение: число строк, порог,
+ * премиум, набор кошельков.
+ */
+std::string watchersFingerprint() {
+    std::string out;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (prepareOrLog(db, &s,
+        "SELECT COUNT(*), COALESCE(SUM(threshold_nanos),0), COALESCE(SUM(is_premium),0), "
+        "COALESCE(SUM(premium_expire),0) FROM users")) {
+        if (sqlite3_step(s) == SQLITE_ROW)
+            for (int i = 0; i < 4; i++)
+                out += std::to_string(sqlite3_column_int64(s, i)) + ":";
+        sqlite3_finalize(s);
+    }
+    if (prepareOrLog(db, &s,
+        "SELECT COUNT(*), COALESCE(SUM(whale_id),0), COALESCE(MAX(created_at),0) FROM user_whales")) {
+        if (sqlite3_step(s) == SQLITE_ROW)
+            for (int i = 0; i < 3; i++)
+                out += std::to_string(sqlite3_column_int64(s, i)) + ":";
+        sqlite3_finalize(s);
+    }
+    return out;
+}
+
 void refreshWatchers() {
     auto m = std::make_shared<std::unordered_map<std::string, std::vector<Watcher>>>();
     auto bscActive = std::make_shared<std::unordered_set<std::string>>();
@@ -1470,6 +1506,9 @@ bool forgetUser(const std::string& chatId) {
         "DELETE FROM users WHERE chat_id=?",
     };
 
+    // Блокировка живёт только на время записи: refreshWatchers() ниже
+    // берёт dbMutex сам, и вызов из-под неё повесил бы бота намертво.
+    {
     std::lock_guard<std::mutex> l(dbMutex);
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
         std::cerr << "[GDPR] BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
@@ -1495,6 +1534,15 @@ bool forgetUser(const std::string& chatId) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         return false;
     }
+    }
+
+    /* Строки удалены, но бот рассылает алерты не по базе, а по таблице
+     * наблюдателей в памяти. Она перестраивается только по явному вызову,
+     * и без него удалённый пользователь продолжал бы получать алерты —
+     * «мы всё стёрли» оказалось бы неправдой на глазах у человека. */
+    refreshWatchers();
+    premiumForgetChat(chatId);
+
     std::cout << "[GDPR] данные пользователя " << chatId << " удалены по /forgetme" << std::endl;
     return true;
 }
@@ -1838,6 +1886,20 @@ void dbMaintenanceLoop() {
         try {
             cleanupTokenPricesPeriodic();
             aiTick();
+
+            // Изменения, пришедшие мимо бота — из мини-аппа. Первый проход
+            // только запоминает слепок и ничего не перестраивает.
+            {
+                static std::string lastFp = watchersFingerprint();
+                const std::string fp = watchersFingerprint();
+                if (fp != lastFp) {
+                    lastFp = fp;
+                    refreshWatchers();
+                    std::cout << "[WATCHERS] база изменилась мимо бота — список наблюдения обновлён"
+                              << std::endl;
+                }
+            }
+
             bool doTruncate = std::chrono::duration_cast<std::chrono::minutes>(
                 std::chrono::steady_clock::now() - lastTruncate).count() >= 30;
             walCheckpoint(doTruncate ? SQLITE_CHECKPOINT_TRUNCATE : SQLITE_CHECKPOINT_PASSIVE);

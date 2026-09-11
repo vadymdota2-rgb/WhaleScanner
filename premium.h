@@ -30,6 +30,9 @@ void pollTonPayments();
 
 bool grantPremiumDays(const std::string& chatId, int days);
 
+/** Забыть чат в памяти модуля: вызывается при удалении данных по /forgetme. */
+void premiumForgetChat(const std::string& chatId);
+
 size_t premiumMaxWallets(const std::string& chatId);
 
 int premiumTopTradersLimit(const std::string& chatId);
