@@ -69,10 +69,7 @@ const cpp_int MIN_TRADE_USD_NANOS = cpp_int("50000000000");
 const cpp_int MAX_TRADE_USD_NANOS_RANK = cpp_int("10000000000000000");
 // Нижний порог оборота кошелька за окно рейтинга: $10 в нанодолларах.
 const cpp_int MIN_GLOBAL_COST_DEPLOYED_NANOS = cpp_int("10000000000");
-/* Глубина доски. Считается всё равно по всем кошелькам, так что тысяча
- * вместо сотни не добавляет работы при перестройке — только размер кэша:
- * строка около 95 байт, значит ~95 КБ на доску и окно. */
-constexpr int MAX_GLOBAL_RANKED = 1000;
+constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 200;
 constexpr int GLOBAL_PER_PAGE = 5;
