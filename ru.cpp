@@ -325,6 +325,44 @@ const std::unordered_map<std::string, Entry>& table() {
         {"help_footer", {"Use the main menu for quick access to all features.",
                          "Используйте главное меню для быстрого доступа ко всем функциям."}},
 
+        {"legal_privacy_title", {"🔒 <b>Privacy Policy</b>", "🔒 <b>Политика конфиденциальности</b>"}},
+        {"legal_privacy_body", {"We store only your Telegram chat ID, interface language, alert threshold and the public blockchain addresses you asked us to watch. "
+                                "We never ask for and never store private keys, seed phrases, names, emails or phone numbers, and the bot can neither move nor trade your funds. "
+                                "Wallet activity comes from public blockchain and exchange data that exists independently of this bot, and we do not link it to your identity. "
+                                "Your data is kept on our own server, is never sold, and reaches only the services needed to deliver a message (Telegram) and to read a price (public APIs). "
+                                "Send /forgetme to erase everything we hold about you, immediately and for good.",
+                                "Мы храним только ваш Telegram chat ID, язык интерфейса, порог алертов и публичные адреса блокчейна, которые вы попросили отслеживать. "
+                                "Мы никогда не спрашиваем и не храним приватные ключи, seed-фразы, имена, почту и телефоны; бот не может ни перевести, ни продать ваши средства. "
+                                "Активность кошельков берётся из публичных данных блокчейна и бирж, которые существуют независимо от бота, и с вашей личностью мы их не связываем. "
+                                "Данные лежат на нашем сервере, никогда не продаются и попадают только туда, без чего не доставить сообщение (Telegram) и не узнать цену (публичные API). "
+                                "Команда /forgetme стирает всё, что мы о вас храним, — сразу и без возврата."}},
+        {"legal_terms_title", {"📄 <b>Terms of Use</b>", "📄 <b>Условия использования</b>"}},
+        {"legal_terms_body", {"Wallet Tracker is an information service: it shows blockchain transactions that have already happened, and nothing more. "
+                              "Nothing here is investment advice, a recommendation or a promise of profit, and past results of any wallet do not predict future ones. "
+                              "We are not a custodian, an exchange or a broker: we never hold, move or trade your funds and have no access to them. "
+                              "Data comes from public sources and can be delayed, incomplete or simply wrong, so check anything you act on and carry your own risk. "
+                              "Premium is a paid subscription to extra features; abusing the service or trying to break it ends access without a refund.",
+                              "Wallet Tracker — информационный сервис: он показывает уже совершённые транзакции блокчейна и больше ничего. "
+                              "Здесь нет инвестиционных советов, рекомендаций и обещаний прибыли, а прошлые результаты кошелька не предсказывают будущие. "
+                              "Мы не кастодиан, не биржа и не брокер: мы не храним, не переводим и не торгуем вашими средствами и не имеем к ним доступа. "
+                              "Данные берутся из публичных источников и бывают с задержкой, неполными или просто неверными, поэтому всё, на чём вы строите решение, проверяйте сами и риск несите сами. "
+                              "Премиум — платная подписка на дополнительные функции; злоупотребление сервисом или попытки его сломать прекращают доступ без возврата денег."}},
+        {"legal_btn_privacy", {"🔒 Privacy", "🔒 Конфиденциальность"}},
+        {"legal_btn_terms", {"📄 Terms", "📄 Условия"}},
+        {"legal_btn_forget", {"🗑 Delete my data", "🗑 Удалить мои данные"}},
+        {"legal_forget_title", {"🗑 <b>Delete my data</b>", "🗑 <b>Удалить мои данные</b>"}},
+        {"legal_forget_warn", {"This erases your tracked wallets, alert threshold, language, delivery history and payment records. "
+                               "Premium, including days you have already paid for, is lost and is not refunded. "
+                               "This cannot be undone.",
+                               "Будут стёрты отслеживаемые кошельки, порог алертов, язык, история доставок и записи о платежах. "
+                               "Премиум, включая уже оплаченные дни, пропадёт и возврату не подлежит. "
+                               "Отменить это нельзя."}},
+        {"legal_forget_yes", {"Yes, delete everything", "Да, удалить всё"}},
+        {"legal_forget_done", {"✅ Done. Everything we held about you is deleted. If you ever want to come back, send /start.",
+                               "✅ Готово. Всё, что мы о вас хранили, удалено. Если захотите вернуться — отправьте /start."}},
+        {"legal_forget_failed", {"❌ Could not delete the data. Please try again later.",
+                                 "❌ Не удалось удалить данные. Попробуйте позже."}},
+
         {"premium_expired_notice", {"⭐ Your Premium has ended. Here is what changed:\n\n🔔 Alerts — main wallet only\nThe others are saved and paused. Pick which one is main in 💼 My wallets.\n\n🔵 Hyperliquid futures — off\nRanking, alerts and open positions are unavailable.\n\n🏆 Top traders — 30 instead of 100\n\nRenewing brings everything back: all 50 wallets, futures and the full Top-100.",
                                     "⭐ Премиум закончился. Что изменилось:\n\n🔔 Алерты — только с основного кошелька\nОстальные сохранены и стоят на паузе. Выбрать основной — в разделе 💼 Мои кошельки.\n\n🔵 Фьючерсы Hyperliquid — отключены\nРейтинг, алерты и открытые позиции недоступны.\n\n🏆 Топ трейдеров — 30 вместо 100\n\nПродление вернёт всё: 50 кошельков, фьючерсы и полный Топ-100."}},
         {"wc_title", {"🚨 <b>Wallet Tracker</b>", "🚨 <b>Wallet Tracker</b>"}},

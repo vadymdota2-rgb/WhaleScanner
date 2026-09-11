@@ -901,6 +901,10 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "legal_btn_privacy")}, {"callback_data", "menu:privacy"}},
+        {{"text", tr(lang, "legal_btn_terms")}, {"callback_data", "menu:terms"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
     }));
 
@@ -925,6 +929,52 @@ UIMessage buildHelpMessage(const std::string& chatId) {
     text += tr(lang, "help_disclaimer");
 
     return {text, keyboard.dump()};
+}
+
+/* Юридические экраны. Документы обязаны быть доступны из бота, а не только
+ * по ссылке: часть пользователей никогда не откроет мини-приложение. */
+UIMessage buildPrivacyMessage(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "legal_btn_terms")}, {"callback_data", "menu:terms"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "legal_btn_forget")}, {"callback_data", "menu:forgetme"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+    }));
+    return {tr(lang, "legal_privacy_title") + "\n\n" + tr(lang, "legal_privacy_body"), keyboard.dump()};
+}
+
+UIMessage buildTermsMessage(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "legal_btn_privacy")}, {"callback_data", "menu:privacy"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+    }));
+    return {tr(lang, "legal_terms_title") + "\n\n" + tr(lang, "legal_terms_body"), keyboard.dump()};
+}
+
+/* Удаление необратимо, поэтому между командой и стиранием стоит явное
+ * подтверждение с перечнем того, что именно пропадёт. */
+UIMessage buildForgetMessage(const std::string& chatId) {
+    Lang lang = langFromCode(getUserLanguage(chatId));
+    json keyboard;
+    keyboard["inline_keyboard"] = json::array();
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "legal_forget_yes")}, {"callback_data", "forget:yes"}}
+    }));
+    keyboard["inline_keyboard"].push_back(json::array({
+        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
+    }));
+    return {tr(lang, "legal_forget_title") + "\n\n" + tr(lang, "legal_forget_warn"), keyboard.dump()};
 }
 
 }
@@ -1007,6 +1057,9 @@ void answerCallbackQuery(const std::string& callbackQueryId, const std::string& 
 void setupBotCommands() {
     json cmds = json::array();
     cmds.push_back({{"command","start"},{"description","Open the main menu"}});
+    cmds.push_back({{"command","privacy"},{"description","Privacy Policy"}});
+    cmds.push_back({{"command","terms"},{"description","Terms of Use"}});
+    cmds.push_back({{"command","forgetme"},{"description","Delete all my data"}});
     json j; j["commands"] = cmds;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
 }
@@ -1387,6 +1440,65 @@ std::string popPreviousView(const std::string& chatId) {
     return it->second.back();
 }
 
+/**
+ * Полное удаление пользователя по /forgetme (GDPR, право на забвение).
+ *
+ * Стираем всё, что привязано к chat_id: сам профиль (язык, порог, статус
+ * премиума), список отслеживаемых кошельков, отметку о пробном периоде,
+ * очередь доставок, записи о платежах и доступ к аналитике. Адрес из
+ * whale_addresses убираем только если его больше никто не отслеживает —
+ * это общий справочник, а не собственность пользователя.
+ *
+ * Таблицы trades, wallet_history, token_cache и рейтинги не трогаем: там
+ * лежат публичные транзакции блокчейна, которые существуют независимо от
+ * бота и ни к какому Telegram-аккаунту не привязаны. Удалять их «по просьбе
+ * пользователя» было бы удалением чужих данных.
+ */
+bool forgetUser(const std::string& chatId) {
+    {
+        std::lock_guard<std::mutex> l(g_lastViewMutex);
+        g_viewStack.erase(chatId);
+    }
+
+    static const char* const STMTS[] = {
+        "DELETE FROM user_whales WHERE user_id=?",
+        "DELETE FROM deliveries WHERE chat_id=?",
+        "DELETE FROM trial_granted WHERE chat_id=?",
+        "DELETE FROM premium_payments WHERE chat_id=?",
+        "DELETE FROM ton_invoices WHERE chat_id=?",
+        "DELETE FROM ai_access WHERE chat_id=?",
+        "DELETE FROM users WHERE chat_id=?",
+    };
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[GDPR] BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    for (const char* sql : STMTS) {
+        sqlite3_stmt* st;
+        // Таблица могла не появиться на старой базе — это не повод рвать удаление.
+        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) continue;
+        sqlite3_bind_text(st, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) != SQLITE_DONE)
+            std::cerr << "[GDPR] " << sql << ": " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_finalize(st);
+    }
+    // Адреса, за которыми больше никто не следит, держать незачем.
+    sqlite3_exec(db,
+        "DELETE FROM whale_addresses WHERE NOT EXISTS "
+        "(SELECT 1 FROM user_whales uw WHERE uw.whale_id = whale_addresses.id)",
+        nullptr, nullptr, nullptr);
+
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[GDPR] COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    std::cout << "[GDPR] данные пользователя " << chatId << " удалены по /forgetme" << std::endl;
+    return true;
+}
+
 void handleCallbackQuery(const json& callbackQuery);
 
 TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::string& data) {
@@ -1403,6 +1515,9 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         if (param == "big") { auto r = buildBigMenu(chatId); return {r.text, r.keyboard}; }
         if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
         if (param == "help") return TelegramUI::buildHelpMessage(chatId);
+        if (param == "privacy") return TelegramUI::buildPrivacyMessage(chatId);
+        if (param == "terms") return TelegramUI::buildTermsMessage(chatId);
+        if (param == "forgetme") return TelegramUI::buildForgetMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
     }
     if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
@@ -1552,6 +1667,32 @@ void handleCallbackQuery(const json& callbackQuery) {
             rememberView(chatId, data);
             auto msg = TelegramUI::buildHelpMessage(chatId);
             replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+        else if (param == "privacy") {
+            rememberView(chatId, data);
+            auto msg = TelegramUI::buildPrivacyMessage(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+        else if (param == "terms") {
+            rememberView(chatId, data);
+            auto msg = TelegramUI::buildTermsMessage(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+        else if (param == "forgetme") {
+            rememberView(chatId, data);
+            auto msg = TelegramUI::buildForgetMessage(chatId);
+            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
+        }
+    }
+    else if (action == "forget") {
+        if (param == "yes") {
+            Lang lang = langFromCode(getUserLanguage(chatId));
+            const std::string done = tr(lang, "legal_forget_done");
+            const std::string failed = tr(lang, "legal_forget_failed");
+            g_sessionManager.clearSession(chatId);
+            const bool ok = forgetUser(chatId);
+            // Клавиатуру не оставляем: кнопки вели бы к данным, которых уже нет.
+            replyInPlace(chatId, messageId, ok ? done : failed, "");
         }
     }
     else if (action == "back") {
@@ -1805,6 +1946,25 @@ void telegramLoop() {
                                 sendMsg(cid, msg.text, msg.keyboard);
                             }
                         }
+                    }
+                    else if (txt=="/privacy") {
+                        ensureUser(cid, tgLang);
+                        resetViewStack(cid, "menu:privacy");
+                        auto msg = TelegramUI::buildPrivacyMessage(cid);
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
+                    else if (txt=="/terms") {
+                        ensureUser(cid, tgLang);
+                        resetViewStack(cid, "menu:terms");
+                        auto msg = TelegramUI::buildTermsMessage(cid);
+                        sendMsg(cid, msg.text, msg.keyboard);
+                    }
+                    else if (txt=="/forgetme") {
+                        // Сначала предупреждение и кнопка подтверждения:
+                        // одна опечатка не должна стирать оплаченный премиум.
+                        auto msg = TelegramUI::buildForgetMessage(cid);
+                        resetViewStack(cid, "menu:forgetme");
+                        sendMsg(cid, msg.text, msg.keyboard);
                     }
                     else if (txt=="/health") {
                         if (cid != OWNER_CHAT_ID) {
