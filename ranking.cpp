@@ -62,6 +62,11 @@ std::string rankCacheKey(const std::string& kind, int days) {
 }
 constexpr long long RETENTION_SECONDS = 365LL * 86400LL;
 constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
+
+// Нижний порог суммы сделки: $50 в нанодолларах.
+const cpp_int MIN_TRADE_USD_NANOS = cpp_int("50000000000");
+// Нижний порог оборота кошелька за окно рейтинга: $10 в нанодолларах.
+const cpp_int MIN_GLOBAL_COST_DEPLOYED_NANOS = cpp_int("10000000000");
 constexpr int MAX_GLOBAL_RANKED = 100;
 
 constexpr int MAX_BOT_FILTER_TRADES = 200;
@@ -379,6 +384,8 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
     long long outerHoldSeconds = 0;
 
     auto flush = [&]() {
+        // Оборот меньше $10 за окно — это пыль: любой PnL по ней даёт бессмысленный ROI.
+        if (outerCostDeployed < MIN_GLOBAL_COST_DEPLOYED_NANOS) return;
         if (!curWallet.empty() && outerCompleted >= MIN_GLOBAL_COMPLETED_TRADES &&
             outerCompleted <= maxForWindow) {
             PnlRow row;
@@ -542,7 +549,6 @@ RankingMessage renderGlobalPage(GlobalRankKind kind, const std::vector<PnlRow>& 
             text << dm << rankLabel(rank) << "\n";
             text << dm << "<code>" << safeString(r.wallet, 42) << "</code>\n\n";
             text << dm << "💵 <b>PnL:</b> " << formatUsdSigned(r.pnlNanos) << "\n";
-            text << dm << "📈 <b>" << tr(lang, "rk_roi_per_trade") << ":</b> " << formatPercentPlain(r.roiPercent) << "\n";
             text << dm << "🎯 <b>" << tr(lang, "ws_winrate") << ":</b> " << r.winRatePercent << "%\n";
             text << dm << "🔄 <b>" << tr(lang, "rk_trades") << ":</b> " << r.completedTrades << "\n";
             text << dm << "⏳ <b>" << tr(lang, "rk_avg_hold") << ":</b> " << formatHoldTime(r.avgHoldSeconds, lang) << "\n";
@@ -819,6 +825,9 @@ void saveTrade(const std::string& walletArg, const TxResult& tx,
 
     if (!tx.valid || !tx.isSwap) return;
     if (tx.usdNanos <= 0) return;
+    // Пыль ниже $50 — это либо реальная мелочь, которая не влияет на рейтинг,
+    // либо последствие неверных decimals/цены. И то и другое портит PnL.
+    if (tx.usdNanos < MIN_TRADE_USD_NANOS) return;
     if (tx.usdNanos > cpp_int("10000000000000000")) {
         std::cerr << "[RANKING] сделка с нереальной суммой отброшена: " << hash << std::endl;
         return;

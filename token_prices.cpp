@@ -37,7 +37,9 @@ constexpr time_t PRICE_TTL_MAJOR = 900;    // major (WBNB/BTCB/стейблы…
 constexpr time_t NATIVE_PRICE_TTL = 900;   // 15 мин (как major, реже RPC на BNB)
 constexpr long long PRICE_HISTORY_STEP_SEC = 3600;
 constexpr long long PRICE_HISTORY_TTL_SEC  = 90LL * 86400LL;
-constexpr double MIN_POOL_LIQUIDITY_USD = 1000.0;
+// Пул мельче десяти тысяч долларов ценой считать нельзя: одна сделка в нём
+// двигает курс в разы, и этот курс потом растекается по всем расчётам.
+constexpr double MIN_POOL_LIQUIDITY_USD = 10000.0;
 constexpr double STRONG_POOL_LIQ_USD = 10000.0;  // порог liq (spike/прочее); порядок: Dex → пул
 constexpr double SPIKE_RATIO = 0.40;             // >40% vs кэш без глубокой liq → отбой
 constexpr double SPIKE_TRUST_LIQ_USD = 50000.0;
@@ -362,14 +364,23 @@ int getDecimals(const std::string& addr) {
         r = rpc("eth_call",{{{"to",addr},{"data","0x313ce567"}},"latest"});
         if (r.is_string()) break;
     }
-    if (!r.is_string()) { bump(3); return 18; }
+    // Не ответил RPC — возвращаем -1, «не знаю», а не 18.
+    //
+    // Прежний откат на восемнадцать молчал о своей догадке, и у токена с
+    // шестью знаками объём сделки выходил в триллион раз больше настоящего.
+    // Отсюда и брались PnL в тридцать миллионов: не рынок, а наша поправка.
+    //
+    // Минус единица, а не ноль: ноль — это законное число знаков, и по нему
+    // не отличить неизвестность от токена без дробной части. Вдобавок все
+    // проверки вокруг уже написаны как `dec < 0`, и -1 они ловят сами.
+    if (!r.is_string()) { bump(3); return -1; }
 
     const std::string hex = r.get<std::string>();
     int d = -1;
     if (hex.length() >= 66) {
         try { d = std::stoi(hex.substr(2), nullptr, 16); } catch (...) { d = -1; }
     }
-    if (d < 0 || d > 36) { bump(3); return 18; }
+    if (d < 0 || d > 36) { bump(3); return -1; }
 
     { std::lock_guard<std::mutex> l(cacheMutex); TOKEN_DECIMALS[a]=d; } saveTokenMetadata(a,"",d); return d;
 }
@@ -924,12 +935,12 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
         }
     }
 
-    uint64_t poolPx = 0;
-    double poolLiq = 0.0;
-    if (!haveDex) {
-        poolPx = priceFromPoolReserves(a);
-        poolLiq = poolPx ? getPoolLiquidityUsd(a) : 0.0;
-    }
+    // Свой разбор резервов пула отключён: он читает любой пул, каким бы
+    // мелким тот ни был, и в нём же ошибается на нестандартных парах. Цену
+    // берём только у DexScreener — он сам выбирает пул поглубже и отдаёт
+    // ликвидность, по которой видно, можно ли этой цене верить.
+    const uint64_t poolPx = 0;
+    const double poolLiq = 0.0;
 
     uint64_t n = 0;
     PriceSource src = PriceSource::None;
@@ -942,9 +953,6 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
             POOL_LIQUIDITY_CACHE[a] = dexLiq;
             POOL_LIQUIDITY_TS[a] = time(nullptr);
         }
-    } else if (poolPx > 0) {
-        n = poolPx;
-        src = PriceSource::Pool;
     }
 
     const double trustLiq = haveDex ? dexLiq : poolLiq;

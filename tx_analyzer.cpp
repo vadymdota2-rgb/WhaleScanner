@@ -95,7 +95,9 @@ std::string formatAmount(const cpp_int& raw, int dec) {
 }
 cpp_int calcUsdNanos(const cpp_int& raw, int dec, uint64_t pn) {
     if (!pn || raw <= 0) return 0;
-    if (dec < 0 || dec > 36) dec = 18;
+    // decimals неизвестны: подстановка 18 давала ошибку объёма в 10^k раз.
+    // Лучше не знать сумму, чем записать выдуманную.
+    if (dec < 0 || dec > 36) return 0;
     cpp_int d = 1;
     for (int i = 0; i < dec; i++) d *= 10;
     const cpp_int usd = (raw * pn) / d;
@@ -124,7 +126,7 @@ std::string formatUsd(const cpp_int& nRaw) {
 
 cpp_int calcUnitPriceNanos(const cpp_int& usdNanos, const cpp_int& rawAmount, int dec) {
     if (rawAmount <= 0 || usdNanos <= 0) return 0;
-    if (dec < 0 || dec > 36) dec = 18;
+    if (dec < 0 || dec > 36) return 0;
     cpp_int d = 1; for (int i = 0; i < dec; i++) d *= 10;
     const cpp_int unit = (usdNanos * d) / rawAmount;
     if (unit > MAX_SANE_UNIT_PRICE_NANOS) return 0;
@@ -274,7 +276,11 @@ FlowRank rankFlow(const std::string& token, const cpp_int& rawAmount) {
     rank.raw = absInt(rawAmount);
 
     int decimals = getDecimals(token);
-    if (decimals < 0 || decimals > 36) decimals = 18;
+    if (decimals < 0 || decimals > 36) {
+        // Токен без известных decimals: цену не считаем, сравниваем только сырое количество.
+        rank.normalized18 = rank.raw;
+        return rank;
+    }
     if (decimals <= 18) rank.normalized18 = rank.raw * pow10Int(18 - decimals);
     else rank.normalized18 = rank.raw / pow10Int(decimals - 18);
 
