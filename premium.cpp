@@ -46,7 +46,7 @@ const char* const TON_RATE_URL =
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
 constexpr int    FREE_TOP_TRADERS    = 30;
-constexpr int    PREMIUM_TOP_TRADERS = 100;
+constexpr int    PREMIUM_TOP_TRADERS = 1000;
 
 std::string g_botToken;
 
