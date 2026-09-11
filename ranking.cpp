@@ -65,6 +65,8 @@ constexpr int MIN_GLOBAL_COMPLETED_TRADES = 5;
 
 // Нижний порог суммы сделки: $50 в нанодолларах.
 const cpp_int MIN_TRADE_USD_NANOS = cpp_int("50000000000");
+// Верхний порог: $10 млн. Тот же, что стоял в saveTrade литералом.
+const cpp_int MAX_TRADE_USD_NANOS_RANK = cpp_int("10000000000000000");
 // Нижний порог оборота кошелька за окно рейтинга: $10 в нанодолларах.
 const cpp_int MIN_GLOBAL_COST_DEPLOYED_NANOS = cpp_int("10000000000");
 constexpr int MAX_GLOBAL_RANKED = 100;
@@ -409,12 +411,28 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
     if (g_rankingReadDb) readLock = std::unique_lock<std::mutex>(g_rankingReadMutex);
     else                 writeLock = std::unique_lock<std::mutex>(dbMutex);
 
-    sqlite3_stmt* s;
-    if (!prepareOrLog(rdb, &s,
+    /* Те же границы, что у saveTrade, но на чтении.
+     *
+     * Фильтр при записи бережёт только новые строки. Сделки с выдуманными
+     * decimals, записанные до починки, лежат в trades до конца хранения —
+     * год — и всё это время кормят рейтинг миллиардными PnL. Отсечь их на
+     * чтении дешевле и безопаснее, чем удалять: данные остаются на месте,
+     * а рейтинг пересчитывается начисто при ближайшей перестройке кэша.
+     *
+     * Выкинуть покупку — значит оставить её продажу без позиции, и она
+     * пропускается (ветка требует heldQty > 0). Выкинуть продажу — значит
+     * оставить монету в держании. В обе стороны прибыль может только
+     * уменьшиться, выдумать её фильтр не может. */
+    const std::string sql =
         "SELECT t.wallet, t.token, t.is_buy, t.usd_nanos, t.token_amount, t.timestamp FROM trades t "
         "WHERE t.timestamp>=? "
+        "AND t.usd_nanos BETWEEN " + MIN_TRADE_USD_NANOS.convert_to<std::string>() +
+        " AND " + MAX_TRADE_USD_NANOS_RANK.convert_to<std::string>() + " "
         "AND NOT EXISTS (SELECT 1 FROM ignored_wallets iw WHERE iw.wallet=t.wallet AND iw.permanent=1) "
-        "ORDER BY t.wallet ASC, t.token ASC, t.timestamp ASC, t.id ASC")) return results;
+        "ORDER BY t.wallet ASC, t.token ASC, t.timestamp ASC, t.id ASC";
+
+    sqlite3_stmt* s;
+    if (!prepareOrLog(rdb, &s, sql.c_str())) return results;
     sqlite3_bind_int64(s, 1, histSince);
 
     int stepRc;
@@ -828,7 +846,7 @@ void saveTrade(const std::string& walletArg, const TxResult& tx,
     // Пыль ниже $50 — это либо реальная мелочь, которая не влияет на рейтинг,
     // либо последствие неверных decimals/цены. И то и другое портит PnL.
     if (tx.usdNanos < MIN_TRADE_USD_NANOS) return;
-    if (tx.usdNanos > cpp_int("10000000000000000")) {
+    if (tx.usdNanos > MAX_TRADE_USD_NANOS_RANK) {
         std::cerr << "[RANKING] сделка с нереальной суммой отброшена: " << hash << std::endl;
         return;
     }
