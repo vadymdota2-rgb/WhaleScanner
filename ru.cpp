@@ -120,8 +120,11 @@ const std::unordered_map<std::string, Entry>& table() {
                       "В этом окне мало независимых кошельков."}},
         {"ai_spot", {"Spot", "Спот"}},
         {"ai_perp", {"Perps", "Перпы"}},
-        {"ai_w1h", {"1h", "1г"}},
-        {"ai_w6h", {"6h", "6г"}},
+        /* Подписи окон собраны из unit_hour и unit_day того же словаря:
+           «1г» по-русски читалось как год, а «24 часа» рядом с «1ч» —
+           разнобой. Пять кнопок в ряд помещаются только короткими. */
+        {"ai_w1h", {"1h", "1ч"}},
+        {"ai_w6h", {"6h", "6ч"}},
         {"ai_w24", {"24h", "24ч"}},
         {"ai_hist_btn", {"📜 Signal history", "📜 История сигналов"}},
         {"ai_st_btn", {"🧠 Model", "🧠 Модель"}},
@@ -192,10 +195,10 @@ const std::unordered_map<std::string, Entry>& table() {
         {"big_liq_account_was", {"Account was", "На счёте было"}},
         {"big_spot_title", {"Biggest buys / sells", "Крупнейшие покупки / продажи"}},
         {"big_perp_title", {"Biggest positions", "Крупнейшие позиции"}},
-        {"big_win_1h", {"1 hour", "1 час"}},
-        {"big_win_24h", {"24 hours", "24 часа"}},
-        {"big_win_7d", {"7 days", "7 дней"}},
-        {"big_win_30d", {"30 days", "30 дней"}},
+        {"big_win_1h", {"1h", "1ч"}},
+        {"big_win_24h", {"24h", "24ч"}},
+        {"big_win_7d", {"7d", "7д"}},
+        {"big_win_30d", {"30d", "30д"}},
         {"big_empty", {"No trades in this window yet.", "За этот период сделок пока нет."}},
         {"big_track_btn", {"Track", "Отслеживать"}},
         {"menu_languages", {"🌐 Languages", "🌐 Язык"}},

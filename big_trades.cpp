@@ -57,6 +57,7 @@ constexpr long long MAX_SPOT_USD_NANOS = 10000000000000000LL;
 
 long long windowSeconds(const std::string& w) {
     if (w == "1h") return 3600LL;
+    if (w == "6h") return 6LL * 3600LL;
     if (w == "7d") return 7LL * 86400LL;
     if (w == "30d") return 30LL * 86400LL;
     return 86400LL;
@@ -64,6 +65,7 @@ long long windowSeconds(const std::string& w) {
 
 const char* windowKey(const std::string& w) {
     if (w == "1h") return "big_win_1h";
+    if (w == "6h") return "ai_w6h";
     if (w == "7d") return "big_win_7d";
     if (w == "30d") return "big_win_30d";
     return "big_win_24h";
@@ -586,7 +588,10 @@ BigTradesMessage buildFlowList(const std::string& chatId, const std::string& win
     }
 
     json winRow = json::array();
-    for (const char* w : {"1h", "24h", "7d", "30d"}) {
+    // Тот же ряд, что в приложении: между часом и сутками без шести
+    // часов слишком большой прыжок — за час по монете бывает две
+    // сделки, а за сутки уже всё размазано.
+    for (const char* w : {"1h", "6h", "24h", "7d", "30d"}) {
         const bool cur = (window == w);
         winRow.push_back({{"text", std::string(cur ? "\u2705 " : "") + tr(lang, windowKey(w))},
                           {"callback_data", std::string("bg_open:flow:") + w}});
@@ -937,7 +942,10 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
     }
 
     json wins = json::array();
-    for (const char* w : {"1h", "24h", "7d", "30d"}) {
+    // Тот же ряд, что в приложении: между часом и сутками без шести
+    // часов слишком большой прыжок — за час по монете бывает две
+    // сделки, а за сутки уже всё размазано.
+    for (const char* w : {"1h", "6h", "24h", "7d", "30d"}) {
         const bool cur = window == w;
         wins.push_back({{"text", std::string(cur ? "\u2705 " : "") + tr(lang, windowKey(w))},
                         {"callback_data", cur ? "bg_noop" : "bg_open:" + venue + ":" + w}});
