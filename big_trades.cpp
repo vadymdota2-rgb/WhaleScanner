@@ -138,43 +138,6 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
     return out;
 }
 
-std::vector<BigRow> liqRows(long long sinceSec, int limit) {
-    std::vector<BigRow> out;
-    std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
-    if (!hl::g_hlDb) return out;
-    sqlite3_stmt* s;
-    if (!prepareOrLog(hl::g_hlDb, &s,
-        "SELECT wallet, coin, dir, notional_nanos, leverage, px, sz, "
-        "       closed_pnl_nanos, margin_nanos, account_value_nanos, dir_code "
-        "FROM hl_fills "
-        "WHERE ts >= ? AND notional_nanos > 0 "
-        "AND dir_code IN (6,7,8) "
-        "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
-        "GROUP BY wallet "
-        "HAVING notional_nanos = MAX(notional_nanos) "
-        "ORDER BY notional_nanos DESC LIMIT ?")) return out;
-    sqlite3_bind_int64(s, 1, sinceSec * 1000LL);   // hl_fills: время в мс
-    sqlite3_bind_int(s, 2, limit);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        BigRow r;
-        r.wallet             = safeColumnText(s, 0);
-        r.asset              = safeColumnText(s, 1);
-        r.side               = safeColumnText(s, 2);
-        r.usdNanos           = sqlite3_column_int64(s, 3);
-        r.leverage           = sqlite3_column_int(s, 4);
-        r.pxStr              = safeColumnText(s, 5);
-        r.amountStr          = safeColumnText(s, 6);
-        r.closedPnlNanos     = sqlite3_column_int64(s, 7);
-        r.marginNanos        = sqlite3_column_int64(s, 8);
-        r.accountValueNanos  = sqlite3_column_int64(s, 9);
-        r.dirCode            = sqlite3_column_int(s, 10);
-        r.isBuy              = hlSideUp(r.dirCode);
-        out.push_back(std::move(r));
-    }
-    sqlite3_finalize(s);
-    return out;
-}
-
 struct FlowRow {
     std::string token;
     long long boughtNanos = 0;
@@ -486,9 +449,6 @@ BigTradesMessage buildBigMenu(const std::string& chatId) {
             {{"text", perpBtn}, {"callback_data", "bg_open:perp:24h"}}
         }));
     }
-        kb["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "big_btn_liq")}, {"callback_data", "bg_open:liq:24h"}}
-    }));
     {
         std::string fundBtn = tr(lang, "fund_btn");
         if (!isPremium(chatId)) fundBtn += " \U0001F512";
@@ -748,14 +708,13 @@ BigTradesMessage buildFundingList(const std::string& chatId) {
 BigTradesMessage buildBigList(const std::string& chatId, const std::string& venue,
                               const std::string& window, int page) {
     const Lang lang = langFromCode(getUserLanguage(chatId));
-    const bool liq  = venue == "liq";
-    const bool perp = venue == "perp" || liq;
+    const bool perp = venue == "perp";
     const bool premium = isPremium(chatId);
 
-    if (perp && !liq && !premium) {
+    if (perp && !premium) {
         std::ostringstream t;
-        t << (liq ? "\U0001F480 " : "\U0001F535 ")
-          << "<b>" << tr(lang, liq ? "big_liq_title" : "big_perp_title") << "</b>\n\n"
+        t << "\U0001F535 "
+          << "<b>" << tr(lang, "big_perp_title") << "</b>\n\n"
           << "\U0001F512 " << tr(lang, "hl_locked_body");
         json kb;
         kb["inline_keyboard"] = json::array();
@@ -780,9 +739,7 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
             rows = it->second.second;
     }
     if (rows.empty()) {
-        rows = liq  ? liqRows(since, fetchRows)
-             : perp ? perpRows(since, fetchRows)
-                    : spotRows(since, fetchRows);
+        rows = perp ? perpRows(since, fetchRows) : spotRows(since, fetchRows);
         std::lock_guard<std::mutex> l(g_listCacheMutex);
         g_spotCache.byWindow[cacheKey] = {time(nullptr), rows};
     }
@@ -798,8 +755,8 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
         rows.resize(static_cast<size_t>(maxRows));
 
     std::ostringstream t;
-    t << (liq ? "\U0001F480 " : perp ? "\U0001F535 " : "\U0001F7E1 ")
-      << "<b>" << tr(lang, liq ? "big_liq_title" : perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
+    t << (perp ? "\U0001F535 " : "\U0001F7E1 ")
+      << "<b>" << tr(lang, perp ? "big_perp_title" : "big_spot_title") << "</b>\n"
       << "" << tr(lang, windowKey(window)) << "\n\n";
 
     json kb;
@@ -822,63 +779,41 @@ BigTradesMessage buildBigList(const std::string& chatId, const std::string& venu
                 const char* dk = hlDirKey(r.dirCode);
                 const bool up = hlSideUp(r.dirCode);
                 const std::string coin = safeString(r.asset.empty() ? "?" : r.asset, 16);
-                const char* mark = liq ? "\U0001F480"
-                                       : (up ? "\U0001F7E2" : "\U0001F534");
+                const char* mark = up ? "\U0001F7E2" : "\U0001F534";
 
                 t << "<b>" << (i + 1) << ".</b> "
                   << mark << " <b>"
                   << tr(lang, dk) << " \u00B7 " << coin << "</b>\n";
 
-                if (liq) {
-                    if (r.closedPnlNanos != 0)
-                        t << "\U0001F4B8 <b>" << tr(lang, "big_liq_loss") << ":</b> "
-                          << formatUsdNanosSigned(r.closedPnlNanos, true) << "\n";
-                    t << "\U0001F4CA " << tr(lang, "big_liq_position") << ": <b>"
-                      << formatUsd(cpp_int(r.usdNanos)) << "</b>";
-                    if (r.leverage > 0)
-                        t << " \u00B7 " << tr(lang, "hl_leverage") << " "
-                          << r.leverage << "\u00D7";
-                    t << "\n";
-                    if (!r.pxStr.empty())
-                        t << "\u2620\uFE0F " << tr(lang, "big_liq_closed_at") << ": <b>"
-                          << safeString(r.pxStr, 24) << "</b>\n";
-                    if (!r.amountStr.empty())
-                        t << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
-                          << safeString(r.amountStr, 24) << " " << coin << "</b>\n";
-                    if (r.accountValueNanos > 0)
-                        t << "\U0001F3E6 " << tr(lang, "big_liq_account_was") << ": <b>"
-                          << formatUsd(cpp_int(r.accountValueNanos)) << "</b>\n";
-                } else {
-                    t << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>"
-                      << formatUsd(cpp_int(r.usdNanos)) << "</b>\n";
-                    if (r.leverage > 0)
-                        t << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>"
-                          << r.leverage << "\u00D7</b>\n";
-                    if (r.marginNanos > 0) {
-                        t << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
-                          << formatUsd(cpp_int(r.marginNanos)) << "</b>";
-                        if (r.accountValueNanos > 0) {
-                            const double share = 100.0 * static_cast<double>(r.marginNanos)
-                                                       / static_cast<double>(r.accountValueNanos);
-                            t << " (" << formatPercent(share, false) << " "
-                              << tr(lang, "hl_of_account") << ")";
-                        }
-                        t << "\n";
+                t << "\U0001F4B0 " << tr(lang, "hl_trade_size") << ": <b>"
+                  << formatUsd(cpp_int(r.usdNanos)) << "</b>\n";
+                if (r.leverage > 0)
+                    t << "\u2699\uFE0F " << tr(lang, "hl_leverage") << ": <b>"
+                      << r.leverage << "\u00D7</b>\n";
+                if (r.marginNanos > 0) {
+                    t << "\U0001F4B5 " << tr(lang, "hl_collateral") << ": <b>"
+                      << formatUsd(cpp_int(r.marginNanos)) << "</b>";
+                    if (r.accountValueNanos > 0) {
+                        const double share = 100.0 * static_cast<double>(r.marginNanos)
+                                                   / static_cast<double>(r.accountValueNanos);
+                        t << " (" << formatPercent(share, false) << " "
+                          << tr(lang, "hl_of_account") << ")";
                     }
-                    if (!r.pxStr.empty())
-                        t << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
-                          << safeString(r.pxStr, 24) << "</b>\n";
-                    if (!r.amountStr.empty())
-                        t << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
-                          << safeString(r.amountStr, 24) << " " << coin << "</b>\n";
-                    if (r.accountValueNanos > 0)
-                        t << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
-                          << formatUsd(cpp_int(r.accountValueNanos)) << "</b>\n";
-                    if (r.closedPnlNanos != 0)
-                        t << (r.closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
-                          << tr(lang, "hl_pnl") << ": <b>"
-                          << formatUsdNanosSigned(r.closedPnlNanos, true) << "</b>\n";
+                    t << "\n";
                 }
+                if (!r.pxStr.empty())
+                    t << "\U0001F4CD " << tr(lang, "hl_price") << ": <b>"
+                      << safeString(r.pxStr, 24) << "</b>\n";
+                if (!r.amountStr.empty())
+                    t << "\U0001F4E6 " << tr(lang, "hl_qty") << ": <b>"
+                      << safeString(r.amountStr, 24) << " " << coin << "</b>\n";
+                if (r.accountValueNanos > 0)
+                    t << "\U0001F3E6 " << tr(lang, "hl_account") << ": <b>"
+                      << formatUsd(cpp_int(r.accountValueNanos)) << "</b>\n";
+                if (r.closedPnlNanos != 0)
+                    t << (r.closedPnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
+                      << tr(lang, "hl_pnl") << ": <b>"
+                      << formatUsdNanosSigned(r.closedPnlNanos, true) << "</b>\n";
                 t << "\U0001F4BC <code>" << r.wallet << "</code>\n\n";
 
                 const std::string btn = std::to_string(i + 1) + ". " + coin + " \u00B7 "
