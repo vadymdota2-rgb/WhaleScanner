@@ -1795,21 +1795,21 @@ void handleCallbackQuery(const json& callbackQuery) {
     }
     else if (action == "premium_ton") {
         const Lang lang = langFromCode(getUserLanguage(chatId));
-        TonInvoice inv;
-        if (!createTonInvoice(chatId, inv)) {
+        UsdtInvoice inv;
+        if (!createUsdtInvoice(chatId, inv)) {
             auto page = buildPremiumPage(chatId);
             replyInPlace(chatId, messageId,
-                tr(lang, "ton_rate_unavailable") + "\n\n" + page.text, page.keyboard);
+                tr(lang, "generic_error_retry") + "\n\n" + page.text, page.keyboard);
             if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
             return;
         }
         char amt[32];
-        std::snprintf(amt, sizeof(amt), "%.2f", inv.gramAmount);
+        std::snprintf(amt, sizeof(amt), "%.2f", inv.amount);
 
         std::string text = tr(lang, "ton_invoice_header") + "\n\n";
         text += "1️⃣ " + tr(lang, "ton_step_network") + "\n<b>TON</b>\n"
               + tr(lang, "ton_network_note") + "\n\n";
-        text += "2️⃣ " + tr(lang, "ton_step_amount") + "\n<code>" + amt + "</code> GRAM\n\n";
+        text += "2️⃣ " + tr(lang, "ton_step_amount") + "\n<code>" + amt + "</code> USDT\n\n";
         text += "3️⃣ " + tr(lang, "ton_step_address") + "\n<code>" + inv.wallet + "</code>\n\n";
         text += "4️⃣ " + tr(lang, "ton_step_memo") + "\n<code>" + inv.memo + "</code>\n\n";
         text += tr(lang, "ton_memo_warning") + "\n\n" + tr(lang, "ton_invoice_footer")
@@ -2380,12 +2380,10 @@ int main() {
                 lsq=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-ltp).count()>=20) {
-                pollTonPayments();
                 pollUsdtPayments();
                 ltp=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
-                warmGramRate();
                 ensureNativePrice();
                 refreshFundingCache();
                 lrt=std::chrono::steady_clock::now();

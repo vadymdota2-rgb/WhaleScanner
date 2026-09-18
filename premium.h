@@ -16,19 +16,19 @@ void cleanupExpiredPremium();
 
 long long premiumExpireTs(const std::string& chatId);
 
-struct TonInvoice {
+/** Счёт на оплату подписки в USD₮ сети TON. */
+struct UsdtInvoice {
     std::string memo;
     std::string wallet;
-    long long nanoAmount = 0;
-    double gramAmount = 0.0;
+    /** Сумма в единицах жетона: у USD₮ шесть знаков после запятой. */
+    long long units = 0;
+    double amount = 0.0;
 };
 
 bool tonPaymentsAvailable();
-void warmGramRate();
-bool createTonInvoice(const std::string& chatId, TonInvoice& out);
-void pollTonPayments();
-/** Опрос переводов USD₮ по счетам из мини-аппа. Порядок тот же, что у
- *  тоновых: занять счёт, потом выдать подписку. */
+bool createUsdtInvoice(const std::string& chatId, UsdtInvoice& out);
+/** Опрос переводов USD₮ — и по счетам из чата, и по счетам из мини-аппа:
+ *  занять счёт одним обновлением, потом выдать подписку. */
 void pollUsdtPayments();
 
 bool grantPremiumDays(const std::string& chatId, int days);
