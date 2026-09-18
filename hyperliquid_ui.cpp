@@ -150,7 +150,6 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
     struct Series {
         long long pnl = 0;
         long long fee = 0;
-        long long margin = 0;
         int lev = 0;
         long long closeOid = 0;
     };
@@ -173,7 +172,6 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         if (net > 0) a.wins++;
         else if (net < 0) a.losses++;
         if (ser.lev > 0) { a.levSum += ser.lev; a.levN++; }
-        if (ser.margin > 0) a.margin += ser.margin;
     };
 
     auto applyHours = [&](Acc& a, const std::string& coin, long long pos, long long px,
@@ -252,15 +250,37 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
 
         ser.pnl += pnl;
         ser.fee += fee;
-        if (margin > 0) {
-            if (margin > ser.margin) ser.margin = margin;
-        } else if (lev > 0 && notional > 0) {
-            const long long m = notional / lev;
-            if (m > ser.margin) ser.margin = m;
-        }
         if (lev > 0) ser.lev = lev;
 
         if (flat != 1 && dir < 5) continue;
+
+        /* Маржа сделки — закрытый ею номинал, делённый на плечо.
+         *
+         * Раньше бралась наибольшая маржа среди филов серии, а маржа стоит в
+         * филе только тогда, когда бот успел снять состояние позиции. У
+         * кошелька, попавшего в наблюдение позже, открытий может не быть
+         * вовсе, и знаменатель оказывался меньше настоящего в разы — прибыль
+         * приходит с закрытий и попадает в расчёт целиком. Размер позиции
+         * биржа сообщает в каждом филе, поэтому теперь считаем по нему.
+         *
+         * Закрыто не больше, чем стояло в позиции: у переворота (лонг в шорт)
+         * половина объёма открывает новую позицию, и закрытой она не была. */
+        long long closedNtl = notional;
+        if (px > 0 && sz > 0) {
+            long long shut = sz;
+            if (startKnown) {
+                const long long had = start < 0 ? -start : start;
+                if (had > 0 && had < shut) shut = had;
+            }
+            if (shut > 0)
+                closedNtl = static_cast<long long>(
+                    (static_cast<__int128>(shut) * static_cast<__int128>(px)) / 1000000000LL);
+        }
+        int effLev = lev > 0 ? lev : ser.lev;
+        if (effLev <= 0 && a.levN > 0)
+            effLev = static_cast<int>((a.levSum + a.levN / 2) / a.levN);
+        if (effLev > 0 && closedNtl > 0) a.margin += closedNtl / effLev;
+        else if (margin > 0) a.margin += margin;
 
         const long long id = oid > 0 ? oid : tid;
         if (id != 0 && id == ser.closeOid) {
@@ -271,7 +291,6 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         }
         ser.pnl = 0;
         ser.fee = 0;
-        ser.margin = 0;
         ser.lev = 0;
     }
     sqlite3_finalize(s);
