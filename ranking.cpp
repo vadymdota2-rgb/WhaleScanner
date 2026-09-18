@@ -105,7 +105,6 @@ bool safeParseAmount(const std::string& amountStr, const std::string& context, c
 
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out) {
     if (s == "pnl") { out = GlobalRankKind::PNL; return true; }
-    if (s == "roi") { out = GlobalRankKind::ROI; return true; }
     if (s == "winrate") { out = GlobalRankKind::WIN_RATE; return true; }
     if (s == "active") { out = GlobalRankKind::ACTIVE; return true; }
     return false;
@@ -114,7 +113,6 @@ bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out) {
 std::string globalRankKindToString(GlobalRankKind k) {
     switch (k) {
         case GlobalRankKind::PNL: return "pnl";
-        case GlobalRankKind::ROI: return "roi";
         case GlobalRankKind::WIN_RATE: return "winrate";
         case GlobalRankKind::ACTIVE: return "active";
     }
@@ -307,7 +305,6 @@ std::string formatPercentPlain(double pct) { return formatPercent(pct, false); }
 struct PnlRow {
     std::string wallet;
     int64_t pnlNanos = 0;
-    double roiPercent = 0.0;
     int winRatePercent = 0;
     int completedTrades = 0;
     long long avgHoldSeconds = 0;
@@ -318,7 +315,7 @@ std::atomic<bool> g_forceRebuild{false};
 std::string rowsToJson(const std::vector<PnlRow>& rows) {
     json a = json::array();
     for (const PnlRow& r : rows) {
-        a.push_back({{"w", r.wallet}, {"p", r.pnlNanos}, {"r", r.roiPercent},
+        a.push_back({{"w", r.wallet}, {"p", r.pnlNanos},
                      {"wr", r.winRatePercent}, {"t", r.completedTrades},
                      {"h", r.avgHoldSeconds}});
     }
@@ -335,7 +332,6 @@ bool rowsFromJson(const std::string& payload, std::vector<PnlRow>& out) {
             PnlRow r;
             r.wallet = e.value("w", "");
             r.pnlNanos = e.value("p", static_cast<int64_t>(0));
-            r.roiPercent = e.value("r", 0.0);
             r.winRatePercent = e.value("wr", 0);
             r.completedTrades = e.value("t", 0);
             r.avgHoldSeconds = e.value("h", static_cast<long long>(0));
@@ -364,7 +360,6 @@ bool loadCachedPayload(const std::string& key, std::string& out) {
 
 struct GlobalRankings {
     std::vector<PnlRow> byPnl;
-    std::vector<PnlRow> byRoi;
     std::vector<PnlRow> byWinRate;
     std::vector<PnlRow> byActive;
 };
@@ -393,10 +388,6 @@ std::vector<PnlRow> computeGlobalTopWindow(long long windowSeconds, bool& ok) {
             PnlRow row;
             row.wallet = curWallet;
             row.pnlNanos = cppIntToClampedI64(outerPnl);
-            double volD = outerCostDeployed > 0 ? outerCostDeployed.convert_to<double>() : 0.0;
-            double pnlD = outerPnl.convert_to<double>();
-
-            row.roiPercent = volD > 0.0 ? (100.0 * pnlD / volD) : 0.0;
             row.winRatePercent = outerCompleted > 0
                 ? static_cast<int>(100.0 * outerWinning / outerCompleted + 0.5)
                 : 0;
@@ -508,11 +499,6 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
         [](const PnlRow& a, const PnlRow& b) { return a.pnlNanos > b.pnlNanos; });
     if (out.byPnl.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byPnl.resize(MAX_GLOBAL_RANKED);
 
-    out.byRoi = base;
-    std::sort(out.byRoi.begin(), out.byRoi.end(),
-        [](const PnlRow& a, const PnlRow& b) { return a.roiPercent > b.roiPercent; });
-    if (out.byRoi.size() > static_cast<size_t>(MAX_GLOBAL_RANKED)) out.byRoi.resize(MAX_GLOBAL_RANKED);
-
     out.byWinRate = base;
     std::sort(out.byWinRate.begin(), out.byWinRate.end(), [](const PnlRow& a, const PnlRow& b) {
         if (a.winRatePercent != b.winRatePercent) return a.winRatePercent > b.winRatePercent;
@@ -533,7 +519,6 @@ GlobalRankings buildGlobalRankings(const std::vector<PnlRow>& base) {
 std::string globalTitle(GlobalRankKind kind, Lang lang) {
     switch (kind) {
         case GlobalRankKind::PNL: return tr(lang, "rk_btn_top_pnl");
-        case GlobalRankKind::ROI: return tr(lang, "rk_btn_top_roi");
         case GlobalRankKind::WIN_RATE: return tr(lang, "rk_btn_top_winrate");
         case GlobalRankKind::ACTIVE: return tr(lang, "rk_btn_most_active");
     }
@@ -687,12 +672,10 @@ void rebuildAllRankings() {
             markRankPresence("spot", top);
         }
         entries.emplace_back(rankCacheKey("pnl", days), rowsToJson(g.byPnl));
-        entries.emplace_back(rankCacheKey("roi", days), rowsToJson(g.byRoi));
         entries.emplace_back(rankCacheKey("winrate", days), rowsToJson(g.byWinRate));
         entries.emplace_back(rankCacheKey("active", days), rowsToJson(g.byActive));
         if (days == 30) {
             entries.emplace_back("global_pnl", rowsToJson(g.byPnl));
-            entries.emplace_back("global_roi", rowsToJson(g.byRoi));
             entries.emplace_back("global_winrate", rowsToJson(g.byWinRate));
             entries.emplace_back("global_active", rowsToJson(g.byActive));
         }
@@ -1149,9 +1132,6 @@ RankingMessage buildGlobalTopMenu(const std::string& chatId) {
         {{"text", tr(lang, "rk_btn_top_pnl")}, {"callback_data", "gt_open:pnl"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "rk_btn_top_roi")}, {"callback_data", "gt_open:roi"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "rk_btn_top_winrate")}, {"callback_data", "gt_open:winrate"}}
     }));
     keyboard["inline_keyboard"].push_back(json::array({
@@ -1191,7 +1171,6 @@ bool spotRankOf(const std::string& wallet, SpotRankInfo& out) {
         out.rank = static_cast<int>(i) + 1;
         out.total = static_cast<int>(rows.size());
         out.pnlNanos = rows[i].pnlNanos;
-        out.roiPercent = rows[i].roiPercent;
         out.winRatePercent = rows[i].winRatePercent;
         out.completedTrades = rows[i].completedTrades;
         return true;

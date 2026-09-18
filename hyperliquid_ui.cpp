@@ -1024,8 +1024,6 @@ HlMessage buildWalletPositions(const std::string& chatId, const std::string& add
     if (spotRankOf(addr, sr) && sr.rank <= 100) {
         t << " — #" << sr.rank << "\n"
           << dm << "\U0001F4B5 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
-          << dm << "\U0001F4C8 " << tr(lang, "rk_roi_per_trade") << ": "
-          << formatPercent(sr.roiPercent, true) << "\n"
           << dm << "\U0001F3AF " << tr(lang, "ws_winrate") << ": " << sr.winRatePercent << "%\n"
           << dm << "\U0001F504 " << tr(lang, "rk_trades") << ": " << sr.completedTrades << "\n";
     } else {

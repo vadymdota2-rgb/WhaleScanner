@@ -387,8 +387,6 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         if (spotRankOf(address, sr) && sr.rank <= 100) {
             text << " — #" << sr.rank << "\n"
                  << "💵 PnL: " << formatUsdNanosSigned(sr.pnlNanos, true) << "\n"
-                 << "📈 " << tr(lang, "rk_roi_per_trade") << ": "
-                 << formatPercent(sr.roiPercent, true) << "\n"
                  << "🎯 " << tr(lang, "ws_winrate") << ": " << sr.winRatePercent << "%\n"
                  << "🔄 " << tr(lang, "rk_trades") << ": " << sr.completedTrades << "\n";
         } else {

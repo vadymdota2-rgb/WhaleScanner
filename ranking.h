@@ -24,7 +24,10 @@ struct SpotRankInfo {
     int rank = 0;
     int total = 0;
     long long pnlNanos = 0;
-    double roiPercent = 0.0;
+    /* Доходности по споту здесь нет: знаменатель собирается из цен DEX на
+       момент покупки, часть монет куплена по ценам, которых уже не достать.
+       Абсолютный PnL остаётся — он считается из тех же сделок, но ни на что
+       не делится. У фьючерсов иначе, там ROI считается от маржи. */
     int winRatePercent = 0;
     int completedTrades = 0;
 };
@@ -43,7 +46,7 @@ struct RankingMessage {
     std::string keyboard;
 };
 
-enum class GlobalRankKind { PNL, ROI, WIN_RATE, ACTIVE };
+enum class GlobalRankKind { PNL, WIN_RATE, ACTIVE };
 
 bool parseGlobalRankKind(const std::string& s, GlobalRankKind& out);
 
