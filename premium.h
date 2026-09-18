@@ -27,6 +27,9 @@ bool tonPaymentsAvailable();
 void warmGramRate();
 bool createTonInvoice(const std::string& chatId, TonInvoice& out);
 void pollTonPayments();
+/** Опрос переводов USD₮ по счетам из мини-аппа. Порядок тот же, что у
+ *  тоновых: занять счёт, потом выдать подписку. */
+void pollUsdtPayments();
 
 bool grantPremiumDays(const std::string& chatId, int days);
 

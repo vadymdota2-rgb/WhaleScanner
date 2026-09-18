@@ -39,6 +39,15 @@ constexpr double TON_PRICE_USD = 3.99;
 constexpr long long TON_INVOICE_TTL_SEC = 3600;
 constexpr double TON_MIN_USD = 3.0;
 const char* const TON_API_URL = "https://toncenter.com/api/v2/";
+// Переводы жетонов отдаёт только третья версия обозревателя: во второй
+// пришлось бы разбирать тело сообщения вручную.
+const char* const TON_API_V3 = "https://toncenter.com/api/v3/";
+// USD₮ в сети TON: адрес мастер-контракта в сыром виде и шесть знаков после
+// запятой. Без сверки с ним подписку можно было бы купить за любой жетон,
+// нарисованный кем угодно.
+const char* const USDT_MASTER =
+    "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE";
+constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниже счёт не бывает
 const char* const TON_RATE_URL =
     "https://api.dexscreener.com/latest/dex/tokens/"
     "EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT";
@@ -101,12 +110,18 @@ bool initPremium(const std::string& botToken, const std::string& serviceChatId) 
         "ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN premium_start INTEGER DEFAULT 0",
         "ALTER TABLE users ADD COLUMN premium_expire INTEGER DEFAULT 0",
+        // Счета бывают двух видов: перевод монеты TON из чата и перевод USD₮
+        // из мини-аппа. Без разделения опрос сверял бы одни с другими.
+        "ALTER TABLE ton_invoices ADD COLUMN kind TEXT NOT NULL DEFAULT 'ton'",
     };
     for (const char* sql : alters) {
         char* err = nullptr;
         if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
             std::string e = err ? err : "";
-            if (e.find("duplicate column") == std::string::npos) {
+            // «Столбец уже есть» — обычное дело на старой базе. «Нет такой
+            // таблицы» — на новой: она создаётся ниже и уже со столбцом.
+            if (e.find("duplicate column") == std::string::npos &&
+                e.find("no such table") == std::string::npos) {
                 std::cerr << "[PREMIUM][FATAL] migration failed: " << e << std::endl;
                 ok = false;
             }
@@ -135,7 +150,8 @@ bool initPremium(const std::string& botToken, const std::string& serviceChatId) 
             status TEXT NOT NULL DEFAULT 'active',
             created_at INTEGER NOT NULL,
             paid_at INTEGER NOT NULL DEFAULT 0,
-            tx_hash TEXT NOT NULL DEFAULT ''
+            tx_hash TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT 'ton'
         );
         CREATE INDEX IF NOT EXISTS idx_ton_active ON ton_invoices(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_ton_chat ON ton_invoices(chat_id);
@@ -368,7 +384,7 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
         sqlite3_stmt* s;
         if (prepareOrLog(db, &s,
             "SELECT memo, nano_amount FROM ton_invoices "
-            "WHERE chat_id=? AND status='active' AND created_at > ? "
+            "WHERE chat_id=? AND status='active' AND kind='ton' AND created_at > ? "
             "ORDER BY created_at DESC LIMIT 1")) {
             sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(s, 2, now - TON_INVOICE_TTL_SEC);
@@ -405,8 +421,8 @@ bool createTonInvoice(const std::string& chatId, TonInvoice& out) {
     for (int attempt = 0; attempt < 5; attempt++) {
         out.memo = makeMemo();
         if (!prepareOrLog(db, &s,
-            "INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at) "
-            "VALUES(?,?,?,'active',?)")) return false;
+            "INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at, kind) "
+            "VALUES(?,?,?,'active',?,'ton')")) return false;
         sqlite3_bind_text(s, 1, out.memo.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 3, out.nanoAmount);
@@ -430,13 +446,13 @@ void pollTonPayments() {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (prepareOrLog(db, &s,
-            "SELECT 1 FROM ton_invoices WHERE status='active' AND created_at > ? LIMIT 1")) {
+            "SELECT 1 FROM ton_invoices WHERE status='active' AND kind='ton' AND created_at > ? LIMIT 1")) {
             sqlite3_bind_int64(s, 1, now - TON_INVOICE_TTL_SEC);
             anyActive = sqlite3_step(s) == SQLITE_ROW;
             sqlite3_finalize(s);
         }
         if (prepareOrLog(db, &s,
-            "UPDATE ton_invoices SET status='expired' WHERE status='active' AND created_at <= ?")) {
+            "UPDATE ton_invoices SET status='expired' WHERE status='active' AND kind='ton' AND created_at <= ?")) {
             sqlite3_bind_int64(s, 1, now - TON_INVOICE_TTL_SEC);
             sqlite3_step(s);
             sqlite3_finalize(s);
@@ -495,7 +511,7 @@ void pollTonPayments() {
             sqlite3_stmt* s;
             if (!prepareOrLog(db, &s,
                 "SELECT chat_id, nano_amount FROM ton_invoices "
-                "WHERE memo=? AND status='active'")) continue;
+                "WHERE memo=? AND status='active' AND kind='ton'")) continue;
             sqlite3_bind_text(s, 1, clean.c_str(), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(s) == SQLITE_ROW) {
                 chatId = safeColumnText(s, 0);
@@ -517,7 +533,7 @@ void pollTonPayments() {
             sqlite3_stmt* s;
             if (prepareOrLog(db, &s,
                 "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
-                "WHERE memo=? AND status='active'")) {
+                "WHERE memo=? AND status='active' AND kind='ton'")) {
                 sqlite3_bind_int64(s, 1, now);
                 sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 3, clean.c_str(), -1, SQLITE_TRANSIENT);
@@ -540,6 +556,124 @@ void pollTonPayments() {
     }
 }
 
+void pollUsdtPayments() {
+    // Счета в USD₮ выставляет мини-апп, а платит человек из своего кошелька.
+    // Порядок тот же, что у тоновых: найти перевод по памятке, занять счёт
+    // одним UPDATE и только потом выдать подписку.
+    if (!g_premiumSchemaOk) return;
+    const std::string wallet = tonWallet();
+    if (wallet.empty()) return;
+
+    const long long now = static_cast<long long>(time(nullptr));
+
+    bool anyActive = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+            "SELECT 1 FROM ton_invoices WHERE status='active' AND kind='usdt' "
+            "AND created_at > ? LIMIT 1")) {
+            // Опоздавшую оплату принимаем сутки: человек, заплативший через
+            // час после счёта, не должен терять деньги.
+            sqlite3_bind_int64(s, 1, now - 86400);
+            anyActive = sqlite3_step(s) == SQLITE_ROW;
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s,
+            "UPDATE ton_invoices SET status='expired' WHERE status='active' "
+            "AND kind='usdt' AND created_at <= ?")) {
+            sqlite3_bind_int64(s, 1, now - 86400);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+    if (!anyActive) return;
+
+    const std::string url = std::string(TON_API_V3) + "jetton/transfers?owner_address=" +
+                            wallet + "&direction=in&limit=50";
+    const std::string resp = http(url, "", 15);
+    if (resp.empty()) return;
+    json j = json::parse(resp, nullptr, false);
+    if (!j.is_object() || !j.contains("jetton_transfers") || !j["jetton_transfers"].is_array())
+        return;
+
+    for (const auto& jt : j["jetton_transfers"]) {
+        if (!jt.is_object()) continue;
+        if (jt.value("transaction_aborted", false)) continue;
+
+        std::string master = jstrField(jt, "jetton_master");
+        for (char& c : master) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (master != USDT_MASTER) continue;
+
+        std::string memo;
+        if (jt.contains("decoded_forward_payload") && jt["decoded_forward_payload"].is_object())
+            memo = jstrField(jt["decoded_forward_payload"], "comment");
+        if (memo.empty()) continue;
+
+        std::string clean;
+        for (char c : memo) {
+            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
+            clean += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+
+        long long got = 0;
+        try { got = std::stoll(jstrField(jt, "amount", "0")); } catch (...) { continue; }
+        if (got < USDT_MIN_UNITS) continue;
+
+        const std::string hash = jstrField(jt, "transaction_hash");
+
+        std::string chatId;
+        long long need = 0;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (!prepareOrLog(db, &s,
+                "SELECT chat_id, nano_amount FROM ton_invoices "
+                "WHERE memo=? AND status='active' AND kind='usdt'")) continue;
+            sqlite3_bind_text(s, 1, clean.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                chatId = safeColumnText(s, 0);
+                need = sqlite3_column_int64(s, 1);
+            }
+            sqlite3_finalize(s);
+        }
+        if (chatId.empty() || need < USDT_MIN_UNITS) continue;
+
+        // Два процента запаса — на случай, если кошелёк округлил сумму вниз.
+        if (got * 100 < need * 98) {
+            std::cerr << "[USDT] недоплата по " << clean << ": пришло " << got
+                      << ", ждали " << need << std::endl;
+            continue;
+        }
+
+        bool claimed = false;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s,
+                "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
+                "WHERE memo=? AND status='active' AND kind='usdt'")) {
+                sqlite3_bind_int64(s, 1, now);
+                sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(s, 3, clean.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) == SQLITE_DONE) claimed = sqlite3_changes(db) > 0;
+                sqlite3_finalize(s);
+            }
+        }
+        if (!claimed) continue;
+
+        if (!grantPremiumDays(chatId, 30)) {
+            std::cerr << "[USDT] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << chatId
+                      << " memo=" << clean << " — выдать вручную" << std::endl;
+            continue;
+        }
+        std::cout << "[USDT] premium 30d выдан: chat=" << chatId
+                  << " memo=" << clean << " " << (got / 1e6) << " USDT" << std::endl;
+
+        const Lang lang = langFromCode(getUserLanguage(chatId));
+        sendMsg(chatId, tr(lang, "ton_paid_ok"));
+    }
+}
 bool grantPremiumDays(const std::string& chatId, int days) {
     if (chatId.empty() || days <= 0 || days > 3650) return false;
     if (!g_premiumSchemaOk) return false;

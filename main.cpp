@@ -2381,6 +2381,7 @@ int main() {
             }
             if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-ltp).count()>=20) {
                 pollTonPayments();
+                pollUsdtPayments();
                 ltp=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
