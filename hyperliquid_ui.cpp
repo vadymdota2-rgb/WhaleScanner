@@ -252,35 +252,52 @@ std::vector<PerpRow> computeRanking(long long windowSec, bool& ok) {
         ser.fee += fee;
         if (lev > 0) ser.lev = lev;
 
-        if (flat != 1 && dir < 5) continue;
-
-        /* Маржа сделки — закрытый ею номинал, делённый на плечо.
+        /* Маржа сделки — закрытый номинал, делённый на плечо. Считается на
+         * каждом закрытии, в том числе частичном.
          *
-         * Раньше бралась наибольшая маржа среди филов серии, а маржа стоит в
-         * филе только тогда, когда бот успел снять состояние позиции. У
-         * кошелька, попавшего в наблюдение позже, открытий может не быть
-         * вовсе, и знаменатель оказывался меньше настоящего в разы — прибыль
-         * приходит с закрытий и попадает в расчёт целиком. Размер позиции
-         * биржа сообщает в каждом филе, поэтому теперь считаем по нему.
+         * Раньше она прибавлялась только там, где серия заканчивалась
+         * (flat=1 или переворот с ликвидацией), а прибыль серии складывалась
+         * со всех её филов. Кто выходит из позиции частями — а так торгует
+         * большинство, — получал знаменатель от одного последнего куска и
+         * доходность во столько раз выше, на сколько частей разбит выход: у
+         * 0x767a…ace выходило 31660% вместо 188%.
          *
          * Закрыто не больше, чем стояло в позиции: у переворота (лонг в шорт)
-         * половина объёма открывает новую позицию, и закрытой она не была. */
-        long long closedNtl = notional;
-        if (px > 0 && sz > 0) {
-            long long shut = sz;
-            if (startKnown) {
-                const long long had = start < 0 ? -start : start;
-                if (had > 0 && had < shut) shut = had;
-            }
-            if (shut > 0)
+         * половина объёма открывает новую, и закрытой она не была. Долив в ту
+         * же сторону не закрывает ничего и в знаменатель не идёт. */
+        long long shut = 0;
+        if (startKnown) {
+            if (start > 0 && signedSz < 0) shut = (-signedSz < start) ? -signedSz : start;
+            else if (start < 0 && signedSz > 0) shut = (signedSz < -start) ? signedSz : -start;
+        } else if (flat == 1 || dir >= DIR_CLOSE_LONG || pnl != 0) {
+            shut = sz;               /* размера позиции нет — строка закрывающая целиком */
+        }
+        if (shut > 0) {
+            long long closedNtl = 0;
+            if (px > 0)
                 closedNtl = static_cast<long long>(
                     (static_cast<__int128>(shut) * static_cast<__int128>(px)) / 1000000000LL);
+            else if (sz > 0)
+                closedNtl = static_cast<long long>(
+                    (static_cast<__int128>(notional) * static_cast<__int128>(shut)) / sz);
+            int effLev = lev > 0 ? lev : ser.lev;
+            if (effLev <= 0 && a.levN > 0)
+                effLev = static_cast<int>((a.levSum + a.levN / 2) / a.levN);
+            if (effLev > 0 && closedNtl > 0) a.margin += closedNtl / effLev;
+            else if (margin > 0) a.margin += margin;
         }
-        int effLev = lev > 0 ? lev : ser.lev;
-        if (effLev <= 0 && a.levN > 0)
-            effLev = static_cast<int>((a.levSum + a.levN / 2) / a.levN);
-        if (effLev > 0 && closedNtl > 0) a.margin += closedNtl / effLev;
-        else if (margin > 0) a.margin += margin;
+
+        /* Сделка засчитывается на каждом закрытии, а не только там, где
+         * позиция обнулилась. Прежде серия сливалась в счёт лишь по флагу
+         * flat (или перевороту с ликвидацией): у того, кто выходит частями,
+         * за 30 дней набиралось одно закрытие вместо полусотни, накопленная
+         * прибыль одной монеты приписывалась ему целиком, а прибыль второй,
+         * не успевшей закрыться, пропадала вовсе — у 0x767a…ace выходило
+         * $1,67M вместо $1,43M на одной «сделке». Теперь числитель,
+         * знаменатель и счётчик сделок считают одни и те же строки, и бот с
+         * приложением показывают одно и то же. Филы одной заявки по-прежнему
+         * склеиваются по oid и сделкой считаются одной. */
+        if (shut <= 0 && flat != 1 && dir < DIR_FLIP) continue;
 
         const long long id = oid > 0 ? oid : tid;
         if (id != 0 && id == ser.closeOid) {
