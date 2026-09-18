@@ -9,7 +9,6 @@
 #include <iostream>
 #include <map>
 #include <mutex>
-#include <random>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -1473,7 +1472,9 @@ void trainOne(bool perp) {
     }
     if (static_cast<int>(xs.size()) < AI_MIN_TRAIN) return;
 
-    std::mt19937 rng(static_cast<unsigned>(hl::nowSec() ^ (perp ? 0x9e3779b9u : 0u)));
+    // Генератор случайных чисел здесь когда-то перемешивал выборку. После
+    // перехода на проверку по времени перемешивать нечего, и обучение стало
+    // повторяемым: одни и те же данные дают одни и те же веса.
     // Проверяем на САМЫХ СВЕЖИХ примерах, а не на случайных. Со случайным
     // разбиением модель учится на будущем и проверяется на прошлом - в бою
     // так не бывает, и точность выходит завышенной.
@@ -1547,7 +1548,15 @@ void trainOne(bool perp) {
             if (k > 1.5) k = 1.5;
         }
     }
-    saveWeights(perp, w, static_cast<long long>(xs.size()), acc, k);
+    // Считаем все размеченные исходы, а не только те, что ушли в обучение.
+    // AI_MIN_TRAIN — один и тот же порог в трёх местах: до разбиения его
+    // сверяют с полной выборкой (и экран показывает «413 / 400»), а
+    // сохранялась пятая часть от неё, отложенная на проверку. Модель,
+    // обученную на 400..499 исходах, при следующем запуске переставали
+    // считать обученной: loadWeightSet и whale_api.py сверяют это же число
+    // с тем же порогом. Перпы как раз в этой дыре и сидели.
+    const long long seen = static_cast<long long>(xs.size() + hold.size());
+    saveWeights(perp, w, seen, acc, k);
     const long long at = hl::nowSec();
     {
         std::lock_guard<std::mutex> l(g_wMutex);
@@ -1562,15 +1571,17 @@ void trainOne(bool perp) {
         if (perp) {
             g_wPerp = w; g_trainedPerp = true;
             g_accPerp = acc; g_calPerp = k;
-            g_trainAtPerp = at; g_trainNPerp = static_cast<long long>(xs.size());
+            g_trainAtPerp = at; g_trainNPerp = seen;
         } else {
             g_wSpot = w; g_trainedSpot = true;
             g_accSpot = acc; g_calSpot = k;
-            g_trainAtSpot = at; g_trainNSpot = static_cast<long long>(xs.size());
+            g_trainAtSpot = at; g_trainNSpot = seen;
         }
     }
     std::cout << "[AI] trained " << (perp ? "perp" : "spot")
-              << " on " << xs.size() << " 24h outcomes" << std::endl;
+              << " on " << xs.size() << " of " << seen << " 24h outcomes, hold "
+              << holdN << ", acc " << static_cast<int>(acc * 100.0 + 0.5) << "%"
+              << std::endl;
 }
 
 void trainWeights() {
