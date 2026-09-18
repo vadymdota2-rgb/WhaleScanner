@@ -333,33 +333,39 @@ const std::unordered_map<std::string, Entry>& table() {
                                 "We never ask for and never store private keys, seed phrases, names, emails or phone numbers, and the bot can neither move nor trade your funds. "
                                 "Wallet activity comes from public blockchain and exchange data that exists independently of this bot, and we do not link it to your identity. "
                                 "Your data is kept on our own server, is never sold, and reaches only the services needed to deliver a message (Telegram) and to read a price (public APIs). "
-                                "Send /forgetme to erase everything we hold about you, immediately and for good.",
+                                "Send /forgetme to erase everything we hold about you, immediately and for good. "
+                                "Paying in USD₮ also stores the invoice comment, the amount and the public address the transfer came from; connecting a wallet shows us only its public address — the transfer is signed inside your wallet, and keys and seed phrases never reach us. One line survives deletion: the chat ID and the date the free week was issued — without it the same account could take that week again and again.",
                                 "Мы храним только ваш Telegram chat ID, язык интерфейса, порог алертов и публичные адреса блокчейна, которые вы попросили отслеживать. "
                                 "Мы никогда не спрашиваем и не храним приватные ключи, seed-фразы, имена, почту и телефоны; бот не может ни перевести, ни продать ваши средства. "
                                 "Активность кошельков берётся из публичных данных блокчейна и бирж, которые существуют независимо от бота, и с вашей личностью мы их не связываем. "
                                 "Данные лежат на нашем сервере, никогда не продаются и попадают только туда, без чего не доставить сообщение (Telegram) и не узнать цену (публичные API). "
-                                "Команда /forgetme стирает всё, что мы о вас храним, — сразу и без возврата."}},
+                                "Команда /forgetme стирает всё, что мы о вас храним, — сразу и без возврата. "
+                                "Оплата в USD₮ добавляет к этому комментарий счёта, сумму и публичный адрес, с которого пришёл перевод; подключение кошелька показывает нам только его публичный адрес — сам перевод подписывается внутри кошелька, а ключи и seed-фразы до нас не доходят. Удаление переживает одна строка: chat ID и дата, когда была выдана бесплатная неделя, — без неё тот же аккаунт мог бы брать ту неделю снова и снова."}},
         {"legal_terms_title", {"📄 <b>Terms of Use</b>", "📄 <b>Условия использования</b>"}},
         {"legal_terms_body", {"Wallet Tracker is an information service: it shows blockchain transactions that have already happened, and nothing more. "
                               "Nothing here is investment advice, a recommendation or a promise of profit, and past results of any wallet do not predict future ones. "
                               "We are not a custodian, an exchange or a broker: we never hold, move or trade your funds and have no access to them. "
                               "Data comes from public sources and can be delayed, incomplete or simply wrong, so check anything you act on and carry your own risk. "
-                              "Premium is a paid subscription to extra features; abusing the service or trying to break it ends access without a refund.",
+                              "Premium is a paid subscription to extra features; abusing the service or trying to break it ends access without a refund. "
+                              "Connecting a TON wallet gives us only its public address, every transfer is signed in your own wallet, and paid days are not refunded — including the days left if you delete your data.",
                               "Wallet Tracker — информационный сервис: он показывает уже совершённые транзакции блокчейна и больше ничего. "
                               "Здесь нет инвестиционных советов, рекомендаций и обещаний прибыли, а прошлые результаты кошелька не предсказывают будущие. "
                               "Мы не кастодиан, не биржа и не брокер: мы не храним, не переводим и не торгуем вашими средствами и не имеем к ним доступа. "
                               "Данные берутся из публичных источников и бывают с задержкой, неполными или просто неверными, поэтому всё, на чём вы строите решение, проверяйте сами и риск несите сами. "
-                              "Премиум — платная подписка на дополнительные функции; злоупотребление сервисом или попытки его сломать прекращают доступ без возврата денег."}},
+                              "Премиум — платная подписка на дополнительные функции; злоупотребление сервисом или попытки его сломать прекращают доступ без возврата денег. "
+                              "Подключение кошелька TON даёт нам только его публичный адрес, каждый перевод подписывается в самом кошельке, а оплаченные дни возврату не подлежат — в том числе те, что остались, если вы удалите свои данные."}},
         {"legal_btn_privacy", {"🔒 Privacy", "🔒 Конфиденциальность"}},
         {"legal_btn_terms", {"📄 Terms", "📄 Условия"}},
         {"legal_btn_forget", {"🗑 Delete my data", "🗑 Удалить мои данные"}},
         {"legal_forget_title", {"🗑 <b>Delete my data</b>", "🗑 <b>Удалить мои данные</b>"}},
         {"legal_forget_warn", {"This erases your tracked wallets, alert threshold, language, delivery history and payment records. "
                                "Premium, including days you have already paid for, is lost and is not refunded. "
-                               "This cannot be undone.",
+                               "This cannot be undone. "
+                               "The record that the free week was already issued stays — otherwise it could be taken again.",
                                "Будут стёрты отслеживаемые кошельки, порог алертов, язык, история доставок и записи о платежах. "
                                "Премиум, включая уже оплаченные дни, пропадёт и возврату не подлежит. "
-                               "Отменить это нельзя."}},
+                               "Отменить это нельзя. "
+                               "Остаётся только отметка, что бесплатная неделя уже выдавалась, — иначе её можно было бы получать заново."}},
         {"legal_forget_yes", {"Yes, delete everything", "Да, удалить всё"}},
         {"legal_forget_done", {"✅ Done. Everything we held about you is deleted. If you ever want to come back, send /start.",
                                "✅ Готово. Всё, что мы о вас хранили, удалено. Если захотите вернуться — отправьте /start."}},

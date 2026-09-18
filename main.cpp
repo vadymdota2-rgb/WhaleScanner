@@ -1496,10 +1496,14 @@ bool forgetUser(const std::string& chatId) {
         g_viewStack.erase(chatId);
     }
 
+    // trial_granted здесь нет намеренно. Эта строка — единственное, что
+    // переживает удаление: chat_id и дата выдачи бесплатной недели. Пока она
+    // удалялась вместе с остальным, любой мог стереть данные, нажать /start и
+    // получить неделю премиума заново — и так без конца. Ничего, кроме факта
+    // «неделя уже выдавалась», в ней нет, и об этом сказано в политике.
     static const char* const STMTS[] = {
         "DELETE FROM user_whales WHERE user_id=?",
         "DELETE FROM deliveries WHERE chat_id=?",
-        "DELETE FROM trial_granted WHERE chat_id=?",
         "DELETE FROM premium_payments WHERE chat_id=?",
         "DELETE FROM ton_invoices WHERE chat_id=?",
         "DELETE FROM ai_access WHERE chat_id=?",
