@@ -21,6 +21,7 @@
 #include "alert_settings.h"
 #include "hyperliquid.h"
 #include "hyperliquid_internal.h"
+#include "oracle.h"
 #include "ranking.h"
 #include "ru.h"
 #include "token_prices.h"
@@ -181,6 +182,31 @@ void featuresOf(const Row& r, std::array<double, AI_NF>& f) {
     }
 }
 
+/* Строка потока в том виде, в каком её ждёт оракул. Одно место перевода:
+   разойдись поля — модель считала бы одно, а обучалась на другом. */
+OracleInput oracleInputOf(const Row& r) {
+    OracleInput in;
+    in.perp = r.perp;
+    in.id = r.id;
+    in.buy = r.buy;
+    in.sell = r.sell;
+    in.nBuy = r.nBuy;
+    in.nSell = r.nSell;
+    in.wallets = r.wallets;
+    in.oneShare = r.oneShare;
+    in.net6h = r.net6h;
+    in.netPrior = r.netPrior;
+    in.funding = r.fundingNanos;
+    in.liqUsd = r.liqUsd;
+    in.levBp = r.levBp;
+    in.liqLong = r.liqLongNanos;
+    in.liqShort = r.liqShortNanos;
+    in.topShare = r.topShare;
+    in.topDir = r.topDir;
+    in.bothVenues = r.bothVenues;
+    return in;
+}
+
 double heuristicScore(const Row& r) {
     const long long vol = r.buy + r.sell;
     if (vol <= 0 || r.wallets < AI_MIN_WALLETS) return 0;
@@ -196,6 +222,15 @@ double heuristicScore(const Row& r) {
 double rowScore(const Row& r) {
     const double h = heuristicScore(r);
     if (h == 0) return 0;
+    // Оракул старше линии: он видит рынок, а не только поток. Нет его —
+    // остаётся прежняя логистическая модель, нет и её — голая формула.
+    if (oracleReady(r.perp)) {
+        const OracleVerdict v = oracleScore(oracleInputOf(r), 0);
+        if (v.known) {
+            const double conf = h > 0 ? v.pUp : (1.0 - v.pUp);
+            return (h > 0 ? 1.0 : -1.0) * conf * std::fabs(h);
+        }
+    }
     std::array<double, AI_NF> w{};
     bool trained = false;
     {
@@ -1145,6 +1180,13 @@ void recordRows(int days, const std::vector<Row>& rows) {
 }
 
 int confPct(const Row& r, bool trained, bool wantLong) {
+    if (oracleReady(r.perp)) {
+        const OracleVerdict v = oracleScore(oracleInputOf(r), 0);
+        if (v.known) {
+            const double c = wantLong ? v.pUp : (1.0 - v.pUp);
+            return std::min(99, std::max(1, static_cast<int>(c * 100.0 + 0.5)));
+        }
+    }
     if (trained) {
         std::array<double, AI_NF> w{};
         double k = 1;
@@ -2120,6 +2162,37 @@ AiMessage buildAiStatus(const std::string& chatId) {
         t << "<b>" << tr(lang, perp ? "ai_perp" : "ai_spot") << "</b>\n";
         t << tr(lang, "ai_st_ready") << " <b>" << ready << "</b> / " << AI_MIN_TRAIN << "\n";
 
+        // Оракул старше линейной модели и показывается вместо неё. Числа —
+        // с теста, которого он не видел при обучении, и рядом всегда стоит
+        // то же число у постоянного прогноза: без него «потери 0.66» ничего
+        // не значат.
+        if (oracleReady(perp)) {
+            const OracleStats os = oracleStats(perp);
+            t << "🧠 <b>Cortex</b> \u00B7 " << os.trees << " " << tr(lang, "ai_st_trees")
+              << " \u00B7 " << os.samples << " " << tr(lang, "ai_st_samples") << "\n";
+            t << "AUC <b>" << std::fixed << std::setprecision(3) << os.auc << "</b>";
+            t.unsetf(std::ios::fixed);
+            t << " \u00B7 " << tr(lang, "ai_st_acc") << " <b>"
+              << static_cast<int>(os.acc * 100.0 + 0.5) << "%</b>\n";
+            t << tr(lang, "ai_st_loss") << " " << std::fixed << std::setprecision(3)
+              << os.logloss << " \u00B7 " << tr(lang, "ai_st_base") << " " << os.baseLogloss << "\n";
+            t << tr(lang, "ai_st_wf") << " AUC " << os.wfAuc << "\n";
+            t.unsetf(std::ios::fixed);
+            if (os.at > 0)
+                t << "\u2699 " << (hl::nowSec() - os.at) / 3600 << tr(lang, "ai_hist_hours") << "\n";
+            if (!os.top.empty()) {
+                t << tr(lang, "ai_st_top") << " ";
+                for (size_t k = 0; k < os.top.size() && k < 3; k++) {
+                    if (k) t << " \u00B7 ";
+                    t << os.top[k].first << " <code>"
+                      << static_cast<int>(os.top[k].second * 100.0 + 0.5) << "%</code>";
+                }
+                t << "\n";
+            }
+            t << "\n";
+            continue;
+        }
+
         if (!trained) {
             t << tr(lang, "ai_st_untrained") << "\n\n";
             continue;
@@ -2345,6 +2418,9 @@ bool handleAiCallback(const std::string& chatId, const std::string& action,
 }
 
 void aiTick() {
+    // Оракул живёт своим расписанием: свечи каждые пять минут, ряды раз в
+    // час, переобучение раз в шесть.
+    oracleTick();
     backfillJournal();
     fillOutcomes();
     snapshotHour();
