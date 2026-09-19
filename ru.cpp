@@ -167,7 +167,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"ai_hist_hours", {"h ago", "ч назад"}},
         {"ai_w7", {"7d", "7д"}},
         {"ai_w30", {"30d", "30д"}},
-        {"ai_trade_hint", {"Flow scoring. Not investment advice.", "Скоринг потока. Не инвестиционный совет."}},
+        {"ai_trade_hint", {"Cortex estimate. Not investment advice.", "Оценка Cortex. Не инвестиционный совет."}},
         {"ai_long", {"Long", "Лонг"}},
         {"ai_short", {"Short", "Шорт"}},
         {"ai_hours", {"{n}h", "{n} ч"}},

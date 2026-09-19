@@ -1305,6 +1305,39 @@ struct Choice {
     std::string why;          // «flow:412,RSI:-88» — имя и сдвиг в сотых процента
 };
 
+/* Доводы формулы — для тех сигналов, где модель ещё не обучена.
+ *
+ * Раздел «почему» на карточке говорил в этом случае одно: «ещё не обучена —
+ * формула». Это правда про модель и ничего про сигнал: человек открыл
+ * карточку, чтобы понять, за что монету выбрали, а ему ответили, чем считали.
+ *
+ * Величины тут нет намеренно. У обученной модели вклад признака — это сдвиг
+ * вероятности в процентных пунктах, его можно поставить на полосу. У формулы
+ * такого числа не существует, и рисовать её веса теми же полосами значило бы
+ * выдавать одно за другое. Поэтому только имена, и на экране это список, а не
+ * диаграмма. Условия — те же, по которым формула и отбирает. */
+std::string whyFormula(const Row& r, bool wantLong) {
+    std::vector<const char*> xs;
+    const long long vol = r.buy + r.sell;
+    const double dir = vol > 0 ? static_cast<double>(r.buy - r.sell) / static_cast<double>(vol) : 0;
+    if ((wantLong && dir > 0.15) || (!wantLong && dir < -0.15)) xs.push_back("flow");
+    if (r.wallets >= 8) xs.push_back("wallets");
+    if (r.oneShare <= 0.45) xs.push_back("spread");
+    if (r.topShare >= 0.12) xs.push_back("top100");
+    if (r.rsi > 0) {
+        if (wantLong && r.rsi <= 60) xs.push_back("RSI");
+        if (!wantLong && r.rsi >= 40) xs.push_back("RSI");
+    }
+    if (r.perp && r.liqLongNanos + r.liqShortNanos > 0) xs.push_back("liq skew");
+    std::string out;
+    for (const char* k : xs) {
+        if (!out.empty()) out += ",";
+        // Ноль на месте вклада: формат один с моделью, а числа у формулы нет.
+        out += std::string(k) + ":0";
+    }
+    return out;
+}
+
 Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
                   double acc, bool thin, int fallbackConf, bool withWhy) {
     Choice k;
@@ -1356,6 +1389,7 @@ Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
         k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp, thin);
         k.plan.horizon = AI_HORIZON_24H;
         k.modelled = false;
+        if (withWhy) k.why = whyFormula(r, wantLong);
     }
     return k;
 }
