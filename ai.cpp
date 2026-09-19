@@ -2010,13 +2010,16 @@ void publishSignals() {
             const double c = wantLong ? v.pUp : (1.0 - v.pUp);
             k.conf = std::min(99, std::max(1, static_cast<int>(c * 100.0 + 0.5)));
             k.modelled = true;
-            // Причина — вклад признаков именно в эту оценку, со знаком в
-            // сторону сигнала: у продажи «вниз» это довод за, а не против.
+            /* Причина — вклад признака именно в эту оценку, со знаком в
+               сторону сигнала: у продажи движение вниз это довод за, а не
+               против. Пишем и величину, в сотых долях процента вероятности:
+               без неё приложению осталось бы рисовать длину полосы по месту
+               в списке, то есть выдумывать. */
             std::ostringstream w;
             for (const OracleReason& why : oracleWhy(oracleInputOf(r), asOf, 3)) {
-                const double signed_ = wantLong ? why.shift : -why.shift;
+                const double shift = wantLong ? why.shift : -why.shift;
                 if (!w.str().empty()) w << ",";
-                w << (signed_ >= 0 ? "+" : "-") << why.name;
+                w << why.name << ":" << static_cast<long long>(std::llround(shift * 10000.0));
             }
             k.why = w.str();
         }
