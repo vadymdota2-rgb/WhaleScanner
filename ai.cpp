@@ -1936,6 +1936,146 @@ void backfillJournal() {
     std::cout << "[AI] backfill labeled " << nS << " spot · " << nP << " perp days" << std::endl;
 }
 
+/* Сигналы для приложения считает бот и кладёт в базу готовыми.
+ *
+ * Раньше их пересчитывал whale_api.py своей формулой: уверенность была
+ * «50 + модуль потока × 8», причины — вшитым списком правил. Модель при этом
+ * жила в боте и до приложения не доходила вовсе — на экране стояло 99%,
+ * которых никто не считал. Второй раз повторять признаки на другом языке
+ * нельзя: разойдутся — и никто не заметит. Поэтому единственный счёт здесь,
+ * а API работает выдачей.
+ */
+void ensureSignalSchema() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return;
+    const char* schema =
+        "CREATE TABLE IF NOT EXISTS ai_signals ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  made_at INTEGER NOT NULL,"
+        "  venue INTEGER NOT NULL,"
+        "  token TEXT NOT NULL,"
+        "  sym TEXT NOT NULL,"
+        "  side INTEGER NOT NULL,"
+        "  conf INTEGER NOT NULL,"
+        "  modelled INTEGER NOT NULL DEFAULT 0,"
+        "  net_nanos INTEGER NOT NULL DEFAULT 0,"
+        "  wallets INTEGER NOT NULL DEFAULT 0,"
+        "  entry REAL NOT NULL DEFAULT 0,"
+        "  stop REAL NOT NULL DEFAULT 0,"
+        "  take1 REAL NOT NULL DEFAULT 0,"
+        "  take2 REAL NOT NULL DEFAULT 0,"
+        "  risk_pct REAL NOT NULL DEFAULT 0,"
+        "  lev INTEGER NOT NULL DEFAULT 1,"
+        "  why TEXT NOT NULL DEFAULT '');"
+        "CREATE INDEX IF NOT EXISTS idx_ai_signals_made ON ai_signals(made_at);";
+    char* err = nullptr;
+    if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
+        std::cerr << "[AI] сигналы: схема не создана: " << (err ? err : "?") << std::endl;
+    if (err) sqlite3_free(err);
+}
+
+void publishSignals() {
+    ensureSignalSchema();
+    const long long asOf = hl::nowSec();
+    auto rows = collectPassing(24, asOf);
+    for (auto& r : rows) finish(r);
+    std::vector<Row> spot, perp;
+    for (auto& r : rows) {
+        if (r.score == 0) continue;
+        (r.perp ? perp : spot).push_back(std::move(r));
+    }
+    std::vector<Row> out;
+    for (std::vector<Row>* side : {&spot, &perp}) {
+        std::vector<Row> buys, avoids;
+        takeSides(*side, buys, avoids);
+        for (auto& r : buys) out.push_back(std::move(r));
+        for (auto& r : avoids) out.push_back(std::move(r));
+    }
+
+    struct Ready {
+        Row r;
+        int conf = 0;
+        bool modelled = false;
+        TradePlan plan;
+        std::string why;
+    };
+    std::vector<Ready> ready;
+    ready.reserve(out.size());
+    for (auto& r : out) {
+        const bool wantLong = r.score > 0;
+        Ready k;
+        const OracleVerdict v = oracleReady(r.perp) ? oracleScore(oracleInputOf(r), asOf)
+                                                    : OracleVerdict{};
+        if (v.known) {
+            const double c = wantLong ? v.pUp : (1.0 - v.pUp);
+            k.conf = std::min(99, std::max(1, static_cast<int>(c * 100.0 + 0.5)));
+            k.modelled = true;
+            // Причина — вклад признаков именно в эту оценку, со знаком в
+            // сторону сигнала: у продажи «вниз» это довод за, а не против.
+            std::ostringstream w;
+            for (const OracleReason& why : oracleWhy(oracleInputOf(r), asOf, 3)) {
+                const double signed_ = wantLong ? why.shift : -why.shift;
+                if (!w.str().empty()) w << ",";
+                w << (signed_ >= 0 ? "+" : "-") << why.name;
+            }
+            k.why = w.str();
+        }
+        bool trained = false;
+        double acc = 0;
+        {
+            std::lock_guard<std::mutex> l(g_wMutex);
+            trained = r.perp ? g_trainedPerp : g_trainedSpot;
+            acc = r.perp ? g_accPerp : g_accSpot;
+        }
+        if (!v.known) k.conf = confPct(r, trained, wantLong);
+        const double live = static_cast<double>(livePriceOf(r)) / 1e9;
+        const double vol = volatilityOf(r.id, r.perp);
+        k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp,
+                        !r.perp && r.liqUsd > 0 && r.liqUsd < 50000.0);
+        if (!k.plan.valid) continue;
+        k.r = std::move(r);
+        ready.push_back(std::move(k));
+    }
+
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) return;
+    bool ok = sqlite3_exec(db, "DELETE FROM ai_signals", nullptr, nullptr, nullptr) == SQLITE_OK;
+    sqlite3_stmt* s = nullptr;
+    if (ok && prepareOrLog(db, &s,
+            "INSERT INTO ai_signals(made_at,venue,token,sym,side,conf,modelled,net_nanos,"
+            "wallets,entry,stop,take1,take2,risk_pct,lev,why) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
+        for (const Ready& k : ready) {
+            sqlite3_reset(s);
+            sqlite3_bind_int64(s, 1, asOf);
+            sqlite3_bind_int(s, 2, k.r.perp ? 1 : 0);
+            sqlite3_bind_text(s, 3, k.r.id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s, 4, k.r.name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(s, 5, k.r.score > 0 ? 1 : 0);
+            sqlite3_bind_int(s, 6, k.conf);
+            sqlite3_bind_int(s, 7, k.modelled ? 1 : 0);
+            sqlite3_bind_int64(s, 8, k.r.buy - k.r.sell);
+            sqlite3_bind_int(s, 9, k.r.wallets);
+            sqlite3_bind_double(s, 10, k.plan.entry);
+            sqlite3_bind_double(s, 11, k.plan.stop);
+            sqlite3_bind_double(s, 12, k.plan.take1);
+            sqlite3_bind_double(s, 13, k.plan.take2);
+            sqlite3_bind_double(s, 14, k.plan.riskPct);
+            sqlite3_bind_int(s, 15, k.plan.leverage);
+            sqlite3_bind_text(s, 16, k.why.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) != SQLITE_DONE) { ok = false; break; }
+        }
+        sqlite3_finalize(s);
+    } else {
+        ok = false;
+    }
+    if (!ok || sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        std::cerr << "[AI] сигналы не записаны" << std::endl;
+    }
+}
+
 void snapshotHour() {
     ensureSchema();
     static long long lastSlot = 0;
@@ -2424,6 +2564,13 @@ void aiTick() {
     backfillJournal();
     fillOutcomes();
     snapshotHour();
+    {
+        // Раз в пять минут: чаще незачем — поток китов за минуту не меняется,
+        // а счёт по всем монетам стоит секунды.
+        static long long last = 0;
+        const long long now = hl::nowSec();
+        if (now - last >= 300) { last = now; publishSignals(); }
+    }
     trainWeights();
     static int n = 0;
     if (++n % 60 == 0) cleanupEvents();

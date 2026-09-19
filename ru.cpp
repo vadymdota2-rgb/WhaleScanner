@@ -112,7 +112,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"flow_empty", {"No data for this window yet.", "За это окно данных пока нет."}},
         {"ai_btn", {"📡 Cortex", "📡 Cortex"}},
         {"ai_title", {"Cortex", "Cortex"}},
-        {"ai_hint", {"Flow scoring across tracked wallets.\nLooks at who is buying and how broadly: volume, wallet count, concentration, acceleration, top-100 presence, funding, market regime.\n\nA filter, not a forecast. Levels come from volatility, risk is a share of the deposit, not an order.", "Скоринг потока по отслеживаемым кошелькам.\nСмотрит, кто покупает и насколько широко: объём, число кошельков, концентрация, ускорение, кто из топ-100 в потоке, фандинг, режим рынка.\n\nЭто фильтр, а не прогноз. Уровни — от волатильности, риск — доля депозита, не приказ."}},
+        {"ai_hint", {"Flow scoring across tracked wallets.\nLooks at who is buying and how broadly, and adds the market: volatility and its spikes, trend, RSI, funding, open interest, liquidations, Bitcoin regime.\n\nA filter, not a forecast. Levels come from volatility, risk is a share of the deposit, not an order.", "Скоринг потока по отслеживаемым кошелькам.\nСмотрит, кто покупает и насколько широко, и добавляет рынок: волатильность и её всплески, тренд, RSI, фандинг, открытый интерес, ликвидации, режим биткоина.\n\nЭто фильтр, а не прогноз. Уровни — от волатильности, риск — доля депозита, не приказ."}},
         {"ai_buy", {"Buy", "Покупка"}},
         {"ai_sell", {"Sell", "Продажа"}},
         {"ai_avoid", {"Avoid", "Избегать"}},

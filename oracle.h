@@ -59,6 +59,14 @@ struct OracleVerdict {
     double pUp = 0.5;          // вероятность роста за горизонт
 };
 
+/* Почему модель так решила: признак и насколько он сдвинул вероятность.
+   Считается подстановкой — признак заменяется срединным значением обучающей
+   выборки, и разница показывает его вклад именно в эту строку, а не вообще. */
+struct OracleReason {
+    const char* name = "";
+    double shift = 0;          // + помогает росту, − тянет вниз
+};
+
 struct OracleStats {
     bool trained = false;
     long long at = 0;          // когда обучена
@@ -81,6 +89,10 @@ void oracleTick();
 /* Вероятность роста за 24 часа. known=false — модели нет, зовущий остаётся
    на формуле. */
 OracleVerdict oracleScore(const OracleInput& in, long long asOf);
+
+/* Три признака, сильнее прочих сдвинувших эту оценку. Пусто, если модели
+   нет: выдумывать причину к числу, которого не было, нельзя. */
+std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n = 3);
 
 OracleStats oracleStats(bool perp);
 bool oracleReady(bool perp);

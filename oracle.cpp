@@ -76,6 +76,11 @@ struct Forest {
     double base = 0;                 // логит базовой ставки
     double calA = 1.0, calB = 0.0;   // калибровка Платта поверх суммы
     std::vector<Tree> trees;
+    /* Срединные значения признаков на обучении. Нужны, чтобы объяснить
+       отдельную оценку: подставляем середину вместо признака и смотрим, куда
+       уехала вероятность. Ноль вместо середины не годится — у объёма и числа
+       кошельков ноль означает «сделок не было», а не «обычный день». */
+    std::array<double, ORACLE_NF> med{};
 
     double raw(const float* f) const {
         double z = base;
@@ -381,6 +386,18 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
         bestAt < static_cast<int>(out.forest.trees.size()))
         out.forest.trees.resize(static_cast<size_t>(bestAt));
     out.trees = static_cast<int>(out.forest.trees.size());
+
+    {
+        std::vector<float> col;
+        for (int f = 0; f < ORACLE_NF; f++) {
+            col.clear();
+            col.reserve(tr.size());
+            for (const Sample& s : tr) col.push_back(s.f[static_cast<size_t>(f)]);
+            std::sort(col.begin(), col.end());
+            out.forest.med[static_cast<size_t>(f)] =
+                col.empty() ? 0.0 : static_cast<double>(col[col.size() / 2]);
+        }
+    }
 
     if (!va.empty()) {
         std::vector<double> zv(va.size());
@@ -974,11 +991,12 @@ bool getBytes(const std::string& s, size_t& at, void* dst, size_t n) {
 
 std::string packForest(const Forest& f) {
     std::string s;
-    s.append("ORC1", 4);
+    s.append("ORC2", 4);
     putU32(s, static_cast<uint32_t>(ORACLE_NF));
     putF64(s, f.base);
     putF64(s, f.calA);
     putF64(s, f.calB);
+    for (double m : f.med) putF64(s, m);
     putU32(s, static_cast<uint32_t>(f.trees.size()));
     for (const Tree& t : f.trees) {
         putU32(s, static_cast<uint32_t>(t.nodes.size()));
@@ -996,12 +1014,14 @@ std::string packForest(const Forest& f) {
 bool unpackForest(const std::string& s, Forest& f) {
     size_t at = 0;
     char magic[4] = {0, 0, 0, 0};
-    if (!getBytes(s, at, magic, 4) || std::memcmp(magic, "ORC1", 4) != 0) return false;
+    if (!getBytes(s, at, magic, 4) || std::memcmp(magic, "ORC2", 4) != 0) return false;
     uint32_t nf = 0;
     if (!getBytes(s, at, &nf, 4) || nf != static_cast<uint32_t>(ORACLE_NF)) return false;
     if (!getBytes(s, at, &f.base, 8)) return false;
     if (!getBytes(s, at, &f.calA, 8)) return false;
     if (!getBytes(s, at, &f.calB, 8)) return false;
+    for (int i = 0; i < ORACLE_NF; i++)
+        if (!getBytes(s, at, &f.med[static_cast<size_t>(i)], 8)) return false;
     uint32_t nt = 0;
     if (!getBytes(s, at, &nt, 4) || nt > 100000) return false;
     f.trees.clear();
@@ -1403,6 +1423,38 @@ OracleVerdict oracleScore(const OracleInput& in, long long asOf) {
     v.pUp = clampd(g_live[slot].forest.p(feat.data()), 0.001, 0.999);
     v.known = true;
     return v;
+}
+
+std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n) {
+    std::vector<OracleReason> out;
+    const int slot = in.perp ? 1 : 0;
+    auto m = market();
+    if (!m || m->builtAt == 0) return out;
+    std::array<float, ORACLE_NF> feat{};
+    featuresOf(*m, in, asOf > 0 ? asOf : hl::nowSec(), feat);
+
+    std::lock_guard<std::mutex> l(g_liveMutex);
+    if (!g_live[slot].have) return out;
+    const Forest& f = g_live[slot].forest;
+    const double p0 = f.p(feat.data());
+    std::vector<std::pair<double, int>> shift;
+    for (int i = 0; i < ORACLE_NF; i++) {
+        const float keep = feat[static_cast<size_t>(i)];
+        const float med = static_cast<float>(f.med[static_cast<size_t>(i)]);
+        if (std::fabs(static_cast<double>(keep - med)) < 1e-9) continue;
+        feat[static_cast<size_t>(i)] = med;
+        const double p1 = f.p(feat.data());
+        feat[static_cast<size_t>(i)] = keep;
+        if (std::fabs(p0 - p1) > 1e-6) shift.emplace_back(p0 - p1, i);
+    }
+    std::sort(shift.begin(), shift.end(),
+              [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                  return std::fabs(a.first) > std::fabs(b.first);
+              });
+    for (int k = 0; k < n && k < static_cast<int>(shift.size()); k++)
+        out.push_back(OracleReason{FEAT_NAME[shift[static_cast<size_t>(k)].second],
+                                   shift[static_cast<size_t>(k)].first});
+    return out;
 }
 
 OracleStats oracleStats(bool perp) {
