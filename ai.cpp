@@ -1967,11 +1967,205 @@ void ensureSignalSchema() {
         "  risk_pct REAL NOT NULL DEFAULT 0,"
         "  lev INTEGER NOT NULL DEFAULT 1,"
         "  why TEXT NOT NULL DEFAULT '');"
-        "CREATE INDEX IF NOT EXISTS idx_ai_signals_made ON ai_signals(made_at);";
+        "CREATE INDEX IF NOT EXISTS idx_ai_signals_made ON ai_signals(made_at);"
+        /* Журнал выданных сигналов. Экран истории раньше показывал строки
+           журнала обучения — то есть монеты, которые сигналами никогда не
+           были, — и считал по ним «угадано». Настоящая история может быть
+           только такой: что выдали, с какими уровнями, и чем это кончилось
+           через сутки. */
+        "CREATE TABLE IF NOT EXISTS ai_signal_log ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  made_at INTEGER NOT NULL,"
+        "  venue INTEGER NOT NULL,"
+        "  token TEXT NOT NULL,"
+        "  sym TEXT NOT NULL,"
+        "  side INTEGER NOT NULL,"
+        "  conf INTEGER NOT NULL,"
+        "  modelled INTEGER NOT NULL DEFAULT 0,"
+        "  entry REAL NOT NULL,"
+        "  stop REAL NOT NULL,"
+        "  take1 REAL NOT NULL,"
+        "  take2 REAL NOT NULL,"
+        "  closed_at INTEGER NOT NULL DEFAULT 0,"
+        "  exit_px REAL NOT NULL DEFAULT 0,"
+        "  outcome INTEGER NOT NULL DEFAULT 0,"   /* 1 цель, -1 стоп, 0 ни то ни другое */
+        "  ret_bp INTEGER NOT NULL DEFAULT 0);"
+        "CREATE INDEX IF NOT EXISTS idx_signal_log_open ON ai_signal_log(closed_at, made_at);"
+        "CREATE INDEX IF NOT EXISTS idx_signal_log_live ON ai_signal_log(venue, token, side, closed_at);";
     char* err = nullptr;
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
         std::cerr << "[AI] сигналы: схема не создана: " << (err ? err : "?") << std::endl;
     if (err) sqlite3_free(err);
+}
+
+/* Записать выданные сигналы в журнал. Один и тот же сигнал висит в списке
+   часами и переписывается каждые пять минут — заводить строку на каждую
+   публикацию нельзя, иначе история наполнится копиями. Пока по монете и
+   стороне есть незакрытая строка, новую не создаём. */
+void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& out,
+                const std::vector<std::pair<int, bool>>& meta) {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return;
+    sqlite3_stmt* find = nullptr;
+    sqlite3_stmt* ins = nullptr;
+    if (!prepareOrLog(db, &find,
+            "SELECT 1 FROM ai_signal_log WHERE venue=? AND token=? AND side=? AND closed_at=0 LIMIT 1"))
+        return;
+    if (!prepareOrLog(db, &ins,
+            "INSERT INTO ai_signal_log(made_at,venue,token,sym,side,conf,modelled,"
+            "entry,stop,take1,take2) VALUES(?,?,?,?,?,?,?,?,?,?,?)")) {
+        sqlite3_finalize(find);
+        return;
+    }
+    sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+    for (size_t i = 0; i < out.size(); i++) {
+        const Row& r = out[i].first;
+        const TradePlan& p = out[i].second;
+        const int side = r.score > 0 ? 1 : 0;
+        sqlite3_reset(find);
+        sqlite3_bind_int(find, 1, r.perp ? 1 : 0);
+        sqlite3_bind_text(find, 2, r.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(find, 3, side);
+        if (sqlite3_step(find) == SQLITE_ROW) continue;      // уже открыт
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, 1, asOf);
+        sqlite3_bind_int(ins, 2, r.perp ? 1 : 0);
+        sqlite3_bind_text(ins, 3, r.id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(ins, 4, r.name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(ins, 5, side);
+        sqlite3_bind_int(ins, 6, meta[i].first);
+        sqlite3_bind_int(ins, 7, meta[i].second ? 1 : 0);
+        sqlite3_bind_double(ins, 8, p.entry);
+        sqlite3_bind_double(ins, 9, p.stop);
+        sqlite3_bind_double(ins, 10, p.take1);
+        sqlite3_bind_double(ins, 11, p.take2);
+        sqlite3_step(ins);
+    }
+    sqlite3_finalize(find);
+    sqlite3_finalize(ins);
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK)
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+}
+
+/* Чем кончился сигнал через сутки.
+ *
+ * Идём по часам от выдачи: что случилось раньше — цена дошла до цели или
+ * свалилась на стоп. У перпов есть настоящие максимум и минимум часа, у
+ * спота только цена закрытия часа, и это стоит помнить: по закрытиям касание
+ * внутри часа не видно, и часть попаданий и стопов теряется.
+ *
+ * Если в одном часе задеты оба уровня, считаем стоп: предполагать, что успели
+ * выйти в плюс, значит рисовать историю лучше, чем она была. */
+struct Walked {
+    bool done = false;
+    int outcome = 0;
+    double exitPx = 0;
+    long long at = 0;
+};
+
+Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long from,
+                   long long to, double stop, double take) {
+    Walked w;
+    std::vector<std::tuple<long long, double, double, double>> bars;  // ts, close, high, low
+    {
+        std::lock_guard<std::mutex> lock(perp ? hl::g_hlDbMutex : dbMutex);
+        sqlite3* h = perp ? hl::g_hlDb : db;
+        if (!h) return w;
+        sqlite3_stmt* s = nullptr;
+        const char* q = perp
+            ? "SELECT hour_ts, c, h, l FROM hl_candles WHERE coin=? AND hour_ts>=? AND hour_ts<=? "
+              "ORDER BY hour_ts"
+            : "SELECT ts, price_nanos, 0, 0 FROM token_price_history WHERE address=? AND ts>=? "
+              "AND ts<=? ORDER BY ts";
+        if (!prepareOrLog(h, &s, q)) return w;
+        sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, from);
+        sqlite3_bind_int64(s, 3, to);
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const long long ts = sqlite3_column_int64(s, 0);
+            double c = perp ? sqlite3_column_double(s, 1)
+                            : static_cast<double>(sqlite3_column_int64(s, 1)) / 1e9;
+            double hi = perp ? sqlite3_column_double(s, 2) : c;
+            double lo = perp ? sqlite3_column_double(s, 3) : c;
+            if (c <= 0) continue;
+            if (hi <= 0) hi = c;
+            if (lo <= 0) lo = c;
+            bars.emplace_back(ts, c, hi, lo);
+        }
+        sqlite3_finalize(s);
+    }
+    if (bars.empty()) return w;
+    for (const auto& b : bars) {
+        const double c = std::get<1>(b), hi = std::get<2>(b), lo = std::get<3>(b);
+        const bool hitStop = isLong ? (lo <= stop) : (hi >= stop);
+        const bool hitTake = isLong ? (hi >= take) : (lo <= take);
+        if (hitStop) { w.done = true; w.outcome = -1; w.exitPx = stop; w.at = std::get<0>(b); return w; }
+        if (hitTake) { w.done = true; w.outcome = 1; w.exitPx = take; w.at = std::get<0>(b); return w; }
+        w.exitPx = c;
+        w.at = std::get<0>(b);
+    }
+    w.done = true;      // сутки вышли, ни цель, ни стоп не задеты
+    w.outcome = 0;
+    return w;
+}
+
+void closeSignalLog() {
+    const long long now = hl::nowSec();
+    struct Open {
+        long long id = 0, made = 0;
+        int venue = 0, side = 0;
+        std::string token;
+        double entry = 0, stop = 0, take = 0;
+    };
+    std::vector<Open> open;
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(db, &s,
+                "SELECT id,made_at,venue,token,side,entry,stop,take1 FROM ai_signal_log "
+                "WHERE closed_at=0 AND made_at<=? LIMIT 200"))
+            return;
+        sqlite3_bind_int64(s, 1, now - AI_HORIZON_24H);
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            Open o;
+            o.id = sqlite3_column_int64(s, 0);
+            o.made = sqlite3_column_int64(s, 1);
+            o.venue = sqlite3_column_int(s, 2);
+            o.token = safeColumnText(s, 3);
+            o.side = sqlite3_column_int(s, 4);
+            o.entry = sqlite3_column_double(s, 5);
+            o.stop = sqlite3_column_double(s, 6);
+            o.take = sqlite3_column_double(s, 7);
+            open.push_back(std::move(o));
+        }
+        sqlite3_finalize(s);
+    }
+    if (open.empty()) return;
+    int closed = 0;
+    for (const Open& o : open) {
+        if (o.entry <= 0) continue;
+        const bool isLong = o.side == 1;
+        const Walked w = walkOutcome(o.venue == 1, o.token, isLong, o.made,
+                                     o.made + AI_HORIZON_24H, o.stop, o.take);
+        if (!w.done || w.exitPx <= 0) continue;
+        const double ret = (isLong ? (w.exitPx - o.entry) : (o.entry - w.exitPx)) / o.entry;
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* u = nullptr;
+        if (!prepareOrLog(db, &u,
+                "UPDATE ai_signal_log SET closed_at=?, exit_px=?, outcome=?, ret_bp=? WHERE id=?"))
+            return;
+        sqlite3_bind_int64(u, 1, w.at > 0 ? w.at : o.made + AI_HORIZON_24H);
+        sqlite3_bind_double(u, 2, w.exitPx);
+        sqlite3_bind_int(u, 3, w.outcome);
+        sqlite3_bind_int(u, 4, static_cast<int>(std::llround(ret * 10000.0)));
+        sqlite3_bind_int64(u, 5, o.id);
+        if (sqlite3_step(u) == SQLITE_DONE) closed++;
+        sqlite3_finalize(u);
+    }
+    if (closed > 0)
+        std::cout << "[AI] история: закрыто сигналов " << closed << std::endl;
 }
 
 void publishSignals() {
@@ -2039,6 +2233,21 @@ void publishSignals() {
         k.r = std::move(r);
         ready.push_back(std::move(k));
     }
+
+    {
+        // Журнал выданного — до замены текущего списка: он про то, что было
+        // показано, и переживает любую перезапись.
+        std::vector<std::pair<Row, TradePlan>> rows;
+        std::vector<std::pair<int, bool>> meta;
+        rows.reserve(ready.size());
+        meta.reserve(ready.size());
+        for (const Ready& k : ready) {
+            rows.emplace_back(k.r, k.plan);
+            meta.emplace_back(k.conf, k.modelled);
+        }
+        logSignals(asOf, rows, meta);
+    }
+    closeSignalLog();
 
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return;

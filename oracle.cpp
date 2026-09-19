@@ -1073,6 +1073,20 @@ void ensureModelSchema() {
         "  wf_auc REAL NOT NULL DEFAULT 0,"
         "  gain BLOB,"
         "  model BLOB,"
+        "  PRIMARY KEY(venue, horizon));"
+        /* Последняя попытка обучения — принятая или нет. Без неё экран мог
+           сказать только «модель не обучена», и человек с 2468 готовыми
+           исходами не понимал, чего ещё ждать. */
+        "CREATE TABLE IF NOT EXISTS ai_model_try ("
+        "  venue INTEGER NOT NULL,"
+        "  horizon INTEGER NOT NULL,"
+        "  at INTEGER NOT NULL,"
+        "  samples INTEGER NOT NULL DEFAULT 0,"
+        "  auc REAL NOT NULL DEFAULT 0,"
+        "  logloss REAL NOT NULL DEFAULT 0,"
+        "  base_logloss REAL NOT NULL DEFAULT 0,"
+        "  wf_auc REAL NOT NULL DEFAULT 0,"
+        "  accepted INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY(venue, horizon));";
     char* err = nullptr;
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
@@ -1134,6 +1148,29 @@ void saveModel(bool perp, const Forest& f, const OracleStats& st,
     sqlite3_bind_blob(s, 15, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
     if (sqlite3_step(s) != SQLITE_DONE)
         std::cerr << "[оракул] модель не сохранена" << std::endl;
+    sqlite3_finalize(s);
+}
+
+void saveTry(bool perp, long long samples, double auc, double loss, double base,
+             double wf, bool accepted) {
+    ensureModelSchema();
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (!db) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "INSERT OR REPLACE INTO ai_model_try(venue,horizon,at,samples,auc,logloss,"
+            "base_logloss,wf_auc,accepted) VALUES(?,?,?,?,?,?,?,?,?)"))
+        return;
+    sqlite3_bind_int(s, 1, perp ? 1 : 0);
+    sqlite3_bind_int64(s, 2, ORACLE_HORIZON);
+    sqlite3_bind_int64(s, 3, hl::nowSec());
+    sqlite3_bind_int64(s, 4, samples);
+    sqlite3_bind_double(s, 5, auc);
+    sqlite3_bind_double(s, 6, loss);
+    sqlite3_bind_double(s, 7, base);
+    sqlite3_bind_double(s, 8, wf);
+    sqlite3_bind_int(s, 9, accepted ? 1 : 0);
+    sqlite3_step(s);
     sqlite3_finalize(s);
 }
 
@@ -1346,7 +1383,10 @@ void trainVenue(bool perp, const Market& m) {
     // Модель принимается, только если она лучше постоянного прогноза и на
     // тесте, и на скользящей проверке. Иначе на экране была бы «модель», а
     // под ней — монетка.
-    if (sc.auc < 0.55 || sc.logloss >= sc.baseLoss || wf < 0.52) {
+    const bool accepted = !(sc.auc < 0.55 || sc.logloss >= sc.baseLoss || wf < 0.52);
+    saveTry(perp, static_cast<long long>(xs.size()), sc.auc, sc.logloss, sc.baseLoss,
+            wf, accepted);
+    if (!accepted) {
         std::cout << "[оракул] " << who << ": не принята, остаёмся на прежнем" << std::endl;
         return;
     }
