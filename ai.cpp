@@ -2161,6 +2161,27 @@ void ensureSignalSchema() {
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
         std::cerr << "[AI] сигналы: схема не создана: " << (err ? err : "?") << std::endl;
     if (err) sqlite3_free(err);
+
+    /* Столбцы, появившиеся позже. У базы, где таблицы уже заведены,
+       CREATE TABLE IF NOT EXISTS не делает ничего, и новых столбцов в ней
+       не появится само.
+       Забыть про это здесь стоило дорого: INSERT падал на каждой публикации,
+       транзакция откатывалась вместе с очисткой, ai_signals оставалась
+       пустой — и на экране стояло «бот ещё не присылал сигналов», хотя бот
+       считал их каждые пять минут. Журнал выданных не писался по той же
+       причине, поэтому и история не набиралась. */
+    const char* alts[] = {
+        "ALTER TABLE ai_signals ADD COLUMN risk_share REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_signals ADD COLUMN horizon INTEGER NOT NULL DEFAULT 86400",
+        "ALTER TABLE ai_signal_log ADD COLUMN horizon INTEGER NOT NULL DEFAULT 86400",
+        nullptr,
+    };
+    for (int i = 0; alts[i]; i++) {
+        char* aerr = nullptr;
+        // «duplicate column name» — обычное дело: столбец уже на месте.
+        sqlite3_exec(db, alts[i], nullptr, nullptr, &aerr);
+        if (aerr) sqlite3_free(aerr);
+    }
 }
 
 /* Записать выданные сигналы в журнал. Один и тот же сигнал висит в списке
@@ -2444,7 +2465,20 @@ void publishSignals() {
     }
     if (!ok || sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        std::cerr << "[AI] сигналы не записаны" << std::endl;
+        std::cerr << "[AI] сигналы не записаны: " << sqlite3_errmsg(db) << std::endl;
+        return;
+    }
+    /* Отметка «считал» — отдельно от самих сигналов.
+     *
+     * Пустая таблица не отличает «бот ни разу не считал» от «посчитал и
+     * ничего не прошло отбор», а на экране это совсем разные вещи: первое —
+     * повод перезапустить бота, второе — обычный тихий час. Поэтому время
+     * последнего расчёта пишется всегда, даже когда выдавать нечего. */
+    sqlite3_stmt* beat = nullptr;
+    if (prepareOrLog(db, &beat, "INSERT OR REPLACE INTO ai_weights(k,v) VALUES(900,?)")) {
+        sqlite3_bind_double(beat, 1, static_cast<double>(asOf));
+        sqlite3_step(beat);
+        sqlite3_finalize(beat);
     }
 }
 
