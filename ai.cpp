@@ -1314,6 +1314,14 @@ Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
     for (const OracleView& view : oracleViews(oracleInputOf(r), asOf)) {
         if (!view.known) continue;
         const double p = wantLong ? view.pUp : (1.0 - view.pUp);
+        /* Модель обязана согласиться со стороной. Сторону выбирает поток
+           китов, вероятность считает модель, и при p ниже половины это
+           значит «поток говорит покупать, а модель ждёт падения». Ожидаемый
+           исход при перекошенных уровнях и тогда выходит плюсовым — цель
+           дальше стопа в полтора раза, — но на экране получалась «Покупка ·
+           40% шанс роста», то есть совет купить то, что модель считает
+           падающим. Такого сигнала не будет: пусть лучше не будет никакого. */
+        if (p < 0.5) continue;
         TradePlan cand;
         if (view.levels)
             cand = planFromLevels(live, wantLong, view.up, view.dn, p, r.perp, thin);

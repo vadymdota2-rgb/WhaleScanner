@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -1726,9 +1728,29 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
  *            выигрыша от этого нет — только пауза.
  */
 void oracleReset() {
+    /* Файл-метка рядом с ботом — второй способ, и на боевой машине
+     * единственный работающий. `sudo WHALE_ORACLE_RESET=all systemctl restart`
+     * не делает ничего: systemd берёт окружение службы из юнита, а не из той
+     * оболочки, где набрали команду, и переменная до бота не доходит.
+     * Поэтому: `echo all > .oracle-reset` и обычный перезапуск. Метка
+     * стирается сразу после сброса, так что второй раз он не повторится. */
+    std::string m;
     const char* mode = std::getenv("WHALE_ORACLE_RESET");
-    if (!mode || !*mode) return;
-    const std::string m = mode;
+    if (mode && *mode) m = mode;
+    const char* MARK = ".oracle-reset";
+    bool fromFile = false;
+    if (m.empty()) {
+        std::ifstream f(MARK);
+        if (f) {
+            std::getline(f, m);
+            fromFile = true;
+            // Пустой файл — значит «modes по умолчанию», а не «ничего».
+            while (!m.empty() && (m.back() == '\r' || m.back() == ' ')) m.pop_back();
+            if (m.empty()) m = "models";
+        }
+    }
+    if (fromFile) std::remove(MARK);
+    if (m.empty()) return;
     if (m == "0" || m == "no") return;
     const bool wipeAll = m == "all";
 
