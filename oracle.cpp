@@ -681,6 +681,61 @@ void macdOf(const Series& s, int i, double& line, double& sig, double& hist) {
     hist = clampd(line - sig, -0.5, 0.5);
 }
 
+/* Возраст монеты в рядах: сколько часов прошло от первого бара до события.
+ *
+ * Это и есть «листинг» в том виде, в каком бот может его знать: новый перп
+ * появляется на бирже — и ряд у него начинается тогда же. Числом берём
+ * логарифм: разница между вчера и позавчера велика, между полугодом и годом
+ * её нет. Ряды бот собирает около трёх месяцев, поэтому всё старше просто
+ * упирается в единицу — различать надо новое, а не древнее. */
+double ageOf(const Series& s, int i) {
+    if (s.bars.empty() || i < 0) return 1.0;
+    const double hours = static_cast<double>(s.bars[static_cast<size_t>(i)].ts
+                                             - s.bars.front().ts) / 3600.0;
+    if (hours <= 0) return 0.0;
+    return clampd(std::log1p(hours) / std::log1p(2160.0), 0.0, 1.0);
+}
+
+/* Объём против собственной недели: насколько час выбивается из привычного.
+ *
+ * Взлом, листинг, новость — что бы ни случилось, оно приходит объёмом.
+ * Текста бот не видит, а всплеск видит, и всплеск считается по тем же рядам,
+ * что и всё остальное, то есть достаётся и всему прошлому журналу. */
+double volumeZ(const Series& s, int i, int hours) {
+    if (i < hours || hours < 8) return 0.0;
+    double sum = 0;
+    for (int k = i - hours; k < i; k++) sum += s.bars[static_cast<size_t>(k)].v;
+    const double mean = sum / hours;
+    if (!(mean > 0)) return 0.0;
+    double var = 0;
+    for (int k = i - hours; k < i; k++) {
+        const double d = s.bars[static_cast<size_t>(k)].v - mean;
+        var += d * d;
+    }
+    const double sd = std::sqrt(var / hours);
+    if (!(sd > 0)) return 0.0;
+    return clampd((s.bars[static_cast<size_t>(i)].v - mean) / sd, -5.0, 5.0) / 5.0;
+}
+
+/* Удар: самый резкий часовой ход за последние часы, в своих же ATR.
+ *
+ * Без знака — важно, что тряхнуло, а куда, скажут другие признаки. В своих
+ * ATR, потому что для спокойной монеты три процента за час — событие, а для
+ * мемкоина обычный час. */
+double shockOf(const Series& s, int i, int hours) {
+    if (i < 1) return 0.0;
+    const double atr = atrOver(s, i, 14);
+    if (!(atr > 1e-6)) return 0.0;
+    double worst = 0;
+    for (int k = std::max(1, i - hours + 1); k <= i; k++) {
+        const double prev = s.bars[static_cast<size_t>(k - 1)].c;
+        if (!(prev > 0)) continue;
+        const double step = std::fabs(s.bars[static_cast<size_t>(k)].c - prev) / prev;
+        if (step > worst) worst = step;
+    }
+    return clampd(worst / atr, 0.0, 6.0) / 6.0;
+}
+
 double fundingZ(const Series& s, int i, int hours) {
     if (i < hours || hours < 8) return 0;
     double sum = 0, sum2 = 0;
@@ -734,7 +789,8 @@ const char* const FEAT_NAME[ORACLE_NF] = {
     "funding",   "funding z", "OI 1h",    "OI 24h",    "OI/vlm",
     "vlm 24h",   "liq skew",  "liq/OI",   "leverage",  "liquidity",
     "BTC 24h",   "BTC vol",   "breadth",  "hour",      "hour 2",
-    "MACD",      "MACD sig",  "MACD hist",
+    "MACD",      "MACD sig",  "MACD hist", "age",       "vlm z",
+    "shock",
 };
 
 /* Единственное место, где считаются признаки. При обучении сюда приходит
@@ -794,6 +850,12 @@ void featuresOf(const Market& m, const OracleInput& in, long long asOf,
         f[17] = static_cast<float>(rsi > 0 ? (rsi - 50.0) / 50.0 : 0.0);
         f[18] = static_cast<float>(smaRatio(*s, i, 24));
         f[19] = static_cast<float>(atrOver(*s, i, 14));
+        /* Событие: давно ли монета появилась, насколько выбился объём и как
+           сильно её тряхнуло за последние шесть часов. Листинги и взломы бот
+           видит только так — по следу в своих же рядах. */
+        f[38] = static_cast<float>(ageOf(*s, i));
+        f[39] = static_cast<float>(volumeZ(*s, i, 168));
+        f[40] = static_cast<float>(shockOf(*s, i, 6));
     }
 
     if (in.perp) {
