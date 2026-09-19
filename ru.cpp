@@ -147,6 +147,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"ai_not_passed", {"Model not accepted yet", "Модель пока не принята"}},
         {"ai_hist_none", {"neither", "мимо"}},
         {"ai_p_short", {"chance of a rise", "шанс роста"}},
+        {"ai_lv_model", {"Levels from the model", "Уровни от модели"}},
+        {"ai_lv_formula", {"Levels from volatility", "Уровни по волатильности"}},
         {"ai_model_ok", {"The model is working", "Модель работает"}},
         {"ai_hits_of", {"right {n} times out of 100", "угадывает {n} раз из 100"}},
         {"ai_like_coin", {"no better than a coin flip yet", "пока не лучше монетки"}},

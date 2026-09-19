@@ -582,6 +582,56 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc,
     return t;
 }
 
+/* Уровни, названные моделью.
+ *
+ * Стоп ставится за пределом отката, который модель ждёт против сигнала, цель
+ * — там, докуда она ждёт хода. Вшитых множителей волатильности здесь нет:
+ * у спокойной монеты на тихом рынке стоп будет узкий, у разогнанной — широкий,
+ * и решает это не константа 2.5, а то, как далеко цена уходила в таких же
+ * условиях.
+ *
+ * Небольшие поправки всё же есть, и они не про рынок, а про исполнение: стоп
+ * чуть дальше ожидаемого отката, иначе его снимает первым же шумом, а цель
+ * чуть ближе ожидаемого хода, иначе до неё не доходит. */
+TradePlan planFromLevels(double px, bool isLong, double up, double dn, double prob,
+                         bool isPerp, bool thinLiq) {
+    TradePlan t;
+    if (px <= 0 || up <= 0 || dn <= 0) return t;
+    const double adverse = isLong ? dn : up;
+    const double favour  = isLong ? up : dn;
+
+    double stopPct = adverse * 1.1;
+    if (stopPct < 0.01) stopPct = 0.01;
+    if (stopPct > 0.15) stopPct = 0.15;
+    double t1 = favour * 0.8;
+    if (t1 > 0.5) t1 = 0.5;
+    double t2 = favour * 1.4;
+    if (t2 > 1.0) t2 = 1.0;
+    if (t2 < t1 * 1.2) t2 = t1 * 1.2;
+    // Цель ближе стопа — сделка не стоит риска, и придумывать её не надо.
+    if (t1 < stopPct * 0.9) return t;
+
+    t.isLong = isLong;
+    t.entry = px;
+    t.stop  = isLong ? px * (1.0 - stopPct) : px * (1.0 + stopPct);
+    t.take1 = isLong ? px * (1.0 + t1) : px * (1.0 - t1);
+    t.take2 = isLong ? px * (1.0 + t2) : px * (1.0 - t2);
+    t.riskPct = stopPct * 100.0;
+    t.rr = t1 / stopPct;
+
+    const double confidence = std::max(0.0, std::min(1.0, (prob - 0.5) * 2.5));
+    double cap = 0.15;
+    if (!isPerp) cap = 0.06;
+    if (thinLiq) cap = std::min(cap, 0.04);
+    const double riskBudget = std::min(cap, 0.02 + 0.13 * confidence);
+    double lev = riskBudget / stopPct;
+    if (lev < 1) lev = 1;
+    if (lev > 10) lev = 10;
+    t.leverage = static_cast<int>(lev + 0.5);
+    t.valid = true;
+    return t;
+}
+
 // Возраст последней записи цены. Разметка по цене недельной давности -
 // не разметка, а шум: событие лучше не писать вовсе.
 long long priceAgeOf(const std::string& token, bool perp) {
@@ -2226,9 +2276,26 @@ void publishSignals() {
         }
         if (!v.known) k.conf = confPct(r, trained, wantLong);
         const double live = static_cast<double>(livePriceOf(r)) / 1e9;
-        const double vol = volatilityOf(r.id, r.perp);
-        k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp,
-                        !r.perp && r.liqUsd > 0 && r.liqUsd < 50000.0);
+        const bool thin = !r.perp && r.liqUsd > 0 && r.liqUsd < 50000.0;
+        const OracleLevels lv = oracleLevels(oracleInputOf(r), asOf);
+        if (lv.known) {
+            k.plan = planFromLevels(live, wantLong, lv.up, lv.dn, k.conf / 100.0,
+                                    r.perp, thin);
+            /* Ожидаемый исход по числам самой модели: цель, взвешенная
+               вероятностью, против стопа, взвешенного обратной. Меньше нуля —
+               сигнал не выдаётся вовсе. Прежде выдавалось всё, что прошло
+               отбор по потоку, а стоило оно того или нет, не спрашивалось. */
+            if (k.plan.valid) {
+                const double p = k.conf / 100.0;
+                const double reward = std::fabs(k.plan.take1 - live) / live;
+                const double risk = std::fabs(k.plan.stop - live) / live;
+                if (p * reward - (1.0 - p) * risk <= 0) continue;
+            }
+        }
+        if (!k.plan.valid) {
+            const double vol = volatilityOf(r.id, r.perp);
+            k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp, thin);
+        }
         if (!k.plan.valid) continue;
         k.r = std::move(r);
         ready.push_back(std::move(k));

@@ -59,6 +59,15 @@ struct OracleVerdict {
     double pUp = 0.5;          // вероятность роста за горизонт
 };
 
+/* Куда модель ждёт хода цены за сутки — в долях от входа. Из этого строятся
+   стоп и цели: не по вшитому множителю волатильности, а по тому, как далеко
+   цена уходила в таких же условиях. */
+struct OracleLevels {
+    bool known = false;
+    double up = 0;             // ожидаемый ход вверх
+    double dn = 0;             // ожидаемый ход вниз
+};
+
 /* Почему модель так решила: признак и насколько он сдвинул вероятность.
    Считается подстановкой — признак заменяется срединным значением обучающей
    выборки, и разница показывает его вклад именно в эту строку, а не вообще. */
@@ -69,6 +78,11 @@ struct OracleReason {
 
 struct OracleStats {
     bool trained = false;
+    /** Обучены ли леса уровней: стоп и цель от модели, а не от формулы. */
+    bool levels = false;
+    /** Средняя ошибка уровней на тесте, в процентах хода. */
+    double upErr = 0;
+    double dnErr = 0;
     long long at = 0;          // когда обучена
     long long samples = 0;     // всего размеченных исходов
     long long test = 0;        // из них в тесте
@@ -93,6 +107,8 @@ OracleVerdict oracleScore(const OracleInput& in, long long asOf);
 /* Три признака, сильнее прочих сдвинувших эту оценку. Пусто, если модели
    нет: выдумывать причину к числу, которого не было, нельзя. */
 std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n = 3);
+
+OracleLevels oracleLevels(const OracleInput& in, long long asOf);
 
 OracleStats oracleStats(bool perp);
 bool oracleReady(bool perp);

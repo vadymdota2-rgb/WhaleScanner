@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -46,6 +47,8 @@ double sigmoid(double z) {
 
 double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
+double usdOf(long long nanos) { return static_cast<double>(nanos) / 1e9; }
+
 /* ---------------------------------------------------------------- лес --- */
 
 struct Node {
@@ -73,6 +76,7 @@ struct Tree {
 };
 
 struct Forest {
+    bool squared = false;            // квадратичная функция потерь — лес про величину
     double base = 0;                 // логит базовой ставки
     double calA = 1.0, calB = 0.0;   // калибровка Платта поверх суммы
     std::vector<Tree> trees;
@@ -88,14 +92,35 @@ struct Forest {
         return z;
     }
     double p(const float* f) const { return sigmoid(calA * raw(f) + calB); }
+    /* Для леса про величину калибровка не нужна: он и так предсказывает само
+       число, а не логит. Отрицательный ход невозможен — это максимум
+       отклонения, он не бывает меньше нуля. */
+    double value(const float* f) const { return std::max(0.0, raw(f)); }
 };
 
+/* Одна строка журнала — три ответа сразу: пошла ли цена в сторону сигнала и
+   как далеко она уходила в обе стороны за сутки. Первое учит направление,
+   второе и третье — уровни. */
 struct Sample {
     std::array<float, ORACLE_NF> f{};
-    float y = 0;
+    float y = 0;        // 1 — выросла за сутки
+    float up = 0;       // максимум хода вверх от входа, доля
+    float dn = 0;       // максимум хода вниз от входа, доля
     float w = 1;
     long long ts = 0;
 };
+
+/* Какую величину учим. У направления логистическая функция потерь, у хода —
+   квадратичная: дерево то же, меняются только градиент с гессианом. */
+enum class Task { Dir, Up, Dn };
+
+float targetOf(const Sample& s, Task t) {
+    switch (t) {
+        case Task::Up: return s.up;
+        case Task::Dn: return s.dn;
+        default: return s.y;
+    }
+}
 
 /* ------------------------------------------------------------ метрики --- */
 
@@ -246,11 +271,14 @@ struct Grower {
         return (*bin)[row * static_cast<size_t>(ORACLE_NF) + static_cast<size_t>(f)];
     }
 
+    bool squared = false;
     double leafValue(const std::vector<size_t>& rows) const {
         double sg = 0, sh = 0;
         for (size_t r : rows) { sg += (*g)[r]; sh += (*h)[r]; }
         const double v = -sg / (sh + ORACLE_L2);
-        return clampd(v, -4.0, 4.0) * ORACLE_LR;
+        // У логита ±4 это край разумного; у доли хода такой зажим ничего не
+        // значит, зато мешает: ход в десять процентов лес бы не выучил.
+        return (squared ? clampd(v, -1.0, 1.0) : clampd(v, -4.0, 4.0)) * ORACLE_LR;
     }
 
     /* Лучшее разбиение узла: перебор по столбцам гистограммы. Выигрыш —
@@ -323,7 +351,7 @@ struct Fit {
 /* Обучение с ранней остановкой по проверочной части. Никакой случайности:
    те же данные дают тот же лес, и разбор расхождений не превращается в
    гадание. */
-Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
+Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va, Task task = Task::Dir) {
     Fit out;
     if (tr.size() < static_cast<size_t>(ORACLE_MIN_SAMPLES)) return out;
 
@@ -336,15 +364,24 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
             bin[i * static_cast<size_t>(ORACLE_NF) + static_cast<size_t>(f)] =
                 bins.binOf(f, tr[i].f[static_cast<size_t>(f)]);
 
-    double pos = 0;
-    for (const Sample& s : tr) pos += s.y;
-    const double rate = clampd(pos / static_cast<double>(n), 1e-3, 1 - 1e-3);
-    out.forest.base = std::log(rate / (1 - rate));
+    const bool sq = task != Task::Dir;
+    out.forest.squared = sq;
+    if (sq) {
+        // Начинаем со среднего хода: дальше деревья правят его по признакам.
+        double sum = 0;
+        for (const Sample& s : tr) sum += targetOf(s, task);
+        out.forest.base = sum / static_cast<double>(n);
+    } else {
+        double pos = 0;
+        for (const Sample& s : tr) pos += s.y;
+        const double rate = clampd(pos / static_cast<double>(n), 1e-3, 1 - 1e-3);
+        out.forest.base = std::log(rate / (1 - rate));
+    }
 
     std::vector<double> F(n, out.forest.base), g(n, 0), h(n, 0);
     std::vector<double> Fv(va.size(), out.forest.base);
     std::vector<float> yv(va.size(), 0);
-    for (size_t i = 0; i < va.size(); i++) yv[i] = va[i].y;
+    for (size_t i = 0; i < va.size(); i++) yv[i] = targetOf(va[i], task);
 
     double bestLoss = 1e9;
     int bestAt = 0;
@@ -353,13 +390,19 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
 
     for (int it = 0; it < ORACLE_MAX_TREES; it++) {
         for (size_t i = 0; i < n; i++) {
-            const double p = sigmoid(F[i]);
             const double w = tr[i].w;
-            g[i] = (p - static_cast<double>(tr[i].y)) * w;
-            h[i] = std::max(1e-6, p * (1 - p)) * w;
+            if (sq) {
+                g[i] = (F[i] - static_cast<double>(targetOf(tr[i], task))) * w;
+                h[i] = w;                       // у квадрата вторая производная постоянна
+            } else {
+                const double p = sigmoid(F[i]);
+                g[i] = (p - static_cast<double>(tr[i].y)) * w;
+                h[i] = std::max(1e-6, p * (1 - p)) * w;
+            }
         }
         Grower gr;
         gr.xs = &tr; gr.bin = &bin; gr.bins = &bins; gr.g = &g; gr.h = &h;
+        gr.squared = sq;
         gr.grow(all, 0);
         if (gr.tree.nodes.size() <= 1 && gr.tree.nodes[0].feat < 0 &&
             std::fabs(static_cast<double>(gr.tree.nodes[0].leaf)) < 1e-9)
@@ -375,9 +418,18 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
             std::vector<double> pv(va.size());
             for (size_t i = 0; i < va.size(); i++) {
                 Fv[i] += out.forest.trees.back().predict(va[i].f.data());
-                pv[i] = sigmoid(Fv[i]);
+                pv[i] = sq ? Fv[i] : sigmoid(Fv[i]);
             }
-            const double loss = loglossOf(pv, yv);
+            double loss = 0;
+            if (sq) {
+                for (size_t i = 0; i < va.size(); i++) {
+                    const double d = pv[i] - static_cast<double>(yv[i]);
+                    loss += d * d;
+                }
+                loss /= static_cast<double>(va.size());
+            } else {
+                loss = loglossOf(pv, yv);
+            }
             if (loss < bestLoss - 1e-6) { bestLoss = loss; bestAt = static_cast<int>(out.forest.trees.size()); }
             else if (static_cast<int>(out.forest.trees.size()) - bestAt >= ORACLE_PATIENCE) break;
         }
@@ -399,7 +451,7 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va) {
         }
     }
 
-    if (!va.empty()) {
+    if (!va.empty() && !sq) {
         std::vector<double> zv(va.size());
         for (size_t i = 0; i < va.size(); i++) zv[i] = out.forest.raw(va[i].f.data());
         fitPlatt(zv, yv, out.forest.calA, out.forest.calB);
@@ -581,6 +633,31 @@ double fundingZ(const Series& s, int i, int hours) {
     const double sd = std::sqrt(std::max(1e-18, sum2 / n - m * m));
     if (sd <= 1e-12) return 0;
     return clampd((s.bars[static_cast<size_t>(i)].fund - m) / sd, -5.0, 5.0);
+}
+
+/* Как далеко цена уходила от входа за горизонт — вверх и вниз.
+ *
+ * Это и есть разметка для уровней: стоп имеет смысл ставить за пределом
+ * обычного отката, а цель — там, куда цена обычно доходит. У перпов есть
+ * настоящие максимум и минимум часа, у спота только цена закрытия, и по
+ * закрытиям ход виден мельче, чем он был. */
+void excursion(const Series& s, long long from, long long to, double entry,
+               double& up, double& dn) {
+    up = dn = 0;
+    if (entry <= 0) return;
+    const int i = s.at(from);
+    if (i < 0) return;
+    for (size_t k = static_cast<size_t>(i); k < s.bars.size(); k++) {
+        const Bar& b = s.bars[k];
+        if (b.ts < from) continue;
+        if (b.ts > to) break;
+        const double hi = b.hi > 0 ? b.hi : b.c;
+        const double lo = b.lo > 0 ? b.lo : b.c;
+        if (hi > 0) up = std::max(up, hi / entry - 1.0);
+        if (lo > 0) dn = std::max(dn, 1.0 - lo / entry);
+    }
+    up = clampd(up, 0.0, 3.0);
+    dn = clampd(dn, 0.0, 1.0);
 }
 
 /* ---------------------------------------------------------- признаки --- */
@@ -993,6 +1070,7 @@ std::string packForest(const Forest& f) {
     std::string s;
     s.append("ORC2", 4);
     putU32(s, static_cast<uint32_t>(ORACLE_NF));
+    putU32(s, f.squared ? 1u : 0u);
     putF64(s, f.base);
     putF64(s, f.calA);
     putF64(s, f.calB);
@@ -1011,12 +1089,14 @@ std::string packForest(const Forest& f) {
     return s;
 }
 
-bool unpackForest(const std::string& s, Forest& f) {
-    size_t at = 0;
+bool unpackForestAt(const std::string& s, size_t& at, Forest& f) {
     char magic[4] = {0, 0, 0, 0};
     if (!getBytes(s, at, magic, 4) || std::memcmp(magic, "ORC2", 4) != 0) return false;
     uint32_t nf = 0;
     if (!getBytes(s, at, &nf, 4) || nf != static_cast<uint32_t>(ORACLE_NF)) return false;
+    uint32_t sq = 0;
+    if (!getBytes(s, at, &sq, 4)) return false;
+    f.squared = sq != 0;
     if (!getBytes(s, at, &f.base, 8)) return false;
     if (!getBytes(s, at, &f.calA, 8)) return false;
     if (!getBytes(s, at, &f.calB, 8)) return false;
@@ -1053,6 +1133,49 @@ bool unpackForest(const std::string& s, Forest& f) {
     return true;
 }
 
+bool unpackForest(const std::string& s, Forest& f) {
+    size_t at = 0;
+    return unpackForestAt(s, at, f);
+}
+
+/* Модель — три леса: направление, ход вверх, ход вниз. Первые два байта
+   говорят, сколько лесов внутри: старая запись с одним читается как прежде,
+   и после обновления бот не теряет обученную модель. */
+struct Model {
+    Forest dir;
+    Forest up;
+    Forest dn;
+    bool levels = false;      // обучены ли леса уровней
+};
+
+std::string packModel(const Model& m) {
+    std::string s;
+    s.append("ORCM", 4);
+    putU32(s, m.levels ? 3u : 1u);
+    s += packForest(m.dir);
+    if (m.levels) {
+        s += packForest(m.up);
+        s += packForest(m.dn);
+    }
+    return s;
+}
+
+bool unpackModel(const std::string& s, Model& m) {
+    if (s.size() >= 4 && std::memcmp(s.data(), "ORC2", 4) == 0) {
+        m.levels = false;            // запись прежнего образца: только направление
+        return unpackForest(s, m.dir);
+    }
+    size_t at = 0;
+    char magic[4] = {0, 0, 0, 0};
+    if (!getBytes(s, at, magic, 4) || std::memcmp(magic, "ORCM", 4) != 0) return false;
+    uint32_t n = 0;
+    if (!getBytes(s, at, &n, 4) || (n != 1 && n != 3)) return false;
+    if (!unpackForestAt(s, at, m.dir)) return false;
+    m.levels = n == 3;
+    if (!m.levels) return true;
+    return unpackForestAt(s, at, m.up) && unpackForestAt(s, at, m.dn);
+}
+
 void ensureModelSchema() {
     std::lock_guard<std::mutex> l(dbMutex);
     if (!db) return;
@@ -1071,6 +1194,9 @@ void ensureModelSchema() {
         "  base_logloss REAL NOT NULL DEFAULT 0,"
         "  base_rate REAL NOT NULL DEFAULT 0,"
         "  wf_auc REAL NOT NULL DEFAULT 0,"
+        "  levels INTEGER NOT NULL DEFAULT 0,"
+        "  up_err REAL NOT NULL DEFAULT 0,"
+        "  dn_err REAL NOT NULL DEFAULT 0,"
         "  gain BLOB,"
         "  model BLOB,"
         "  PRIMARY KEY(venue, horizon));"
@@ -1092,11 +1218,19 @@ void ensureModelSchema() {
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
         std::cerr << "[оракул] схема моделей: " << (err ? err : "?") << std::endl;
     if (err) sqlite3_free(err);
+    // Старая таблица без столбцов уровней: доливаем на месте.
+    for (const char* mig : {"ALTER TABLE ai_models ADD COLUMN levels INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_models ADD COLUMN up_err REAL NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_models ADD COLUMN dn_err REAL NOT NULL DEFAULT 0"}) {
+        char* e = nullptr;
+        sqlite3_exec(db, mig, nullptr, nullptr, &e);
+        if (e) sqlite3_free(e);
+    }
 }
 
 struct Live {
     bool have = false;
-    Forest forest;
+    Model model;
     OracleStats st;
 };
 std::mutex g_liveMutex;
@@ -1117,10 +1251,10 @@ void applyStats(OracleStats& st, const std::array<double, ORACLE_NF>& gain) {
     st.top = std::move(v);
 }
 
-void saveModel(bool perp, const Forest& f, const OracleStats& st,
+void saveModel(bool perp, const Model& f, const OracleStats& st,
                const std::array<double, ORACLE_NF>& gain) {
     ensureModelSchema();
-    const std::string blob = packForest(f);
+    const std::string blob = packModel(f);
     std::string gblob;
     for (double g : gain) putF64(gblob, g);
     std::lock_guard<std::mutex> l(dbMutex);
@@ -1128,8 +1262,8 @@ void saveModel(bool perp, const Forest& f, const OracleStats& st,
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
             "INSERT OR REPLACE INTO ai_models(venue,horizon,created_at,samples,test_n,trees,"
-            "auc,logloss,acc,brier,base_logloss,base_rate,wf_auc,gain,model) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "auc,logloss,acc,brier,base_logloss,base_rate,wf_auc,levels,up_err,dn_err,"
+            "gain,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, ORACLE_HORIZON);
@@ -1144,8 +1278,11 @@ void saveModel(bool perp, const Forest& f, const OracleStats& st,
     sqlite3_bind_double(s, 11, st.baseLogloss);
     sqlite3_bind_double(s, 12, st.baseRate);
     sqlite3_bind_double(s, 13, st.wfAuc);
-    sqlite3_bind_blob(s, 14, gblob.data(), static_cast<int>(gblob.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_blob(s, 15, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_int(s, 14, st.levels ? 1 : 0);
+    sqlite3_bind_double(s, 15, st.upErr);
+    sqlite3_bind_double(s, 16, st.dnErr);
+    sqlite3_bind_blob(s, 17, gblob.data(), static_cast<int>(gblob.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_blob(s, 18, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
     if (sqlite3_step(s) != SQLITE_DONE)
         std::cerr << "[оракул] модель не сохранена" << std::endl;
     sqlite3_finalize(s);
@@ -1185,7 +1322,8 @@ void loadModels() {
             sqlite3_stmt* s = nullptr;
             if (!prepareOrLog(db, &s,
                     "SELECT created_at,samples,test_n,trees,auc,logloss,acc,brier,"
-                    "base_logloss,base_rate,wf_auc,gain,model FROM ai_models "
+                    "base_logloss,base_rate,wf_auc,gain,model,levels,up_err,dn_err "
+                    "FROM ai_models "
                     "WHERE venue=? AND horizon=?"))
                 return;
             sqlite3_bind_int(s, 1, v);
@@ -1208,12 +1346,14 @@ void loadModels() {
                 const void* p = sqlite3_column_blob(s, 12);
                 const int n = sqlite3_column_bytes(s, 12);
                 if (p && n > 0) blob.assign(static_cast<const char*>(p), static_cast<size_t>(n));
+                st.upErr = sqlite3_column_double(s, 14);
+                st.dnErr = sqlite3_column_double(s, 15);
             }
             sqlite3_finalize(s);
         }
         if (blob.empty()) continue;
-        Forest f;
-        if (!unpackForest(blob, f)) {
+        Model f;
+        if (!unpackModel(blob, f)) {
             std::cerr << "[оракул] модель " << (v ? "перпов" : "спота")
                       << " не читается, забыта" << std::endl;
             continue;
@@ -1224,10 +1364,11 @@ void loadModels() {
             for (int i = 0; i < ORACLE_NF; i++) getBytes(gblob, at, &gain[static_cast<size_t>(i)], 8);
         }
         st.trained = true;
+        st.levels = f.levels;
         applyStats(st, gain);
         std::lock_guard<std::mutex> l(g_liveMutex);
         g_live[v].have = true;
-        g_live[v].forest = std::move(f);
+        g_live[v].model = std::move(f);
         g_live[v].st = std::move(st);
     }
 }
@@ -1286,6 +1427,22 @@ std::vector<Sample> loadSamples(bool perp, const Market& m) {
         sm.ts = ts;
         featuresOf(m, in, ts, sm.f);
         sm.y = ret > 0 ? 1.0f : 0.0f;
+        {
+            // Ход цены в обе стороны — разметка для уровней. Считается по тем
+            // же рядам, что и признаки, и только вперёд от события.
+            const Series* ser = nullptr;
+            if (perp) {
+                auto it = m.perp.find(in.id);
+                if (it != m.perp.end()) ser = &it->second;
+            } else {
+                auto it = m.spot.find(toLower(in.id));
+                if (it != m.spot.end()) ser = &it->second;
+            }
+            double up = 0, dn = 0;
+            if (ser) excursion(*ser, ts, ts + ORACLE_HORIZON, usdOf(then), up, dn);
+            sm.up = static_cast<float>(up);
+            sm.dn = static_cast<float>(dn);
+        }
         // Большое движение весит больше маленького: ошибка на нём дороже.
         sm.w = static_cast<float>(clampd(std::fabs(ret) / ORACLE_MIN_MOVE, 1.0, 3.0));
         out.push_back(std::move(sm));
@@ -1372,6 +1529,47 @@ void trainVenue(bool perp, const Market& m) {
     const Scored sc = scoreOn(fit.forest, te);
     const double wf = walkForward(xs);
 
+    /* Уровни: два леса про то, как далеко цена уходит вверх и вниз. Они
+       принимаются отдельно от направления и по своему признаку — средняя
+       ошибка должна быть меньше, чем у предсказания «всегда средний ход».
+       Иначе стоп с целью считает прежняя формула от волатильности. */
+    Model model;
+    model.dir = fit.forest;
+    double upErr = 0, dnErr = 0;
+    {
+        Fit fUp = trainForest(tr, va, Task::Up);
+        Fit fDn = trainForest(tr, va, Task::Dn);
+        if (fUp.trees > 0 && fDn.trees > 0) {
+            double eUp = 0, eDn = 0, bUp = 0, bDn = 0, mUp = 0, mDn = 0;
+            for (const Sample& x : tr) { mUp += x.up; mDn += x.dn; }
+            mUp /= static_cast<double>(tr.size());
+            mDn /= static_cast<double>(tr.size());
+            for (const Sample& x : te) {
+                eUp += std::fabs(fUp.forest.value(x.f.data()) - x.up);
+                eDn += std::fabs(fDn.forest.value(x.f.data()) - x.dn);
+                bUp += std::fabs(mUp - x.up);
+                bDn += std::fabs(mDn - x.dn);
+            }
+            const size_t nte = te.empty() ? 1 : te.size();
+            eUp /= nte; eDn /= nte; bUp /= nte; bDn /= nte;
+            if (eUp < bUp && eDn < bDn) {
+                model.up = fUp.forest;
+                model.dn = fDn.forest;
+                model.levels = true;
+                upErr = eUp * 100.0;
+                dnErr = eDn * 100.0;
+                std::cout << "[оракул] " << who << ": уровни от модели, ошибка "
+                          << std::llround(eUp * 1000) / 10.0 << "% / "
+                          << std::llround(eDn * 1000) / 10.0 << "% против "
+                          << std::llround(bUp * 1000) / 10.0 << "% / "
+                          << std::llround(bDn * 1000) / 10.0 << "%" << std::endl;
+            } else {
+                std::cout << "[оракул] " << who
+                          << ": уровни не приняты, остаётся формула" << std::endl;
+            }
+        }
+    }
+
     std::cout << "[оракул] " << who << ": " << xs.size() << " исходов, "
               << fit.trees << " деревьев, тест " << te.size()
               << " · AUC " << std::llround(sc.auc * 1000) / 1000.0
@@ -1404,12 +1602,15 @@ void trainVenue(bool perp, const Market& m) {
     st.baseLogloss = sc.baseLoss;
     st.baseRate = sc.rate;
     st.wfAuc = wf;
+    st.levels = model.levels;
+    st.upErr = upErr;
+    st.dnErr = dnErr;
     applyStats(st, fit.gain);
-    saveModel(perp, fit.forest, st, fit.gain);
+    saveModel(perp, model, st, fit.gain);
     {
         std::lock_guard<std::mutex> l(g_liveMutex);
         g_live[perp ? 1 : 0].have = true;
-        g_live[perp ? 1 : 0].forest = fit.forest;
+        g_live[perp ? 1 : 0].model = model;
         g_live[perp ? 1 : 0].st = st;
     }
 }
@@ -1418,6 +1619,51 @@ void trainVenue(bool perp, const Market& m) {
 
 /* -------------------------------------------------------- наружу --- */
 
+/* Переучивание с чистого листа.
+ *
+ * Включается переменной окружения WHALE_ORACLE_RESET и срабатывает один раз
+ * за запуск. Два уровня, и разница между ними велика:
+ *
+ *   models — стираются обученные модели, записи о попытках, текущие сигналы
+ *            и журнал выданных. Модель переучится на первом же тике, послужной
+ *            список начнётся с нуля. Это то, что нужно после смены правил.
+ *
+ *   all    — вдобавок стирается журнал исходов (ai_events). Это три месяца
+ *            собранных результатов, и без них обучать будет нечего недели две.
+ *            Разметка уровней и так считается заново из истории цен, так что
+ *            выигрыша от этого нет — только пауза.
+ */
+void oracleReset() {
+    const char* mode = std::getenv("WHALE_ORACLE_RESET");
+    if (!mode || !*mode) return;
+    const std::string m = mode;
+    if (m == "0" || m == "no") return;
+    const bool wipeAll = m == "all";
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (!db) return;
+    // Каждая таблица отдельно: часть из них заводит ai.cpp, и на первом
+    // запуске их ещё нет. Одной командой первая же ошибка отменила бы всё.
+    auto wipe = [&](const char* table) {
+        const std::string sql = std::string("DELETE FROM ") + table;
+        char* err = nullptr;
+        if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err) != SQLITE_OK) {
+            const std::string msg = err ? err : "";
+            if (msg.find("no such table") == std::string::npos)
+                std::cerr << "[оракул] сброс " << table << ": " << msg << std::endl;
+        }
+        if (err) sqlite3_free(err);
+    };
+    for (const char* t : {"ai_models", "ai_model_try", "ai_signals", "ai_signal_log"})
+        wipe(t);
+    std::cout << "[оракул] сброшены модели, попытки и журнал сигналов" << std::endl;
+    if (wipeAll) {
+        wipe("ai_events");
+        std::cout << "[оракул] журнал исходов стёрт: обучать будет нечего, "
+                     "пока он не наберётся заново" << std::endl;
+    }
+}
+
 void oracleTick() {
     static long long lastCandles = 0;
     static long long lastTrain = 0;
@@ -1425,7 +1671,13 @@ void oracleTick() {
     static bool loaded = false;
     const long long now = hl::nowSec();
 
-    if (!loaded) { loadModels(); loaded = true; }
+    if (!loaded) {
+        // Сброс до чтения моделей: иначе прочитаем то, что сейчас сотрём.
+        ensureModelSchema();
+        oracleReset();
+        loadModels();
+        loaded = true;
+    }
 
     // Свечи докачиваем понемногу: за тик не больше двух десятков монет,
     // чтобы не съесть весь лимит запросов к бирже.
@@ -1460,7 +1712,7 @@ OracleVerdict oracleScore(const OracleInput& in, long long asOf) {
     // монету в списке.
     std::lock_guard<std::mutex> l(g_liveMutex);
     if (!g_live[slot].have) return v;
-    v.pUp = clampd(g_live[slot].forest.p(feat.data()), 0.001, 0.999);
+    v.pUp = clampd(g_live[slot].model.dir.p(feat.data()), 0.001, 0.999);
     v.known = true;
     return v;
 }
@@ -1475,7 +1727,7 @@ std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n
 
     std::lock_guard<std::mutex> l(g_liveMutex);
     if (!g_live[slot].have) return out;
-    const Forest& f = g_live[slot].forest;
+    const Forest& f = g_live[slot].model.dir;
     const double p0 = f.p(feat.data());
     std::vector<std::pair<double, int>> shift;
     for (int i = 0; i < ORACLE_NF; i++) {
@@ -1495,6 +1747,21 @@ std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n
         out.push_back(OracleReason{FEAT_NAME[shift[static_cast<size_t>(k)].second],
                                    shift[static_cast<size_t>(k)].first});
     return out;
+}
+
+OracleLevels oracleLevels(const OracleInput& in, long long asOf) {
+    OracleLevels v;
+    const int slot = in.perp ? 1 : 0;
+    auto m = market();
+    if (!m || m->builtAt == 0) return v;
+    std::array<float, ORACLE_NF> feat{};
+    featuresOf(*m, in, asOf > 0 ? asOf : hl::nowSec(), feat);
+    std::lock_guard<std::mutex> l(g_liveMutex);
+    if (!g_live[slot].have || !g_live[slot].model.levels) return v;
+    v.up = clampd(g_live[slot].model.up.value(feat.data()), 0.0, 3.0);
+    v.dn = clampd(g_live[slot].model.dn.value(feat.data()), 0.0, 1.0);
+    v.known = v.up > 0 && v.dn > 0;
+    return v;
 }
 
 OracleStats oracleStats(bool perp) {
