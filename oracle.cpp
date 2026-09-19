@@ -35,8 +35,14 @@ constexpr double ORACLE_L2 = 1.0;        // регуляризация лист�
 constexpr int ORACLE_MIN_LEAF = 20;      // примеров в листе
 constexpr double ORACLE_MIN_H = 4.0;     // суммарный гессиан в листе
 constexpr int ORACLE_PATIENCE = 25;      // деревьев без улучшения
+/* Раньше этого порога ранняя остановка не срабатывает. Взаимодействие
+   признаков — «приток помогает только при низкой волатильности» — жадное
+   дерево не видит на первом же разбиении: по отдельности ни поток, ни
+   волатильность класс не разделяют. Модель находит такое через несколько
+   деревьев, а проверка на четырёхстах примерах шумит и успевает остановить
+   обучение на первом. */
+constexpr int ORACLE_MIN_TREES = 60;
 constexpr int ORACLE_MIN_SAMPLES = 300;  // меньше — обучать нечего
-constexpr long long ORACLE_HORIZON = 86400;
 constexpr double ORACLE_MIN_MOVE = 0.02; // движение меньше — шум, как в ai.cpp
 
 double sigmoid(double z) {
@@ -46,6 +52,18 @@ double sigmoid(double z) {
 }
 
 double clampd(double v, double lo, double hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* Порог «движение, а не шум» зависит от окна: за шесть часов цена проходит
+   меньше, чем за сутки, и требовать от неё тех же двух процентов — значит
+   оставить шестичасовому горизонту одни только обвалы. Масштаб — корень из
+   времени, как у волатильности случайного блуждания: на шести часах порог
+   получается ровно вдвое мягче. */
+inline double oracleMinMove(long long horizon) {
+    const double k = std::sqrt(static_cast<double>(horizon) /
+                               static_cast<double>(ORACLE_H24));
+    return ORACLE_MIN_MOVE * clampd(k, 0.25, 1.0);
+}
+
 
 double usdOf(long long nanos) { return static_cast<double>(nanos) / 1e9; }
 
@@ -431,12 +449,19 @@ Fit trainForest(const std::vector<Sample>& tr, const std::vector<Sample>& va, Ta
                 loss = loglossOf(pv, yv);
             }
             if (loss < bestLoss - 1e-6) { bestLoss = loss; bestAt = static_cast<int>(out.forest.trees.size()); }
-            else if (static_cast<int>(out.forest.trees.size()) - bestAt >= ORACLE_PATIENCE) break;
+            else if (static_cast<int>(out.forest.trees.size()) >= ORACLE_MIN_TREES &&
+                     static_cast<int>(out.forest.trees.size()) - bestAt >= ORACLE_PATIENCE) break;
         }
     }
+    // Обрезаем до лучшего шага, но не короче порога: лес из одного дерева —
+    // это не «рано остановились», это «не успели начать».
     if (!va.empty() && bestAt > 0 &&
-        bestAt < static_cast<int>(out.forest.trees.size()))
-        out.forest.trees.resize(static_cast<size_t>(bestAt));
+        bestAt < static_cast<int>(out.forest.trees.size())) {
+        const size_t keep = std::max<size_t>(static_cast<size_t>(bestAt),
+                                             std::min<size_t>(ORACLE_MIN_TREES,
+                                                              out.forest.trees.size()));
+        out.forest.trees.resize(keep);
+    }
     out.trees = static_cast<int>(out.forest.trees.size());
 
     {
@@ -620,6 +645,40 @@ double changeOf(double now, double before) {
     return clampd(now / before - 1.0, -1.0, 5.0);
 }
 
+/* MACD: разность быстрой и медленной скользящих, её сигнальная линия и
+   разность между ними. Считается по часовым закрытиям и делится на цену —
+   иначе у биткоина и у мем-монеты числа несравнимы.
+ 
+   Экспоненциальная средняя разгоняется с первого бара ряда, а не с i: иначе
+   у двух событий по одной монете в разные часы был бы разный разогрев и
+   разные признаки на одних и тех же данных. */
+void macdOf(const Series& s, int i, double& line, double& sig, double& hist) {
+    line = sig = hist = 0;
+    if (i < 26) return;
+    const double kf = 2.0 / 13.0, ks = 2.0 / 27.0, kg = 2.0 / 10.0;
+    double fast = 0, slow = 0, signal = 0;
+    bool started = false;
+    int n = 0;
+    for (int k = std::max(0, i - 400); k <= i; k++) {
+        const double c = s.bars[static_cast<size_t>(k)].c;
+        if (c <= 0) continue;
+        if (!started) { fast = slow = c; started = true; }
+        else {
+            fast += kf * (c - fast);
+            slow += ks * (c - slow);
+        }
+        const double m = fast - slow;
+        if (n == 0) signal = m;
+        else signal += kg * (m - signal);
+        n++;
+    }
+    const double px = s.bars[static_cast<size_t>(i)].c;
+    if (px <= 0 || n < 26) return;
+    line = clampd((fast - slow) / px, -0.5, 0.5);
+    sig = clampd(signal / px, -0.5, 0.5);
+    hist = clampd(line - sig, -0.5, 0.5);
+}
+
 double fundingZ(const Series& s, int i, int hours) {
     if (i < hours || hours < 8) return 0;
     double sum = 0, sum2 = 0;
@@ -673,6 +732,7 @@ const char* const FEAT_NAME[ORACLE_NF] = {
     "funding",   "funding z", "OI 1h",    "OI 24h",    "OI/vlm",
     "vlm 24h",   "liq skew",  "liq/OI",   "leverage",  "liquidity",
     "BTC 24h",   "BTC vol",   "breadth",  "hour",      "hour 2",
+    "MACD",      "MACD sig",  "MACD hist",
 };
 
 /* Единственное место, где считаются признаки. При обучении сюда приходит
@@ -770,6 +830,14 @@ void featuresOf(const Market& m, const OracleInput& in, long long asOf,
     const double hour = static_cast<double>((asOf % 86400) / 3600);
     f[33] = static_cast<float>(std::sin(2 * M_PI * hour / 24.0));
     f[34] = static_cast<float>(std::cos(2 * M_PI * hour / 24.0));
+
+    if (s && i >= 26) {
+        double line = 0, sig = 0, hist = 0;
+        macdOf(*s, i, line, sig, hist);
+        f[35] = static_cast<float>(line);
+        f[36] = static_cast<float>(sig);
+        f[37] = static_cast<float>(hist);
+    }
 
     for (int k = 0; k < ORACLE_NF; k++)
         if (!std::isfinite(f[static_cast<size_t>(k)])) f[static_cast<size_t>(k)] = 0.0f;
@@ -1234,7 +1302,16 @@ struct Live {
     OracleStats st;
 };
 std::mutex g_liveMutex;
-Live g_live[2];
+/* Площадка × горизонт. Индекс горизонта — порядок в ORACLE_HZ. */
+constexpr long long ORACLE_HZ[] = {ORACLE_H6, ORACLE_H24};
+constexpr int ORACLE_NH = 2;
+Live g_live[2][ORACLE_NH];
+
+int hIndex(long long horizon) {
+    for (int i = 0; i < ORACLE_NH; i++)
+        if (ORACLE_HZ[i] == horizon) return i;
+    return ORACLE_NH - 1;                      // по умолчанию сутки
+}
 
 void applyStats(OracleStats& st, const std::array<double, ORACLE_NF>& gain) {
     std::vector<std::pair<std::string, double>> v;
@@ -1253,6 +1330,7 @@ void applyStats(OracleStats& st, const std::array<double, ORACLE_NF>& gain) {
 
 void saveModel(bool perp, const Model& f, const OracleStats& st,
                const std::array<double, ORACLE_NF>& gain) {
+    const long long horizon = st.horizon > 0 ? st.horizon : ORACLE_H24;
     ensureModelSchema();
     const std::string blob = packModel(f);
     std::string gblob;
@@ -1266,7 +1344,7 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
             "gain,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
-    sqlite3_bind_int64(s, 2, ORACLE_HORIZON);
+    sqlite3_bind_int64(s, 2, horizon);
     sqlite3_bind_int64(s, 3, st.at);
     sqlite3_bind_int64(s, 4, st.samples);
     sqlite3_bind_int64(s, 5, st.test);
@@ -1288,8 +1366,8 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
     sqlite3_finalize(s);
 }
 
-void saveTry(bool perp, long long samples, double auc, double loss, double base,
-             double wf, bool accepted) {
+void saveTry(bool perp, long long horizon, long long samples, double auc, double loss,
+             double base, double wf, bool accepted) {
     ensureModelSchema();
     std::lock_guard<std::mutex> l(dbMutex);
     if (!db) return;
@@ -1299,7 +1377,7 @@ void saveTry(bool perp, long long samples, double auc, double loss, double base,
             "base_logloss,wf_auc,accepted) VALUES(?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
-    sqlite3_bind_int64(s, 2, ORACLE_HORIZON);
+    sqlite3_bind_int64(s, 2, horizon);
     sqlite3_bind_int64(s, 3, hl::nowSec());
     sqlite3_bind_int64(s, 4, samples);
     sqlite3_bind_double(s, 5, auc);
@@ -1313,7 +1391,8 @@ void saveTry(bool perp, long long samples, double auc, double loss, double base,
 
 void loadModels() {
     ensureModelSchema();
-    for (int v = 0; v < 2; v++) {
+    for (int v = 0; v < 2; v++) for (int hi = 0; hi < ORACLE_NH; hi++) {
+        const long long horizon = ORACLE_HZ[hi];
         std::string blob, gblob;
         OracleStats st;
         {
@@ -1327,7 +1406,7 @@ void loadModels() {
                     "WHERE venue=? AND horizon=?"))
                 return;
             sqlite3_bind_int(s, 1, v);
-            sqlite3_bind_int64(s, 2, ORACLE_HORIZON);
+            sqlite3_bind_int64(s, 2, horizon);
             if (sqlite3_step(s) == SQLITE_ROW) {
                 st.at = sqlite3_column_int64(s, 0);
                 st.samples = sqlite3_column_int64(s, 1);
@@ -1365,11 +1444,12 @@ void loadModels() {
         }
         st.trained = true;
         st.levels = f.levels;
+        st.horizon = horizon;
         applyStats(st, gain);
         std::lock_guard<std::mutex> l(g_liveMutex);
-        g_live[v].have = true;
-        g_live[v].model = std::move(f);
-        g_live[v].st = std::move(st);
+        g_live[v][hi].have = true;
+        g_live[v][hi].model = std::move(f);
+        g_live[v][hi].st = std::move(st);
     }
 }
 
@@ -1378,23 +1458,32 @@ void loadModels() {
 /* Журнал событий с исходами. Дубли одной монеты за день схлопываются: иначе
    один разогнавшийся день даёт двадцать почти одинаковых примеров и модель
    учит его наизусть. */
-std::vector<Sample> loadSamples(bool perp, const Market& m) {
+std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
+    /* Исходы обоих горизонтов бот собирает давно: на шести часах своя пара
+       столбцов, на сутках своя. Разметка хода считается на том же окне. */
+    const bool six = horizon == ORACLE_H6;
+    const double minMove = oracleMinMove(horizon);
     std::vector<Sample> out;
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return out;
     sqlite3_stmt* s = nullptr;
-    if (!prepareOrLog(db, &s,
-            "SELECT e.ts,e.token,e.buy_nanos,e.sell_nanos,e.n_buy,e.n_sell,e.wallets,"
-            "e.one_share_bp,e.net_6h,e.net_prior,e.funding_nanos,e.liq_nanos,e.lev_bp,"
-            "e.top_share_bp,e.top_dir_bp,e.liq_long_nanos,e.liq_short_nanos,e.both_venues,"
-            "e.price_then,e.price_24h "
-            "FROM ai_events e WHERE e.filled_at>0 AND e.price_then>0 AND e.price_24h>0 "
-            "AND e.window_days=24 AND e.venue=? "
-            "AND NOT EXISTS ("
-            "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
-            "  AND e2.window_days=24 AND e2.filled_at>0 AND e2.price_then>0 AND e2.price_24h>0 "
-            "  AND e2.ts/86400=e.ts/86400 AND e2.id<e.id) "
-            "ORDER BY e.ts"))
+    const std::string px = six ? "price_6h" : "price_24h";
+    const std::string filled = six ? "filled_6h" : "filled_at";
+    const std::string sql =
+        "SELECT e.ts,e.token,e.buy_nanos,e.sell_nanos,e.n_buy,e.n_sell,e.wallets,"
+        "e.one_share_bp,e.net_6h,e.net_prior,e.funding_nanos,e.liq_nanos,e.lev_bp,"
+        "e.top_share_bp,e.top_dir_bp,e.liq_long_nanos,e.liq_short_nanos,e.both_venues,"
+        "e.price_then,e." + px + " "
+        "FROM ai_events e WHERE e." + filled + ">0 AND e.price_then>0 AND e." + px + ">0 "
+        "AND e.window_days=24 AND e.venue=? "
+        // Один пример на монету в день: иначе разогнавшийся день учится
+        // наизусть двадцатью почти одинаковыми строками.
+        "AND NOT EXISTS ("
+        "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
+        "  AND e2.window_days=24 AND e2." + filled + ">0 AND e2.price_then>0 "
+        "  AND e2." + px + ">0 AND e2.ts/86400=e.ts/86400 AND e2.id<e.id) "
+        "ORDER BY e.ts";
+    if (!prepareOrLog(db, &s, sql.c_str()))
         return out;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     while (sqlite3_step(s) == SQLITE_ROW) {
@@ -1422,7 +1511,7 @@ std::vector<Sample> loadSamples(bool perp, const Market& m) {
         const long long later = sqlite3_column_int64(s, 19);
         if (then <= 0 || later <= 0) continue;
         const double ret = static_cast<double>(later - then) / static_cast<double>(then);
-        if (std::fabs(ret) < ORACLE_MIN_MOVE) continue;
+        if (std::fabs(ret) < minMove) continue;
         Sample sm;
         sm.ts = ts;
         featuresOf(m, in, ts, sm.f);
@@ -1439,12 +1528,12 @@ std::vector<Sample> loadSamples(bool perp, const Market& m) {
                 if (it != m.spot.end()) ser = &it->second;
             }
             double up = 0, dn = 0;
-            if (ser) excursion(*ser, ts, ts + ORACLE_HORIZON, usdOf(then), up, dn);
+            if (ser) excursion(*ser, ts, ts + horizon, usdOf(then), up, dn);
             sm.up = static_cast<float>(up);
             sm.dn = static_cast<float>(dn);
         }
         // Большое движение весит больше маленького: ошибка на нём дороже.
-        sm.w = static_cast<float>(clampd(std::fabs(ret) / ORACLE_MIN_MOVE, 1.0, 3.0));
+        sm.w = static_cast<float>(clampd(std::fabs(ret) / minMove, 1.0, 3.0));
         out.push_back(std::move(sm));
     }
     sqlite3_finalize(s);
@@ -1502,9 +1591,10 @@ double walkForward(const std::vector<Sample>& xs) {
     return n > 0 ? sum / n : 0;
 }
 
-void trainVenue(bool perp, const Market& m) {
-    std::vector<Sample> xs = loadSamples(perp, m);
-    const char* who = perp ? "перпы" : "спот";
+void trainVenue(bool perp, const Market& m, long long horizon) {
+    std::vector<Sample> xs = loadSamples(perp, m, horizon);
+    const std::string who = std::string(perp ? "перпы" : "спот") + " "
+                          + (horizon == ORACLE_H6 ? "6ч" : "24ч");
     if (xs.size() < static_cast<size_t>(ORACLE_MIN_SAMPLES) + 100) {
         std::cout << "[оракул] " << who << ": исходов " << xs.size()
                   << ", нужно " << ORACLE_MIN_SAMPLES + 100 << std::endl;
@@ -1582,8 +1672,8 @@ void trainVenue(bool perp, const Market& m) {
     // тесте, и на скользящей проверке. Иначе на экране была бы «модель», а
     // под ней — монетка.
     const bool accepted = !(sc.auc < 0.55 || sc.logloss >= sc.baseLoss || wf < 0.52);
-    saveTry(perp, static_cast<long long>(xs.size()), sc.auc, sc.logloss, sc.baseLoss,
-            wf, accepted);
+    saveTry(perp, horizon, static_cast<long long>(xs.size()), sc.auc, sc.logloss,
+            sc.baseLoss, wf, accepted);
     if (!accepted) {
         std::cout << "[оракул] " << who << ": не принята, остаёмся на прежнем" << std::endl;
         return;
@@ -1591,6 +1681,7 @@ void trainVenue(bool perp, const Market& m) {
 
     OracleStats st;
     st.trained = true;
+    st.horizon = horizon;
     st.at = hl::nowSec();
     st.samples = static_cast<long long>(xs.size());
     st.test = static_cast<long long>(te.size());
@@ -1608,10 +1699,11 @@ void trainVenue(bool perp, const Market& m) {
     applyStats(st, fit.gain);
     saveModel(perp, model, st, fit.gain);
     {
+        const int hi = hIndex(horizon);
         std::lock_guard<std::mutex> l(g_liveMutex);
-        g_live[perp ? 1 : 0].have = true;
-        g_live[perp ? 1 : 0].model = model;
-        g_live[perp ? 1 : 0].st = st;
+        g_live[perp ? 1 : 0][hi].have = true;
+        g_live[perp ? 1 : 0][hi].model = model;
+        g_live[perp ? 1 : 0][hi].st = st;
     }
 }
 
@@ -1696,14 +1788,17 @@ void oracleTick() {
         lastTrain = now;
         auto m = market();
         if (!m || m->builtAt == 0) return;
-        trainVenue(false, *m);
-        trainVenue(true, *m);
+        for (long long h : ORACLE_HZ) {
+            trainVenue(false, *m, h);
+            trainVenue(true, *m, h);
+        }
     }
 }
 
-OracleVerdict oracleScore(const OracleInput& in, long long asOf) {
+OracleVerdict oracleScore(const OracleInput& in, long long asOf, long long horizon) {
     OracleVerdict v;
     const int slot = in.perp ? 1 : 0;
+    const int hi = hIndex(horizon);
     auto m = market();
     if (!m || m->builtAt == 0) return v;
     std::array<float, ORACLE_NF> feat{};
@@ -1711,23 +1806,25 @@ OracleVerdict oracleScore(const OracleInput& in, long long asOf) {
     // Лес не копируем: он на сотню килобайт, а зовут эту функцию на каждую
     // монету в списке.
     std::lock_guard<std::mutex> l(g_liveMutex);
-    if (!g_live[slot].have) return v;
-    v.pUp = clampd(g_live[slot].model.dir.p(feat.data()), 0.001, 0.999);
+    if (!g_live[slot][hi].have) return v;
+    v.pUp = clampd(g_live[slot][hi].model.dir.p(feat.data()), 0.001, 0.999);
     v.known = true;
     return v;
 }
 
-std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n) {
+std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf,
+                                    long long horizon, int n) {
     std::vector<OracleReason> out;
     const int slot = in.perp ? 1 : 0;
+    const int hi = hIndex(horizon);
     auto m = market();
     if (!m || m->builtAt == 0) return out;
     std::array<float, ORACLE_NF> feat{};
     featuresOf(*m, in, asOf > 0 ? asOf : hl::nowSec(), feat);
 
     std::lock_guard<std::mutex> l(g_liveMutex);
-    if (!g_live[slot].have) return out;
-    const Forest& f = g_live[slot].model.dir;
+    if (!g_live[slot][hi].have) return out;
+    const Forest& f = g_live[slot][hi].model.dir;
     const double p0 = f.p(feat.data());
     std::vector<std::pair<double, int>> shift;
     for (int i = 0; i < ORACLE_NF; i++) {
@@ -1749,29 +1846,58 @@ std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n
     return out;
 }
 
-OracleLevels oracleLevels(const OracleInput& in, long long asOf) {
+OracleLevels oracleLevels(const OracleInput& in, long long asOf, long long horizon) {
     OracleLevels v;
     const int slot = in.perp ? 1 : 0;
+    const int hi = hIndex(horizon);
     auto m = market();
     if (!m || m->builtAt == 0) return v;
     std::array<float, ORACLE_NF> feat{};
     featuresOf(*m, in, asOf > 0 ? asOf : hl::nowSec(), feat);
     std::lock_guard<std::mutex> l(g_liveMutex);
-    if (!g_live[slot].have || !g_live[slot].model.levels) return v;
-    v.up = clampd(g_live[slot].model.up.value(feat.data()), 0.0, 3.0);
-    v.dn = clampd(g_live[slot].model.dn.value(feat.data()), 0.0, 1.0);
+    if (!g_live[slot][hi].have || !g_live[slot][hi].model.levels) return v;
+    v.up = clampd(g_live[slot][hi].model.up.value(feat.data()), 0.0, 3.0);
+    v.dn = clampd(g_live[slot][hi].model.dn.value(feat.data()), 0.0, 1.0);
     v.known = v.up > 0 && v.dn > 0;
     return v;
 }
 
-OracleStats oracleStats(bool perp) {
+OracleStats oracleStats(bool perp, long long horizon) {
     std::lock_guard<std::mutex> l(g_liveMutex);
-    return g_live[perp ? 1 : 0].st;
+    return g_live[perp ? 1 : 0][hIndex(horizon)].st;
 }
 
-bool oracleReady(bool perp) {
+bool oracleReady(bool perp, long long horizon) {
     std::lock_guard<std::mutex> l(g_liveMutex);
-    return g_live[perp ? 1 : 0].have;
+    return g_live[perp ? 1 : 0][hIndex(horizon)].have;
+}
+
+/* Все горизонты разом: один обход признаков на каждый, дальше зовущий
+   сравнивает планы и берёт лучший. Считать признаки по два раза незачем —
+   они от горизонта не зависят. */
+std::vector<OracleView> oracleViews(const OracleInput& in, long long asOf) {
+    std::vector<OracleView> out;
+    const int slot = in.perp ? 1 : 0;
+    auto m = market();
+    if (!m || m->builtAt == 0) return out;
+    std::array<float, ORACLE_NF> feat{};
+    featuresOf(*m, in, asOf > 0 ? asOf : hl::nowSec(), feat);
+    std::lock_guard<std::mutex> l(g_liveMutex);
+    for (int hi = 0; hi < ORACLE_NH; hi++) {
+        const Live& live = g_live[slot][hi];
+        if (!live.have) continue;
+        OracleView v;
+        v.horizon = ORACLE_HZ[hi];
+        v.known = true;
+        v.pUp = clampd(live.model.dir.p(feat.data()), 0.001, 0.999);
+        if (live.model.levels) {
+            v.up = clampd(live.model.up.value(feat.data()), 0.0, 3.0);
+            v.dn = clampd(live.model.dn.value(feat.data()), 0.0, 1.0);
+            v.levels = v.up > 0 && v.dn > 0;
+        }
+        out.push_back(v);
+    }
+    return out;
 }
 
 const char* oracleFeatureName(int i) {

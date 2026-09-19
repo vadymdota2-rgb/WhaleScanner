@@ -29,7 +29,13 @@
 #include <string>
 #include <vector>
 
-constexpr int ORACLE_NF = 35;
+constexpr int ORACLE_NF = 38;
+
+/* Горизонты, на которых учится модель. Шесть часов и сутки: исходы для обоих
+   бот и так собирает, а какой из них подходит монете сейчас — решает сам
+   оракул, сравнивая ожидаемый исход. */
+constexpr long long ORACLE_H6 = 6 * 3600;
+constexpr long long ORACLE_H24 = 86400;
 
 /* Поток китов по монете — то, что знает ai.cpp. Рыночную часть признаков
    оракул добирает сам по своим рядам. */
@@ -77,6 +83,7 @@ struct OracleReason {
 };
 
 struct OracleStats {
+    long long horizon = 0;
     bool trained = false;
     /** Обучены ли леса уровней: стоп и цель от модели, а не от формулы. */
     bool levels = false;
@@ -102,16 +109,34 @@ void oracleTick();
 
 /* Вероятность роста за 24 часа. known=false — модели нет, зовущий остаётся
    на формуле. */
-OracleVerdict oracleScore(const OracleInput& in, long long asOf);
+OracleVerdict oracleScore(const OracleInput& in, long long asOf,
+                          long long horizon = ORACLE_H24);
+
+/* Что модель говорит про один горизонт: вероятность роста и ожидаемый ход в
+   обе стороны. */
+struct OracleView {
+    long long horizon = 0;
+    bool known = false;
+    double pUp = 0.5;
+    bool levels = false;
+    double up = 0;
+    double dn = 0;
+};
+
+/* Все горизонты разом — выбирать из них зовущему: решение зависит от того,
+   какой план получается, а план строит он. */
+std::vector<OracleView> oracleViews(const OracleInput& in, long long asOf);
 
 /* Три признака, сильнее прочих сдвинувших эту оценку. Пусто, если модели
    нет: выдумывать причину к числу, которого не было, нельзя. */
-std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf, int n = 3);
+std::vector<OracleReason> oracleWhy(const OracleInput& in, long long asOf,
+                                    long long horizon = ORACLE_H24, int n = 3);
 
-OracleLevels oracleLevels(const OracleInput& in, long long asOf);
+OracleLevels oracleLevels(const OracleInput& in, long long asOf,
+                          long long horizon = ORACLE_H24);
 
-OracleStats oracleStats(bool perp);
-bool oracleReady(bool perp);
+OracleStats oracleStats(bool perp, long long horizon = ORACLE_H24);
+bool oracleReady(bool perp, long long horizon = ORACLE_H24);
 
 /* Имена признаков — для экрана состояния и для проверок. */
 const char* oracleFeatureName(int i);

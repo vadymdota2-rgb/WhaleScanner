@@ -537,6 +537,8 @@ struct TradePlan {
     int leverage = 1;
     double riskPct = 0;      // насколько далеко стоп, в процентах
     double rr = 0;           // отношение прибыли к риску до первой цели
+    double riskShare = 0;    // доля депозита под риском, в процентах
+    long long horizon = 0;   // на каком горизонте модель это посчитала
 };
 
 // Уровни считаются от типичного хода цены за сутки, а не от круглых
@@ -619,15 +621,35 @@ TradePlan planFromLevels(double px, bool isLong, double up, double dn, double pr
     t.riskPct = stopPct * 100.0;
     t.rr = t1 / stopPct;
 
-    const double confidence = std::max(0.0, std::min(1.0, (prob - 0.5) * 2.5));
+    /* Доля депозита — по критерию Келли от чисел самой модели.
+     *
+     * Ставка, растущая быстрее всех в длинной череде сделок, равна
+     * (p·b − q·a) / (a·b), где b — ход до цели, a — до стопа, p —
+     * вероятность модели. Прежде здесь была лесенка «от 2% при слабом
+     * сигнале до 15% при сильном»: числа взяты с потолка и не связаны ни с
+     * расстоянием до стопа, ни с тем, сколько можно взять.
+     *
+     * Берём четверть от Келли. Полная ставка растит капитал быстрее всех, но
+     * только при верной вероятности; наша верна приблизительно, и просадки у
+     * полной ставки такие, что до долгого счёта доживают немногие. */
+    const double b = t1, a = stopPct;
+    const double p = std::min(0.99, std::max(0.01, prob));
+    const double kelly = (p * b - (1.0 - p) * a) / (a * b);
+    double stake = 0.25 * kelly;                 // доля депозита в номинале
+    if (stake <= 0) return t;                    // ставка невыгодна — плана нет
+
     double cap = 0.15;
     if (!isPerp) cap = 0.06;
     if (thinLiq) cap = std::min(cap, 0.04);
-    const double riskBudget = std::min(cap, 0.02 + 0.13 * confidence);
-    double lev = riskBudget / stopPct;
+    // Потолок — на потерю при стопе, а не на номинал: он и есть то, чем
+    // человек рискует.
+    if (stake * a > cap) stake = cap / a;
+    double lev = stake;
     if (lev < 1) lev = 1;
     if (lev > 10) lev = 10;
+    if (!isPerp && lev > 1) lev = 1;             // на споте плеча нет
     t.leverage = static_cast<int>(lev + 0.5);
+    t.riskShare = std::min(cap, stake * a) * 100.0;
     t.valid = true;
     return t;
 }
@@ -1265,6 +1287,81 @@ int confPct(const Row& r, bool trained, bool wantLong) {
     return v;
 }
 
+/* Выбор горизонта и плана — одно место на оба выхода.
+ *
+ * Оракул обучен и на шести часах, и на сутках. Для каждого обученного окна
+ * строится свой план, считается ожидаемый исход `p·цель − (1−p)·стоп`, и
+ * побеждает большее. Раньше горизонт был один на всё, хотя монете на
+ * разогнанном рынке сутки держать незачем, а на тихом за шесть часов ничего
+ * не происходит.
+ *
+ * Раздельные реализации для чата и для мини-аппа означали бы, что человек
+ * видит в Telegram один план, а в приложении другой, — поэтому считает это
+ * одна функция, а оба выхода только рисуют её ответ. */
+struct Choice {
+    TradePlan plan;
+    int conf = 0;
+    bool modelled = false;
+    std::string why;          // «flow:412,RSI:-88» — имя и сдвиг в сотых процента
+};
+
+Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
+                  double acc, bool thin, int fallbackConf, bool withWhy) {
+    Choice k;
+    k.conf = fallbackConf;
+    if (live <= 0) return k;
+    double bestEv = 0;
+    for (const OracleView& view : oracleViews(oracleInputOf(r), asOf)) {
+        if (!view.known) continue;
+        const double p = wantLong ? view.pUp : (1.0 - view.pUp);
+        TradePlan cand;
+        if (view.levels)
+            cand = planFromLevels(live, wantLong, view.up, view.dn, p, r.perp, thin);
+        if (!cand.valid) {
+            const double vol = volatilityOf(r.id, r.perp);
+            cand = planOf(live, vol, p, wantLong, acc, r.perp, thin);
+        }
+        if (!cand.valid) continue;
+        const double reward = std::fabs(cand.take1 - live) / live;
+        const double risk = std::fabs(cand.stop - live) / live;
+        // Меньше нуля — сигнала на этом горизонте нет; меньше прочих — есть
+        // горизонт получше.
+        const double ev = p * reward - (1.0 - p) * risk;
+        if (ev <= 0 || ev <= bestEv) continue;
+        bestEv = ev;
+        cand.horizon = view.horizon;
+        k.plan = cand;
+        k.conf = std::min(99, std::max(1, static_cast<int>(p * 100.0 + 0.5)));
+        k.modelled = true;
+        if (!withWhy) continue;
+        std::ostringstream w;
+        for (const OracleReason& why : oracleWhy(oracleInputOf(r), asOf, view.horizon, 3)) {
+            const double shift = wantLong ? why.shift : -why.shift;
+            if (!w.str().empty()) w << ",";
+            w << why.name << ":" << static_cast<long long>(std::llround(shift * 10000.0));
+        }
+        k.why = w.str();
+    }
+    if (!k.plan.valid) {
+        // Модели нет вовсе — старый путь: формула от волатильности.
+        const double vol = volatilityOf(r.id, r.perp);
+        k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp, thin);
+        k.plan.horizon = AI_HORIZON_24H;
+        k.modelled = false;
+    }
+    return k;
+}
+
+/* Горизонт словами: «6 ч», «24 ч». Он у каждого сигнала свой, и подставляется
+   в строку перевода — в шестнадцати языках единица стоит по-разному. */
+std::string horizonWords(long long horizon, Lang lang) {
+    const long long h = std::max(1LL, (horizon > 0 ? horizon : AI_HORIZON_24H) / 3600);
+    std::string s = tr(lang, "ai_hours");
+    const std::string::size_type at = s.find("{n}");
+    if (at == std::string::npos) return std::to_string(h) + s;
+    return s.replace(at, 3, std::to_string(h));
+}
+
 void writeWhy(std::ostringstream& t, const Row& r, Lang lang, bool trained, bool wantLong) {
     std::vector<std::pair<double, const char*>> xs;
     if (trained) {
@@ -1342,26 +1439,33 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
                                 : (wantLong ? "ai_buy"  : "ai_sell");
     t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, sideKey);
     t << " · <b>" << r.name << "</b>\n";
-    t << tr(lang, "ai_horizon") << " · " << tr(lang, "ai_conf") << " "
-      << confPct(r, trained, wantLong) << "%\n";
-    t << tr(lang, "ai_market") << "\n";
-    t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
-    t << " · " << r.wallets << "\n";
-
     const double px = static_cast<double>(livePx) / 1000000000.0;
-    const double vol = volatilityOf(r.id, r.perp);
     double acc = 0;
     {
         std::lock_guard<std::mutex> l(g_wMutex);
         acc = r.perp ? g_accPerp : g_accSpot;
     }
     const bool thinLiq = !r.perp && r.liqUsd > 0 && r.liqUsd < 200000.0;
-    const TradePlan tp = planOf(px, vol, confPct(r, trained, wantLong) / 100.0, wantLong, acc,
-                                r.perp, thinLiq);
+    /* Тот же выбор горизонта и тот же план, что уходят в мини-апп: два
+       расчёта означали бы два разных ответа на один вопрос. */
+    const Choice ch = choosePlan(r, wantLong, px, hl::nowSec(), acc, thinLiq,
+                                 confPct(r, trained, wantLong), false);
+    const TradePlan tp = ch.plan;
+    t << horizonWords(tp.horizon, lang) << " · " << tr(lang, "ai_conf") << " "
+      << ch.conf << "%\n";
+    t << tr(lang, "ai_market") << "\n";
+    t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
+    t << " · " << r.wallets << "\n";
+
     if (tp.valid) {
         t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>";
         if (r.perp) {
-            const double budget = tp.riskPct * tp.leverage;
+            /* Доля депозита под риском — то, чем человек рискует, и её
+               называет модель (четверть Келли). Прежде здесь стояло
+               «расстояние до стопа × плечо»: число выходило похожим, но
+               значило другое и ни на что не опиралось. */
+            const double budget = tp.riskShare > 0 ? tp.riskShare
+                                                   : tp.riskPct * tp.leverage;
             t << " \u00B7 " << tr(lang, "ai_risk") << " "
               << std::fixed << std::setprecision(1) << budget << "%"
               << " (" << tp.leverage << "x)";
@@ -2016,6 +2120,8 @@ void ensureSignalSchema() {
         "  take2 REAL NOT NULL DEFAULT 0,"
         "  risk_pct REAL NOT NULL DEFAULT 0,"
         "  lev INTEGER NOT NULL DEFAULT 1,"
+        "  risk_share REAL NOT NULL DEFAULT 0,"
+        "  horizon INTEGER NOT NULL DEFAULT 86400,"
         "  why TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_ai_signals_made ON ai_signals(made_at);"
         /* Журнал выданных сигналов. Экран истории раньше показывал строки
@@ -2039,6 +2145,7 @@ void ensureSignalSchema() {
         "  closed_at INTEGER NOT NULL DEFAULT 0,"
         "  exit_px REAL NOT NULL DEFAULT 0,"
         "  outcome INTEGER NOT NULL DEFAULT 0,"   /* 1 цель, -1 стоп, 0 ни то ни другое */
+        "  horizon INTEGER NOT NULL DEFAULT 86400,"
         "  ret_bp INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS idx_signal_log_open ON ai_signal_log(closed_at, made_at);"
         "CREATE INDEX IF NOT EXISTS idx_signal_log_live ON ai_signal_log(venue, token, side, closed_at);";
@@ -2063,7 +2170,7 @@ void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& ou
         return;
     if (!prepareOrLog(db, &ins,
             "INSERT INTO ai_signal_log(made_at,venue,token,sym,side,conf,modelled,"
-            "entry,stop,take1,take2) VALUES(?,?,?,?,?,?,?,?,?,?,?)")) {
+            "entry,stop,take1,take2,horizon) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")) {
         sqlite3_finalize(find);
         return;
     }
@@ -2089,6 +2196,7 @@ void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& ou
         sqlite3_bind_double(ins, 9, p.stop);
         sqlite3_bind_double(ins, 10, p.take1);
         sqlite3_bind_double(ins, 11, p.take2);
+        sqlite3_bind_int64(ins, 12, p.horizon > 0 ? p.horizon : AI_HORIZON_24H);
         sqlite3_step(ins);
     }
     sqlite3_finalize(find);
@@ -2166,6 +2274,7 @@ void closeSignalLog() {
         int venue = 0, side = 0;
         std::string token;
         double entry = 0, stop = 0, take = 0;
+        long long horizon = AI_HORIZON_24H;
     };
     std::vector<Open> open;
     {
@@ -2173,10 +2282,10 @@ void closeSignalLog() {
         if (!db) return;
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(db, &s,
-                "SELECT id,made_at,venue,token,side,entry,stop,take1 FROM ai_signal_log "
-                "WHERE closed_at=0 AND made_at<=? LIMIT 200"))
+                "SELECT id,made_at,venue,token,side,entry,stop,take1,horizon "
+                "FROM ai_signal_log WHERE closed_at=0 AND made_at+horizon<=? LIMIT 200"))
             return;
-        sqlite3_bind_int64(s, 1, now - AI_HORIZON_24H);
+        sqlite3_bind_int64(s, 1, now);
         while (sqlite3_step(s) == SQLITE_ROW) {
             Open o;
             o.id = sqlite3_column_int64(s, 0);
@@ -2187,6 +2296,8 @@ void closeSignalLog() {
             o.entry = sqlite3_column_double(s, 5);
             o.stop = sqlite3_column_double(s, 6);
             o.take = sqlite3_column_double(s, 7);
+            o.horizon = sqlite3_column_int64(s, 8);
+            if (o.horizon <= 0) o.horizon = AI_HORIZON_24H;
             open.push_back(std::move(o));
         }
         sqlite3_finalize(s);
@@ -2197,7 +2308,7 @@ void closeSignalLog() {
         if (o.entry <= 0) continue;
         const bool isLong = o.side == 1;
         const Walked w = walkOutcome(o.venue == 1, o.token, isLong, o.made,
-                                     o.made + AI_HORIZON_24H, o.stop, o.take);
+                                     o.made + o.horizon, o.stop, o.take);
         if (!w.done || w.exitPx <= 0) continue;
         const double ret = (isLong ? (w.exitPx - o.entry) : (o.entry - w.exitPx)) / o.entry;
         std::lock_guard<std::mutex> lock(dbMutex);
@@ -2206,7 +2317,7 @@ void closeSignalLog() {
         if (!prepareOrLog(db, &u,
                 "UPDATE ai_signal_log SET closed_at=?, exit_px=?, outcome=?, ret_bp=? WHERE id=?"))
             return;
-        sqlite3_bind_int64(u, 1, w.at > 0 ? w.at : o.made + AI_HORIZON_24H);
+        sqlite3_bind_int64(u, 1, w.at > 0 ? w.at : o.made + o.horizon);
         sqlite3_bind_double(u, 2, w.exitPx);
         sqlite3_bind_int(u, 3, w.outcome);
         sqlite3_bind_int(u, 4, static_cast<int>(std::llround(ret * 10000.0)));
@@ -2248,25 +2359,8 @@ void publishSignals() {
     for (auto& r : out) {
         const bool wantLong = r.score > 0;
         Ready k;
-        const OracleVerdict v = oracleReady(r.perp) ? oracleScore(oracleInputOf(r), asOf)
-                                                    : OracleVerdict{};
-        if (v.known) {
-            const double c = wantLong ? v.pUp : (1.0 - v.pUp);
-            k.conf = std::min(99, std::max(1, static_cast<int>(c * 100.0 + 0.5)));
-            k.modelled = true;
-            /* Причина — вклад признака именно в эту оценку, со знаком в
-               сторону сигнала: у продажи движение вниз это довод за, а не
-               против. Пишем и величину, в сотых долях процента вероятности:
-               без неё приложению осталось бы рисовать длину полосы по месту
-               в списке, то есть выдумывать. */
-            std::ostringstream w;
-            for (const OracleReason& why : oracleWhy(oracleInputOf(r), asOf, 3)) {
-                const double shift = wantLong ? why.shift : -why.shift;
-                if (!w.str().empty()) w << ",";
-                w << why.name << ":" << static_cast<long long>(std::llround(shift * 10000.0));
-            }
-            k.why = w.str();
-        }
+        /* Уверенность и причина заполняются вместе с выбором горизонта ниже:
+           у каждого горизонта своя вероятность и свои доводы. */
         bool trained = false;
         double acc = 0;
         {
@@ -2274,28 +2368,17 @@ void publishSignals() {
             trained = r.perp ? g_trainedPerp : g_trainedSpot;
             acc = r.perp ? g_accPerp : g_accSpot;
         }
-        if (!v.known) k.conf = confPct(r, trained, wantLong);
+        k.conf = confPct(r, trained, wantLong);
         const double live = static_cast<double>(livePriceOf(r)) / 1e9;
         const bool thin = !r.perp && r.liqUsd > 0 && r.liqUsd < 50000.0;
-        const OracleLevels lv = oracleLevels(oracleInputOf(r), asOf);
-        if (lv.known) {
-            k.plan = planFromLevels(live, wantLong, lv.up, lv.dn, k.conf / 100.0,
-                                    r.perp, thin);
-            /* Ожидаемый исход по числам самой модели: цель, взвешенная
-               вероятностью, против стопа, взвешенного обратной. Меньше нуля —
-               сигнал не выдаётся вовсе. Прежде выдавалось всё, что прошло
-               отбор по потоку, а стоило оно того или нет, не спрашивалось. */
-            if (k.plan.valid) {
-                const double p = k.conf / 100.0;
-                const double reward = std::fabs(k.plan.take1 - live) / live;
-                const double risk = std::fabs(k.plan.stop - live) / live;
-                if (p * reward - (1.0 - p) * risk <= 0) continue;
-            }
-        }
-        if (!k.plan.valid) {
-            const double vol = volatilityOf(r.id, r.perp);
-            k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp, thin);
-        }
+
+        // Горизонт, уровни и долю депозита выбирает оракул — тем же расчётом,
+        // что уходит в сообщение бота.
+        const Choice ch = choosePlan(r, wantLong, live, asOf, acc, thin, k.conf, true);
+        k.plan = ch.plan;
+        k.conf = ch.conf;
+        k.modelled = ch.modelled;
+        k.why = ch.why;
         if (!k.plan.valid) continue;
         k.r = std::move(r);
         ready.push_back(std::move(k));
@@ -2323,8 +2406,8 @@ void publishSignals() {
     sqlite3_stmt* s = nullptr;
     if (ok && prepareOrLog(db, &s,
             "INSERT INTO ai_signals(made_at,venue,token,sym,side,conf,modelled,net_nanos,"
-            "wallets,entry,stop,take1,take2,risk_pct,lev,why) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
+            "wallets,entry,stop,take1,take2,risk_pct,lev,risk_share,horizon,why) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
         for (const Ready& k : ready) {
             sqlite3_reset(s);
             sqlite3_bind_int64(s, 1, asOf);
@@ -2342,7 +2425,9 @@ void publishSignals() {
             sqlite3_bind_double(s, 13, k.plan.take2);
             sqlite3_bind_double(s, 14, k.plan.riskPct);
             sqlite3_bind_int(s, 15, k.plan.leverage);
-            sqlite3_bind_text(s, 16, k.why.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_double(s, 16, k.plan.riskShare);
+            sqlite3_bind_int64(s, 17, k.plan.horizon > 0 ? k.plan.horizon : AI_HORIZON_24H);
+            sqlite3_bind_text(s, 18, k.why.c_str(), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(s) != SQLITE_DONE) { ok = false; break; }
         }
         sqlite3_finalize(s);
