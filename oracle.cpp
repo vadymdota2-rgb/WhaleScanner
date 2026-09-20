@@ -670,7 +670,7 @@ void swingsOf(const Series& s, int i, int hours, double thr, std::vector<Swing>&
             dir = -1;
             extHi = h; hiI = k;
             extLo = l; loI = k;
-        } else if (dir <= 0 && l > 0 && h >= extLo * (1.0 + thr)) {
+        } else if (dir <= 0 && h >= extLo * (1.0 + thr)) {
             out.push_back(Swing{loI, extLo, false});
             dir = 1;
             extHi = h; hiI = k;
