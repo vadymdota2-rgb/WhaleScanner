@@ -2224,6 +2224,13 @@ void ensureSignalSchema() {
         "  exit_px REAL NOT NULL DEFAULT 0,"
         "  outcome INTEGER NOT NULL DEFAULT 0,"   /* 1 цель, -1 стоп, 0 ни то ни другое */
         "  horizon INTEGER NOT NULL DEFAULT 86400,"
+        /* Доля депозита, плечо и доводы — часть выданного плана, и хранятся
+           здесь по той же причине, что стоп с целями: приложение показывает
+           сигнал таким, каким он вышел, а не пересчитанным пять минут
+           назад. */
+        "  risk_share REAL NOT NULL DEFAULT 0,"
+        "  lev INTEGER NOT NULL DEFAULT 1,"
+        "  why TEXT NOT NULL DEFAULT '',"
         "  ret_bp INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS idx_signal_log_open ON ai_signal_log(closed_at, made_at);"
         "CREATE INDEX IF NOT EXISTS idx_signal_log_live ON ai_signal_log(venue, token, side, closed_at);";
@@ -2244,6 +2251,9 @@ void ensureSignalSchema() {
         "ALTER TABLE ai_signals ADD COLUMN risk_share REAL NOT NULL DEFAULT 0",
         "ALTER TABLE ai_signals ADD COLUMN horizon INTEGER NOT NULL DEFAULT 86400",
         "ALTER TABLE ai_signal_log ADD COLUMN horizon INTEGER NOT NULL DEFAULT 86400",
+        "ALTER TABLE ai_signal_log ADD COLUMN risk_share REAL NOT NULL DEFAULT 0",
+        "ALTER TABLE ai_signal_log ADD COLUMN lev INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE ai_signal_log ADD COLUMN why TEXT NOT NULL DEFAULT ''",
         nullptr,
     };
     for (int i = 0; alts[i]; i++) {
@@ -2254,12 +2264,27 @@ void ensureSignalSchema() {
     }
 }
 
-/* Записать выданные сигналы в журнал. Один и тот же сигнал висит в списке
-   часами и переписывается каждые пять минут — заводить строку на каждую
-   публикацию нельзя, иначе история наполнится копиями. Пока по монете и
-   стороне есть незакрытая строка, новую не создаём. */
-void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& out,
-                const std::vector<std::pair<int, bool>>& meta) {
+/* Записать выданные сигналы в журнал.
+
+   Один и тот же сигнал висит в списке часами и переписывается каждые пять
+   минут — заводить строку на каждую публикацию нельзя, иначе история
+   наполнится копиями. Пока по монете и стороне есть незакрытая строка, новую
+   не создаём.
+
+   Отсюда и второе назначение журнала: здесь лежит сигнал таким, каким его
+   выдали. В ai_signals план каждые пять минут пересчитывается от свежей
+   цены — вход там всегда равен цене прямо сейчас, — а исход потом считается
+   по этим, записанным один раз, уровням. Приложение берёт план отсюда: иначе
+   человек видел бы один план, а судили бы его по другому. */
+struct LoggedSignal {
+    Row r;
+    TradePlan plan;
+    int conf = 0;
+    bool modelled = false;
+    std::string why;
+};
+
+void logSignals(long long asOf, const std::vector<LoggedSignal>& out) {
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return;
     sqlite3_stmt* find = nullptr;
@@ -2269,14 +2294,15 @@ void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& ou
         return;
     if (!prepareOrLog(db, &ins,
             "INSERT INTO ai_signal_log(made_at,venue,token,sym,side,conf,modelled,"
-            "entry,stop,take1,take2,horizon) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")) {
+            "entry,stop,take1,take2,horizon,risk_share,lev,why) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")) {
         sqlite3_finalize(find);
         return;
     }
     sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
-    for (size_t i = 0; i < out.size(); i++) {
-        const Row& r = out[i].first;
-        const TradePlan& p = out[i].second;
+    for (const LoggedSignal& k : out) {
+        const Row& r = k.r;
+        const TradePlan& p = k.plan;
         const int side = r.score > 0 ? 1 : 0;
         sqlite3_reset(find);
         sqlite3_bind_int(find, 1, r.perp ? 1 : 0);
@@ -2289,13 +2315,16 @@ void logSignals(long long asOf, const std::vector<std::pair<Row, TradePlan>>& ou
         sqlite3_bind_text(ins, 3, r.id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(ins, 4, r.name.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(ins, 5, side);
-        sqlite3_bind_int(ins, 6, meta[i].first);
-        sqlite3_bind_int(ins, 7, meta[i].second ? 1 : 0);
+        sqlite3_bind_int(ins, 6, k.conf);
+        sqlite3_bind_int(ins, 7, k.modelled ? 1 : 0);
         sqlite3_bind_double(ins, 8, p.entry);
         sqlite3_bind_double(ins, 9, p.stop);
         sqlite3_bind_double(ins, 10, p.take1);
         sqlite3_bind_double(ins, 11, p.take2);
         sqlite3_bind_int64(ins, 12, p.horizon > 0 ? p.horizon : AI_HORIZON_24H);
+        sqlite3_bind_double(ins, 13, p.riskShare);
+        sqlite3_bind_int(ins, 14, p.leverage);
+        sqlite3_bind_text(ins, 15, k.why.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(ins);
     }
     sqlite3_finalize(find);
@@ -2486,15 +2515,11 @@ void publishSignals() {
     {
         // Журнал выданного — до замены текущего списка: он про то, что было
         // показано, и переживает любую перезапись.
-        std::vector<std::pair<Row, TradePlan>> rows;
-        std::vector<std::pair<int, bool>> meta;
+        std::vector<LoggedSignal> rows;
         rows.reserve(ready.size());
-        meta.reserve(ready.size());
-        for (const Ready& k : ready) {
-            rows.emplace_back(k.r, k.plan);
-            meta.emplace_back(k.conf, k.modelled);
-        }
-        logSignals(asOf, rows, meta);
+        for (const Ready& k : ready)
+            rows.push_back(LoggedSignal{k.r, k.plan, k.conf, k.modelled, k.why});
+        logSignals(asOf, rows);
     }
     closeSignalLog();
 
