@@ -1545,9 +1545,25 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
     const bool six = horizon == ORACLE_H6;
     const double minMove = oracleMinMove(horizon);
     std::vector<Sample> out;
+    /* Под замком базы — только чтение строк. Признаки считаются после, без
+       него: RSI, ATR, MACD и полосы по часовым рядам — работа на заметные
+       доли секунды на тысячах строк, и всё это время база была занята. Ряды
+       лежат в памяти, к базе они не ходят, так что держать замок незачем;
+       а с переходом на шаг в горизонт строк стало вчетверо больше, и цена
+       этой ошибки выросла во столько же. */
+    struct Raw {
+        OracleInput in;
+        long long ts = 0, then = 0, later = 0;
+    };
+    std::vector<Raw> raws;
+    sqlite3_stmt* s = nullptr;
+    /* Воронка: сколько строк пережило прореживание и сколько из них отсеял
+       порог хода. Без этих двух чисел «примеров мало» не говорит, что
+       менять — собирать больше событий или трогать порог. */
+    long long kept = 0, small = 0;
+    {
     std::lock_guard<std::mutex> lock(dbMutex);
     if (!db) return out;
-    sqlite3_stmt* s = nullptr;
     const std::string px = six ? "price_6h" : "price_24h";
     const std::string filled = six ? "filled_6h" : "filled_at";
     const std::string sql =
@@ -1580,10 +1596,6 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
     if (!prepareOrLog(db, &s, sql.c_str()))
         return out;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
-    /* Воронка: сколько строк пережило прореживание и сколько из них отсеял
-       порог хода. Без этих двух чисел «примеров мало» не говорит, что
-       менять — собирать больше событий или трогать порог. */
-    long long kept = 0, small = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         OracleInput in;
         in.perp = perp;
@@ -1611,6 +1623,16 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         kept++;
         const double ret = static_cast<double>(later - then) / static_cast<double>(then);
         if (std::fabs(ret) < minMove) { small++; continue; }
+        raws.push_back(Raw{std::move(in), ts, then, later});
+    }
+    sqlite3_finalize(s);
+    }   // замок базы отпущен: дальше только счёт по рядам в памяти
+
+    out.reserve(raws.size());
+    for (const Raw& r : raws) {
+        const OracleInput& in = r.in;
+        const long long ts = r.ts, then = r.then, later = r.later;
+        const double ret = static_cast<double>(later - then) / static_cast<double>(then);
         Sample sm;
         sm.ts = ts;
         featuresOf(m, in, ts, sm.f);
@@ -1635,7 +1657,6 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         sm.w = static_cast<float>(clampd(std::fabs(ret) / minMove, 1.0, 3.0));
         out.push_back(std::move(sm));
     }
-    sqlite3_finalize(s);
     std::cout << "[оракул] выборка " << (perp ? "перпы " : "спот ")
               << horizon / 3600 << "ч: непересекающихся " << kept
               << ", из них ход меньше порога у " << small

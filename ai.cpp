@@ -347,6 +347,13 @@ void ensureSchema() {
         ");"
         "CREATE INDEX IF NOT EXISTS idx_ai_events_fill ON ai_events(filled_at, ts);"
         "CREATE INDEX IF NOT EXISTS idx_ai_events_fill6 ON ai_events(filled_6h, ts);"
+        /* Отбор примеров ищет по монете дубли внутри окна: «есть ли строка
+           по этой же монете в этом же окне раньше». Без индекса по монете
+           SQLite перебирает все предыдущие строки журнала на каждую строку —
+           на сорока тысячах это двадцать две секунды против половины с ним,
+           и запрос идёт по разу на каждую площадку и горизонт, в боте при
+           переобучении и в API при сборе выдачи. */
+        "CREATE INDEX IF NOT EXISTS idx_ai_events_coin ON ai_events(token, venue, ts);"
         "CREATE TABLE IF NOT EXISTS ai_weights ("
         "  k INTEGER PRIMARY KEY,"
         "  v REAL NOT NULL"
@@ -1558,6 +1565,59 @@ std::string fmtPx(double v) {
     return b;
 }
 
+/* Имя признака словами.
+ *
+ * Оракул отдаёт имена по-английски — «flow», «vol 24h», — и в сообщении они
+ * так и стояли. Читателю чата они говорят не больше, чем читателю экрана.
+ * Список тот же, что в приложении, и порождён из него же; сторож сверяет,
+ * что они не разошлись. Чего здесь нет, остаётся как есть: RSI, ATR и MACD
+ * читаются одинаково на любом языке.
+ */
+const std::pair<const char*, const char*> FEATURE_KEY[] = {
+    {"flow", "ai_why_flow"},
+    {"volume", "ai_why_vol"},
+    {"top100", "ai_why_top"},
+    {"top dir", "ai_why_topdir"},
+    {"wallets", "ai_why_breadth"},
+    {"liq skew", "ai_why_liqskew"},
+    {"spread", "ai_why_share"},
+    {"OI 1h", "ai_why_oi"},
+    {"OI 24h", "ai_why_oi"},
+    {"RSI", "ai_why_rsi"},
+    {"leverage", "ai_why_lev"},
+    {"liquidity", "ai_why_liq"},
+    {"age", "ai_why_age"},
+    {"vlm z", "ai_why_volz"},
+    {"shock", "ai_why_shock"},
+    {"accel", "ai_ft_accel"},
+    {"trades", "ai_ft_trades"},
+    {"ticket", "ai_ft_ticket"},
+    {"both", "ai_ft_both"},
+    {"ret 1h", "ai_ft_ret1"},
+    {"ret 6h", "ai_ft_ret6"},
+    {"ret 24h", "ai_ft_ret24"},
+    {"vol 24h", "ai_ft_vol24"},
+    {"vol jump", "ai_ft_voljump"},
+    {"to high", "ai_ft_tohigh"},
+    {"from low", "ai_ft_fromlow"},
+    {"trend", "ai_ft_trend"},
+    {"funding", "ai_ft_fund"},
+    {"funding z", "ai_ft_fundz"},
+    {"OI/vlm", "ai_ft_oivlm"},
+    {"vlm 24h", "ai_ft_vlm24"},
+    {"liq/OI", "ai_ft_liqoi"},
+    {"BTC 24h", "ai_ft_btc24"},
+    {"BTC vol", "ai_ft_btcvol"},
+    {"breadth", "ai_ft_breadth"},
+    {"hour", "ai_ft_hour"},
+    {"hour 2", "ai_ft_hour"},
+};
+
+std::string featureLabel(const std::string& name, Lang lang) {
+    for (const auto& kv : FEATURE_KEY)
+        if (name == kv.first) return tr(lang, kv.second);
+    return name;
+}
 /* Возвращает false, если писать нечего: модель эту сделку не дала. Счёт
    ведётся по написанному, поэтому решение принимается до первой строки —
    оборванная на середине карточка хуже отсутствующей. */
@@ -1728,14 +1788,18 @@ void fillOutcomes() {
  * на шести часах вдвое ниже суточного, примеров там должно быть больше — а
  * на экране стояло восемьдесят восемь из шестисот.
  *
- * Цену того часа ищем в собранных рядах. Идём по журналу один раз, партиями,
- * запоминая, где остановились: строку, для которой цены в рядах не нашлось,
- * второй раз не трогаем — иначе каждая партия уходила бы на одни и те же
- * безнадёжные записи. Дойдя до конца, ремонт больше не просыпается.
+ * Цену того часа ищем в собранных рядах. Идём по журналу партиями, запоминая,
+ * где остановились: строку, для которой цены в рядах не нашлось, второй раз в
+ * этом проходе не трогаем — иначе каждая партия уходила бы на одни и те же
+ * безнадёжные записи.
+ *
+ * Дойдя до конца, начинаем сначала, а не засыпаем навсегда. Дыра может
+ * появиться и позади курсора: бот простоял час, исход этого часа записался
+ * нулём, а курсор те строки уже миновал. Один проход по сорока тысячам строк
+ * партиями по три сотни занимает пару часов фоновой работы и стоит одного
+ * запроса в минуту — дешевле, чем потерянная разметка.
  */
 void repairOutcomes() {
-    static bool done = false;
-    if (done) return;
     ensureSchema();
     const long long now = hl::nowSec();
     constexpr int BATCH = 300;
@@ -1786,8 +1850,15 @@ void repairOutcomes() {
         sqlite3_finalize(s);
     }
     if (!any) {
-        done = true;
-        std::cout << "[AI] ремонт журнала: пройден весь" << std::endl;
+        // Конец журнала: следующий проход начнётся с начала.
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* c = nullptr;
+        if (prepareOrLog(db, &c, "INSERT OR REPLACE INTO ai_weights(k,v) VALUES(?,0)")) {
+            sqlite3_bind_int(c, 1, CURSOR_KEY);
+            sqlite3_step(c);
+            sqlite3_finalize(c);
+        }
         return;
     }
 
@@ -3025,16 +3096,22 @@ AiMessage buildAiStatus(const std::string& chatId) {
         // то же число у постоянного прогноза: без него «потери 0.66» ничего
         // не значат.
         if (oracleReady(perp)) {
+            /* Чат — такой же публичный экран, как мини-апп: «AUC», «потери»
+               и число деревьев говорят читателю ровно ничего. Числа те же,
+               подписи — теми же словами, что на экране состояния. Сколько в
+               модели деревьев, снято совсем: это про её устройство, а не про
+               то, стоит ли ей верить. */
             const OracleStats os = oracleStats(perp);
-            t << "🧠 <b>Cortex</b> \u00B7 " << os.trees << " " << tr(lang, "ai_st_trees")
-              << " \u00B7 " << os.samples << " " << tr(lang, "ai_st_samples") << "\n";
-            t << "AUC <b>" << std::fixed << std::setprecision(3) << os.auc << "</b>";
+            t << "🧠 <b>Cortex</b> \u00B7 " << os.samples << " "
+              << tr(lang, "ai_st_samples") << "\n";
+            t << tr(lang, "ai_st_quality") << " <b>" << std::fixed << std::setprecision(3)
+              << os.auc << "</b>";
             t.unsetf(std::ios::fixed);
             t << " \u00B7 " << tr(lang, "ai_st_acc") << " <b>"
               << static_cast<int>(os.acc * 100.0 + 0.5) << "%</b>\n";
             t << tr(lang, "ai_st_loss") << " " << std::fixed << std::setprecision(3)
               << os.logloss << " \u00B7 " << tr(lang, "ai_st_base") << " " << os.baseLogloss << "\n";
-            t << tr(lang, "ai_st_wf") << " AUC " << os.wfAuc << "\n";
+            t << tr(lang, "ai_st_wf") << " " << os.wfAuc << "\n";
             t.unsetf(std::ios::fixed);
             if (os.at > 0)
                 t << "\u2699 " << (hl::nowSec() - os.at) / 3600 << tr(lang, "ai_hist_hours") << "\n";
@@ -3042,7 +3119,8 @@ AiMessage buildAiStatus(const std::string& chatId) {
                 t << tr(lang, "ai_st_top") << " ";
                 for (size_t k = 0; k < os.top.size() && k < 3; k++) {
                     if (k) t << " \u00B7 ";
-                    t << os.top[k].first << " <code>"
+                    // Имя признака словами: сырое «vol 24h» ничего не объясняет.
+                    t << featureLabel(os.top[k].first, lang) << " <code>"
                       << static_cast<int>(os.top[k].second * 100.0 + 0.5) << "%</code>";
                 }
                 t << "\n";
