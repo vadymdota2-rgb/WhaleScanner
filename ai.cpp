@@ -1611,6 +1611,12 @@ const std::pair<const char*, const char*> FEATURE_KEY[] = {
     {"breadth", "ai_ft_breadth"},
     {"hour", "ai_ft_hour"},
     {"hour 2", "ai_ft_hour"},
+    {"fib back", "ai_ft_fibback"},
+    {"fib level", "ai_ft_fiblevel"},
+    {"fib ext", "ai_ft_fibext"},
+    {"wave run", "ai_ft_waverun"},
+    {"wave with", "ai_ft_wavewith"},
+    {"wave grow", "ai_ft_wavegrow"},
 };
 
 std::string featureLabel(const std::string& name, Lang lang) {

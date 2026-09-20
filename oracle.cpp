@@ -632,6 +632,132 @@ void bandOver(const Series& s, int i, int hours, double& fromHigh, double& fromL
     fromLow = clampd(px / lo - 1.0, 0.0, 5.0);
 }
 
+/* ------------------------------------ колена, волны и Фибоначчи --- */
+
+/* Разворот ряда: бар, на котором цена развернулась, и его цена.
+ *
+ * Всё, что ниже, строится на одном: ряд размечается на колена. Колено — ход
+ * в одну сторону, который кончился откатом не меньше порога. Никакой теории
+ * здесь нет, это простой зигзаг, и он считается только по барам не позже
+ * события: заглянуть вперёд разметка не может по устройству. */
+struct Swing {
+    int i = 0;         // бар разворота
+    double px = 0;     // цена разворота
+    bool high = false; // разворот сверху или снизу
+};
+
+/* Разметка последних hours часов на колена с порогом отката thr.
+ *
+ * Порог берётся от собственной волатильности монеты, а не числом: на
+ * спокойной паре откат в три процента — разворот, на мем-монете — обычный
+ * час. Без этого у одних всё было бы одним коленом, у других — сотней. */
+void swingsOf(const Series& s, int i, int hours, double thr, std::vector<Swing>& out) {
+    out.clear();
+    if (i < 8 || thr <= 0 || hours < 24) return;
+    const int from = std::max(0, i - hours + 1);
+    double extHi = 0, extLo = 0;
+    int hiI = from, loI = from, dir = 0;   // 0 — сторона ещё не определилась
+    for (int k = from; k <= i; k++) {
+        const Bar& b = s.bars[static_cast<size_t>(k)];
+        const double h = b.hi > 0 ? b.hi : b.c;
+        const double l = b.lo > 0 ? b.lo : b.c;
+        if (h <= 0 || l <= 0) continue;
+        if (extHi <= 0) { extHi = h; extLo = l; hiI = loI = k; continue; }
+        if (h > extHi) { extHi = h; hiI = k; }
+        if (l < extLo) { extLo = l; loI = k; }
+        if (dir >= 0 && l <= extHi * (1.0 - thr)) {
+            out.push_back(Swing{hiI, extHi, true});
+            dir = -1;
+            extHi = h; hiI = k;
+            extLo = l; loI = k;
+        } else if (dir <= 0 && l > 0 && h >= extLo * (1.0 + thr)) {
+            out.push_back(Swing{loI, extLo, false});
+            dir = 1;
+            extHi = h; hiI = k;
+            extLo = l; loI = k;
+        }
+        if (out.size() > 32) out.erase(out.begin());
+    }
+}
+
+/* Шесть признаков: где цена внутри последнего колена, насколько это место
+ * похоже на уровень Фибоначчи, как далеко ушло текущее колено, сколько колен
+ * подряд рынок идёт в одну сторону, идёт ли нынешнее с ними заодно и длиннее
+ * ли оно предыдущего своей стороны.
+ *
+ * Про волны Эллиотта стоит сказать честно: сосчитать их так, как это делает
+ * человек, нельзя — разметка у двух аналитиков выходит разной, и спорить о
+ * ней можно бесконечно. Считается то, что в этой разметке объективно:
+ * колена, их длины и отношения. «Третья волна не бывает самой короткой» и
+ * «откат идёт к 0.382–0.618» — это утверждения про числа, и вот эти числа
+ * модели и даются. Значит ли что-нибудь хоть одно из них, решает не автор
+ * признака: модель сама разберётся по важности, а ворота приёмки не пустят
+ * её в бой, если от них ничего не прибавилось.
+ *
+ * Всё считается по барам не позже i. Уровень, посчитанный по будущему
+ * максимуму, был бы не признаком, а ответом. */
+void wavesOf(const Series& s, int i, std::array<float, 6>& f) {
+    f.fill(0.0f);
+    if (i < 48) return;
+    const double px = s.bars[static_cast<size_t>(i)].c;
+    if (px <= 0) return;
+    /* Порог разворота — три средних часовых хода, но не меньше полутора
+       процентов и не больше двенадцати: иначе у тихой пары коленом станет
+       шум, а у бурной весь месяц окажется одним коленом. */
+    const double thr = clampd(3.0 * atrOver(s, i, 24), 0.015, 0.12);
+    std::vector<Swing> sw;
+    swingsOf(s, i, 336, thr, sw);
+    if (sw.size() < 2) return;
+
+    const Swing& end = sw[sw.size() - 1];   // конец последнего готового колена
+    const Swing& beg = sw[sw.size() - 2];   // его начало
+    const double span = std::fabs(end.px - beg.px);
+    if (!(span > 0) || beg.px <= 0 || end.px <= 0) return;
+
+    /* 1. Глубина отката: 0 — цена осталась на конце колена, 1 — вернулась к
+          его началу, больше единицы — колено перекрыто целиком. */
+    const double back = clampd((px - end.px) / (beg.px - end.px), -0.25, 1.75);
+    f[0] = static_cast<float>(back);
+
+    /* 2. Похоже ли это на уровень Фибоначчи. Единица — цена ровно на нём,
+          ноль — дальше девяти сотых от любого из трёх. Отдельным признаком,
+          а не порогом: пусть модель сама решит, значит ли это что-нибудь. */
+    double near = 1.0;
+    for (const double lv : {0.382, 0.5, 0.618})
+        near = std::min(near, std::fabs(back - lv) / 0.09);
+    f[1] = static_cast<float>(clampd(1.0 - near, 0.0, 1.0));
+
+    /* 3. Насколько далеко ушло нынешнее, ещё не кончившееся колено, против
+          предыдущего. Единица — они равны, 1.618 — та самая проекция. */
+    f[2] = static_cast<float>(clampd(std::fabs(px - end.px) / span, 0.0, 3.0));
+
+    /* 4. Сколько колен подряд рынок идёт в одну сторону, не сбиваясь: каждый
+          следующий верх выше прошлого и каждый низ выше прошлого (или ниже —
+          если вниз). Пять — полная последовательность, о которой и речь у
+          Эллиотта; дальше считать нечего. */
+    int run = 0;
+    const bool up = !beg.high;   // колено из низа в верх — ход вверх
+    for (int k = static_cast<int>(sw.size()) - 1; k >= 2; k--) {
+        const double a = sw[static_cast<size_t>(k)].px;
+        const double b = sw[static_cast<size_t>(k - 2)].px;
+        if (up ? a > b : a < b) run++;
+        else break;
+        if (run >= 5) break;
+    }
+    f[3] = static_cast<float>(clampd(run / 5.0, 0.0, 1.0));
+
+    /* 5. Идёт ли нынешнее колено заодно с этим ходом или против него. */
+    const bool nowUp = px > end.px;
+    f[4] = static_cast<float>(nowUp == up ? 1.0 : -1.0);
+
+    /* 6. «Третья волна не бывает самой короткой» — числом: насколько
+          последнее готовое колено длиннее предыдущего своей стороны. */
+    if (sw.size() >= 4) {
+        const double prev = std::fabs(sw[sw.size() - 3].px - sw[sw.size() - 4].px);
+        if (prev > 0) f[5] = static_cast<float>(clampd(span / prev, 0.0, 3.0));
+    }
+}
+
 double smaRatio(const Series& s, int i, int hours) {
     if (i < hours || hours < 2) return 0;
     double sum = 0;
@@ -802,7 +928,8 @@ const char* const FEAT_NAME[ORACLE_NF] = {
     "vlm 24h",   "liq skew",  "liq/OI",   "leverage",  "liquidity",
     "BTC 24h",   "BTC vol",   "breadth",  "hour",      "hour 2",
     "MACD",      "MACD sig",  "MACD hist", "age",       "vlm z",
-    "shock",
+    "shock",     "fib back",  "fib level", "fib ext",   "wave run",
+    "wave with", "wave grow",
 };
 
 /* Единственное место, где считаются признаки. При обучении сюда приходит
@@ -868,6 +995,12 @@ void featuresOf(const Market& m, const OracleInput& in, long long asOf,
         f[38] = static_cast<float>(ageOf(*s, i));
         f[39] = static_cast<float>(volumeZ(*s, i, 168));
         f[40] = static_cast<float>(shockOf(*s, i, 6));
+        /* Колена, волны и уровни Фибоначчи. Ряд размечается зигзагом по
+           порогу от собственной волатильности монеты, и дальше считаются
+           отношения длин — то в разметке волн, что можно посчитать. */
+        std::array<float, 6> w{};
+        wavesOf(*s, i, w);
+        for (int k = 0; k < 6; k++) f[41 + k] = w[static_cast<size_t>(k)];
     }
 
     if (in.perp) {
@@ -1673,8 +1806,15 @@ void loadModels() {
         if (blob.empty()) continue;
         Model f;
         if (!unpackModel(blob, f)) {
-            std::cerr << "[оракул] модель " << (v ? "перпов" : "спота")
-                      << " не читается, забыта" << std::endl;
+            /* Запись не читается — чаще всего потому, что признаков стало
+               больше и старая модель считает не то. Строку надо удалить, а
+               не просто забыть: API читает ai_models напрямую, и на экране
+               стояло бы «модель принята», пока бот считает формулой. */
+            std::cerr << "[оракул] модель " << (v ? "перпов" : "спота") << " "
+                      << (horizon == ORACLE_H6 ? "6ч" : "24ч")
+                      << " не читается (признаки изменились?), снята"
+                      << std::endl;
+            revokeModel(v != 0, horizon);
             continue;
         }
         std::array<double, ORACLE_NF> gain{};
