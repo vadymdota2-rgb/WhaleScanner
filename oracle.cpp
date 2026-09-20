@@ -1557,16 +1557,33 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         "e.price_then,e." + px + " "
         "FROM ai_events e WHERE e." + filled + ">0 AND e.price_then>0 AND e." + px + ">0 "
         "AND e.window_days=24 AND e.venue=? "
-        // Один пример на монету в день: иначе разогнавшийся день учится
-        // наизусть двадцатью почти одинаковыми строками.
+        /* Один пример на монету в окно длиной с горизонт.
+         *
+         * Журнал пишется каждый час, и соседние часы по одной монете — почти
+         * одна и та же строка: признаки за час меняются мало, а окна исходов
+         * перекрываются почти целиком. Учить на всех двадцати четырёх значило
+         * бы дать модели выучить один день наизусть, а при делении выборки по
+         * времени — развести почти-двойники по разные стороны границы и
+         * получить завышенный AUC на пустом месте.
+         *
+         * Поэтому берём примеры, чьи окна исходов не перекрываются: шаг равен
+         * горизонту. Раньше шаг был сутками для обоих горизонтов — для
+         * суточного это и есть правило, а шестичасовой терял вчетверо больше,
+         * чем требовала осторожность: четыре непересекающихся шестичасовых
+         * окна в сутках помещаются свободно. */
         "AND NOT EXISTS ("
         "  SELECT 1 FROM ai_events e2 WHERE e2.token=e.token AND e2.venue=e.venue "
         "  AND e2.window_days=24 AND e2." + filled + ">0 AND e2.price_then>0 "
-        "  AND e2." + px + ">0 AND e2.ts/86400=e.ts/86400 AND e2.id<e.id) "
+        "  AND e2." + px + ">0 AND e2.ts/" + std::to_string(horizon)
+        + "=e.ts/" + std::to_string(horizon) + " AND e2.id<e.id) "
         "ORDER BY e.ts";
     if (!prepareOrLog(db, &s, sql.c_str()))
         return out;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
+    /* Воронка: сколько строк пережило прореживание и сколько из них отсеял
+       порог хода. Без этих двух чисел «примеров мало» не говорит, что
+       менять — собирать больше событий или трогать порог. */
+    long long kept = 0, small = 0;
     while (sqlite3_step(s) == SQLITE_ROW) {
         OracleInput in;
         in.perp = perp;
@@ -1591,8 +1608,9 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         const long long then = sqlite3_column_int64(s, 18);
         const long long later = sqlite3_column_int64(s, 19);
         if (then <= 0 || later <= 0) continue;
+        kept++;
         const double ret = static_cast<double>(later - then) / static_cast<double>(then);
-        if (std::fabs(ret) < minMove) continue;
+        if (std::fabs(ret) < minMove) { small++; continue; }
         Sample sm;
         sm.ts = ts;
         featuresOf(m, in, ts, sm.f);
@@ -1618,6 +1636,11 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         out.push_back(std::move(sm));
     }
     sqlite3_finalize(s);
+    std::cout << "[оракул] выборка " << (perp ? "перпы " : "спот ")
+              << horizon / 3600 << "ч: непересекающихся " << kept
+              << ", из них ход меньше порога у " << small
+              << " (порог " << std::llround(minMove * 1000) / 10.0 << "%), осталось "
+              << out.size() << std::endl;
     return out;
 }
 
