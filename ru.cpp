@@ -157,7 +157,7 @@ const std::unordered_map<std::string, Entry>& table() {
         {"ai_collecting", {"collecting results", "собираем результаты"}},
         {"ai_auc_hint", {"0.50 is a coin flip, 1.00 is perfect", "0.50 — как монетка, 1.00 — идеально"}},
         {"ai_loss_hint", {"lower is better; next to it, the same without the model", "меньше — лучше; рядом то же без модели"}},
-        {"ai_wf_hint", {"the same check on four stretches of time in a row", "та же проверка на четырёх отрезках времени подряд"}},
+        {"ai_wf_hint", {"the same check on several stretches of time in a row", "та же проверка на нескольких отрезках времени подряд"}},
         {"ai_hist_head", {"{a} of {b} signals reached the target", "{a} из {b} сигналов дошли до цели"}},
         {"ai_hist_rest", {"the rest hit the stop or went nowhere", "остальные ушли в стоп или никуда"}},
         {"ai_hist_title", {"Signal history", "История сигналов"}},

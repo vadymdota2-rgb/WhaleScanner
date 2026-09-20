@@ -578,8 +578,18 @@ TradePlan planOf(double px, double vol, double prob, bool isLong, double acc,
     double lev = riskBudget / stopPct;
     if (lev < 1) lev = 1;
     if (lev > 10) lev = 10;
+    if (!isPerp && lev > 1) lev = 1;       // на споте плеча нет
     t.leverage = static_cast<int>(lev + 0.5);
 
+    /* Доля депозита под риском — потеря на стопе при этом плече.
+     *
+     * Раньше формульный план не считал её вовсе, и число оставалось нулём.
+     * Дальше каждый читал ноль по-своему: чат подставлял «расстояние до
+     * стопа × плечо» — верно, — а приложение «расстояние до стопа» — без
+     * плеча. Под одной подписью «риск» выходили два разных числа, и на
+     * перпах с плечом 5 приложение занижало риск впятеро. Считаем здесь,
+     * один раз, и оба показывают одно. */
+    t.riskShare = std::min(cap, stopPct * t.leverage) * 100.0;
     t.valid = true;
     return t;
 }
@@ -649,7 +659,10 @@ TradePlan planFromLevels(double px, bool isLong, double up, double dn, double pr
     if (lev > 10) lev = 10;
     if (!isPerp && lev > 1) lev = 1;             // на споте плеча нет
     t.leverage = static_cast<int>(lev + 0.5);
-    t.riskShare = std::min(cap, stake * a) * 100.0;
+    /* Считаем по плечу, которое осталось после зажимов, а не по ставке
+       Келли. На споте плечо снимается до единицы, и доля, посчитанная по
+       номиналу в три депозита, обещала риск втрое больше возможного. */
+    t.riskShare = std::min(cap, a * t.leverage) * 100.0;
     t.valid = true;
     return t;
 }
@@ -1303,6 +1316,11 @@ struct Choice {
     int conf = 0;
     bool modelled = false;
     std::string why;          // «flow:412,RSI:-88» — имя и сдвиг в сотых процента
+    /* Модель эту сделку видела и не дала: либо ждёт хода в другую сторону,
+       либо при её уровнях сделка не окупает риск. Сигнала быть не должно —
+       ни в чате, ни в приложении. Отличать это от «модели нет вовсе»
+       обязательно: там работает формула, и это законно. */
+    bool blocked = false;
 };
 
 /* Доводы формулы — для тех сигналов, где модель ещё не обучена.
@@ -1344,8 +1362,10 @@ Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
     k.conf = fallbackConf;
     if (live <= 0) return k;
     double bestEv = 0;
+    bool sawModel = false;
     for (const OracleView& view : oracleViews(oracleInputOf(r), asOf)) {
         if (!view.known) continue;
+        sawModel = true;
         const double p = wantLong ? view.pUp : (1.0 - view.pUp);
         /* Модель обязана согласиться со стороной. Сторону выбирает поток
            китов, вероятность считает модель, и при p ниже половины это
@@ -1384,7 +1404,18 @@ Choice choosePlan(const Row& r, bool wantLong, double live, long long asOf,
         k.why = w.str();
     }
     if (!k.plan.valid) {
-        // Модели нет вовсе — старый путь: формула от волатильности.
+        /* Формула — только когда модели нет вовсе.
+         *
+         * Прежде откат был безусловным, и отказ модели выше по коду ничего
+         * не отменял: сигнал всё равно уходил в список, а уверенность к нему
+         * бралась из confPct, который первым делом спрашивает ту же модель.
+         * На экране получалась «Покупка · 38% шанс роста» — ровно то, что
+         * проверка выше обещала не допустить. Теперь отказ модели значит
+         * отсутствие сигнала. */
+        if (sawModel) {
+            k.blocked = true;
+            return k;
+        }
         const double vol = volatilityOf(r.id, r.perp);
         k.plan = planOf(live, vol, k.conf / 100.0, wantLong, acc, r.perp, thin);
         k.plan.horizon = AI_HORIZON_24H;
@@ -1472,15 +1503,11 @@ std::string fmtPx(double v) {
     return b;
 }
 
-void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong,
+/* Возвращает false, если писать нечего: модель эту сделку не дала. Счёт
+   ведётся по написанному, поэтому решение принимается до первой строки —
+   оборванная на середине карточка хуже отсутствующей. */
+bool writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trained, bool wantLong,
                 long long livePx) {
-    const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
-    const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
-    t << medal << num;
-    const char* sideKey = r.perp ? (wantLong ? "ai_long" : "ai_short")
-                                : (wantLong ? "ai_buy"  : "ai_sell");
-    t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, sideKey);
-    t << " · <b>" << r.name << "</b>\n";
     const double px = static_cast<double>(livePx) / 1000000000.0;
     double acc = 0;
     {
@@ -1492,7 +1519,16 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
        расчёта означали бы два разных ответа на один вопрос. */
     const Choice ch = choosePlan(r, wantLong, px, hl::nowSec(), acc, thinLiq,
                                  confPct(r, trained, wantLong), false);
+    if (ch.blocked) return false;
     const TradePlan tp = ch.plan;
+
+    const char* medal = i == 0 ? "🥇 " : (i == 1 ? "🥈 " : (i == 2 ? "🥉 " : ""));
+    const std::string num = i >= 3 ? "#" + std::to_string(i + 1) + " " : "";
+    t << medal << num;
+    const char* sideKey = r.perp ? (wantLong ? "ai_long" : "ai_short")
+                                : (wantLong ? "ai_buy"  : "ai_sell");
+    t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, sideKey);
+    t << " · <b>" << r.name << "</b>\n";
     t << horizonWords(tp.horizon, lang) << " · " << tr(lang, "ai_conf") << " "
       << ch.conf << "%\n";
     t << tr(lang, "ai_market") << "\n";
@@ -1502,12 +1538,11 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     if (tp.valid) {
         t << tr(lang, "ai_entry") << " <code>" << fmtPx(tp.entry) << "</code>";
         if (r.perp) {
-            /* Доля депозита под риском — то, чем человек рискует, и её
-               называет модель (четверть Келли). Прежде здесь стояло
-               «расстояние до стопа × плечо»: число выходило похожим, но
-               значило другое и ни на что не опиралось. */
-            const double budget = tp.riskShare > 0 ? tp.riskShare
-                                                   : tp.riskPct * tp.leverage;
+            /* Доля депозита под риском — то, чем человек рискует. Её считает
+               сам план, обоими путями: у модели по четверти Келли, у формулы
+               по плечу и стопу. Запасного расчёта здесь больше нет — он и
+               разошёлся когда-то с тем, что показывало приложение. */
+            const double budget = tp.riskShare;
             t << " \u00B7 " << tr(lang, "ai_risk") << " "
               << std::fixed << std::setprecision(1) << budget << "%"
               << " (" << tp.leverage << "x)";
@@ -1522,6 +1557,7 @@ void writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
     }
 
     writeWhy(t, r, lang, trained, wantLong);
+    return true;
 }
 
 std::string windowLabel(int hours, Lang lang) {
@@ -2931,8 +2967,12 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
             if (shown >= AI_TRADE_N) break;
             const long long live = livePriceOf(r);
             if (!keepSignal(r, wantLong, live)) continue;
+            /* Разделитель — только если карточка будет. Модель может не дать
+               сделку, и тогда между соседями осталась бы пустая строка. */
+            std::ostringstream one;
+            if (!writeTrade(one, shown, r, lang, trainedHere, wantLong, live)) continue;
             if (shown) t << "\n";
-            writeTrade(t, shown, r, lang, trainedHere, wantLong, live);
+            t << one.str();
             shown++;
         }
         if (shown == 0) t << tr(lang, "ai_empty");
