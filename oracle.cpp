@@ -499,6 +499,10 @@ struct Bar {
 
 struct Series {
     std::vector<Bar> bars;   // по возрастанию времени
+    /* Час, когда монета впервые попала боту на глаза, из ai_coin_seen.
+       Ноль — «была и раньше, когда именно, неизвестно». Не начало ряда:
+       начало уезжает вместе с окном хранения, а это — нет. */
+    long long seen = 0;
 
     /* Последний бар не позже asOf. Именно здесь проходит граница между
        «модель знает» и «модель подглядывает в будущее»: всё, что после,
@@ -681,17 +685,25 @@ void macdOf(const Series& s, int i, double& line, double& sig, double& hist) {
     hist = clampd(line - sig, -0.5, 0.5);
 }
 
-/* Возраст монеты в рядах: сколько часов прошло от первого бара до события.
+/* Возраст монеты: сколько часов прошло от её появления до события.
  *
  * Это и есть «листинг» в том виде, в каком бот может его знать: новый перп
- * появляется на бирже — и ряд у него начинается тогда же. Числом берём
+ * появляется на бирже — и бот впервые видит его тогда же. Числом берём
  * логарифм: разница между вчера и позавчера велика, между полугодом и годом
- * её нет. Ряды бот собирает около трёх месяцев, поэтому всё старше просто
- * упирается в единицу — различать надо новое, а не древнее. */
+ * её нет. Три месяца и больше упираются в единицу — различать надо новое, а
+ * не древнее.
+ *
+ * Считается от s.seen, а не от начала ряда. Ряды живут окном в 95 суток, и
+ * начало у них уезжает каждый час: у одного и того же события возраст
+ * выходил бы сегодня один, завтра другой, а послезавтра монета «помолодела»
+ * бы до нуля. Обученное разошлось бы с применённым, и заметить это было бы
+ * нельзя. Час первой встречи записан в базе один раз и не меняется.
+ *
+ * Ноль в seen — «была раньше, чем бот начал смотреть»: когда появилась, он
+ * не знает, и честный ответ здесь «старая», единица. */
 double ageOf(const Series& s, int i) {
-    if (s.bars.empty() || i < 0) return 1.0;
-    const double hours = static_cast<double>(s.bars[static_cast<size_t>(i)].ts
-                                             - s.bars.front().ts) / 3600.0;
+    if (s.bars.empty() || i < 0 || s.seen <= 0) return 1.0;
+    const double hours = static_cast<double>(s.bars[static_cast<size_t>(i)].ts - s.seen) / 3600.0;
     if (hours <= 0) return 0.0;
     return clampd(std::log1p(hours) / std::log1p(2160.0), 0.0, 1.0);
 }
@@ -1165,6 +1177,68 @@ void buildBreadth(Market& m, long long from, long long to) {
     }
 }
 
+/* Час первой встречи с каждой монетой: читаем записанное, недостающее
+ * дописываем — и больше никогда не трогаем.
+ *
+ * Как узнаётся час в первый раз: берём начало ряда. Если оно совпало с
+ * краем всех рядов вообще — то есть дальше бот не помнит ничего, — значит
+ * ряд обрезан окном, монета была и раньше, и записываем ноль: «старая,
+ * когда появилась — неизвестно». Пока база моложе окна, краем стоит день,
+ * когда бот начал собирать, и «новых» монет не оказывается вовсе. Это
+ * честно: он и правда не знает, кто из них когда появился.
+ *
+ * Записанное не переписывается никогда. Монета, у которой листинг однажды
+ * попал в окно, сохранит настоящий возраст и через год, когда сам листинг
+ * из рядов давно выпадет. */
+void fillFirstSeen(Market& m) {
+    long long edge = 0;
+    for (const auto* side : {&m.perp, &m.spot})
+        for (const auto& kv : *side)
+            if (!kv.second.bars.empty() && (edge == 0 || kv.second.bars.front().ts < edge))
+                edge = kv.second.bars.front().ts;
+
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (!db) return;
+    std::unordered_map<std::string, long long> known;
+    sqlite3_stmt* q = nullptr;
+    if (prepareOrLog(db, &q, "SELECT venue,id,first_ts FROM ai_coin_seen")) {
+        while (sqlite3_step(q) == SQLITE_ROW)
+            known[std::to_string(sqlite3_column_int(q, 0)) + ":" + safeColumnText(q, 1)] =
+                sqlite3_column_int64(q, 2);
+        sqlite3_finalize(q);
+    }
+    sqlite3_stmt* ins = nullptr;
+    const bool ready = prepareOrLog(db, &ins,
+        "INSERT OR IGNORE INTO ai_coin_seen(venue,id,first_ts) VALUES(?,?,?)");
+    char* err = nullptr;
+    sqlite3_exec(db, "BEGIN", nullptr, nullptr, &err);
+    if (err) sqlite3_free(err);
+    int added = 0;
+    for (int v = 0; v < 2; v++) {
+        auto& side = v ? m.perp : m.spot;
+        for (auto& kv : side) {
+            if (kv.second.bars.empty()) continue;
+            auto it = known.find(std::to_string(v) + ":" + kv.first);
+            if (it != known.end()) { kv.second.seen = it->second; continue; }
+            const long long first = kv.second.bars.front().ts;
+            kv.second.seen = (edge > 0 && first <= edge + 2 * 3600) ? 0 : first;
+            added++;
+            if (!ready) continue;
+            sqlite3_reset(ins);
+            sqlite3_bind_int(ins, 1, v);
+            sqlite3_bind_text(ins, 2, kv.first.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins, 3, kv.second.seen);
+            sqlite3_step(ins);
+        }
+    }
+    err = nullptr;
+    sqlite3_exec(db, "COMMIT", nullptr, nullptr, &err);
+    if (err) sqlite3_free(err);
+    if (ready) sqlite3_finalize(ins);
+    if (added > 0)
+        std::cout << "[оракул] впервые вижу монет: " << added << std::endl;
+}
+
 void rebuildMarket() {
     const long long now = hl::nowSec();
     const long long from = now - ORACLE_HISTORY;
@@ -1178,6 +1252,7 @@ void rebuildMarket() {
     size_t bars = 0;
     for (const auto& kv : fresh.perp) bars += kv.second.bars.size();
     for (const auto& kv : fresh.spot) bars += kv.second.bars.size();
+    fillFirstSeen(fresh);
     {
         std::lock_guard<std::mutex> l(g_mktMutex);
         g_mkt = std::make_shared<const Market>(std::move(fresh));
@@ -1350,8 +1425,21 @@ void ensureModelSchema() {
         "  wf_auc REAL NOT NULL DEFAULT 0,"
         "  wf_min REAL NOT NULL DEFAULT 0,"
         "  wf_folds INTEGER NOT NULL DEFAULT 0,"
+        /* Сколько раз подряд модель прошла ворота. Одного раза мало: на
+           шестнадцати попытках в сутки случайность проходит их сама. */
+        "  passes INTEGER NOT NULL DEFAULT 0,"
         "  accepted INTEGER NOT NULL DEFAULT 0,"
-        "  PRIMARY KEY(venue, horizon));";
+        "  PRIMARY KEY(venue, horizon));"
+        /* Когда бот впервые увидел монету. Записывается один раз и больше
+           не меняется: возраст монеты обязан быть одним и тем же числом и
+           при обучении, и в бою, а ряды живут окном в 95 суток и края у них
+           уезжают каждый час. Ноль значит «монета была раньше, чем бот
+           начал смотреть» — то есть старая. */
+        "CREATE TABLE IF NOT EXISTS ai_coin_seen ("
+        "  venue INTEGER NOT NULL,"
+        "  id TEXT NOT NULL,"
+        "  first_ts INTEGER NOT NULL,"
+        "  PRIMARY KEY(venue, id));";
     char* err = nullptr;
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
         std::cerr << "[оракул] схема моделей: " << (err ? err : "?") << std::endl;
@@ -1363,7 +1451,8 @@ void ensureModelSchema() {
                             "ALTER TABLE ai_models ADD COLUMN wf_min REAL NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_models ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_model_try ADD COLUMN wf_min REAL NOT NULL DEFAULT 0",
-                            "ALTER TABLE ai_model_try ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0"}) {
+                            "ALTER TABLE ai_model_try ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_model_try ADD COLUMN passes INTEGER NOT NULL DEFAULT 0"}) {
         char* e = nullptr;
         sqlite3_exec(db, mig, nullptr, nullptr, &e);
         if (e) sqlite3_free(e);
@@ -1443,15 +1532,72 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
     sqlite3_finalize(s);
 }
 
+/* Прошлая попытка по этой паре: на скольких примерах считалась и сколько раз
+   подряд прошла ворота. По первому числу видно, стала ли выборка новой. */
+struct LastTry {
+    long long samples = 0;
+    int passes = 0;
+};
+
+LastTry loadLastTry(bool perp, long long horizon) {
+    LastTry r;
+    ensureModelSchema();
+    std::lock_guard<std::mutex> l(dbMutex);
+    if (!db) return r;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT samples, passes FROM ai_model_try WHERE venue=? AND horizon=?"))
+        return r;
+    sqlite3_bind_int(s, 1, perp ? 1 : 0);
+    sqlite3_bind_int64(s, 2, horizon);
+    if (sqlite3_step(s) == SQLITE_ROW) {
+        r.samples = sqlite3_column_int64(s, 0);
+        r.passes = sqlite3_column_int(s, 1);
+    }
+    sqlite3_finalize(s);
+    return r;
+}
+
+/* Снять принятую модель.
+ *
+ * Прежде принятая оставалась навсегда: провалившаяся попытка делала return и
+ * не трогала прежнюю. Модель, прошедшая ворота по удаче, жила бы вечно, даже
+ * если следующие сорок проверок её заворачивали. */
+bool oracleReadyUnlocked(bool perp, long long horizon) {
+    std::lock_guard<std::mutex> l(g_liveMutex);
+    return g_live[perp ? 1 : 0][hIndex(horizon)].have;
+}
+
+void revokeModel(bool perp, long long horizon) {
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        if (db) {
+            sqlite3_stmt* s = nullptr;
+            if (prepareOrLog(db, &s, "DELETE FROM ai_models WHERE venue=? AND horizon=?")) {
+                sqlite3_bind_int(s, 1, perp ? 1 : 0);
+                sqlite3_bind_int64(s, 2, horizon);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
+        }
+    }
+    std::lock_guard<std::mutex> l(g_liveMutex);
+    Live& live = g_live[perp ? 1 : 0][hIndex(horizon)];
+    live.have = false;
+    live.model = Model{};
+    live.st = OracleStats{};
+}
+
 void saveTry(bool perp, long long horizon, long long samples, double auc, double loss,
-             double base, double wf, double wfWorst, int wfFolds, bool accepted) {
+             double base, double wf, double wfWorst, int wfFolds, int passes, bool accepted) {
     ensureModelSchema();
     std::lock_guard<std::mutex> l(dbMutex);
     if (!db) return;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
             "INSERT OR REPLACE INTO ai_model_try(venue,horizon,at,samples,auc,logloss,"
-            "base_logloss,wf_auc,wf_min,wf_folds,accepted) VALUES(?,?,?,?,?,?,?,?,?,?,?)"))
+            "base_logloss,wf_auc,wf_min,wf_folds,passes,accepted) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, horizon);
@@ -1463,7 +1609,8 @@ void saveTry(bool perp, long long horizon, long long samples, double auc, double
     sqlite3_bind_double(s, 8, wf);
     sqlite3_bind_double(s, 9, wfWorst);
     sqlite3_bind_int(s, 10, wfFolds);
-    sqlite3_bind_int(s, 11, accepted ? 1 : 0);
+    sqlite3_bind_int(s, 11, passes);
+    sqlite3_bind_int(s, 12, accepted ? 1 : 0);
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
@@ -1622,7 +1769,7 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
         if (then <= 0 || later <= 0) continue;
         kept++;
         const double ret = static_cast<double>(later - then) / static_cast<double>(then);
-        if (std::fabs(ret) < minMove) { small++; continue; }
+        if (std::fabs(ret) < minMove) small++;
         raws.push_back(Raw{std::move(in), ts, then, later});
     }
     sqlite3_finalize(s);
@@ -1653,13 +1800,23 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
             sm.up = static_cast<float>(up);
             sm.dn = static_cast<float>(dn);
         }
-        // Большое движение весит больше маленького: ошибка на нём дороже.
-        sm.w = static_cast<float>(clampd(std::fabs(ret) / minMove, 1.0, 3.0));
+        /* Вес вместо отбора.
+         *
+         * Прежде строки с ходом меньше порога выбрасывались, и модель
+         * оценивала «шанс роста при условии, что ход был значимым». В бою
+         * этого условия нет: её спрашивают про любую монету, и про тихую
+         * тоже. Обучать на одном распределении, а применять к другому —
+         * расхождение, которого не видно ни в одном числе на экране.
+         *
+         * Поэтому не выбрасываем ничего, а взвешиваем: ход на пороге весит
+         * единицу, большой — до тройки, крошечный — четверть. Смысл «шум
+         * дешевле движения» сохранён, а условие из определения цели ушло. */
+        sm.w = static_cast<float>(clampd(std::fabs(ret) / minMove, 0.25, 3.0));
         out.push_back(std::move(sm));
     }
     std::cout << "[оракул] выборка " << (perp ? "перпы " : "спот ")
               << horizon / 3600 << "ч: непересекающихся " << kept
-              << ", из них ход меньше порога у " << small
+              << ", из них тихих (вес четверть) " << small
               << " (порог " << std::llround(minMove * 1000) / 10.0 << "%), осталось "
               << out.size() << std::endl;
     return out;
@@ -1668,6 +1825,20 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
 struct Scored {
     double auc = 0, logloss = 0, acc = 0, brier = 0, baseLoss = 0, rate = 0;
 };
+
+/* Карантин на границе двух частей выборки.
+ *
+ * Из первой части убираются примеры, чьи окна исходов заходят на начало
+ * второй. Окно длиной в горизонт: событие в 10:00 с суточной целью знает
+ * цену до 10:00 следующего дня, и проверять на нём модель, обученную до
+ * полудня того же дня, — значит проверять на том, что она отчасти видела.
+ */
+void embargo(std::vector<Sample>& before, const std::vector<Sample>& after,
+             long long horizon) {
+    if (before.empty() || after.empty()) return;
+    const long long edge = after.front().ts - horizon;
+    while (!before.empty() && before.back().ts > edge) before.pop_back();
+}
 
 /* Итог скользящей проверки: среднее, худшая складка и сколько их вышло. */
 struct WalkResult {
@@ -1711,7 +1882,7 @@ Scored scoreOn(const Forest& f, const std::vector<Sample>& xs) {
    шестистах считаются три. Поэтому приёмка требует, чтобы отработали все
    четыре, — иначе «проверено на нескольких отрезках» означало бы разное в
    разные дни. */
-WalkResult walkForward(const std::vector<Sample>& xs) {
+WalkResult walkForward(const std::vector<Sample>& xs, long long horizon) {
     WalkResult r;
     if (xs.size() < static_cast<size_t>(ORACLE_MIN_SAMPLES) * 2) return r;
     double sum = 0;
@@ -1727,6 +1898,8 @@ WalkResult walkForward(const std::vector<Sample>& xs) {
                                xs.begin() + static_cast<long>(trEnd));
         std::vector<Sample> te(xs.begin() + static_cast<long>(trEnd),
                                xs.begin() + static_cast<long>(teEnd));
+        embargo(tr, va, horizon);
+        embargo(va, te, horizon);
         if (tr.size() < static_cast<size_t>(ORACLE_MIN_SAMPLES) || te.size() < 40) continue;
         Fit fit = trainForest(tr, va);
         if (fit.trees == 0) continue;
@@ -1751,16 +1924,38 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
                   << ", нужно " << ORACLE_MIN_SAMPLES + 100 << std::endl;
         return;
     }
+    /* Новая выборка — новая проверка; та же выборка плюс двадцать строк — та
+       же проверка заново. Пока журнал не прибавил четверти, обучение не
+       запускается вовсе: это и бережёт ворота от того, чтобы в них стучались
+       шестнадцать раз в сутки, и не тратит процессор впустую. */
+    const LastTry last = loadLastTry(perp, horizon);
+    if (last.samples > 0
+        && xs.size() * ORACLE_GROWTH_DEN
+             < static_cast<size_t>(last.samples) * ORACLE_GROWTH_NUM) {
+        std::cout << "[оракул] " << who << ": выборка не выросла ("
+                  << xs.size() << " против " << last.samples
+                  << "), проверка не повторяется" << std::endl;
+        return;
+    }
     std::sort(xs.begin(), xs.end(),
               [](const Sample& a, const Sample& b) { return a.ts < b.ts; });
 
-    // Делим по времени, а не случайно: в бою модель всегда смотрит вперёд.
+    /* Делим по времени, а не случайно: в бою модель всегда смотрит вперёд.
+     *
+     * На границах — зазор длиной в горизонт. Последний обучающий пример и
+     * первый проверочный могут отстоять на час: монеты разные, но биткоин,
+     * ширина рынка и режим у них общие, а окна исходов перекрываются. Без
+     * зазора часть того, что проверка считает незнакомым, модель уже видела
+     * — и оценка выходит лучше правды. Выброшенные строки — цена честной
+     * границы, их единицы. */
     const size_t nTr = xs.size() * 70 / 100;
     const size_t nVa = xs.size() * 85 / 100;
     std::vector<Sample> tr(xs.begin(), xs.begin() + static_cast<long>(nTr));
     std::vector<Sample> va(xs.begin() + static_cast<long>(nTr),
                            xs.begin() + static_cast<long>(nVa));
     std::vector<Sample> te(xs.begin() + static_cast<long>(nVa), xs.end());
+    embargo(tr, va, horizon);
+    embargo(va, te, horizon);
 
     Fit fit = trainForest(tr, va);
     if (fit.trees == 0) {
@@ -1768,7 +1963,7 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
         return;
     }
     const Scored sc = scoreOn(fit.forest, te);
-    const WalkResult wf = walkForward(xs);
+    const WalkResult wf = walkForward(xs, horizon);
 
     /* Уровни: два леса про то, как далеко цена уходит вверх и вниз. Они
        принимаются отдельно от направления и по своему признаку — средняя
@@ -1837,18 +2032,33 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
      * складка выше монетки, а не только среднее выше 0.52, — одна удачная
      * не должна вытаскивать остальные. */
     const bool enough = xs.size() >= static_cast<size_t>(ORACLE_MIN_ACCEPT);
-    const bool accepted = enough && wf.folds >= ORACLE_WF_FOLDS
-                       && sc.auc >= 0.55 && sc.logloss < sc.baseLoss
-                       && wf.mean >= 0.52 && wf.worst >= 0.50;
+    const bool passed = enough && wf.folds >= ORACLE_WF_FOLDS
+                     && sc.auc >= 0.55 && sc.logloss < sc.baseLoss
+                     && wf.mean >= 0.52 && wf.worst >= 0.50;
+    /* Ворота, пройденные один раз, — совпадение. Считаем их подряд: принимаем
+       только со второго раза, на другой, выросшей выборке. Провал обнуляет
+       счёт. */
+    const int passes = passed ? last.passes + 1 : 0;
+    const bool accepted = passed && passes >= ORACLE_CONFIRMS;
     saveTry(perp, horizon, static_cast<long long>(xs.size()), sc.auc, sc.logloss,
-            sc.baseLoss, wf.mean, wf.worst, wf.folds, accepted);
+            sc.baseLoss, wf.mean, wf.worst, wf.folds, passes, accepted);
     if (!accepted) {
         std::cout << "[оракул] " << who << ": не принята";
         if (!enough)
             std::cout << " — примеров " << xs.size() << " из " << ORACLE_MIN_ACCEPT;
         else if (wf.folds < ORACLE_WF_FOLDS)
             std::cout << " — складок " << wf.folds << " из " << ORACLE_WF_FOLDS;
-        std::cout << ", остаёмся на прежнем" << std::endl;
+        else if (passed)
+            std::cout << " — подтверждений " << passes << " из " << ORACLE_CONFIRMS;
+        /* Провалившая ворота модель снимается, а не остаётся висеть. Прежде
+           провал делал return и не трогал прежнюю: принятая по удаче жила бы
+           вечно. Подтверждение, наоборот, не снимает ничего — это та же
+           модель, просто ещё не подтверждённая. */
+        if (!passed && oracleReadyUnlocked(perp, horizon)) {
+            revokeModel(perp, horizon);
+            std::cout << " (прежняя снята)";
+        }
+        std::cout << std::endl;
         return;
     }
 
