@@ -192,6 +192,52 @@ double brierOf(const std::vector<double>& p, const std::vector<float>& y) {
     return s / static_cast<double>(p.size());
 }
 
+/* Совпадает ли обещанное со сбывшимся.
+ *
+ * AUC говорит только про порядок: модель может безошибочно ранжировать и при
+ * этом называть 90% там, где на деле 55%. Человеку показывают именно число, и
+ * если оно врёт, то врёт весь экран — «61% шанс роста» читается как обещание,
+ * а не как место в очереди.
+ *
+ * Оценки раскладываются по корзинам, в каждой сравнивается средняя обещанная
+ * вероятность со сбывшейся долей, и расхождения складываются с весом корзины.
+ * Это ECE — средняя по выборке ошибка обещания.
+ *
+ * Рядом считается шумовой пол. На полутора сотнях строк даже идеально
+ * калиброванная модель даст ECE около восьми сотых просто от случайности
+ * выборки: в корзине три десятка примеров, и доля в ней гуляет. Сравнивать
+ * ECE с наперёд заданным числом поэтому бессмысленно — сравнивать надо с тем,
+ * сколько дала бы сама случайность при таких же корзинах. */
+void calibrationOf(const std::vector<double>& p, const std::vector<float>& y,
+                   double& ece, double& floor) {
+    ece = 0; floor = 0;
+    const size_t n = p.size();
+    if (n < 20) return;
+    constexpr int BINS = 5;
+    std::array<double, BINS> sumP{}, sumY{};
+    std::array<size_t, BINS> cnt{};
+    for (size_t i = 0; i < n; i++) {
+        int b = static_cast<int>(clampd(p[i], 0.0, 0.9999) * BINS);
+        b = std::min(BINS - 1, std::max(0, b));
+        sumP[static_cast<size_t>(b)] += p[i];
+        sumY[static_cast<size_t>(b)] += static_cast<double>(y[i]);
+        cnt[static_cast<size_t>(b)]++;
+    }
+    for (int b = 0; b < BINS; b++) {
+        const size_t nb = cnt[static_cast<size_t>(b)];
+        if (nb == 0) continue;
+        const double w = static_cast<double>(nb) / static_cast<double>(n);
+        const double mp = sumP[static_cast<size_t>(b)] / static_cast<double>(nb);
+        const double my = sumY[static_cast<size_t>(b)] / static_cast<double>(nb);
+        ece += w * std::fabs(mp - my);
+        /* Сколько дала бы одна случайность: стандартная ошибка доли в
+           корзине такого размера. Снизу ограничиваем, чтобы вырожденная
+           корзина не обнулила пол. */
+        floor += w * std::sqrt(std::max(mp * (1.0 - mp), 0.01)
+                               / static_cast<double>(nb));
+    }
+}
+
 double accOf(const std::vector<double>& p, const std::vector<float>& y) {
     if (p.empty()) return 0;
     size_t hit = 0;
@@ -1538,6 +1584,8 @@ void ensureModelSchema() {
            одна удачная. Приёмка смотрит именно сюда. */
         "  wf_min REAL NOT NULL DEFAULT 0,"
         "  wf_folds INTEGER NOT NULL DEFAULT 0,"
+        "  ece REAL NOT NULL DEFAULT 0,"
+        "  ece_floor REAL NOT NULL DEFAULT 0,"
         "  levels INTEGER NOT NULL DEFAULT 0,"
         "  up_err REAL NOT NULL DEFAULT 0,"
         "  dn_err REAL NOT NULL DEFAULT 0,"
@@ -1560,6 +1608,8 @@ void ensureModelSchema() {
         "  wf_folds INTEGER NOT NULL DEFAULT 0,"
         /* Сколько раз подряд модель прошла ворота. Одного раза мало: на
            шестнадцати попытках в сутки случайность проходит их сама. */
+        "  ece REAL NOT NULL DEFAULT 0,"
+        "  ece_floor REAL NOT NULL DEFAULT 0,"
         "  passes INTEGER NOT NULL DEFAULT 0,"
         /* Время самого свежего примера на той попытке. По нему считается,
            сколько данных с тех пор действительно новые: объём выборки для
@@ -1591,7 +1641,11 @@ void ensureModelSchema() {
                             "ALTER TABLE ai_model_try ADD COLUMN wf_min REAL NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_model_try ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_model_try ADD COLUMN passes INTEGER NOT NULL DEFAULT 0",
-                            "ALTER TABLE ai_model_try ADD COLUMN last_ts INTEGER NOT NULL DEFAULT 0"}) {
+                            "ALTER TABLE ai_model_try ADD COLUMN last_ts INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_models ADD COLUMN ece REAL NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_models ADD COLUMN ece_floor REAL NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_model_try ADD COLUMN ece REAL NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_model_try ADD COLUMN ece_floor REAL NOT NULL DEFAULT 0"}) {
         char* e = nullptr;
         sqlite3_exec(db, mig, nullptr, nullptr, &e);
         if (e) sqlite3_free(e);
@@ -1643,8 +1697,8 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
     if (!prepareOrLog(db, &s,
             "INSERT OR REPLACE INTO ai_models(venue,horizon,created_at,samples,test_n,trees,"
             "auc,logloss,acc,brier,base_logloss,base_rate,wf_auc,wf_min,wf_folds,"
-            "levels,up_err,dn_err,gain,model) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "ece,ece_floor,levels,up_err,dn_err,gain,model) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, horizon);
@@ -1661,11 +1715,13 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
     sqlite3_bind_double(s, 13, st.wfAuc);
     sqlite3_bind_double(s, 14, st.wfWorst);
     sqlite3_bind_int(s, 15, st.wfFolds);
-    sqlite3_bind_int(s, 16, st.levels ? 1 : 0);
-    sqlite3_bind_double(s, 17, st.upErr);
-    sqlite3_bind_double(s, 18, st.dnErr);
-    sqlite3_bind_blob(s, 19, gblob.data(), static_cast<int>(gblob.size()), SQLITE_TRANSIENT);
-    sqlite3_bind_blob(s, 20, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_double(s, 16, st.ece);
+    sqlite3_bind_double(s, 17, st.eceFloor);
+    sqlite3_bind_int(s, 18, st.levels ? 1 : 0);
+    sqlite3_bind_double(s, 19, st.upErr);
+    sqlite3_bind_double(s, 20, st.dnErr);
+    sqlite3_bind_blob(s, 21, gblob.data(), static_cast<int>(gblob.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_blob(s, 22, blob.data(), static_cast<int>(blob.size()), SQLITE_TRANSIENT);
     if (sqlite3_step(s) != SQLITE_DONE)
         std::cerr << "[оракул] модель не сохранена" << std::endl;
     sqlite3_finalize(s);
@@ -1732,7 +1788,8 @@ void revokeModel(bool perp, long long horizon) {
 }
 
 void saveTry(bool perp, long long horizon, long long samples, double auc, double loss,
-             double base, double wf, double wfWorst, int wfFolds, int passes,
+             double base, double wf, double wfWorst, int wfFolds,
+             double ece, double eceFloor, int passes,
              long long lastTs, bool accepted) {
     ensureModelSchema();
     std::lock_guard<std::mutex> l(dbMutex);
@@ -1740,8 +1797,8 @@ void saveTry(bool perp, long long horizon, long long samples, double auc, double
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
             "INSERT OR REPLACE INTO ai_model_try(venue,horizon,at,samples,auc,logloss,"
-            "base_logloss,wf_auc,wf_min,wf_folds,passes,last_ts,accepted) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "base_logloss,wf_auc,wf_min,wf_folds,ece,ece_floor,passes,last_ts,accepted) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, horizon);
@@ -1753,9 +1810,11 @@ void saveTry(bool perp, long long horizon, long long samples, double auc, double
     sqlite3_bind_double(s, 8, wf);
     sqlite3_bind_double(s, 9, wfWorst);
     sqlite3_bind_int(s, 10, wfFolds);
-    sqlite3_bind_int(s, 11, passes);
-    sqlite3_bind_int64(s, 12, lastTs);
-    sqlite3_bind_int(s, 13, accepted ? 1 : 0);
+    sqlite3_bind_double(s, 11, ece);
+    sqlite3_bind_double(s, 12, eceFloor);
+    sqlite3_bind_int(s, 13, passes);
+    sqlite3_bind_int64(s, 14, lastTs);
+    sqlite3_bind_int(s, 15, accepted ? 1 : 0);
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
@@ -1773,7 +1832,7 @@ void loadModels() {
             if (!prepareOrLog(db, &s,
                     "SELECT created_at,samples,test_n,trees,auc,logloss,acc,brier,"
                     "base_logloss,base_rate,wf_auc,gain,model,levels,up_err,dn_err,"
-                    "wf_min,wf_folds FROM ai_models "
+                    "wf_min,wf_folds,ece,ece_floor FROM ai_models "
                     "WHERE venue=? AND horizon=?"))
                 return;
             sqlite3_bind_int(s, 1, v);
@@ -1800,6 +1859,8 @@ void loadModels() {
                 st.dnErr = sqlite3_column_double(s, 15);
                 st.wfWorst = sqlite3_column_double(s, 16);
                 st.wfFolds = sqlite3_column_int(s, 17);
+                st.ece = sqlite3_column_double(s, 18);
+                st.eceFloor = sqlite3_column_double(s, 19);
             }
             sqlite3_finalize(s);
         }
@@ -1976,6 +2037,8 @@ std::vector<Sample> loadSamples(bool perp, const Market& m, long long horizon) {
 
 struct Scored {
     double auc = 0, logloss = 0, acc = 0, brier = 0, baseLoss = 0, rate = 0;
+    /* Ошибка калибровки и шумовой пол под ней — см. calibrationOf. */
+    double ece = 0, eceFloor = 0;
 };
 
 /* Карантин на границе двух частей выборки.
@@ -2017,6 +2080,7 @@ Scored scoreOn(const Forest& f, const std::vector<Sample>& xs) {
     r.brier = brierOf(p, y);
     std::vector<double> flat(xs.size(), clampd(r.rate, 1e-6, 1 - 1e-6));
     r.baseLoss = loglossOf(flat, y);
+    calibrationOf(p, y, r.ece, r.eceFloor);
     return r;
 }
 
@@ -2195,16 +2259,21 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
      * складка выше монетки, а не только среднее выше 0.52, — одна удачная
      * не должна вытаскивать остальные. */
     const bool enough = xs.size() >= static_cast<size_t>(ORACLE_MIN_ACCEPT);
+    /* Пятое условие — про само число, а не про порядок: обещанное обязано
+       совпадать со сбывшимся. Без него модель могла бы безошибочно
+       ранжировать и при этом называть 90% там, где на деле 55%. */
+    const bool calibrated = sc.eceFloor > 0 && sc.ece <= ORACLE_ECE_K * sc.eceFloor;
     const bool passed = enough && wf.folds >= ORACLE_WF_FOLDS
                      && sc.auc >= 0.55 && sc.logloss < sc.baseLoss
-                     && wf.mean >= 0.52 && wf.worst >= 0.50;
+                     && wf.mean >= 0.52 && wf.worst >= 0.50 && calibrated;
     /* Ворота, пройденные один раз, — совпадение. Считаем их подряд: принимаем
        только со второго раза, на другой, выросшей выборке. Провал обнуляет
        счёт. */
     const int passes = passed ? last.passes + 1 : 0;
     const bool accepted = passed && passes >= ORACLE_CONFIRMS;
     saveTry(perp, horizon, static_cast<long long>(xs.size()), sc.auc, sc.logloss,
-            sc.baseLoss, wf.mean, wf.worst, wf.folds, passes, lastTs, accepted);
+            sc.baseLoss, wf.mean, wf.worst, wf.folds, sc.ece, sc.eceFloor,
+            passes, lastTs, accepted);
     if (!accepted) {
         std::cout << "[оракул] " << who << ": не принята";
         if (!enough)
@@ -2241,6 +2310,8 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
     st.wfAuc = wf.mean;
     st.wfWorst = wf.worst;
     st.wfFolds = wf.folds;
+    st.ece = sc.ece;
+    st.eceFloor = sc.eceFloor;
     st.levels = model.levels;
     st.upErr = upErr;
     st.dnErr = dnErr;
