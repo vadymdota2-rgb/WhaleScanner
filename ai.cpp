@@ -57,6 +57,10 @@ std::map<int, AiCacheEntry> g_aiCache;
 constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
 constexpr int AI_TRADE_N = 5;
+/* Сколько живых цен разбор спрашивает за один проход. Проход идёт раз в
+   минуту, кэш цены живёт минуту, и больше восьмидесяти запросов в минуту
+   ради разбора незачем: остальные подождут следующего круга. */
+constexpr int AI_LIVE_CHECK_N = 80;
 /* Телеграм не принимает сообщение длиннее 4096 знаков — и не обрезает его, а
    отказывает целиком: человек остался бы без сигналов вовсе. Держим запас на
    разметку и на то, что длину он считает по символам, а не по байтам. */
@@ -827,8 +831,10 @@ struct LivePx {
 std::mutex g_livePxMutex;
 std::map<std::string, LivePx> g_livePx;
 
-long long livePriceOf(const Row& r) {
-    const std::string key = std::string(r.perp ? "p:" : "s:") + r.id;
+/* Живая цена по монете. Кэш на минуту общий с publishSignals: разбор
+   сигналов ходит сюда же, и второй раз за ту же минуту сеть не дёргается. */
+long long livePriceById(bool perp, const std::string& id) {
+    const std::string key = std::string(perp ? "p:" : "s:") + id;
     const time_t now = time(nullptr);
     {
         std::lock_guard<std::mutex> l(g_livePxMutex);
@@ -837,12 +843,12 @@ long long livePriceOf(const Row& r) {
             return it->second.nanos;
     }
     long long px = 0;
-    if (r.perp) {
-        px = hlMidNow(r.id);
-        if (px <= 0) px = perpMarkNow(r.id);
+    if (perp) {
+        px = hlMidNow(id);
+        if (px <= 0) px = perpMarkNow(id);
     } else {
-        px = dexUsdByToken(r.id);
-        if (px <= 0) px = priceNowOf(false, r.id);
+        px = dexUsdByToken(id);
+        if (px <= 0) px = priceNowOf(false, id);
     }
     if (px > 0) {
         std::lock_guard<std::mutex> l(g_livePxMutex);
@@ -855,6 +861,8 @@ long long livePriceOf(const Row& r) {
     }
     return px;
 }
+
+long long livePriceOf(const Row& r) { return livePriceById(r.perp, r.id); }
 
 struct FrozenEntry {
     long long px = 0;
@@ -2490,7 +2498,11 @@ void ensureSignalSchema() {
         "  why TEXT NOT NULL DEFAULT '',"
         "  ret_bp INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS idx_signal_log_open ON ai_signal_log(closed_at, made_at);"
-        "CREATE INDEX IF NOT EXISTS idx_signal_log_live ON ai_signal_log(venue, token, side, closed_at);";
+        "CREATE INDEX IF NOT EXISTS idx_signal_log_live ON ai_signal_log(venue, token, side, closed_at);"
+        /* История считается по площадкам врозь, и итоги по каждой — это
+           COUNT и SUM по всем её закрытым строкам. Без этого индекса каждый
+           сбор кэша дважды прочёсывал весь журнал целиком. */
+        "CREATE INDEX IF NOT EXISTS idx_signal_log_done ON ai_signal_log(venue, closed_at);";
     char* err = nullptr;
     if (sqlite3_exec(db, schema, nullptr, nullptr, &err) != SQLITE_OK)
         std::cerr << "[AI] сигналы: схема не создана: " << (err ? err : "?") << std::endl;
@@ -2622,8 +2634,12 @@ Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long f
         const char* q = perp
             ? "SELECT hour_ts, c, h, l FROM hl_candles WHERE coin=? AND hour_ts>=? AND hour_ts<=? "
               "ORDER BY hour_ts"
-            : "SELECT ts, price_nanos, 0, 0 FROM token_price_history WHERE address=? AND ts>=? "
-              "AND ts<=? ORDER BY ts";
+            /* У спота верх и низ теперь свои, а не подставленная цена: по
+               одной точке в час не видно, что цена задевала стоп и вернулась.
+               У строк старше миграции там нули, и ниже они заменяются ценой —
+               как было. */
+            : "SELECT ts, price_nanos, hi_nanos, lo_nanos FROM token_price_history "
+              "WHERE address=? AND ts>=? AND ts<=? ORDER BY ts";
         if (!prepareOrLog(h, &s, q)) return w;
         sqlite3_bind_text(s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 2, from);
@@ -2632,8 +2648,10 @@ Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long f
             const long long ts = sqlite3_column_int64(s, 0);
             double c = perp ? sqlite3_column_double(s, 1)
                             : static_cast<double>(sqlite3_column_int64(s, 1)) / 1e9;
-            double hi = perp ? sqlite3_column_double(s, 2) : c;
-            double lo = perp ? sqlite3_column_double(s, 3) : c;
+            double hi = perp ? sqlite3_column_double(s, 2)
+                             : static_cast<double>(sqlite3_column_int64(s, 2)) / 1e9;
+            double lo = perp ? sqlite3_column_double(s, 3)
+                             : static_cast<double>(sqlite3_column_int64(s, 3)) / 1e9;
             if (c <= 0) continue;
             if (hi <= 0) hi = c;
             if (lo <= 0) lo = c;
@@ -2641,7 +2659,21 @@ Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long f
         }
         sqlite3_finalize(s);
     }
-    if (bars.empty()) return w;
+    if (bars.empty()) {
+        /* Цен за это время в базе нет вовсе — токен перестали опрашивать
+           (делистинг, слитый пул), либо история по нему истекла. Раньше
+           такой сигнал не закрывался никогда: разбор уходил ни с чем, строка
+           оставалась открытой, и следующий проход снова брал её в те же
+           двести. Накопившись, такие мертвецы съедали всё окно разбора, и
+           живые сигналы переставали закрываться вовсе.
+
+           Когда горизонт вышел, закрываем: цена не дошла ни до цели, ни до
+           стопа — на то и «мимо». Цену выхода не выдумываем, её подставит
+           вызывающий. */
+        w.done = expired;
+        w.outcome = 0;
+        return w;
+    }
     for (const auto& b : bars) {
         const double c = std::get<1>(b), hi = std::get<2>(b), lo = std::get<3>(b);
         const bool hitStop = isLong ? (lo <= stop) : (hi >= stop);
@@ -2699,26 +2731,82 @@ void closeSignalLog() {
         sqlite3_finalize(s);
     }
     if (open.empty()) return;
+    /* Начало окна живых проверок едет по кругу: иначе первые в списке
+       спрашивались бы каждую минуту, а хвост — никогда. */
+    static size_t liveFrom = 0;
+    if (liveFrom >= open.size()) liveFrom = 0;
+    if (liveFrom > 0) std::rotate(open.begin(), open.begin() + static_cast<long>(liveFrom),
+                                  open.end());
+    liveFrom += AI_LIVE_CHECK_N;
     int closed = 0;
+    int lookedUp = 0;
     for (const Open& o : open) {
-        if (o.entry <= 0) continue;
         const bool isLong = o.side == 1;
         const bool expired = o.made + o.horizon <= now;
+        /* Вход нулевой — судить не по чему. Такую строку раньше пропускали
+           каждый проход, и она оставалась открытой вечно, занимая место в
+           окне разбора. Закрываем пустым исходом, как только вышел горизонт. */
+        if (o.entry <= 0) {
+            if (!expired) continue;
+            std::lock_guard<std::mutex> lock(dbMutex);
+            if (!db) return;
+            sqlite3_stmt* z = nullptr;
+            if (prepareOrLog(db, &z,
+                    "UPDATE ai_signal_log SET closed_at=?, exit_px=0, outcome=0, ret_bp=0 "
+                    "WHERE id=?")) {
+                sqlite3_bind_int64(z, 1, o.made + o.horizon);
+                sqlite3_bind_int64(z, 2, o.id);
+                if (sqlite3_step(z) == SQLITE_DONE) closed++;
+                sqlite3_finalize(z);
+            }
+            continue;
+        }
         // Смотрим по сегодняшний час: заглядывать за горизонт незачем.
         const long long until = std::min(now, o.made + o.horizon);
         const Walked w = walkOutcome(o.venue == 1, o.token, isLong, o.made,
                                      until, o.stop, o.take, expired);
-        if (!w.done || w.exitPx <= 0) continue;
-        const double ret = (isLong ? (w.exitPx - o.entry) : (o.entry - w.exitPx)) / o.entry;
+        Walked v = w;
+        /* Часовые бары отстают: последний записанный час — это в лучшем
+           случае то, что успели опросить, а стоп может быть задет прямо
+           сейчас. Поэтому, если по барам исхода нет, спрашиваем живую цену и
+           судим по ней — тогда цель закрывает сигнал в ту же минуту, а не
+           следующим часом. Порядок тот же, что и по барам: сперва стоп.
+
+           Цена берётся из общего минутного кэша, и за проход их спрашивается
+           не больше AI_LIVE_CHECK_N: открытых сигналов бывает две сотни, и
+           дёргать биржу за каждым ежеминутно незачем. Кого не успели в этот
+           раз, тот попадёт в следующий — начало окна едет по кругу.
+
+           Только пока горизонт не вышел. У истёкшего сигнала сегодняшняя
+           цена — это уже после его срока, и судить по ней значило бы
+           засчитывать ему чужое движение. */
+        if (!v.done && !expired && lookedUp < AI_LIVE_CHECK_N) {
+            lookedUp++;
+            const long long livePx = livePriceById(o.venue == 1, o.token);
+            const double live = static_cast<double>(livePx) / 1000000000.0;
+            if (live > 0) {
+                if (isLong ? (live <= o.stop) : (live >= o.stop)) {
+                    v.done = true; v.outcome = -1; v.exitPx = o.stop; v.at = now;
+                } else if (isLong ? (live >= o.take) : (live <= o.take)) {
+                    v.done = true; v.outcome = 1; v.exitPx = o.take; v.at = now;
+                }
+            }
+        }
+        if (!v.done) continue;
+        /* Цены выхода может не быть: разбор не увидел ни одного часа. Тогда
+           выходом считаем вход — движения мы не наблюдали, и приписывать ему
+           доход нечестно. */
+        const double exitPx = v.exitPx > 0 ? v.exitPx : o.entry;
+        const double ret = (isLong ? (exitPx - o.entry) : (o.entry - exitPx)) / o.entry;
         std::lock_guard<std::mutex> lock(dbMutex);
         if (!db) return;
         sqlite3_stmt* u = nullptr;
         if (!prepareOrLog(db, &u,
                 "UPDATE ai_signal_log SET closed_at=?, exit_px=?, outcome=?, ret_bp=? WHERE id=?"))
             return;
-        sqlite3_bind_int64(u, 1, w.at > 0 ? w.at : o.made + o.horizon);
-        sqlite3_bind_double(u, 2, w.exitPx);
-        sqlite3_bind_int(u, 3, w.outcome);
+        sqlite3_bind_int64(u, 1, v.at > 0 ? v.at : o.made + o.horizon);
+        sqlite3_bind_double(u, 2, exitPx);
+        sqlite3_bind_int(u, 3, v.outcome);
         sqlite3_bind_int(u, 4, static_cast<int>(std::llround(ret * 10000.0)));
         sqlite3_bind_int64(u, 5, o.id);
         if (sqlite3_step(u) == SQLITE_DONE) closed++;

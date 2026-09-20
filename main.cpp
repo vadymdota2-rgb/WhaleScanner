@@ -342,6 +342,7 @@ void initDB() {
             price_nanos INTEGER DEFAULT 0, price_ts INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS token_price_history (
             address TEXT NOT NULL, ts INTEGER NOT NULL, price_nanos INTEGER NOT NULL,
+            hi_nanos INTEGER NOT NULL DEFAULT 0, lo_nanos INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (address, ts));
         CREATE INDEX IF NOT EXISTS idx_price_hist_ts ON token_price_history(ts);
         CREATE TABLE IF NOT EXISTS alerts (id INTEGER PRIMARY KEY AUTOINCREMENT, message TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -363,6 +364,19 @@ void initDB() {
         if (sqlite3_exec(db, "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                          nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
+        if (mErr) sqlite3_free(mErr);
+    }
+    /* Максимум и минимум цены внутри часа. Раньше от часа оставалась одна
+       точка — первая, — хотя бот опрашивал цену по многу раз за час и просто
+       выбрасывал остальное. По одной точке не видно, что цена задевала стоп
+       и вернулась: сигнал считался «никуда не пошёл», а на деле его выбило.
+       У старых строк здесь нули, и тогда в ход идёт та самая единственная
+       цена — как было. */
+    for (const char* mig : {"ALTER TABLE token_price_history ADD COLUMN hi_nanos INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE token_price_history ADD COLUMN lo_nanos INTEGER NOT NULL DEFAULT 0"}) {
+        char* mErr = nullptr;
+        if (sqlite3_exec(db, mig, nullptr, nullptr, &mErr) == SQLITE_OK)
+            std::cout << "[STARTUP] token_price_history: added hi/lo column" << std::endl;
         if (mErr) sqlite3_free(mErr);
     }
     {

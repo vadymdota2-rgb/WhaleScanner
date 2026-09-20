@@ -322,17 +322,35 @@ void saveTokenMetadata(const std::string& a, const std::string& sym, int dec) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
+/* Цена токена за час: первая в часе плюс верх и низ за тот же час.
+ *
+ * Бот опрашивает цену по многу раз за час, а в базе оставалась одна точка —
+ * первая, и остальное выбрасывалось. По одной точке не видно, что цена
+ * задевала стоп и вернулась: разбор сигнала считал «никуда не пошёл», хотя
+ * на деле его выбило, и история выходила лучше правды.
+ *
+ * price_nanos не трогаем: на нём построены ряды оракула, и подмена его на
+ * последнюю цену часа сдвинула бы все признаки разом — обученное перестало
+ * бы отвечать применённому. Верх и низ дописываются рядом и идут только в
+ * разбор исходов, где такой симметрии не требуется. */
 void savePriceHistory(const std::string& a, uint64_t pn) {
     if (!pn) return;
     const long long slot = (static_cast<long long>(time(nullptr)) / PRICE_HISTORY_STEP_SEC)
                          * PRICE_HISTORY_STEP_SEC;
+    const auto v = static_cast<sqlite3_int64>(pn);
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
-        "INSERT OR IGNORE INTO token_price_history(address,ts,price_nanos) VALUES(?,?,?)")) return;
+        "INSERT INTO token_price_history(address,ts,price_nanos,hi_nanos,lo_nanos) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(address,ts) DO UPDATE SET "
+        "  hi_nanos=MAX(CASE WHEN hi_nanos>0 THEN hi_nanos ELSE price_nanos END, excluded.hi_nanos),"
+        "  lo_nanos=MIN(CASE WHEN lo_nanos>0 THEN lo_nanos ELSE price_nanos END, excluded.lo_nanos)")) return;
     sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 2, slot);
-    sqlite3_bind_int64(s, 3, static_cast<sqlite3_int64>(pn));
+    sqlite3_bind_int64(s, 3, v);
+    sqlite3_bind_int64(s, 4, v);
+    sqlite3_bind_int64(s, 5, v);
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
