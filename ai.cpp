@@ -2333,7 +2333,7 @@ void logSignals(long long asOf, const std::vector<LoggedSignal>& out) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
 }
 
-/* Чем кончился сигнал через сутки.
+/* Чем кончился сигнал.
  *
  * Идём по часам от выдачи: что случилось раньше — цена дошла до цели или
  * свалилась на стоп. У перпов есть настоящие максимум и минимум часа, у
@@ -2341,7 +2341,11 @@ void logSignals(long long asOf, const std::vector<LoggedSignal>& out) {
  * внутри часа не видно, и часть попаданий и стопов теряется.
  *
  * Если в одном часе задеты оба уровня, считаем стоп: предполагать, что успели
- * выйти в плюс, значит рисовать историю лучше, чем она была. */
+ * выйти в плюс, значит рисовать историю лучше, чем она была.
+ *
+ * `expired` — прошёл ли горизонт. Пока не прошёл, «ни цель, ни стоп» — это не
+ * исход, а «ещё идёт»: сигнал остаётся открытым. А вот стоп и цель — исход
+ * сразу, в тот час, когда их задели. */
 struct Walked {
     bool done = false;
     int outcome = 0;
@@ -2350,7 +2354,7 @@ struct Walked {
 };
 
 Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long from,
-                   long long to, double stop, double take) {
+                   long long to, double stop, double take, bool expired) {
     Walked w;
     std::vector<std::tuple<long long, double, double, double>> bars;  // ts, close, high, low
     {
@@ -2390,7 +2394,9 @@ Walked walkOutcome(bool perp, const std::string& token, bool isLong, long long f
         w.exitPx = c;
         w.at = std::get<0>(b);
     }
-    w.done = true;      // сутки вышли, ни цель, ни стоп не задеты
+    /* Ни цель, ни стоп. Исход это только когда горизонт уже вышел; иначе
+       сигнал просто ещё идёт, и закрывать его нечем. */
+    w.done = expired;
     w.outcome = 0;
     return w;
 }
@@ -2409,11 +2415,16 @@ void closeSignalLog() {
         std::lock_guard<std::mutex> lock(dbMutex);
         if (!db) return;
         sqlite3_stmt* s = nullptr;
+        /* Берём все открытые, а не только те, у которых вышел горизонт.
+           Сигнал, у которого цена пробила стоп, кончился в тот же час —
+           ждать ради него сутки значит показывать мёртвый план живым.
+           Именно это и было видно на карточке: стоп на −15%, а под ним
+           «−19.6% с момента сигнала», и до закрытия оставалось ещё
+           семнадцать часов. */
         if (!prepareOrLog(db, &s,
                 "SELECT id,made_at,venue,token,side,entry,stop,take1,horizon "
-                "FROM ai_signal_log WHERE closed_at=0 AND made_at+horizon<=? LIMIT 200"))
+                "FROM ai_signal_log WHERE closed_at=0 LIMIT 200"))
             return;
-        sqlite3_bind_int64(s, 1, now);
         while (sqlite3_step(s) == SQLITE_ROW) {
             Open o;
             o.id = sqlite3_column_int64(s, 0);
@@ -2435,8 +2446,11 @@ void closeSignalLog() {
     for (const Open& o : open) {
         if (o.entry <= 0) continue;
         const bool isLong = o.side == 1;
+        const bool expired = o.made + o.horizon <= now;
+        // Смотрим по сегодняшний час: заглядывать за горизонт незачем.
+        const long long until = std::min(now, o.made + o.horizon);
         const Walked w = walkOutcome(o.venue == 1, o.token, isLong, o.made,
-                                     o.made + o.horizon, o.stop, o.take);
+                                     until, o.stop, o.take, expired);
         if (!w.done || w.exitPx <= 0) continue;
         const double ret = (isLong ? (w.exitPx - o.entry) : (o.entry - w.exitPx)) / o.entry;
         std::lock_guard<std::mutex> lock(dbMutex);
