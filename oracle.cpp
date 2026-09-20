@@ -1428,6 +1428,11 @@ void ensureModelSchema() {
         /* Сколько раз подряд модель прошла ворота. Одного раза мало: на
            шестнадцати попытках в сутки случайность проходит их сама. */
         "  passes INTEGER NOT NULL DEFAULT 0,"
+        /* Время самого свежего примера на той попытке. По нему считается,
+           сколько данных с тех пор действительно новые: объём выборки для
+           этого не годится — журнал живёт окном и рано или поздно выходит
+           на полку, а новые исходы в него идти не перестают. */
+        "  last_ts INTEGER NOT NULL DEFAULT 0,"
         "  accepted INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY(venue, horizon));"
         /* Когда бот впервые увидел монету. Записывается один раз и больше
@@ -1452,7 +1457,8 @@ void ensureModelSchema() {
                             "ALTER TABLE ai_models ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_model_try ADD COLUMN wf_min REAL NOT NULL DEFAULT 0",
                             "ALTER TABLE ai_model_try ADD COLUMN wf_folds INTEGER NOT NULL DEFAULT 0",
-                            "ALTER TABLE ai_model_try ADD COLUMN passes INTEGER NOT NULL DEFAULT 0"}) {
+                            "ALTER TABLE ai_model_try ADD COLUMN passes INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE ai_model_try ADD COLUMN last_ts INTEGER NOT NULL DEFAULT 0"}) {
         char* e = nullptr;
         sqlite3_exec(db, mig, nullptr, nullptr, &e);
         if (e) sqlite3_free(e);
@@ -1537,6 +1543,9 @@ void saveModel(bool perp, const Model& f, const OracleStats& st,
 struct LastTry {
     long long samples = 0;
     int passes = 0;
+    /* Самый свежий пример на той попытке: всё, что позже, — данные, которых
+       проверка ещё не видела. */
+    long long lastTs = 0;
 };
 
 LastTry loadLastTry(bool perp, long long horizon) {
@@ -1546,13 +1555,14 @@ LastTry loadLastTry(bool perp, long long horizon) {
     if (!db) return r;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
-            "SELECT samples, passes FROM ai_model_try WHERE venue=? AND horizon=?"))
+            "SELECT samples, passes, last_ts FROM ai_model_try WHERE venue=? AND horizon=?"))
         return r;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, horizon);
     if (sqlite3_step(s) == SQLITE_ROW) {
         r.samples = sqlite3_column_int64(s, 0);
         r.passes = sqlite3_column_int(s, 1);
+        r.lastTs = sqlite3_column_int64(s, 2);
     }
     sqlite3_finalize(s);
     return r;
@@ -1589,15 +1599,16 @@ void revokeModel(bool perp, long long horizon) {
 }
 
 void saveTry(bool perp, long long horizon, long long samples, double auc, double loss,
-             double base, double wf, double wfWorst, int wfFolds, int passes, bool accepted) {
+             double base, double wf, double wfWorst, int wfFolds, int passes,
+             long long lastTs, bool accepted) {
     ensureModelSchema();
     std::lock_guard<std::mutex> l(dbMutex);
     if (!db) return;
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
             "INSERT OR REPLACE INTO ai_model_try(venue,horizon,at,samples,auc,logloss,"
-            "base_logloss,wf_auc,wf_min,wf_folds,passes,accepted) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"))
+            "base_logloss,wf_auc,wf_min,wf_folds,passes,last_ts,accepted) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_int(s, 1, perp ? 1 : 0);
     sqlite3_bind_int64(s, 2, horizon);
@@ -1610,7 +1621,8 @@ void saveTry(bool perp, long long horizon, long long samples, double auc, double
     sqlite3_bind_double(s, 9, wfWorst);
     sqlite3_bind_int(s, 10, wfFolds);
     sqlite3_bind_int(s, 11, passes);
-    sqlite3_bind_int(s, 12, accepted ? 1 : 0);
+    sqlite3_bind_int64(s, 12, lastTs);
+    sqlite3_bind_int(s, 13, accepted ? 1 : 0);
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
@@ -1924,18 +1936,29 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
                   << ", нужно " << ORACLE_MIN_SAMPLES + 100 << std::endl;
         return;
     }
-    /* Новая выборка — новая проверка; та же выборка плюс двадцать строк — та
-       же проверка заново. Пока журнал не прибавил четверти, обучение не
-       запускается вовсе: это и бережёт ворота от того, чтобы в них стучались
-       шестнадцать раз в сутки, и не тратит процессор впустую. */
+    /* Новые данные — новая проверка; те же данные плюс двадцать строк — та
+       же проверка заново. Пока с прошлой попытки не набралось четверти
+       выборки новых исходов, обучение не запускается вовсе: это и бережёт
+       ворота от того, чтобы в них стучались четыре раза в сутки, и не
+       тратит процессор впустую.
+     *
+     * Считается новизна, а не размер. Размером мерить нельзя: журнал живёт
+     * окном и рано или поздно выходит на полку — сколько исходов приходит,
+     * столько и уходит. По росту выборки обучение в этот день замерло бы
+     * навсегда, хотя данные с тех пор сменились целиком. */
     const LastTry last = loadLastTry(perp, horizon);
-    if (last.samples > 0
-        && xs.size() * ORACLE_GROWTH_DEN
-             < static_cast<size_t>(last.samples) * ORACLE_GROWTH_NUM) {
-        std::cout << "[оракул] " << who << ": выборка не выросла ("
-                  << xs.size() << " против " << last.samples
-                  << "), проверка не повторяется" << std::endl;
-        return;
+    long long lastTs = 0;
+    for (const Sample& x : xs) if (x.ts > lastTs) lastTs = x.ts;
+    if (last.lastTs > 0) {
+        size_t fresh = 0;
+        for (const Sample& x : xs) if (x.ts > last.lastTs) fresh++;
+        if (fresh * ORACLE_GROWTH_DEN
+                < xs.size() * (ORACLE_GROWTH_NUM - ORACLE_GROWTH_DEN)) {
+            std::cout << "[оракул] " << who << ": новых исходов " << fresh
+                      << " из " << xs.size() << ", нужно четверть — "
+                      << "проверка не повторяется" << std::endl;
+            return;
+        }
     }
     std::sort(xs.begin(), xs.end(),
               [](const Sample& a, const Sample& b) { return a.ts < b.ts; });
@@ -2041,7 +2064,7 @@ void trainVenue(bool perp, const Market& m, long long horizon) {
     const int passes = passed ? last.passes + 1 : 0;
     const bool accepted = passed && passes >= ORACLE_CONFIRMS;
     saveTry(perp, horizon, static_cast<long long>(xs.size()), sc.auc, sc.logloss,
-            sc.baseLoss, wf.mean, wf.worst, wf.folds, passes, accepted);
+            sc.baseLoss, wf.mean, wf.worst, wf.folds, passes, lastTs, accepted);
     if (!accepted) {
         std::cout << "[оракул] " << who << ": не принята";
         if (!enough)
