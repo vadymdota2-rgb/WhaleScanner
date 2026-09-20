@@ -703,27 +703,32 @@ long long usdToNanos(double usd) {
  * шестичасовым горизонтом, — момент упущен, и цену остаётся искать в
  * собранных рядах.
  *
- * Берём ближайшую запись в пределах часа: ряды почасовые, и точного
- * попадания в секунду не бывает. Дальше часа не ищем — это уже не цена того
- * момента, а соседнего.
+ * Берём первую запись НЕ РАНЬШЕ нужного часа, в пределах часа после него.
+ * Не ближайшую в обе стороны: живой путь заполняет исход в первый тик после
+ * истечения горизонта, то есть всегда чуть позже, и никогда раньше. Возьми
+ * мы ближайшую, метка «вырос за шесть часов» иногда считалась бы по пятому
+ * часу — а на разогнанной монете час это несколько процентов. Модель училась
+ * бы на цели размытее той, по которой её потом судят.
+ *
+ * Дальше часа не ищем: это уже не цена того момента. Лучше не разметить
+ * событие вовсе, чем разметить соседним часом.
  *
  * Зовётся только без блокировки базы: внутри она берётся своя.
  */
 long long priceAtOf(bool perp, const std::string& id, long long at) {
     if (id.empty() || at <= 0) return 0;
-    const long long from = at - 3600, to = at + 3600;
+    const long long from = at, to = at + 3600;
     if (perp) {
         std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
         if (!hl::g_hlDb) return 0;
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(hl::g_hlDb, &s,
                 "SELECT c FROM hl_candles WHERE coin=? AND hour_ts BETWEEN ? AND ? "
-                "ORDER BY ABS(hour_ts-?) LIMIT 1"))
+                "ORDER BY hour_ts ASC LIMIT 1"))
             return 0;
         sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(s, 2, from);
         sqlite3_bind_int64(s, 3, to);
-        sqlite3_bind_int64(s, 4, at);
         long long out = 0;
         if (sqlite3_step(s) == SQLITE_ROW) out = usdToNanos(sqlite3_column_double(s, 0));
         sqlite3_finalize(s);
@@ -734,12 +739,11 @@ long long priceAtOf(bool perp, const std::string& id, long long at) {
     sqlite3_stmt* s = nullptr;
     if (!prepareOrLog(db, &s,
             "SELECT price_nanos FROM token_price_history WHERE address=? AND ts BETWEEN ? AND ? "
-            "ORDER BY ABS(ts-?) LIMIT 1"))
+            "ORDER BY ts ASC LIMIT 1"))
         return 0;
     sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 2, from);
     sqlite3_bind_int64(s, 3, to);
-    sqlite3_bind_int64(s, 4, at);
     long long out = 0;
     if (sqlite3_step(s) == SQLITE_ROW) out = sqlite3_column_int64(s, 0);
     sqlite3_finalize(s);
