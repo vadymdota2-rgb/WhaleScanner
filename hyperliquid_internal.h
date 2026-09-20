@@ -45,6 +45,41 @@ inline int dirCode(const std::string& dirRaw) {
     return DIR_UNKNOWN;
 }
 
+/* Куда сделка двинула цену: +1 вверх, -1 вниз, 0 — в счёт не идёт.
+ *
+ * Закрытие позиции — такая же сделка на рынке, как открытие. Кит, который
+ * выходит из лонга, продаёт: цену это давит вниз ровно так же, как открытый
+ * шорт. Считать одни открытия значило видеть половину рынка — и именно из-за
+ * этого карточка показывала «96% в лонге» в час, когда лонги как раз
+ * распродавали.
+ *
+ *   открыл лонг, закрыл шорт   → вверх
+ *   открыл шорт, закрыл лонг   → вниз
+ *
+ * У переворота направление в коде потеряно: и «Long > Short», и
+ * «Short > Long» — одна пятёрка. Исходный текст остаётся рядом, и читаем его.
+ *
+ * Ликвидации сюда не идут: у них свои признаки (перекос ликвидаций, их доля
+ * к открытому интересу), и подмешивать принуждение к решениям китов значило
+ * бы смешать две разные вещи. */
+inline int dirPush(int code, const std::string& dirRaw) {
+    switch (code) {
+        case DIR_OPEN_LONG:
+        case DIR_CLOSE_SHORT: return 1;
+        case DIR_OPEN_SHORT:
+        case DIR_CLOSE_LONG:  return -1;
+        case DIR_FLIP: break;
+        default: return 0;
+    }
+    std::string dir;
+    dir.reserve(dirRaw.size());
+    for (char c : dirRaw)
+        dir += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    if (dir.find("short > long") != std::string::npos) return 1;
+    if (dir.find("long > short") != std::string::npos) return -1;
+    return 0;
+}
+
 namespace hl {
 
 extern sqlite3* g_hlDb;

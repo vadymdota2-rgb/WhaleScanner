@@ -1185,8 +1185,8 @@ std::vector<Row> loadPerp(long long asOf, long long since, const std::unordered_
         if (!hl::g_hlDb) return {};
         sqlite3_stmt* s = nullptr;
         if (!prepareOrLog(hl::g_hlDb, &s,
-                "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage FROM hl_fills "
-                "WHERE ts>=? AND ts<=? AND dir_code IN (1,2,6,7,8)"))
+                "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage,dir FROM hl_fills "
+                "WHERE ts>=? AND ts<=? AND dir_code IN (1,2,3,4,5,6,7,8)"))
             return {};
         sqlite3_bind_int64(s, 1, sinceMs);
         sqlite3_bind_int64(s, 2, asOfMs);
@@ -1207,7 +1207,12 @@ std::vector<Row> loadPerp(long long asOf, long long since, const std::unordered_
                 else if (dir == DIR_LIQ_SHORT) m[coin].liqShort += a;
                 continue;
             }
-            addVol(m[coin], wallet, notional, dir == DIR_OPEN_LONG, ts, t6, t24,
+            /* Куда сделка двинула цену — общее правило на все места. Ноль
+               значит «в поток не идёт»: неизвестное направление или
+               переворот, у которого не разобрать текст. */
+            const int push = dirPush(dir, safeColumnText(s, 6));
+            if (push == 0) continue;
+            addVol(m[coin], wallet, notional, push > 0, ts, t6, t24,
                    top.count(wallet) != 0);
             int lev = sqlite3_column_int(s, 5);
             if (lev > 0) {
@@ -2243,10 +2248,53 @@ void insertLabeled(const Row& r, long long ts, long long slot, long long thenPx,
     sqlite3_finalize(s);
 }
 
+/* Правило потока по перпам изменилось: раньше в признаки шли одни открытия
+   позиций, теперь — всё, что двигает цену. Строки журнала, посчитанные по
+   прежнему правилу, оставить нельзя: признак означал бы на разных концах
+   выборки разное, и обученное перестало бы отвечать применённому — та же
+   беда, что была с возрастом монеты.
+
+   Поэтому перпы в журнале стираются и заливаются заново. Данных хватает:
+   заливки хранятся год, журнал — три месяца. Отметка в ai_weights, чтобы это
+   случилось один раз на базу, а не каждый запуск. Спот не трогаем — там
+   поток всегда читался целиком, и по покупкам, и по продажам. */
+constexpr int FLOW_RULE_KEY = 920;
+constexpr double FLOW_RULE_VER = 2.0;
+
+void migrateFlowRule() {
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return;
+    double have = 0;
+    sqlite3_stmt* g = nullptr;
+    if (prepareOrLog(db, &g, "SELECT v FROM ai_weights WHERE k=?")) {
+        sqlite3_bind_int(g, 1, FLOW_RULE_KEY);
+        if (sqlite3_step(g) == SQLITE_ROW) have = sqlite3_column_double(g, 0);
+        sqlite3_finalize(g);
+    }
+    if (have >= FLOW_RULE_VER) return;
+    for (const char* q : {"DELETE FROM ai_events WHERE venue=1",
+                          "DELETE FROM ai_models WHERE venue=1",
+                          "DELETE FROM ai_model_try WHERE venue=1"}) {
+        char* e = nullptr;
+        sqlite3_exec(db, q, nullptr, nullptr, &e);
+        if (e) sqlite3_free(e);
+    }
+    sqlite3_stmt* p = nullptr;
+    if (prepareOrLog(db, &p, "INSERT OR REPLACE INTO ai_weights(k,v) VALUES(?,?)")) {
+        sqlite3_bind_int(p, 1, FLOW_RULE_KEY);
+        sqlite3_bind_double(p, 2, FLOW_RULE_VER);
+        sqlite3_step(p);
+        sqlite3_finalize(p);
+    }
+    std::cout << "[AI] журнал перпов стёрт: поток теперь считается целиком, "
+                 "заливаю заново" << std::endl;
+}
+
 void backfillJournal() {
     static bool done = false;
     if (done) return;
     ensureSchema();
+    migrateFlowRule();
     const long long now = hl::nowSec();
     const long long oldest = now - AI_EVENT_TTL_SEC;
     const auto banS = bannedSpot();
@@ -2304,8 +2352,9 @@ void backfillJournal() {
         if (hl::g_hlDb) {
             sqlite3_stmt* s = nullptr;
             if (prepareOrLog(hl::g_hlDb, &s,
-                    "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage,px FROM hl_fills "
-                    "WHERE ts>=? AND dir_code IN (1,2,6,7,8)")) {
+                    "SELECT coin,wallet,dir_code,notional_nanos,ts,leverage,px,dir "
+                    "FROM hl_fills "
+                    "WHERE ts>=? AND dir_code IN (1,2,3,4,5,6,7,8)")) {
                 sqlite3_bind_int64(s, 1, oldest * 1000);
                 int rc = SQLITE_DONE;
                 while ((rc = sqlite3_step(s)) == SQLITE_ROW) {
@@ -2322,7 +2371,12 @@ void backfillJournal() {
                         a.b.liqFill += x;
                         continue;
                     }
-                    addVol(a.b, wallet, notional, dir == DIR_OPEN_LONG, tsMs,
+                    /* То же правило, что и в живом счёте: заливка обязана
+                       считать поток ровно так же, иначе половина журнала
+                       будет означать одно, а половина — другое. */
+                    const int push = dirPush(dir, safeColumnText(s, 7));
+                    if (push == 0) continue;
+                    addVol(a.b, wallet, notional, push > 0, tsMs,
                            ((day + 1) * 86400 - AI_HORIZON_6H) * 1000,
                            ((day + 1) * 86400 - AI_HORIZON_24H) * 1000,
                            topP.count(wallet) != 0);

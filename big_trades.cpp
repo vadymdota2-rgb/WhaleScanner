@@ -111,7 +111,10 @@ std::vector<BigRow> perpRows(long long sinceSec, int limit) {
         "       closed_pnl_nanos, margin_nanos, account_value_nanos, dir_code "
         "FROM hl_fills "
         "WHERE ts >= ? AND notional_nanos > 0 "
-        "AND dir_code IN (1,2) "
+        /* Закрытие позиции — такая же крупная сделка, как открытие: кит,
+           вышедший из лонга на пять миллионов, в ленту не попадал вовсе.
+           Ликвидации сюда не идут — это не его решение. */
+        "AND dir_code IN (1,2,3,4,5) "
         "AND wallet NOT IN (SELECT wallet FROM hl_banned) "
         "GROUP BY wallet "
         "HAVING notional_nanos = MAX(notional_nanos) "
