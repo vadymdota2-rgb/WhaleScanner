@@ -57,6 +57,10 @@ std::map<int, AiCacheEntry> g_aiCache;
 constexpr int AI_MIN_WALLETS = 3;
 constexpr int AI_TOP_N = 10;
 constexpr int AI_TRADE_N = 5;
+/* Телеграм не принимает сообщение длиннее 4096 знаков — и не обрезает его, а
+   отказывает целиком: человек остался бы без сигналов вовсе. Держим запас на
+   разметку и на то, что длину он считает по символам, а не по байтам. */
+constexpr size_t TG_LIMIT = 3900;
 constexpr double AI_MAX_ONE_SHARE = 0.70;
 constexpr int AI_NF = 11;
 constexpr int AI_MIN_TRAIN = 400;
@@ -3250,10 +3254,19 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
       << tr(lang, venue ? "ai_perp" : "ai_spot") << " · "
       << windowLabel(days, lang) << "\n\n";
     t << "<i>" << tr(lang, "ai_trade_hint") << "</i>\n";
-    // Развёрнутое описание только на первом экране: дальше оно занимало бы
-    // место, которое нужно самим сигналам.
+    /* Развёрнутое описание только на первом экране: дальше оно занимало бы
+       место, которое нужно самим сигналам.
+
+       Вставляется оно в конце, а место под него запоминается здесь. Телеграм
+       не принимает сообщение длиннее 4096 знаков, а описание — полторы
+       тысячи: вместе с пятью карточками сделок во французском и немецком это
+       подходило к пределу вплотную, и первый же лишний абзац оставил бы
+       человека без сигналов вовсе. Описание — приятная мелочь, сигналы —
+       смысл экрана, поэтому при нехватке места уходит описание. */
+    const size_t hintAt = t.str().size();
+    std::string hint;
     if (days == 24 && venue == 0 && side == 0)
-        t << "<i>" << tr(lang, "ai_hint") << "</i>\n";
+        hint = "<i>" + tr(lang, "ai_hint") + "</i>\n";
     // Точность на отложенных примерах: видно, стоит ли доверять модели.
     {
         const double acc = venue ? g_accPerp : g_accSpot;
@@ -3297,6 +3310,11 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
                сделку, и тогда между соседями осталась бы пустая строка. */
             std::ostringstream one;
             if (!writeTrade(one, shown, r, lang, trainedHere, wantLong, live)) continue;
+            /* Лучше показать четыре карточки, чем не отправить сообщение.
+               Длину карточки задаёт имя монеты и её цена, а они бывают
+               какими угодно: без этой проверки достаточно одной монеты с
+               длинным именем, чтобы экран не открылся вовсе. */
+            if (t.str().size() + one.str().size() + 1 > TG_LIMIT) break;
             if (shown) t << "\n";
             t << one.str();
             shown++;
@@ -3304,11 +3322,15 @@ AiMessage buildAiSignals(const std::string& chatId, int days, int venue, int sid
         if (shown == 0) t << tr(lang, "ai_empty");
     }
 
+    std::string out = t.str();
+    if (!hint.empty() && out.size() + hint.size() <= TG_LIMIT)
+        out.insert(hintAt, hint);
+
     {
         std::lock_guard<std::mutex> l(g_aiCacheMutex);
-        g_aiCache[key] = {time(nullptr), t.str()};
+        g_aiCache[key] = {time(nullptr), out};
     }
-    return {t.str(), kbBase.dump()};
+    return {out, kbBase.dump()};
 }
 
 bool handleAiHistoryCallback(const std::string& chatId, const std::string& param,
