@@ -695,6 +695,57 @@ long long usdToNanos(double usd) {
     return static_cast<long long>(usd * 1000000000.0 + 0.5);
 }
 
+/* Цена монеты на момент в прошлом.
+ *
+ * Нужна для разметки журнала задним числом. Исход события заполняется в тот
+ * час, когда горизонт истёк: берётся цена «прямо сейчас». Но если бот в этот
+ * час не работал — или столбца под исход тогда ещё не было, как вышло с
+ * шестичасовым горизонтом, — момент упущен, и цену остаётся искать в
+ * собранных рядах.
+ *
+ * Берём ближайшую запись в пределах часа: ряды почасовые, и точного
+ * попадания в секунду не бывает. Дальше часа не ищем — это уже не цена того
+ * момента, а соседнего.
+ *
+ * Зовётся только без блокировки базы: внутри она берётся своя.
+ */
+long long priceAtOf(bool perp, const std::string& id, long long at) {
+    if (id.empty() || at <= 0) return 0;
+    const long long from = at - 3600, to = at + 3600;
+    if (perp) {
+        std::lock_guard<std::mutex> lock(hl::g_hlDbMutex);
+        if (!hl::g_hlDb) return 0;
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(hl::g_hlDb, &s,
+                "SELECT c FROM hl_candles WHERE coin=? AND hour_ts BETWEEN ? AND ? "
+                "ORDER BY ABS(hour_ts-?) LIMIT 1"))
+            return 0;
+        sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 2, from);
+        sqlite3_bind_int64(s, 3, to);
+        sqlite3_bind_int64(s, 4, at);
+        long long out = 0;
+        if (sqlite3_step(s) == SQLITE_ROW) out = usdToNanos(sqlite3_column_double(s, 0));
+        sqlite3_finalize(s);
+        return out;
+    }
+    std::lock_guard<std::mutex> lock(dbMutex);
+    if (!db) return 0;
+    sqlite3_stmt* s = nullptr;
+    if (!prepareOrLog(db, &s,
+            "SELECT price_nanos FROM token_price_history WHERE address=? AND ts BETWEEN ? AND ? "
+            "ORDER BY ABS(ts-?) LIMIT 1"))
+        return 0;
+    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 2, from);
+    sqlite3_bind_int64(s, 3, to);
+    sqlite3_bind_int64(s, 4, at);
+    long long out = 0;
+    if (sqlite3_step(s) == SQLITE_ROW) out = sqlite3_column_int64(s, 0);
+    sqlite3_finalize(s);
+    return out;
+}
+
 long long dexUsdByToken(const std::string& addr) {
     if (addr.empty()) return 0;
     const auto body = http("https://api.dexscreener.com/latest/dex/tokens/" + addr, "", 3);
@@ -1612,8 +1663,20 @@ void fillOutcomes() {
         long long then = p.priceThen;
         long long px6 = 0;
         long long px24 = 0;
-        if (due6 && !stale6) px6 = priceNowOf(p.venue != 0, p.token);
-        if (due24 && !stale24) px24 = priceNowOf(p.venue != 0, p.token);
+        /* Опоздали — ищем цену того часа в собранных рядах.
+         *
+         * Прежде просроченная строка помечалась заполненной с ценой ноль, то
+         * есть выбывала из разметки навсегда. Для суточного горизонта это
+         * случалось редко, а шестичасовой выгорел целиком: столбцы под него
+         * появились позже, и в тот же день все накопленные события ушли в
+         * ноль. Оттого на экране и стояло «88 из 600» там, где порог хода
+         * вдвое ниже и примеров должно быть больше, чем у суток. */
+        const bool perp = p.venue != 0;
+        if (due6) px6 = stale6 ? priceAtOf(perp, p.token, p.ts + AI_HORIZON_6H)
+                               : priceNowOf(perp, p.token);
+        if (due24) px24 = stale24 ? priceAtOf(perp, p.token, p.ts + AI_HORIZON_24H)
+                                  : priceNowOf(perp, p.token);
+        // Свежая строка без цены — не беда: придём через минуту.
         if (due6 && px6 <= 0 && !stale6) continue;
         if (due24 && px24 <= 0 && !stale24) continue;
         std::lock_guard<std::mutex> lock(dbMutex);
@@ -1650,6 +1713,115 @@ void fillOutcomes() {
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
+}
+
+/* Разовый ремонт журнала: достать исходы, которые когда-то ушли в ноль.
+ *
+ * Строка, до которой не успели в свой час, помечалась заполненной с ценой
+ * ноль — и выбывала из разметки навсегда. Шестичасовой горизонт так потерял
+ * всю накопленную историю: столбцы под него появились позже самого журнала,
+ * и в день появления все прошлые события разом стали непригодны. Порог хода
+ * на шести часах вдвое ниже суточного, примеров там должно быть больше — а
+ * на экране стояло восемьдесят восемь из шестисот.
+ *
+ * Цену того часа ищем в собранных рядах. Идём по журналу один раз, партиями,
+ * запоминая, где остановились: строку, для которой цены в рядах не нашлось,
+ * второй раз не трогаем — иначе каждая партия уходила бы на одни и те же
+ * безнадёжные записи. Дойдя до конца, ремонт больше не просыпается.
+ */
+void repairOutcomes() {
+    static bool done = false;
+    if (done) return;
+    ensureSchema();
+    const long long now = hl::nowSec();
+    constexpr int BATCH = 300;
+    constexpr int CURSOR_KEY = 901;
+
+    long long cursor = 0;
+    struct Hole {
+        long long id = 0, ts = 0;
+        std::string token;
+        int venue = 0;
+        bool need6 = false, need24 = false;
+    };
+    std::vector<Hole> holes;
+    bool any = false;
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* c = nullptr;
+        if (prepareOrLog(db, &c, "SELECT v FROM ai_weights WHERE k=?")) {
+            sqlite3_bind_int(c, 1, CURSOR_KEY);
+            if (sqlite3_step(c) == SQLITE_ROW)
+                cursor = static_cast<long long>(sqlite3_column_double(c, 0));
+            sqlite3_finalize(c);
+        }
+        sqlite3_stmt* s = nullptr;
+        if (!prepareOrLog(db, &s,
+                "SELECT id,ts,token,venue,price_6h,filled_6h,price_24h,filled_at "
+                "FROM ai_events WHERE id>? AND price_then>0 ORDER BY id LIMIT ?"))
+            return;
+        sqlite3_bind_int64(s, 1, cursor);
+        sqlite3_bind_int(s, 2, BATCH);
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            any = true;
+            Hole h;
+            h.id = sqlite3_column_int64(s, 0);
+            h.ts = sqlite3_column_int64(s, 1);
+            h.token = safeColumnText(s, 2);
+            h.venue = sqlite3_column_int(s, 3);
+            const long long px6 = sqlite3_column_int64(s, 4);
+            const long long f6 = sqlite3_column_int64(s, 5);
+            const long long px24 = sqlite3_column_int64(s, 6);
+            const long long f24 = sqlite3_column_int64(s, 7);
+            cursor = h.id;
+            h.need6 = f6 > 0 && px6 <= 0 && h.ts + AI_HORIZON_6H <= now;
+            h.need24 = f24 > 0 && px24 <= 0 && h.ts + AI_HORIZON_24H <= now;
+            if (h.need6 || h.need24) holes.push_back(std::move(h));
+        }
+        sqlite3_finalize(s);
+    }
+    if (!any) {
+        done = true;
+        std::cout << "[AI] ремонт журнала: пройден весь" << std::endl;
+        return;
+    }
+
+    // Цены ищем без блокировки: внутри priceAtOf она берётся своя.
+    int fixed = 0;
+    for (const Hole& h : holes) {
+        const long long p6 = h.need6 ? priceAtOf(h.venue != 0, h.token, h.ts + AI_HORIZON_6H) : 0;
+        const long long p24 = h.need24 ? priceAtOf(h.venue != 0, h.token, h.ts + AI_HORIZON_24H) : 0;
+        if (p6 <= 0 && p24 <= 0) continue;
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* u = nullptr;
+        if (!prepareOrLog(db, &u,
+                "UPDATE ai_events SET price_6h=CASE WHEN ?>0 THEN ? ELSE price_6h END,"
+                " price_24h=CASE WHEN ?>0 THEN ? ELSE price_24h END WHERE id=?"))
+            break;
+        sqlite3_bind_int64(u, 1, p6);
+        sqlite3_bind_int64(u, 2, p6);
+        sqlite3_bind_int64(u, 3, p24);
+        sqlite3_bind_int64(u, 4, p24);
+        sqlite3_bind_int64(u, 5, h.id);
+        if (sqlite3_step(u) == SQLITE_DONE) fixed++;
+        sqlite3_finalize(u);
+    }
+    {
+        std::lock_guard<std::mutex> lock(dbMutex);
+        if (!db) return;
+        sqlite3_stmt* c = nullptr;
+        if (prepareOrLog(db, &c, "INSERT OR REPLACE INTO ai_weights(k,v) VALUES(?,?)")) {
+            sqlite3_bind_int(c, 1, CURSOR_KEY);
+            sqlite3_bind_double(c, 2, static_cast<double>(cursor));
+            sqlite3_step(c);
+            sqlite3_finalize(c);
+        }
+    }
+    if (fixed > 0)
+        std::cout << "[AI] ремонт журнала: восстановлено исходов " << fixed
+                  << ", дошли до " << cursor << std::endl;
 }
 
 void saveWeights(bool perp, const std::array<double, AI_NF>& w, long long nSamp, double acc, double cal) {
@@ -2526,6 +2698,33 @@ void publishSignals() {
         ready.push_back(std::move(k));
     }
 
+    /* В список идут десять лучших по уверенности на каждой площадке.
+     *
+     * Учится модель по-прежнему на всём: журнал исходов собирается из каждого
+     * события, которое прошло отбор потока, и отсечка здесь его не трогает.
+     * Она про экран: два десятка сигналов подряд человек не читает, а
+     * одиннадцатый по уверенности — это уже не «лучшее, что нашлось», а
+     * просто остаток списка.
+     *
+     * Отсекаем до журнала выданного: он про то, что человеку показали, и
+     * считать исход по сигналу, которого никто не видел, нечестно.
+     *
+     * Десять на площадку, а не десять всего: вкладка показывает одну из двух,
+     * и общая десятка могла бы целиком уйти в перпы, оставив спот пустым. */
+    {
+        constexpr size_t SHOW_PER_VENUE = 10;
+        std::vector<Ready> spotK, perpK;
+        for (Ready& k : ready) (k.r.perp ? perpK : spotK).push_back(std::move(k));
+        const auto byConf = [](const Ready& a, const Ready& b) { return a.conf > b.conf; };
+        for (std::vector<Ready>* side : {&spotK, &perpK}) {
+            std::stable_sort(side->begin(), side->end(), byConf);
+            if (side->size() > SHOW_PER_VENUE) side->resize(SHOW_PER_VENUE);
+        }
+        ready.clear();
+        for (Ready& k : spotK) ready.push_back(std::move(k));
+        for (Ready& k : perpK) ready.push_back(std::move(k));
+    }
+
     {
         // Журнал выданного — до замены текущего списка: он про то, что было
         // показано, и переживает любую перезапись.
@@ -3082,6 +3281,7 @@ void aiTick() {
     oracleTick();
     backfillJournal();
     fillOutcomes();
+    repairOutcomes();
     snapshotHour();
     {
         // Раз в пять минут: чаще незачем — поток китов за минуту не меняется,
