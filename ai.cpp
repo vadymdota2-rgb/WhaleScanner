@@ -1667,8 +1667,14 @@ bool writeTrade(std::ostringstream& t, int i, const Row& r, Lang lang, bool trai
                                 : (wantLong ? "ai_buy"  : "ai_sell");
     t << (wantLong ? "🟢 " : "🔴 ") << tr(lang, sideKey);
     t << " · <b>" << r.name << "</b>\n";
-    t << horizonWords(tp.horizon, lang) << " · " << tr(lang, "ai_conf") << " "
-      << ch.conf << "%\n";
+    /* У формулы процента нет: её «уверенность» — оценка, втиснутая в
+       проценты (40 + счёт×5, зажато в 35…80), а не вероятность. В чате она
+       стояла как «Уверенность 57%», и сверка обещанного со сбывшимся
+       показала, что сбывалось 31%. Прогнозом называем только то, что
+       посчитала принятая модель. */
+    t << horizonWords(tp.horizon, lang) << " · ";
+    if (ch.modelled) t << tr(lang, "ai_conf") << " " << ch.conf << "%\n";
+    else t << tr(lang, "ai_formula_note") << "\n";
     t << tr(lang, "ai_market") << "\n";
     t << "<b>" << signedCompact(r.buy - r.sell) << "</b>";
     t << " · " << r.wallets << "\n";
