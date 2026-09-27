@@ -366,6 +366,19 @@ void initDB() {
             std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
         if (mErr) sqlite3_free(mErr);
     }
+    /* Куда слать алерты и что человек уже видел — выбирается в мини-аппе.
+       alert_tg=0 — «только в приложении»: в чат алерты не идут, лежат в
+       истории. alerts_seen_at — когда человек последний раз открыл историю;
+       всё новее считается непрочитанным. API добавляет те же колонки сам,
+       если бот ещё не обновлён, — поэтому ошибка «уже есть» здесь норма. */
+    for (const char* sql : {
+            "ALTER TABLE users ADD COLUMN alert_tg INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE users ADD COLUMN alerts_seen_at INTEGER NOT NULL DEFAULT 0"}) {
+        char* mErr = nullptr;
+        if (sqlite3_exec(db, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
+            std::cout << "[STARTUP] " << sql << std::endl;
+        if (mErr) sqlite3_free(mErr);
+    }
     /* Максимум и минимум цены внутри часа. Раньше от часа оставалась одна
        точка — первая, — хотя бот опрашивал цену по многу раз за час и просто
        выбрасывал остальное. По одной точке не видно, что цена задевала стоп
@@ -1396,7 +1409,8 @@ void cleanupOldAlerts() {
     std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     const long long now = static_cast<long long>(time(nullptr));
 
-    if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
+    // 6 — «только в приложении»: такая же завершённая доставка, срок у неё тот же.
+    if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4,6) AND id IN (SELECT d.id FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE a.created_at<?)")) {
         sqlite3_bind_int64(s,1,now-2*86400); sqlite3_step(s); int dd=sqlite3_changes(db); sqlite3_finalize(s);
         if (dd>0) std::cout << "[CLEANUP] Removed " << dd << " terminal deliveries" << std::endl; }
 
@@ -1404,7 +1418,7 @@ void cleanupOldAlerts() {
         sqlite3_bind_int64(s,1,now-3*86400); sqlite3_step(s); int da=sqlite3_changes(db); sqlite3_finalize(s);
         if (da>0) std::cout << "[CLEANUP] Removed " << da << " old alerts" << std::endl; }
 
-    if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4) AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.id=deliveries.alert_id)")) {
+    if (prepareOrLog(db,&s,"DELETE FROM deliveries WHERE status IN (1,2,4,6) AND NOT EXISTS (SELECT 1 FROM alerts a WHERE a.id=deliveries.alert_id)")) {
         sqlite3_step(s); int orp=sqlite3_changes(db); sqlite3_finalize(s);
         if (orp>0) std::cout << "[CLEANUP] Removed " << orp << " orphaned deliveries" << std::endl; }
 }
