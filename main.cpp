@@ -258,7 +258,6 @@ const std::string TG_TOKEN = []{
     return std::string(env);
 }();
 
-constexpr int TRIAL_DAYS = 7;
 constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
@@ -689,26 +688,12 @@ void setUserLanguage(const std::string& chatId, const std::string& lang) {
     sqlite3_step(s); sqlite3_finalize(s);
 }
 
-bool trialAlreadyGranted(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, "SELECT 1 FROM trial_granted WHERE chat_id=?")) return true;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    const bool found = sqlite3_step(s) == SQLITE_ROW;
-    sqlite3_finalize(s);
-    return found;
-}
-
-void markTrialGranted(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "INSERT OR IGNORE INTO trial_granted(chat_id,granted_at) VALUES(?,?)")) return;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 2, static_cast<sqlite3_int64>(time(nullptr)));
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-}
+/* Бесплатную неделю премиума бот больше не выдаёт: её выдаёт API при первом
+   открытии мини-аппа (grant_trial в whale_api.py). Таблица trial_granted
+   осталась общей — по ней и API, и прежние выдачи ботом видят, что неделя
+   уже была, и второй раз её не дают. Премиум, выданный мимо бота, тот
+   подхватывает сам: отпечаток watchersFingerprint() включает is_premium и
+   premium_expire, и список наблюдения перестраивается в течение минуты. */
 
 void removeUser(const std::string& chatId) {
 
@@ -1527,7 +1512,8 @@ bool forgetUser(const std::string& chatId) {
     // trial_granted здесь нет намеренно. Эта строка — единственное, что
     // переживает удаление: chat_id и дата выдачи бесплатной недели. Пока она
     // удалялась вместе с остальным, любой мог стереть данные, нажать /start и
-    // получить неделю премиума заново — и так без конца. Ничего, кроме факта
+    // получить неделю премиума заново — и так без конца. Теперь неделю выдаёт
+    // API при первом открытии мини-аппа, но смотрит он в ту же таблицу. Ничего, кроме факта
     // «неделя уже выдавалась», в ней нет, и об этом сказано в политике.
     static const char* const STMTS[] = {
         "DELETE FROM user_whales WHERE user_id=?",
@@ -2024,13 +2010,6 @@ void telegramLoop() {
                             sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
                         } else {
                             ensureUser(cid, tgLang);
-                            if (!trialAlreadyGranted(cid)) {
-                                if (grantPremiumDays(cid, TRIAL_DAYS)) {
-                                    markTrialGranted(cid);
-                                    Lang tl = langFromCode(getUserLanguage(cid));
-                                    sendMsg(cid, tr(tl, "trial_granted"));
-                                }
-                            }
                             resetViewStack(cid, "menu:main");
                             if (isNewUser || cid == SERVICE_CHAT_ID) {
                                 auto msg = TelegramUI::buildWelcomeMessage(cid);
