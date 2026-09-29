@@ -457,6 +457,10 @@ void initDB() {
                 text TEXT NOT NULL,
                 at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS digest_mute (
+                chat_id TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_digest_comments_d ON digest_comments(digest_id, at);
             CREATE INDEX IF NOT EXISTS idx_digest_comments_c ON digest_comments(chat_id);
             CREATE INDEX IF NOT EXISTS idx_digest_likes_c ON digest_likes(chat_id);
@@ -1566,6 +1570,7 @@ bool forgetUser(const std::string& chatId) {
         "DELETE FROM ton_invoices WHERE chat_id=?",
         "DELETE FROM digest_likes WHERE chat_id=?",
         "DELETE FROM digest_comments WHERE chat_id=?",
+        "DELETE FROM digest_mute WHERE chat_id=?",
         "DELETE FROM users WHERE chat_id=?",
     };
 
