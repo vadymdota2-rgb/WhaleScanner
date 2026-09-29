@@ -27,7 +27,6 @@
 #include "json.hpp"
 #include "utils.h"
 #include "ranking.h"
-#include "ai.h"
 #include "token_prices.h"
 #include "big_trades.h"
 #include "alert_settings.h"
@@ -415,6 +414,59 @@ void initDB() {
             if (n > 0) std::cout << "[STARTUP] Raised " << n << " user threshold(s) to the $50 minimum" << std::endl;
         }
     }
+
+    // Cortex (сигналы и обучаемая модель) убран из проекта. Его таблицы
+    // больше никто не пишет и не чистит — удаляем их, чтобы журнал сигналов
+    // и свечи не лежали в базе без срока. На чистой базе это пустая операция.
+    {
+        const char* dropSql =
+            "DROP TABLE IF EXISTS ai_signals; DROP TABLE IF EXISTS ai_signal_log;"
+            "DROP TABLE IF EXISTS ai_events; DROP TABLE IF EXISTS ai_weights;"
+            "DROP TABLE IF EXISTS ai_access; DROP TABLE IF EXISTS ai_models;"
+            "DROP TABLE IF EXISTS ai_model_try; DROP TABLE IF EXISTS ai_coin_seen;"
+            "DROP TABLE IF EXISTS hl_candles;";
+        char* derr = nullptr;
+        if (sqlite3_exec(db, dropSql, nullptr, nullptr, &derr) != SQLITE_OK) {
+            std::cerr << "[STARTUP] Cortex tables cleanup failed: " << (derr ? derr : "") << std::endl;
+            sqlite3_free(derr);
+        }
+    }
+
+    // Дайджест мини-аппа: выпуски пишет API, лайки и комментарии — люди.
+    // Таблицы заводятся здесь, у хозяина базы, чтобы /forgetme мог стереть
+    // лайки и комментарии человека, даже если API ещё ни разу не запускался.
+    {
+        const char* digestSql = R"(
+            CREATE TABLE IF NOT EXISTS digests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL UNIQUE,
+                made_at INTEGER NOT NULL,
+                body TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS digest_likes (
+                digest_id INTEGER NOT NULL,
+                chat_id TEXT NOT NULL,
+                at INTEGER NOT NULL,
+                PRIMARY KEY (digest_id, chat_id)
+            );
+            CREATE TABLE IF NOT EXISTS digest_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                digest_id INTEGER NOT NULL,
+                chat_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                text TEXT NOT NULL,
+                at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_digest_comments_d ON digest_comments(digest_id, at);
+            CREATE INDEX IF NOT EXISTS idx_digest_comments_c ON digest_comments(chat_id);
+            CREATE INDEX IF NOT EXISTS idx_digest_likes_c ON digest_likes(chat_id);
+        )";
+        char* gerr = nullptr;
+        if (sqlite3_exec(db, digestSql, nullptr, nullptr, &gerr) != SQLITE_OK) {
+            std::cerr << "[STARTUP] digest schema failed: " << (gerr ? gerr : "") << std::endl;
+            sqlite3_free(gerr);
+        }
+    }
 }
 
 void walCheckpoint(int mode = SQLITE_CHECKPOINT_TRUNCATE) { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_checkpoint_v2(db,nullptr,mode,nullptr,nullptr); }
@@ -779,11 +831,6 @@ UIMessage buildMainMenu(const std::string& chatId) {
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
     }));
-    if (aiHasAccess(chatId)) {
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "ai_btn")}, {"callback_data", "ai_open:24"}}
-        }));
-    }
     keyboard["inline_keyboard"].push_back(json::array({
         {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
     }));
@@ -1416,9 +1463,6 @@ constexpr size_t VIEW_STACK_MAX = 12;
 std::string pagingRoot(const std::string& data) {
     if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
     if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
-    if (data.rfind("ai_open:", 0) == 0) return data;
-    if (data.rfind("ai_hist:", 0) == 0) return data;
-    if (data.rfind("ai_stat:", 0) == 0) return data;
     if (data.rfind("bg_page:", 0) == 0) {
         const size_t a = data.find(':'), b = data.find(':', a + 1);
         const size_t c = b == std::string::npos ? std::string::npos : data.find(':', b + 1);
@@ -1520,7 +1564,8 @@ bool forgetUser(const std::string& chatId) {
         "DELETE FROM deliveries WHERE chat_id=?",
         "DELETE FROM premium_payments WHERE chat_id=?",
         "DELETE FROM ton_invoices WHERE chat_id=?",
-        "DELETE FROM ai_access WHERE chat_id=?",
+        "DELETE FROM digest_likes WHERE chat_id=?",
+        "DELETE FROM digest_comments WHERE chat_id=?",
         "DELETE FROM users WHERE chat_id=?",
     };
 
@@ -1585,29 +1630,6 @@ TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::str
         if (param == "terms") return TelegramUI::buildTermsMessage(chatId);
         if (param == "forgetme") return TelegramUI::buildForgetMessage(chatId);
         return TelegramUI::buildMainMenu(chatId);
-    }
-    if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
-        if (!aiHasAccess(chatId)) return TelegramUI::buildMainMenu(chatId);
-        int days = 1;
-        int venue = 0;
-        int side = 0;
-        const size_t sep1 = param.find(':');
-        try {
-            days = std::stoi(sep1 == std::string::npos ? param : param.substr(0, sep1));
-        } catch (...) { days = 1; }
-        if (sep1 != std::string::npos) {
-            const std::string rest = param.substr(sep1 + 1);
-            if (!rest.empty()) {
-                if (rest[0] == 'p' || rest[0] == '1') venue = 1;
-                const size_t sep2 = rest.find(':');
-                if (sep2 != std::string::npos && sep2 + 1 < rest.size()) {
-                    const char s = rest[sep2 + 1];
-                    if (s == 'a' || s == '1') side = 1;
-                }
-            }
-        }
-        auto r = buildAiSignals(chatId, days, venue, side);
-        return {r.text, r.keyboard};
     }
     {
         HlMessage hl;
@@ -1862,10 +1884,6 @@ void handleCallbackQuery(const json& callbackQuery) {
         rememberView(chatId, "menu:alert_threshold");
         handleThresholdCallback(chatId, param, messageId);
     }
-    else if (action == "ai_open" || action == "ai_hist" || action == "ai_stat") {
-        if (aiHasAccess(chatId))
-            handleAiCallback(chatId, action, param, data, messageId, callbackQueryId);
-    }
     else if (action == "bg_open" || action == "bg_page" || action == "bg_noop") {
         handleBigTradesCallback(chatId, action, param, data, messageId, callbackQueryId);
     }
@@ -1903,7 +1921,6 @@ void dbMaintenanceLoop() {
         std::this_thread::sleep_for(std::chrono::minutes(1));
         try {
             cleanupTokenPricesPeriodic();
-            aiTick();
 
             // Изменения, пришедшие мимо бота — из мини-аппа. Первый проход
             // только запоминает слепок и ничего не перестраивает.
@@ -2223,27 +2240,6 @@ void telegramLoop() {
                                 sendMsg(cid, rep.str());
                             }
                         }
-                    }
-                    else if (txt.rfind("/ai_grant", 0) == 0 && cid == OWNER_CHAT_ID) {
-                        const size_t sp = txt.find(' ');
-                        const std::string who = sp == std::string::npos ? "" : trim(txt.substr(sp + 1));
-                        if (who.empty()) sendMsg(cid, "Использование: /ai_grant <chat_id>");
-                        else if (aiGrantAccess(who)) sendMsg(cid, "Доступ к Aladdin открыт: " + who);
-                        else sendMsg(cid, "Не удалось открыть доступ.");
-                    }
-                    else if (txt.rfind("/ai_revoke", 0) == 0 && cid == OWNER_CHAT_ID) {
-                        const size_t sp = txt.find(' ');
-                        const std::string who = sp == std::string::npos ? "" : trim(txt.substr(sp + 1));
-                        if (who.empty()) sendMsg(cid, "Использование: /ai_revoke <chat_id>");
-                        else if (aiRevokeAccess(who)) sendMsg(cid, "Доступ к Aladdin закрыт: " + who);
-                        else sendMsg(cid, "Такого доступа нет.");
-                    }
-                    else if (txt == "/ai_list" && cid == OWNER_CHAT_ID) {
-                        const auto lst = aiAccessList();
-                        std::string out = "Доступ к Aladdin (" + std::to_string(lst.size()) + "):\n";
-                        for (const auto& c : lst) out += c + "\n";
-                        if (lst.empty()) out += "только владелец";
-                        sendMsg(cid, out);
                     }
                     else if (txt.rfind("/unban", 0) == 0) {
                         if (cid != OWNER_CHAT_ID) {
