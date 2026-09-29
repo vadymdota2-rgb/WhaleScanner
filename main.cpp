@@ -455,7 +455,15 @@ void initDB() {
                 chat_id TEXT NOT NULL,
                 name TEXT NOT NULL,
                 text TEXT NOT NULL,
-                at INTEGER NOT NULL
+                at INTEGER NOT NULL,
+                anon INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS digest_tr (
+                comment_id INTEGER NOT NULL,
+                lang TEXT NOT NULL,
+                text TEXT NOT NULL,
+                src TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (comment_id, lang)
             );
             CREATE TABLE IF NOT EXISTS digest_mute (
                 chat_id TEXT PRIMARY KEY,
@@ -1569,6 +1577,7 @@ bool forgetUser(const std::string& chatId) {
         "DELETE FROM premium_payments WHERE chat_id=?",
         "DELETE FROM ton_invoices WHERE chat_id=?",
         "DELETE FROM digest_likes WHERE chat_id=?",
+        "DELETE FROM digest_tr WHERE comment_id IN (SELECT id FROM digest_comments WHERE chat_id=?)",
         "DELETE FROM digest_comments WHERE chat_id=?",
         "DELETE FROM digest_mute WHERE chat_id=?",
         "DELETE FROM users WHERE chat_id=?",
