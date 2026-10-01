@@ -15,6 +15,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cmath>
+#include <cctype>
 #include <curl/curl.h>
 #include <sstream>
 #include <iomanip>
@@ -38,6 +39,7 @@
 #include "message_queue.h"
 #include "tx_analyzer.h"
 #include "beneficiary_stats.h"
+#include "btc_chain.h"
 #include "hyperliquid.h"
 #include "hyperliquid_internal.h"
 #include "ws_heads.h"
@@ -2094,6 +2096,12 @@ void telegramLoop() {
                             sendMsg(cid,ss2.str());
                         }
                     }
+                    else if (txt=="/statsbtc") {
+                        // Сеть Bitcoin — отдельной командой: в /stats и так
+                        // десятки строк про BSC и Hyperliquid.
+                        if (cid != OWNER_CHAT_ID) sendMsg(cid, "Access denied.");
+                        else sendMsg(cid, btcStatsLine());
+                    }
                     else if (txt=="/stats") {
                         if (cid != OWNER_CHAT_ID) {
                             sendMsg(cid, "Access denied.");
@@ -2229,8 +2237,33 @@ void telegramLoop() {
                                     p += 2;
                                 }
                             }
-                            if (found.empty()) {
-                                sendMsg(cid, "Использование: /import 0x... 0x... (адреса через пробел, запятую или с новой строки)");
+                            // Адреса биткоина — в свою базу того же сервисного
+                            // аккаунта (btc.db). Регистр base58 значим, поэтому
+                            // разбираем исходный текст, а не строчную копию.
+                            std::vector<std::string> btcFound;
+                            {
+                                std::string tok;
+                                auto flush = [&] {
+                                    if (!tok.empty() && isBtcAddress(tok)) btcFound.push_back(normBtcAddress(tok));
+                                    tok.clear();
+                                };
+                                for (char ch : txt) {
+                                    if (std::isalnum(static_cast<unsigned char>(ch))) tok += ch;
+                                    else flush();
+                                }
+                                flush();
+                            }
+                            if (found.empty() && btcFound.empty()) {
+                                sendMsg(cid, "Использование: /import 0x... bc1... (адреса BSC, Hyperliquid и Bitcoin через пробел, запятую или с новой строки)");
+                            } else if (found.empty()) {
+                                BtcImportResult br = btcImport(btcFound);
+                                std::stringstream rep;
+                                rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
+                                    << "₿ Адресов Bitcoin: <b>" << btcFound.size() << "</b>\n"
+                                    << "✅ Добавлено: <b>" << br.added << "</b>\n"
+                                    << "↩️ Уже в базе: <b>" << br.dup << "</b>\n"
+                                    << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+                                sendMsg(cid, rep.str());
                             } else {
                                 int added = 0, dup = 0, banned = 0, failed = 0;
                                 for (const auto& a : found) {
@@ -2251,6 +2284,12 @@ void telegramLoop() {
                                 if (failed > 0) rep << "⚠️ Не удалось добавить: <b>" << failed << "</b>\n";
                                 rep << "\nВсего на сервисном аккаунте: <b>"
                                     << countUserWhales(SERVICE_CHAT_ID) << "</b>";
+                                if (!btcFound.empty()) {
+                                    BtcImportResult br = btcImport(btcFound);
+                                    rep << "\n\n₿ Bitcoin: найдено <b>" << btcFound.size() << "</b>, добавлено <b>"
+                                        << br.added << "</b>, уже в базе <b>" << br.dup << "</b>"
+                                        << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+                                }
                                 sendMsg(cid, rep.str());
                             }
                         }
@@ -2352,6 +2391,7 @@ int main() {
     } else {
         startHyperliquidLoop();
     }
+    startBtcLoop();
     setupBotCommands();
     size_t initialWatcherAddrs;
     { std::shared_lock l(watchersMutex); initialWatcherAddrs = WATCHERS_PTR->size(); }
@@ -2426,6 +2466,7 @@ int main() {
     af.join();
     dm.join();
     stopHyperliquid();
+    stopBtc();
     stopWsBsc();
     walCheckpoint();
     closeRankingDB();
