@@ -350,13 +350,39 @@ bool loadFromEsplora(const std::string& hash, Block& b) {
 // Проверенные вручную: баланс и число транзакций на mempool.space совпадают
 // с публичной разметкой. Сомнительные сюда не попали — ложная метка хуже
 // пропущенной: она превращает перекладку биржи в «кита, купившего 5 000 BTC».
+//
+// Вторая часть — открытая разметка крупнейших адресов bitinfocharts.com
+// (холодные кошельки бирж из первой тысячи). Взломы, конфискации и пул
+// майнинга Binance сюда не взяты: это не биржевые деньги. От холодного
+// кошелька сканер сам доходит до горячего — по совместной трате и сбору.
 const std::vector<std::pair<const char*, const char*>> SEEDS = {
     {"34xp4vRoCGJym3xR7yCVPFHoCNxv4Twseo", "Binance"},
     {"3M219KR5vEneNb47ewrPfWyb5jQ2DjxRP6", "Binance"},
     {"3LYJfcfHPXYJreMsASk2jkn69LWEYKzexb", "Binance"},
     {"bc1qm34lsc65zpw79lxes69zkqmk6ee3ewf0j77s3h", "Binance"},
+    {"3LQUu4v9z6KNch71j7kbj8GPeAGUo1FW6a", "Binance"},
+    {"3FHNBLobJnbCTFTVakh5TXmEneyf5PT61B", "Binance"},
+    {"1PJiGp2yDLvUgqeBsuZVCBADArNsk6XEiw", "Binance"},
+    {"34HpHYiyQwg69gFmCq2BGHjF1DZnZnBeBP", "Binance"},
+    {"395vnFScKQ1ay695C6v7gf89UzoFpx3WuJ", "Binance"},
+    {"bc1q7t9fxfaakmtk8pj7tdxjvwsng6y9x76czuaf5h", "Binance"},
+    {"3HdGoUTbcztBnS7UzY4vSPYhwr424CiWAA", "Binance"},
+    {"3LcgLHzTvjLKBixBvkKGiadtiw2GBSKKqH", "Binance"},
     {"bc1qgdjqv0av3q56jvd82tkdjpy7gdp9ut8tlqmgrpmv24sq90ecnvqqjwvw97", "Bitfinex"},
+    {"3JZq4atUahhuA9rLhXLMhhTo133J9rF97j", "Bitfinex"},
     {"bc1ql49ydapnjafl5t2cp9zqpjwe6pdgmxy98859v2", "Robinhood"},
+    {"3MgEAFWu1HKSnZ5ZsC8qf61ZW18xrP5pgd", "OKX"},
+    {"3FM9vDYsN2iuMPKWjAcqgyahdwdrUxhbJ3", "OKX"},
+    {"39wVd42giU95ca39sEPkbPTpWygvsBDuA5", "OKX"},
+    {"3E5EPMGRL5PC6YDCLcHLVu9ayC3DysMpau", "OKX"},
+    {"1CY7fykRLWXeSbKB885Kr4KjQxmDdvW923", "OKX"},
+    {"16rF2zwSJ9goQ9fZfYoti5LsUqqegb5RnA", "OKX"},
+    {"1LnoZawVFFQihU8d8ntxLMpYheZUfyeVAK", "OKX"},
+    {"bc1qr4dl5wa7kl8yu792dceg9z5knl2gkn220lk7a9", "Crypto.com"},
+    {"162bzZT2hJfv5Gm3ZmWfWfHJjCtMD6rHhw", "Gate"},
+    {"143gLvWYUojXaWZRrxquRKpVNTkhmr415B", "Huobi"},
+    {"bc1qchctnvmdva5z9vrpxkkxck64v7nmzdtyxsrq64", "BitMEX"},
+    {"bc1q32lyrhp9zpww22phqjwwmelta0c8a5q990ghs6", "Ceffu"},
 };
 
 // Кластеры бирж из раздела «Exchanges» walletexplorer.com. Остальные его
@@ -1091,9 +1117,11 @@ void btcLoop() {
         }
     }
     sc.seed();
-    if (sc.state("clusters") != "1") {
+    // Номер — версия списка SEEDS: список вырос — кластеры новых адресов
+    // надо спросить заново.
+    if (sc.state("clusters") != "2") {
         sc.seedClusters();
-        sc.setStateLocked("clusters", "1");
+        sc.setStateLocked("clusters", "2");
     }
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
 
