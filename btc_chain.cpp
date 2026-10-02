@@ -383,6 +383,32 @@ const std::vector<std::pair<const char*, const char*>> SEEDS = {
     {"143gLvWYUojXaWZRrxquRKpVNTkhmr415B", "Huobi"},
     {"bc1qchctnvmdva5z9vrpxkkxck64v7nmzdtyxsrq64", "BitMEX"},
     {"bc1q32lyrhp9zpww22phqjwwmelta0c8a5q990ghs6", "Ceffu"},
+    // Bybit сам публикует свои кошельки в аудите резервов (Proof of
+    // Reserves, отчёт Hacken от 17 декабря 2025): 23 адреса сети Bitcoin,
+    // среди них горячий кошелёк с сотнями тысяч транзакций.
+    {"12XZMdaAGmcHf4ocFSqpd8jFd1WH7RHUPs", "Bybit"},
+    {"12rFmDggwCNrRL6vuPEjzCDSskTRPjDajP", "Bybit"},
+    {"139RYdfv7vNtbnK88juMR3s4pgwvB4db9Y", "Bybit"},
+    {"14ug9BVtGnxY8ezvd5cr1PXHeXBYXkpsdw", "Bybit"},
+    {"16jVbMCcqq1deKrMB3esL2HPso7kvqUsec", "Bybit"},
+    {"1DLeNApsHNNzUMNZJVoXeyEY5sdp8vzx3w", "Bybit"},
+    {"1GrwDkr33gT6LuumniYjKEGjTLhsL5kmqC", "Bybit"},
+    {"1HDnsptgeJ6fYFHCgd1TFzLSRpuVcV51GL", "Bybit"},
+    {"1KHch51TT2eazxYkUXtr38GXtPTjf8Mue", "Bybit"},
+    {"1Ko6Sbu8VgZaQNZMfRgNjR8zVzVN9wL7aX", "Bybit"},
+    {"1LrsskS2hmLvevKiqASDymS8xRmJ7Gp83u", "Bybit"},
+    {"1Nb9NUVWpjruzafXh2uKK5v5xxEEL1hPrH", "Bybit"},
+    {"bc1q0npwm7hphq4w3pn0m4nr5hmum2sdg725edylgn", "Bybit"},
+    {"bc1q2qqqt87kh33s0er58akh7v9cwjgd83z5smh9rp", "Bybit"},
+    {"bc1q59nmn5v9tz36talq7g090yue5kf7actqr62f96kakte70eu2948sw6ddxr", "Bybit"},
+    {"bc1q7enk8z5gkuzk2sla4vnmzh5qq8jq6wptx0pty5", "Bybit"},
+    {"bc1q8msl0p3ph7dzfn7dxwrhays46cklzpnn8mgyp2", "Bybit"},
+    {"bc1qa2eu6p5rl9255e3xz7fcgm6snn4wl5kdfh7zpt05qp5fad9dmsys0qjg0e", "Bybit"},
+    {"bc1qmv30sf5tnlx52x6vszl0gmey7vae6elzpm2zxw", "Bybit"},
+    {"bc1qpz86ltanq6042k36rs0yl0wjpd6tgu8fwckan7", "Bybit"},
+    {"bc1qqc0h2sxt9lvrsqt90rtpjqnjj7qcwv457g28h2", "Bybit"},
+    {"bc1qr7dl0rtnfvzkfqrvctpk068c8zluknkzapwhe9", "Bybit"},
+    {"bc1qs5vdqkusz4v7qac8ynx0vt9jrekwuupx2fl5udp9jql3sr03z3gsr2mf0f", "Bybit"},
 };
 
 // Кластеры бирж из раздела «Exchanges» walletexplorer.com. Остальные его
@@ -1119,9 +1145,9 @@ void btcLoop() {
     sc.seed();
     // Номер — версия списка SEEDS: список вырос — кластеры новых адресов
     // надо спросить заново.
-    if (sc.state("clusters") != "2") {
+    if (sc.state("clusters") != "3") {
         sc.seedClusters();
-        sc.setStateLocked("clusters", "2");
+        sc.setStateLocked("clusters", "3");
     }
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
 
