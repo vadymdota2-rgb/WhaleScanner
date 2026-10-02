@@ -1,5 +1,5 @@
 #include "premium.h"
-#include "alert_settings.h"
+#include "telegram.h"
 #include <climits>
 
 #include <sqlite3.h>
@@ -10,7 +10,6 @@
 #include <sstream>
 #include <unordered_map>
 #include <atomic>
-#include <random>
 #include <cmath>
 #include <algorithm>
 #include <cctype>
@@ -18,16 +17,12 @@
 #include "utils.h"
 #include "ru.h"
 
-std::string getUserLanguage(const std::string& chatId);
-
 using json = nlohmann::json;
 
 extern sqlite3* db;
 extern std::mutex dbMutex;
 
 std::string http(const std::string& url, const std::string& post, int timeout);
-void ensureUser(const std::string& chatId, const std::string& tgLangCode = "");
-void refreshWatchers();
 
 namespace {
 
@@ -52,27 +47,13 @@ constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниже сч
 
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
-constexpr int    FREE_TOP_TRADERS    = 30;
-constexpr int    PREMIUM_TOP_TRADERS = 100;
 
 std::string g_botToken;
 
 std::string g_serviceChatId;
 
-std::mutex g_lastInvoiceMutex;
-std::unordered_map<std::string, long long> g_lastInvoiceMsgId;
-
 std::string apiUrl(const char* method) {
     return "https://api.telegram.org/bot" + g_botToken + "/" + method;
-}
-
-std::string formatDateDDMMYYYY(long long ts) {
-    time_t t = static_cast<time_t>(ts);
-    struct tm tmv{};
-    localtime_r(&t, &tmv);
-    char buf[16];
-    if (std::strftime(buf, sizeof(buf), "%d.%m.%Y", &tmv) == 0) return "??.??.????";
-    return buf;
 }
 
 bool readPremiumRowLocked(const std::string& chatId,
@@ -247,21 +228,9 @@ void cleanupExpiredPremium() {
         for (const std::string& cid : expired) {
             if (cid == g_serviceChatId) continue;
             Lang lang = langFromCode(getUserLanguage(cid));
-            json kb;
-            kb["inline_keyboard"] = json::array();
-            kb["inline_keyboard"].push_back(json::array({
-                {{"text", tr(lang, "menu_premium")}, {"callback_data", "menu:premium"}}
-            }));
-            sendMsg(cid, tr(lang, "premium_expired_notice"), kb.dump());
+            sendMsg(cid, tr(lang, "premium_expired_notice"), openAppKeyboard(lang));
         }
     }
-}
-
-long long premiumExpireTs(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(dbMutex);
-    int flag = 0; long long start = 0, expire = 0;
-    if (!readPremiumRowLocked(chatId, flag, start, expire)) return 0;
-    return expire;
 }
 
 namespace {
@@ -303,73 +272,6 @@ std::string jstrField(const json& j, const char* key, const char* def = "") {
     return it->get<std::string>();
 }
 
-std::string makeMemo() {
-    static const char* ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    static std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<size_t> pick(0, 30);
-    std::string m = "WB-";
-    for (int i = 0; i < 4; i++) m += ALPHABET[pick(rng)];
-    return m;
-}
-
-}
-
-bool tonPaymentsAvailable() { return !tonWallet().empty(); }
-
-bool createUsdtInvoice(const std::string& chatId, UsdtInvoice& out) {
-    // Цена в долларах — она же цена в USD₮: пересчитывать нечего, и курса,
-    // который мог не прийти, больше нет. Раньше здесь считался GRAM.
-    if (!g_premiumSchemaOk) {
-        std::cerr << "[USDT] счёт не создан: схема базы не готова" << std::endl;
-        return false;
-    }
-    out.wallet = tonWallet();
-    if (out.wallet.empty()) {
-        std::cerr << "[USDT] счёт не создан: адрес кошелька пуст" << std::endl;
-        return false;
-    }
-    out.units = static_cast<long long>(PREMIUM_PRICE_USD * 1e6 + 0.5);
-    out.amount = static_cast<double>(out.units) / 1e6;
-
-    const long long now = static_cast<long long>(time(nullptr));
-    {
-        // Пока счёт жив, отдаём тот же: два счёта на одного человека значили
-        // бы, что один перевод закрывает не тот из них.
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (prepareOrLog(db, &s,
-            "SELECT memo, nano_amount FROM ton_invoices "
-            "WHERE chat_id=? AND status='active' AND kind='usdt' AND created_at > ? "
-            "ORDER BY created_at DESC LIMIT 1")) {
-            sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(s, 2, now - TON_INVOICE_TTL_SEC);
-            if (sqlite3_step(s) == SQLITE_ROW) {
-                out.memo = safeColumnText(s, 0);
-                out.units = sqlite3_column_int64(s, 1);
-                out.amount = static_cast<double>(out.units) / 1e6;
-                sqlite3_finalize(s);
-                return true;
-            }
-            sqlite3_finalize(s);
-        }
-    }
-
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        out.memo = makeMemo();
-        if (!prepareOrLog(db, &s,
-            "INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at, kind) "
-            "VALUES(?,?,?,'active',?,'usdt')")) return false;
-        sqlite3_bind_text(s, 1, out.memo.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, chatId.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(s, 3, out.units);
-        sqlite3_bind_int64(s, 4, now);
-        const bool ok = sqlite3_step(s) == SQLITE_DONE;
-        sqlite3_finalize(s);
-        if (ok) return true;
-    }
-    return false;
 }
 
 void pollUsdtPayments() {
@@ -629,157 +531,11 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
 
     std::cout << "[PREMIUM] " << (wasAlreadyActive ? "Extended" : "Activated")
               << " for " << chatId << " (charge " << chargeId << ")" << std::endl;
-    {
-        std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
-        g_lastInvoiceMsgId.erase(chatId);
-    }
-
     return wasAlreadyActive ? PaymentApplyResult::Extended : PaymentApplyResult::Activated;
-}
-
-void premiumForgetChat(const std::string& chatId) {
-    // Карта живёт в памяти и удаление строк в базе её не касается.
-    std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
-    g_lastInvoiceMsgId.erase(chatId);
 }
 
 size_t premiumMaxWallets(const std::string& chatId) {
     return isPremium(chatId) ? PREMIUM_MAX_WALLETS : FREE_MAX_WALLETS;
-}
-
-int premiumTopTradersLimit(const std::string& chatId) {
-    return isPremium(chatId) ? PREMIUM_TOP_TRADERS : FREE_TOP_TRADERS;
-}
-
-PremiumMessage buildPremiumPage(const std::string& chatId) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-
-    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) {
-        json kb;
-        kb["inline_keyboard"] = json::array();
-        kb["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-        }));
-        return {tr(lang, "pr_active_title") + "\n\n" + tr(lang, "pr_service_account"), kb.dump()};
-    }
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-
-    bool active = isPremium(chatId);
-
-    std::stringstream text;
-    if (active) {
-        long long expire = premiumExpireTs(chatId);
-        long long secsLeft = expire - static_cast<long long>(time(nullptr));
-        long long daysLeft = secsLeft > 0 ? (secsLeft + 86399LL) / 86400LL : 0;
-        text << tr(lang, "pr_active_title") << "\n\n"
-             << tr(lang, "pr_valid_until_inline") << " <b>" << formatDateDDMMYYYY(expire)
-             << "</b> (" << tr(lang, "pr_days_left") << " " << daysLeft << ")\n\n"
-             << tr(lang, "pr_includes") << "\n"
-             << tr(lang, "help_premium_1") << "\n"
-             << tr(lang, "help_premium_2") << "\n"
-             << tr(lang, "help_premium_3") << "\n"
-             << tr(lang, "help_premium_4");
-
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "pr_renew")}, {"callback_data", "premium_buy"}}
-        }));
-        if (tonPaymentsAvailable()) keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "pr_renew_ton")}, {"callback_data", "premium_ton"}}
-        }));
-    } else {
-        text << tr(lang, "pr_title") << "\n\n"
-             << tr(lang, "pr_unlock") << "\n\n"
-             << tr(lang, "pr_includes") << "\n"
-             << tr(lang, "help_premium_1") << "\n"
-             << tr(lang, "help_premium_2") << "\n"
-             << tr(lang, "help_premium_3") << "\n"
-             << tr(lang, "help_premium_4") << "\n\n"
-             << tr(lang, "pr_subscription_label") << " · "
-             << tr(lang, "pr_price_label") << " ⭐ " << PREMIUM_PRICE_STARS << " Stars";
-
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "pr_buy")}, {"callback_data", "premium_buy"}}
-        }));
-        if (tonPaymentsAvailable()) keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "pr_buy_ton")}, {"callback_data", "premium_ton"}}
-        }));
-    }
-
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-
-    return {text.str(), keyboard.dump()};
-}
-
-PremiumMessage buildWalletLimitMessage(Lang lang) {
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "mw_upgrade")}, {"callback_data", "menu:premium"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-
-    std::string text =
-        tr(lang, "pr_limit_title") + "\n\n" +
-        tr(lang, "pr_limit_free") + "\n\n" +
-        tr(lang, "pr_limit_upgrade");
-    return {text, keyboard.dump()};
-}
-
-bool sendPremiumInvoice(const std::string& chatId) {
-    if (!g_premiumSchemaOk) {
-        std::cerr << "[PREMIUM] sendInvoice blocked: schema not initialized" << std::endl;
-        return false;
-    }
-
-    Lang lang = langFromCode(getUserLanguage(chatId));
-
-    {
-        long long staleId = 0;
-        {
-            std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
-            auto it = g_lastInvoiceMsgId.find(chatId);
-            if (it != g_lastInvoiceMsgId.end()) { staleId = it->second; g_lastInvoiceMsgId.erase(it); }
-        }
-        if (staleId != 0) {
-            json d; d["chat_id"] = chatId; d["message_id"] = staleId;
-            http(apiUrl("deleteMessage"), d.dump(), 10);
-        }
-    }
-
-    json j;
-    j["chat_id"] = chatId;
-    j["title"] = tr(lang, "invoice_title");
-    j["description"] = tr(lang, "invoice_description");
-    j["payload"] = PREMIUM_PAYLOAD;
-    j["provider_token"] = "";
-    j["currency"] = "XTR";
-    j["prices"] = json::array();
-    j["prices"].push_back({{"label", tr(lang, "invoice_price_label")},
-                           {"amount", PREMIUM_PRICE_STARS}});
-
-    auto r = http(apiUrl("sendInvoice"), j.dump(), 10);
-    try {
-        auto p = json::parse(r);
-        if (p.value("ok", false)) {
-            if (p.contains("result") && p["result"].is_object() && p["result"].contains("message_id")) {
-                long long msgId = p["result"]["message_id"].get<long long>();
-                std::lock_guard<std::mutex> l(g_lastInvoiceMutex);
-                g_lastInvoiceMsgId[chatId] = msgId;
-            }
-            return true;
-        }
-        std::cerr << "[PREMIUM] sendInvoice failed: "
-                  << p.value("description", "(no description)") << std::endl;
-    } catch (...) {
-        std::cerr << "[PREMIUM] sendInvoice: bad API response" << std::endl;
-    }
-    return false;
 }
 
 void handlePreCheckoutQuery(const json& q) {

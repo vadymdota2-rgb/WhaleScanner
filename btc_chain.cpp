@@ -1513,18 +1513,6 @@ bool isBtcKey(const std::string& a) {
     return true;
 }
 
-void btcRememberCase(const std::string& raw) {
-    const std::string a = normBtcAddress(raw);
-    std::lock_guard<std::mutex> l(g_btcDbMutex);
-    if (!g_btcDb) return;
-    sqlite3_stmt* s = nullptr;
-    if (!prep(&s, "INSERT OR REPLACE INTO btc_case(lower, addr) VALUES(?,?)")) return;
-    bindText(s, 1, lower(a));
-    bindText(s, 2, a);
-    sqlite3_step(s);
-    sqlite3_finalize(s);
-}
-
 BtcImportResult btcImport(const std::vector<std::string>& addrs) {
     BtcImportResult r;
     std::lock_guard<std::mutex> l(g_btcDbMutex);

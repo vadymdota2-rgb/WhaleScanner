@@ -29,11 +29,10 @@
 #include "utils.h"
 #include "ranking.h"
 #include "token_prices.h"
-#include "big_trades.h"
-#include "alert_settings.h"
+#include "telegram.h"
 #include "rpc_client.h"
 #include "chains.h"
-#include "wallet_menu.h"
+#include "wallets.h"
 #include "ru.h"
 #include "premium.h"
 #include "message_queue.h"
@@ -267,9 +266,6 @@ const std::string DB_FILE = "whale_bot.db";
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
-constexpr size_t MAX_USERS = 1000000;
-
-double nanosToUsd(uint64_t nanos) { return static_cast<double>(nanos) / 1000000000.0; }
 
 std::atomic<bool> running{true};
 std::atomic<int64_t> g_lastProcessedBlock{0};
@@ -435,8 +431,8 @@ void initDB() {
     }
 
     // Дайджест мини-аппа: выпуски пишет API, лайки и комментарии — люди.
-    // Таблицы заводятся здесь, у хозяина базы, чтобы /forgetme мог стереть
-    // лайки и комментарии человека, даже если API ещё ни разу не запускался.
+    // Таблицы заводятся и здесь, у хозяина базы, — те же CREATE, что в API:
+    // кто бы из двоих ни поднялся первым, схема одна.
     {
         const char* digestSql = R"(
             CREATE TABLE IF NOT EXISTS digests (
@@ -698,25 +694,6 @@ std::vector<std::string> hlWatchedAddresses() {
     return out;
 }
 
-std::vector<HlUserWallet> hlUserWallets(const std::string& chatId) {
-    std::vector<HlUserWallet> out;
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "SELECT wa.address, uw.label FROM user_whales uw "
-        "JOIN whale_addresses wa ON wa.id = uw.whale_id "
-        "WHERE uw.user_id = ? ORDER BY uw.created_at")) return out;
-    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
-        HlUserWallet w;
-        w.address = toLower(safeColumnText(s, 0));
-        w.label = safeColumnText(s, 1);
-        if (!w.address.empty()) out.push_back(std::move(w));
-    }
-    sqlite3_finalize(s);
-    return out;
-}
-
 std::vector<HlRecipient> hlWatchersFor(const std::string& addressLower) {
     std::vector<HlRecipient> out;
     std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> snapshot;
@@ -755,14 +732,6 @@ std::string getUserLanguage(const std::string& chatId) {
     return lang;
 }
 
-void setUserLanguage(const std::string& chatId, const std::string& lang) {
-    ensureUser(chatId);
-    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"UPDATE users SET language=? WHERE chat_id=?")) return;
-    sqlite3_bind_text(s,1,lang.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_text(s,2,chatId.c_str(),-1,SQLITE_TRANSIENT);
-    sqlite3_step(s); sqlite3_finalize(s);
-}
-
 /* Бесплатную неделю премиума бот больше не выдаёт: её выдаёт API при первом
    открытии мини-аппа (grant_trial в whale_api.py). Таблица trial_granted
    осталась общей — по ней и API, и прежние выдачи ботом видят, что неделя
@@ -799,306 +768,6 @@ public:
     }
 } g_rateLimiter;
 
-struct CallbackLimiter {
-    struct S { std::chrono::steady_clock::time_point last; std::deque<std::chrono::steady_clock::time_point> hist; };
-    std::mutex mtx;
-    std::map<std::string, S> users;
-    static constexpr int MIN_MS = 250;
-    static constexpr int MAX_MIN = 90;
-    static constexpr int CLEANUP_H = 6;
-
-    bool allow(const std::string& c) {
-        std::lock_guard<std::mutex> l(mtx);
-        auto now = std::chrono::steady_clock::now();
-        static int cc = 0;
-        if (++cc % 1000 == 0)
-            for (auto it = users.begin(); it != users.end();)
-                if (std::chrono::duration_cast<std::chrono::hours>(now - it->second.last).count() > CLEANUP_H)
-                    it = users.erase(it);
-                else ++it;
-        auto& st = users[c];
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now - st.last).count() < MIN_MS) return false;
-        while (!st.hist.empty() &&
-               std::chrono::duration_cast<std::chrono::seconds>(now - st.hist.front()).count() > 60)
-            st.hist.pop_front();
-        if (static_cast<int>(st.hist.size()) >= MAX_MIN) return false;
-        st.last = now; st.hist.push_back(now);
-        return true;
-    }
-} g_callbackLimiter;
-
-namespace TelegramUI {
-
-UIMessage buildMainMenu(const std::string& chatId) {
-    size_t walletCount = countUserWhales(chatId);
-    double thresholdUsd = nanosToUsd(getUserThresholdNanos(chatId));
-    Lang lang = langFromCode(getUserLanguage(chatId));
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    const char* miniUrl = std::getenv("WHALE_MINIAPP_URL");
-    if (miniUrl && *miniUrl) {
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "menu_open_app")}, {"web_app", {{"url", std::string(miniUrl)}}}}
-        }));
-    }
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_add_wallet")}, {"callback_data", "menu:add_wallet"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_account") + " (" + std::to_string(walletCount) + ")"}, {"callback_data", "menu:account"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_big_trades")}, {"callback_data", "menu:big"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_alert_threshold") + " ($" + formatThousands(static_cast<uint64_t>(thresholdUsd)) + ")"}, {"callback_data", "menu:alert_threshold"}}
-    }));
-    std::string premiumLabel = tr(lang, "menu_premium");
-    if (chatId == SERVICE_CHAT_ID) {
-        premiumLabel += " (\u221E)";
-    } else if (isPremium(chatId)) {
-        const long long expire = premiumExpireTs(chatId);
-        const long long now = static_cast<long long>(time(nullptr));
-        if (expire > now) {
-            const long long days = (expire - now + 86399) / 86400;
-            premiumLabel += " (" + std::to_string(days) + " " + tr(lang, "unit_day") + ")";
-        }
-    } else {
-        premiumLabel += " \U0001F512";
-    }
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", premiumLabel}, {"callback_data", "menu:premium"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_languages")}, {"callback_data", "menu:languages"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_help")}, {"callback_data", "menu:help"}}
-    }));
-
-    std::stringstream text;
-    text << tr(lang, "menu_title") << "\n\n";
-    if (walletCount == 0) {
-        text << tr(lang, "menu_no_wallets");
-    } else if (lang == Lang::RU) {
-        std::string walletWord = pluralRu(static_cast<long long>(walletCount), "кошелёк", "кошелька", "кошельков");
-        text << tr(lang, "menu_tracking_prefix") << " <b>" << walletCount << "</b> " << walletWord
-             << ", " << tr(lang, "menu_alerts_above") << " <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
-    } else {
-        text << tr(lang, "menu_tracking_prefix") << " <b>" << walletCount << "</b> wallet" << (walletCount == 1 ? "" : "s")
-             << ", " << tr(lang, "menu_alerts_above") << " <b>$" << formatThousands(static_cast<uint64_t>(thresholdUsd)) << "</b>.";
-    }
-    return {text.str(), keyboard.dump()};
-}
-
-UIMessage buildWelcomeMessage(const std::string& chatId) {
-    const Lang lang = langFromCode(getUserLanguage(chatId));
-    std::ostringstream t;
-
-    t << tr(lang, "wc_title") << "\n\n"
-      << tr(lang, "wc_how") << "\n\n";
-
-    std::vector<std::pair<std::string, PerpRankInfo>> top3 = perpTopThree();
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-
-    auto addWhale = [&](int n, const std::string& addr, long long pnl, int winRate) {
-        const char* medal = n == 0 ? "\U0001F947" : (n == 1 ? "\U0001F948" : "\U0001F949");
-        const bool tracked = isTrackingWallet(chatId, addr);
-        t << medal << " <code>" << shortAddress(addr) << "</code>"
-          << (tracked ? "  \u2705" : "") << "\n"
-          << "\U0001F4B5 PnL: " << formatUsdNanosSigned(pnl, true)
-          << " \u00B7 \U0001F3AF " << winRate << "%\n\n";
-        keyboard["inline_keyboard"].push_back(json::array({
-            {{"text", tracked
-                        ? "\u2705 " + tr(lang, "wc_tracked_btn") + " " + shortAddress(addr)
-                        : std::string(medal) + " " + tr(lang, "wc_track_btn") + " " + shortAddress(addr)},
-             {"callback_data", tracked ? "wc_noop" : "wc_track:" + addr}}
-        }));
-    };
-
-    if (!top3.empty()) {
-        t << tr(lang, "wc_top_intro") << "\n\n";
-        int n = 0;
-        for (const auto& [addr, info] : top3) { addWhale(n, addr, info.pnlNanos, info.winRatePercent); if (++n >= 3) break; }
-    }
-
-    t << tr(lang, "wc_free_note");
-
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "wc_next_btn")}, {"callback_data", "menu:main"}}
-    }));
-
-    return {t.str(), keyboard.dump()};
-}
-
-std::string buildCancelButton(Lang lang) {
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
-    }));
-    return keyboard.dump();
-}
-
-std::string buildCancelWithTopTraders(Lang lang) {
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
-    }));
-    return keyboard.dump();
-}
-
-std::string buildCancelWithSpotTop(Lang lang) {
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "menu_top_traders")}, {"callback_data", "menu:toptrader_spot"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "cancel_button")}, {"callback_data", "cancel"}}
-    }));
-    return keyboard.dump();
-}
-
-UIMessage buildLanguagesMenu(const std::string& chatId) {
-    static const std::vector<std::pair<std::string, std::string>> LANGUAGES = {
-        {"en", "🇬🇧 English"},
-        {"ru", "🇷🇺 Русский"},
-        {"es", "🇪🇸 Español"},
-        {"pt", "🇧🇷 Português"},
-        {"fr", "🇫🇷 Français"},
-        {"tr", "🇹🇷 Türkçe"},
-        {"ar", "🇸🇦 العربية"},
-        {"pl", "🇵🇱 Polski"},
-        {"de", "🇩🇪 Deutsch"},
-        {"uk", "🇺🇦 Українська"},
-        {"hi", "🇮🇳 हिन्दी"},
-        {"id", "🇮🇩 Indonesia"},
-        {"vi", "🇻🇳 Tiếng Việt"},
-        {"ko", "🇰🇷 한국어"},
-        {"zh", "🇨🇳 中文"},
-        {"ja", "🇯🇵 日本語"},
-    };
-    std::string current = getUserLanguage(chatId);
-    Lang lang = langFromCode(current);
-
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    json row = json::array();
-    for (size_t i = 0; i < LANGUAGES.size(); ++i) {
-        const auto& l = LANGUAGES[i];
-        std::string labelText = l.second + (l.first == current ? " ✅" : "");
-        row.push_back({{"text", labelText}, {"callback_data", "lang:" + l.first}});
-        if (row.size() == 2 || i + 1 == LANGUAGES.size()) {
-            keyboard["inline_keyboard"].push_back(row);
-            row = json::array();
-        }
-    }
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-
-    std::string currentLabel = current;
-    for (const auto& l : LANGUAGES) if (l.first == current) { currentLabel = l.second; break; }
-    std::string text = tr(lang, "lang_title") + "\n" + tr(lang, "lang_current") + " <b>" + currentLabel + "</b>\n\n" + tr(lang, "lang_choose");
-    return {text, keyboard.dump()};
-}
-
-UIMessage buildHelpMessage(const std::string& chatId) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "legal_btn_privacy")}, {"callback_data", "menu:privacy"}},
-        {{"text", tr(lang, "legal_btn_terms")}, {"callback_data", "menu:terms"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-
-    std::string text = tr(lang, "help_title") + "\n\n";
-    text += tr(lang, "help_intro") + "\n\n";
-    text += tr(lang, "help_commands") + "\n";
-    text += tr(lang, "help_menu_add") + "\n";
-    text += tr(lang, "help_menu_mywallets") + "\n";
-    text += tr(lang, "help_menu_threshold") + "\n";
-    text += tr(lang, "help_menu_top") + "\n";
-    text += tr(lang, "help_menu_positions") + "\n";
-    text += tr(lang, "help_menu_premium") + "\n";
-    text += tr(lang, "help_menu_languages") + "\n\n";
-    text += tr(lang, "help_premium_title") + "\n";
-    text += tr(lang, "help_premium_1") + "\n";
-    text += tr(lang, "help_premium_2") + "\n";
-    text += tr(lang, "help_premium_3") + "\n";
-    text += tr(lang, "help_premium_4") + "\n\n";
-    text += tr(lang, "help_support") + "\n";
-    text += tr(lang, "help_channel") + "\n\n";
-    text += tr(lang, "help_footer") + "\n\n";
-    text += tr(lang, "help_disclaimer");
-
-    return {text, keyboard.dump()};
-}
-
-/* Юридические экраны. Документы обязаны быть доступны из бота, а не только
- * по ссылке: часть пользователей никогда не откроет мини-приложение. */
-UIMessage buildPrivacyMessage(const std::string& chatId) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "legal_btn_terms")}, {"callback_data", "menu:terms"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "legal_btn_forget")}, {"callback_data", "menu:forgetme"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-    return {tr(lang, "legal_privacy_title") + "\n\n" + tr(lang, "legal_privacy_body"), keyboard.dump()};
-}
-
-UIMessage buildTermsMessage(const std::string& chatId) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "legal_btn_privacy")}, {"callback_data", "menu:privacy"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-    return {tr(lang, "legal_terms_title") + "\n\n" + tr(lang, "legal_terms_body"), keyboard.dump()};
-}
-
-/* Удаление необратимо, поэтому между командой и стиранием стоит явное
- * подтверждение с перечнем того, что именно пропадёт. */
-UIMessage buildForgetMessage(const std::string& chatId) {
-    Lang lang = langFromCode(getUserLanguage(chatId));
-    json keyboard;
-    keyboard["inline_keyboard"] = json::array();
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "legal_forget_yes")}, {"callback_data", "forget:yes"}}
-    }));
-    keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "back_button")}, {"callback_data", "back"}}
-    }));
-    return {tr(lang, "legal_forget_title") + "\n\n" + tr(lang, "legal_forget_warn"), keyboard.dump()};
-}
-
-}
-
-UserSessionManager g_sessionManager;
-
 SendResult sendMsg(const std::string& c, const std::string& t, const std::string& reply_markup) {
     json j;
     j["chat_id"] = c;
@@ -1131,55 +800,40 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     } catch (...) { return {false, false, 0}; }
 }
 
-bool editMsg(const std::string& c, long long messageId, const std::string& t, const std::string& reply_markup = "") {
-    json j; j["chat_id"] = c; j["message_id"] = messageId;
-    j["text"] = t;
-    j["parse_mode"] = "HTML";
-    j["disable_web_page_preview"] = true;
-    if (!reply_markup.empty()) {
-        try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
-    }
-    auto r = http("https://api.telegram.org/bot" + TG_TOKEN + "/editMessageText", j.dump());
-    try {
-        auto p = json::parse(r);
-        if (p.value("ok", false)) return true;
-        std::string desc = p.value("description", std::string());
-        if (desc.find("message is not modified") != std::string::npos) return true;
-        return false;
-    } catch (...) { return false; }
-}
-
-void replyInPlace(const std::string& chatId, long long messageId, const std::string& text, const std::string& keyboard) {
-    std::string kb = keyboard.empty() ? "{\"inline_keyboard\":[]}" : keyboard;
-    if (messageId <= 0 || !editMsg(chatId, messageId, text, kb)) {
-        sendMsg(chatId, text, keyboard);
-    }
-}
-
-void deleteMsg(const std::string& chatId, long long messageId) {
-    if (messageId <= 0) return;
-    json j;
-    j["chat_id"] = chatId;
-    j["message_id"] = messageId;
-    http("https://api.telegram.org/bot" + TG_TOKEN + "/deleteMessage", j.dump());
-}
-
-void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text, bool showAlert) {
+void answerCallbackQuery(const std::string& callbackQueryId) {
     json j;
     j["callback_query_id"] = callbackQueryId;
-    if (!text.empty()) j["text"] = text;
-    if (showAlert) j["show_alert"] = true;
     http("https://api.telegram.org/bot" + TG_TOKEN + "/answerCallbackQuery", j.dump());
 }
 
+const std::string MINIAPP_URL = []{
+    const char* v = std::getenv("WHALE_MINIAPP_URL");
+    return std::string(v ? v : "");
+}();
+
+std::string openAppKeyboard(Lang lang) {
+    if (MINIAPP_URL.empty()) return "";
+    json kb;
+    kb["inline_keyboard"] = json::array({json::array({
+        {{"text", tr(lang, "menu_open_app")}, {"web_app", {{"url", MINIAPP_URL}}}}
+    })});
+    return kb.dump();
+}
+
+// Ответ на любое сообщение и на кнопки старых меню: всё теперь в приложении.
+void sendOpenApp(const std::string& chatId) {
+    const Lang lang = langFromCode(getUserLanguage(chatId));
+    sendMsg(chatId, tr(lang, "start_open_app"), openAppKeyboard(lang));
+}
+
+/* Меню команд в чате больше не нужно: всё открывается из приложения.
+   Список команд стираем — у людей, открывших бота
+   раньше, он иначе так и висел бы со старыми командами — политика, условия
+   и удаление данных теперь в приложении. */
 void setupBotCommands() {
-    json cmds = json::array();
-    cmds.push_back({{"command","start"},{"description","Open the main menu"}});
-    cmds.push_back({{"command","privacy"},{"description","Privacy Policy"}});
-    cmds.push_back({{"command","terms"},{"description","Terms of Use"}});
-    cmds.push_back({{"command","forgetme"},{"description","Delete all my data"}});
-    json j; j["commands"] = cmds;
-    http("https://api.telegram.org/bot" + TG_TOKEN + "/setMyCommands", j.dump());
+    http("https://api.telegram.org/bot" + TG_TOKEN + "/deleteMyCommands", "{}");
+    if (MINIAPP_URL.empty())
+        std::cerr << "[TG] WHALE_MINIAPP_URL не задан — кнопки «Открыть приложение» не будет" << std::endl;
 }
 
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
@@ -1548,468 +1202,6 @@ void cleanupOldAlerts() {
         if (orp>0) std::cout << "[CLEANUP] Removed " << orp << " orphaned deliveries" << std::endl; }
 }
 
-std::mutex g_lastViewMutex;
-thread_local bool g_navigatingBack = false;
-std::unordered_map<std::string, std::vector<std::string>> g_viewStack;
-constexpr size_t VIEW_STACK_MAX = 12;
-
-std::string pagingRoot(const std::string& data) {
-    if (data.rfind("mw_page:", 0) == 0)     return "menu:my_wallets";
-    if (data.rfind("hl_pospage:", 0) == 0)  return "hl_positions";
-    if (data.rfind("bg_page:", 0) == 0) {
-        const size_t a = data.find(':'), b = data.find(':', a + 1);
-        const size_t c = b == std::string::npos ? std::string::npos : data.find(':', b + 1);
-        if (c != std::string::npos) return "bg_open:" + data.substr(a + 1, c - a - 1);
-        return "menu:big";
-    }
-    if (data.rfind("gt_open:", 0) == 0) {
-        const size_t k1 = data.find(':');
-        const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
-        if (k2 != std::string::npos) return data.substr(0, k2);
-        return data;
-    }
-    if (data.rfind("gt_page:", 0) == 0) {
-        const size_t k1 = data.find(':');
-        const size_t k2 = data.find(':', k1 + 1);
-        if (k2 != std::string::npos) return "gt_open:" + data.substr(k1 + 1, k2 - k1 - 1);
-        return "menu:toptrader_spot";
-    }
-    if (data.rfind("hl_open:", 0) == 0) {
-        const size_t k1 = data.find(':');
-        const size_t k2 = k1 == std::string::npos ? std::string::npos : data.find(':', k1 + 1);
-        if (k2 != std::string::npos) return data.substr(0, k2);
-        return data;
-    }
-    if (data.rfind("hl_page:", 0) == 0) {
-        const size_t k1 = data.find(':');
-        const size_t k2 = data.find(':', k1 + 1);
-        if (k2 != std::string::npos) return "hl_open:" + data.substr(k1 + 1, k2 - k1 - 1);
-        return "hl_menu";
-    }
-    return "";
-}
-
-void rememberView(const std::string& chatId, const std::string& data) {
-    if (g_navigatingBack) return;
-    std::lock_guard<std::mutex> l(g_lastViewMutex);
-    auto& st = g_viewStack[chatId];
-    const std::string root = pagingRoot(data);
-    if (!root.empty()) {
-        if (!st.empty() && (st.back() == root || pagingRoot(st.back()) == root))
-            st.back() = data;
-        else
-            st.push_back(data);
-        if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
-        return;
-    }
-    if (!st.empty() && st.back() == data) return;
-    st.push_back(data);
-    if (st.size() > VIEW_STACK_MAX) st.erase(st.begin());
-}
-
-void resetViewStack(const std::string& chatId, const std::string& root) {
-    std::lock_guard<std::mutex> l(g_lastViewMutex);
-    g_viewStack[chatId] = { root };
-}
-
-std::string getLastView(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(g_lastViewMutex);
-    auto it = g_viewStack.find(chatId);
-    return (it == g_viewStack.end() || it->second.empty()) ? "" : it->second.back();
-}
-
-std::string popPreviousView(const std::string& chatId) {
-    std::lock_guard<std::mutex> l(g_lastViewMutex);
-    auto it = g_viewStack.find(chatId);
-    if (it == g_viewStack.end() || it->second.size() < 2) return "";
-    it->second.pop_back();
-    return it->second.back();
-}
-
-/**
- * Полное удаление пользователя по /forgetme (GDPR, право на забвение).
- *
- * Стираем всё, что привязано к chat_id: сам профиль (язык, порог, статус
- * премиума), список отслеживаемых кошельков, отметку о пробном периоде,
- * очередь доставок, записи о платежах и доступ к аналитике. Адрес из
- * whale_addresses убираем только если его больше никто не отслеживает —
- * это общий справочник, а не собственность пользователя.
- *
- * Таблицы trades, wallet_history, token_cache и рейтинги не трогаем: там
- * лежат публичные транзакции блокчейна, которые существуют независимо от
- * бота и ни к какому Telegram-аккаунту не привязаны. Удалять их «по просьбе
- * пользователя» было бы удалением чужих данных.
- */
-bool forgetUser(const std::string& chatId) {
-    {
-        std::lock_guard<std::mutex> l(g_lastViewMutex);
-        g_viewStack.erase(chatId);
-    }
-
-    // trial_granted здесь нет намеренно. Эта строка — единственное, что
-    // переживает удаление: chat_id и дата выдачи бесплатной недели. Пока она
-    // удалялась вместе с остальным, любой мог стереть данные, нажать /start и
-    // получить неделю премиума заново — и так без конца. Теперь неделю выдаёт
-    // API при первом открытии мини-аппа, но смотрит он в ту же таблицу. Ничего, кроме факта
-    // «неделя уже выдавалась», в ней нет, и об этом сказано в политике.
-    static const char* const STMTS[] = {
-        "DELETE FROM user_whales WHERE user_id=?",
-        "DELETE FROM deliveries WHERE chat_id=?",
-        "DELETE FROM premium_payments WHERE chat_id=?",
-        "DELETE FROM ton_invoices WHERE chat_id=?",
-        "DELETE FROM digest_likes WHERE chat_id=?",
-        "DELETE FROM digest_tr WHERE comment_id IN (SELECT id FROM digest_comments WHERE chat_id=?)",
-        "DELETE FROM digest_comments WHERE chat_id=?",
-        "DELETE FROM digest_mute WHERE chat_id=?",
-        "DELETE FROM users WHERE chat_id=?",
-    };
-
-    // Блокировка живёт только на время записи: refreshWatchers() ниже
-    // берёт dbMutex сам, и вызов из-под неё повесил бы бота намертво.
-    {
-    std::lock_guard<std::mutex> l(dbMutex);
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        std::cerr << "[GDPR] BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
-        return false;
-    }
-    for (const char* sql : STMTS) {
-        sqlite3_stmt* st;
-        // Таблица могла не появиться на старой базе — это не повод рвать удаление.
-        if (sqlite3_prepare_v2(db, sql, -1, &st, nullptr) != SQLITE_OK) continue;
-        sqlite3_bind_text(st, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(st) != SQLITE_DONE)
-            std::cerr << "[GDPR] " << sql << ": " << sqlite3_errmsg(db) << std::endl;
-        sqlite3_finalize(st);
-    }
-    // Адреса, за которыми больше никто не следит, держать незачем.
-    sqlite3_exec(db,
-        "DELETE FROM whale_addresses WHERE NOT EXISTS "
-        "(SELECT 1 FROM user_whales uw WHERE uw.whale_id = whale_addresses.id)",
-        nullptr, nullptr, nullptr);
-
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        std::cerr << "[GDPR] COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
-        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
-        return false;
-    }
-    }
-
-    /* Строки удалены, но бот рассылает алерты не по базе, а по таблице
-     * наблюдателей в памяти. Она перестраивается только по явному вызову,
-     * и без него удалённый пользователь продолжал бы получать алерты —
-     * «мы всё стёрли» оказалось бы неправдой на глазах у человека. */
-    refreshWatchers();
-    premiumForgetChat(chatId);
-
-    std::cout << "[GDPR] данные пользователя " << chatId << " удалены по /forgetme" << std::endl;
-    return true;
-}
-
-void handleCallbackQuery(const json& callbackQuery);
-
-TelegramUI::UIMessage renderViewByData(const std::string& chatId, const std::string& data) {
-    size_t colonPos = data.find(':');
-    std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
-    std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
-
-    if (action == "menu") {
-        if (param == "my_wallets") return TelegramUI::buildWalletsList(chatId);
-        if (param == "alert_threshold") return TelegramUI::buildAlertThresholdMenu(getUserThresholdNanos(chatId), langFromCode(getUserLanguage(chatId)));
-        if (param == "toptrader") { auto r = buildVenueMenu(chatId); return {r.text, r.keyboard}; }
-        if (param == "toptrader_spot") { auto r = buildGlobalTopMenu(chatId); return {r.text, r.keyboard}; }
-        if (param == "premium") { auto r = buildPremiumPage(chatId); return {r.text, r.keyboard}; }
-        if (param == "big") { auto r = buildBigMenu(chatId); return {r.text, r.keyboard}; }
-        if (param == "languages") return TelegramUI::buildLanguagesMenu(chatId);
-        if (param == "help") return TelegramUI::buildHelpMessage(chatId);
-        if (param == "privacy") return TelegramUI::buildPrivacyMessage(chatId);
-        if (param == "terms") return TelegramUI::buildTermsMessage(chatId);
-        if (param == "forgetme") return TelegramUI::buildForgetMessage(chatId);
-        return TelegramUI::buildMainMenu(chatId);
-    }
-    {
-        HlMessage hl;
-        if (renderHyperliquidView(chatId, action, param, hl)) return {hl.text, hl.keyboard};
-    }
-    if (action == "mw_page") {
-        int page = 1;
-        try { page = std::stoi(param); } catch (...) {}
-        return TelegramUI::buildWalletsList(chatId, page);
-    }
-    if (action == "gt_open") {
-        GlobalRankKind kind;
-        if (parseGlobalRankKind(param, kind)) {
-            auto r = buildGlobalTopMessage(chatId, kind, premiumTopTradersLimit(chatId), !isPremium(chatId));
-            return {r.text, r.keyboard};
-        }
-    }
-    if (action == "gt_page") {
-        size_t sep = param.find(':');
-        if (sep != std::string::npos) {
-            GlobalRankKind kind;
-            if (parseGlobalRankKind(param.substr(0, sep), kind)) {
-                int page = 1;
-                try { page = std::stoi(param.substr(sep + 1)); } catch (...) {}
-                auto r = buildGlobalTopPage(chatId, kind, page, premiumTopTradersLimit(chatId), !isPremium(chatId));
-                return {r.text, r.keyboard};
-            }
-        }
-    }
-    return TelegramUI::buildMainMenu(chatId);
-}
-
-bool navigateBack(const std::string& chatId, long long messageId) {
-    std::string back = popPreviousView(chatId);
-    if (back.empty()) return false;
-    json synthetic;
-    synthetic["data"] = back;
-    synthetic["from"] = json::object();
-    synthetic["from"]["id"] = std::stoll(chatId);
-    synthetic["message"] = json::object();
-    synthetic["message"]["message_id"] = messageId;
-    g_navigatingBack = true;
-    handleCallbackQuery(synthetic);
-    g_navigatingBack = false;
-    return true;
-}
-
-void handleCallbackQuery(const json& callbackQuery) {
-    if (!callbackQuery.contains("data") || !callbackQuery["data"].is_string()) return;
-    if (!callbackQuery.contains("from") || !callbackQuery["from"].contains("id")) return;
-
-    std::string data = callbackQuery["data"].get<std::string>();
-    std::string chatId = std::to_string(callbackQuery["from"]["id"].get<long>());
-    std::string callbackQueryId = callbackQuery.contains("id") ? callbackQuery["id"].get<std::string>() : "";
-    long long messageId = 0;
-    if (callbackQuery.contains("message") && callbackQuery["message"].is_object() &&
-        callbackQuery["message"].contains("message_id")) {
-        messageId = callbackQuery["message"]["message_id"].get<long long>();
-    }
-
-    size_t colonPos = data.find(':');
-    std::string action = colonPos != std::string::npos ? data.substr(0, colonPos) : data;
-    std::string param = colonPos != std::string::npos ? data.substr(colonPos + 1) : "";
-
-    if (action != "tt_track" && action != "wc_track" && action != "remove" && !callbackQueryId.empty()) {
-        answerCallbackQuery(callbackQueryId);
-    }
-
-    if (action == "menu") {
-        g_sessionManager.clearSession(chatId);
-
-        if (param == "main") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "add_wallet") {
-            rememberView(chatId, data);
-            startAddWalletFlow(chatId, messageId);
-        }
-        else if (param == "account") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildAccountMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "my_wallets") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildWalletsList(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "alert_threshold") {
-            rememberView(chatId, data);
-            uint64_t threshold = getUserThresholdNanos(chatId);
-            auto msg = TelegramUI::buildAlertThresholdMenu(threshold, langFromCode(getUserLanguage(chatId)));
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "toptrader") {
-            rememberView(chatId, data);
-            auto msg = buildVenueMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "toptrader_spot") {
-            rememberView(chatId, data);
-            auto msg = buildGlobalTopMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "premium") {
-            rememberView(chatId, data);
-            auto msg = buildPremiumPage(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "big") {
-            rememberView(chatId, data);
-            auto msg = buildBigMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "languages") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildLanguagesMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "help") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildHelpMessage(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "privacy") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildPrivacyMessage(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "terms") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildTermsMessage(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-        else if (param == "forgetme") {
-            rememberView(chatId, data);
-            auto msg = TelegramUI::buildForgetMessage(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-    }
-    else if (action == "forget") {
-        if (param == "yes") {
-            Lang lang = langFromCode(getUserLanguage(chatId));
-            const std::string done = tr(lang, "legal_forget_done");
-            const std::string failed = tr(lang, "legal_forget_failed");
-            g_sessionManager.clearSession(chatId);
-            const bool ok = forgetUser(chatId);
-            // Клавиатуру не оставляем: кнопки вели бы к данным, которых уже нет.
-            replyInPlace(chatId, messageId, ok ? done : failed, "");
-        }
-    }
-    else if (action == "back") {
-        g_sessionManager.clearSession(chatId);
-        if (!navigateBack(chatId, messageId)) {
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-    }
-    else if (action == "cancel") {
-        g_sessionManager.clearSession(chatId);
-        if (!navigateBack(chatId, messageId)) {
-            Lang lang = langFromCode(getUserLanguage(chatId));
-            auto msg = TelegramUI::buildMainMenu(chatId);
-            replyInPlace(chatId, messageId, tr(lang, "op_cancelled") + "\n\n" + msg.text, msg.keyboard);
-        }
-    }
-    else if (action == "lang") {
-        static const std::set<std::string> SUPPORTED_LANGS = {"en", "ru", "es", "pt", "fr", "tr", "ar", "pl", "de", "uk", "hi", "id", "vi", "ko", "zh", "ja"};
-        if (SUPPORTED_LANGS.count(param)) {
-            setUserLanguage(chatId, param);
-            rememberView(chatId, "menu:languages");
-            auto msg = TelegramUI::buildLanguagesMenu(chatId);
-            replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-        }
-    }
-    else if (action == "wc_noop") {
-        if (!callbackQueryId.empty())
-            answerCallbackQuery(callbackQueryId,
-                tr(langFromCode(getUserLanguage(chatId)), "toast_already_tracking"), false);
-    }
-    else if (action == "wc_track") {
-        const Lang lang = langFromCode(getUserLanguage(chatId));
-        const std::string address = toLower(param);
-        std::string toast;
-        if (!isValidAddress(address)) {
-            toast = tr(lang, "toast_invalid_address");
-        } else if (isTrackingWallet(chatId, address)) {
-            toast = tr(lang, "toast_already_tracking");
-        } else {
-            switch (addUserWhale(chatId, address, shortAddress(address))) {
-                case AddWhaleResult::OK:            toast = tr(lang, "wc_track_done"); break;
-                case AddWhaleResult::ALREADY_EXISTS:toast = tr(lang, "toast_already_tracking"); break;
-                case AddWhaleResult::LIMIT_REACHED: toast = tr(lang, "free_plan_1_wallet"); break;
-                case AddWhaleResult::PERMANENTLY_BANNED: toast = tr(lang, "wallet_bot_banned"); break;
-                default:                            toast = tr(lang, "generic_error_retry"); break;
-            }
-        }
-        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId, toast, true);
-        auto msg = TelegramUI::buildWelcomeMessage(chatId);
-        replyInPlace(chatId, messageId, msg.text, msg.keyboard);
-    }
-    else if (action == "premium_ton") {
-        const Lang lang = langFromCode(getUserLanguage(chatId));
-        UsdtInvoice inv;
-        if (!createUsdtInvoice(chatId, inv)) {
-            auto page = buildPremiumPage(chatId);
-            replyInPlace(chatId, messageId,
-                tr(lang, "generic_error_retry") + "\n\n" + page.text, page.keyboard);
-            if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-            return;
-        }
-        char amt[32];
-        std::snprintf(amt, sizeof(amt), "%.2f", inv.amount);
-
-        std::string text = tr(lang, "ton_invoice_header") + "\n\n";
-        text += "1️⃣ " + tr(lang, "ton_step_network") + "\n<b>TON</b>\n"
-              + tr(lang, "ton_network_note") + "\n\n";
-        text += "2️⃣ " + tr(lang, "ton_step_amount") + "\n<code>" + amt + "</code> USDT\n\n";
-        text += "3️⃣ " + tr(lang, "ton_step_address") + "\n<code>" + inv.wallet + "</code>\n\n";
-        text += "4️⃣ " + tr(lang, "ton_step_memo") + "\n<code>" + inv.memo + "</code>\n\n";
-        text += tr(lang, "ton_memo_warning") + "\n\n" + tr(lang, "ton_invoice_footer")
-              + "\n\n" + tr(lang, "ton_scam_note")
-              + "\n\n" + tr(lang, "ton_support_note");
-
-        json kb;
-        kb["inline_keyboard"] = json::array();
-        kb["inline_keyboard"].push_back(json::array({
-            {{"text", tr(lang, "back_button")}, {"callback_data", "menu:premium"}}
-        }));
-        replyInPlace(chatId, messageId, text, kb.dump());
-        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-    }
-    else if (action == "premium_buy") {
-
-        if (!sendPremiumInvoice(chatId)) {
-            Lang lang = langFromCode(getUserLanguage(chatId));
-            auto page = buildPremiumPage(chatId);
-            replyInPlace(chatId, messageId,
-                tr(lang, "err_invoice_failed") + "\n\n" + page.text, page.keyboard);
-        }
-    }
-    else if (action == "mw_noop") {
-        if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-    }
-    else if (action == "mw_page" || action == "rename" || action == "setmain" ||
-             action == "askremove" || action == "remove") {
-        handleWalletCallback(chatId, action, param, data, messageId, callbackQueryId);
-    }
-    else if (action == "threshold") {
-        rememberView(chatId, "menu:alert_threshold");
-        handleThresholdCallback(chatId, param, messageId);
-    }
-    else if (action == "bg_open" || action == "bg_page" || action == "bg_noop") {
-        handleBigTradesCallback(chatId, action, param, data, messageId, callbackQueryId);
-    }
-    else if (action == "tt_track" || action == "tt_noop" ||
-             action == "gt_open" || action == "gt_page") {
-        handleRankingCallback(chatId, action, param, data, messageId, callbackQueryId);
-    }
-    else if (action == "hl_menu" || action == "hl_open" || action == "hl_page" ||
-             action == "hl_positions" || action == "hl_pos" ||
-             action == "hl_pospage" || action == "hl_posnoop") {
-        handleHyperliquidCallback(chatId, action, param, data, messageId, callbackQueryId);
-    }
-
-    if (!callbackQueryId.empty()) answerCallbackQuery(callbackQueryId);
-}
-
-bool handleTextInput(const std::string& chatId, const std::string& text) {
-    UserSession session = g_sessionManager.getSession(chatId);
-
-    if (session.state == UserState::IDLE) {
-        return false;
-    }
-
-    if (handleWalletText(chatId, text, session)) return true;
-
-    if (session.state == UserState::AWAITING_CUSTOM_THRESHOLD)
-        return handleThresholdText(chatId, text);
-
-    return false;
-}
-
 void dbMaintenanceLoop() {
     auto lastTruncate = std::chrono::steady_clock::now();
     while (running.load(std::memory_order_relaxed)) {
@@ -2049,362 +1241,288 @@ void alertFlushLoop() {
     }
 }
 
+/* Служебные команды владельца: состояние сканера, импорт кошельков в
+   сервисный аккаунт, снятие бана. Остальным они не видны — на любой текст
+   человек получает кнопку приложения. */
+bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
+    if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
+    if (txt=="/health") {
+        size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
+        int diskFree = getDiskFreePercent();
+        time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
+        bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
+        std::stringstream ss2; ss2 << "✅ <b>OK</b>\n\n"
+            << "Block: <code>" << getLastBlock() << "</code>\n"
+            << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
+            << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
+            << "RPC endpoint: <code>" << safeString(RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
+            << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
+        if (diskFree >= 0) {
+            ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
+            if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
+        } else {
+            ss2 << "Disk: <b>unknown</b>\n";
+        }
+        ss2 << "Uptime: <b>" << getUptime() << "</b>";
+        sendMsg(cid,ss2.str());
+    }
+    else if (txt=="/statsbtc") {
+        // Сеть Bitcoin — отдельной командой: в /stats и так
+        // десятки строк про BSC и Hyperliquid.
+        sendMsg(cid, btcStatsLine());
+    }
+    else if (txt=="/stats") {
+        size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
+        { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
+        std::string langStats;
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s,
+                "SELECT COALESCE(NULLIF(TRIM(u.language), ''), 'en') AS lang, "
+                "COUNT(*), "
+                "SUM(CASE WHEN EXISTS(SELECT 1 FROM user_whales uw WHERE uw.user_id=u.chat_id) "
+                "THEN 1 ELSE 0 END) "
+                "FROM users u GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC")) {
+                struct LangRow { std::string lang; long long users, active; };
+                std::vector<LangRow> rows;
+                long long total = 0, totalActive = 0;
+                while (sqlite3_step(s) == SQLITE_ROW) {
+                    LangRow r;
+                    r.lang = safeColumnText(s, 0);
+                    r.users = sqlite3_column_int64(s, 1);
+                    r.active = sqlite3_column_int64(s, 2);
+                    total += r.users;
+                    totalActive += r.active;
+                    rows.push_back(std::move(r));
+                }
+                sqlite3_finalize(s);
+                if (!rows.empty()) {
+                    std::ostringstream ls;
+                    ls << "🌐 Languages (с кошельком):";
+                    for (const auto& r : rows) {
+                        ls << "\n· " << r.lang << ": <b>" << r.users << "</b>";
+                        if (total > 0) ls << " (" << (r.users * 100 / total) << "%)";
+                        ls << " → <b>" << r.active << "</b>";
+                        if (r.users > 0) ls << " (" << (r.active * 100 / r.users) << "%)";
+                    }
+                    if (total > 0)
+                        ls << "\n· всего с кошельком: <b>" << totalActive
+                           << "</b> из " << total
+                           << " (" << (totalActive * 100 / total) << "%)";
+                    langStats = ls.str();
+                }
+            }
+        }
+
+        std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>"
+              << "\n🧵 Потоки: <b>" << g_msgQueue.busy() << "/"
+              << g_msgQueue.threads() << "</b> заняты · отправлено <b>"
+              << g_msgQueue.sent() << "</b>"
+              << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
+        if (!langStats.empty()) ss2 << "\n" << langStats;
+        ss2 << "\n\n"
+            << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · "
+            << g_stats.rpc_giveups.load() << " отказов"
+            << "\n💰 Цена: кэш " << g_stats.price_cache_hit.load()
+            << " · пул " << g_stats.price_from_pool.load()
+            << " · DexScreener " << g_stats.price_from_dex.load()
+            << " · CoinGecko " << g_stats.price_from_cg.load()
+            << "\n💰 Защита: тонкий пул " << g_stats.price_thin_pool.load()
+            << " · устаревший кэш " << g_stats.price_fallbacks.load()
+            << " · расхождение " << g_stats.price_divergence.load()
+            << " · скачок " << g_stats.price_spike_reject.load()
+            << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
+            << "\n📨 Sent: " << g_stats.alerts_sent.load()
+            << "\n🔍 TX: " << g_stats.tx_processed.load()
+            << "\n⏳ Lag: " << g_stats.current_lag.load()
+            << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
+        if (wsHeadsOk()) {
+            ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest();
+        } else {
+            ss2 << "\n🔌 WS: ❌ HTTP fallback"
+                << (wsHeadsLatest() > 0
+                        ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
+                        : "");
+        }
+        ss2 << rpcSlowSummary();
+        {
+            auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
+                uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
+                         wrap=c.wrap.load(), unwrap=c.unwrap.load(), xfer=c.transfer.load(),
+                         inter=c.interaction.load(), arb=c.arbitrage.load(), unk=c.unknown.load();
+                uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer+inter+arb+unk;
+                out << "\n\n" << title << " (valid tx: " << total << ")\n"
+                    << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell
+                    << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
+                    << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap
+                    << "\n📤 Transfer: " << xfer << "\n🤝 Interaction: " << inter
+                    << "\n♻️ Arbitrage: " << arb << "\n❓ Unknown: " << unk;
+            };
+            renderCov(ss2, "📈 <b>Coverage — users</b>", g_covUser);
+            renderCov(ss2, "🤖 <b>Coverage — service</b>", g_covSvc);
+            ss2 << "\n\n🔬 <b>Signals</b>\n💱 Swap Event: " << g_stats.sig_swap_event.load()
+                << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
+                << "\n📦 Multicall: " << g_stats.sig_multicall.load()
+                << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
+                << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
+                << "ERC20 mint/burn: " << g_stats.sig_lp_mint_burn.load()
+                << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
+                << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
+                << "\n\n❓ <b>Unknown reasons</b>\n"
+                << "Unconfirmed opposite: " << g_stats.unk_unconfirmed_opposite.load()
+                << "\nLP not linked: " << g_stats.unk_lp_not_linked.load()
+                << "\nOther: " << g_stats.unk_other.load()
+                << "\n\n\xF0\x9F\xA9\xBA <b>Diagnostics</b>\n"
+                << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
+                << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
+                << "\nSwap inferred from flow: " << g_stats.diag_swap_inferred.load()
+                << "\nNative counter needs trace: " << g_stats.diag_native_counter.load()
+                << "\nNative from router unwrap: " << g_stats.diag_native_unwrap.load()
+                << "\nNative refund adjusted: " << g_stats.diag_native_refund.load()
+                << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
+        }
+        ss2 << hyperliquidStatsLine();
+        if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
+        sendMsg(cid,ss2.str());
+    }
+    else if (txt.rfind("/import", 0) == 0) {
+        std::vector<std::string> found;
+        {
+            std::string s = toLower(txt);
+            size_t p = 0;
+            while ((p = s.find("0x", p)) != std::string::npos) {
+                if (p + 42 <= s.size()) {
+                    std::string cand = s.substr(p, 42);
+                    if (isValidAddress(cand)) { found.push_back(cand); p += 42; continue; }
+                }
+                p += 2;
+            }
+        }
+        // Адреса биткоина — в свою базу того же сервисного
+        // аккаунта (btc.db). Регистр base58 значим, поэтому
+        // разбираем исходный текст, а не строчную копию.
+        std::vector<std::string> btcFound;
+        {
+            std::string tok;
+            auto flush = [&] {
+                if (!tok.empty() && isBtcAddress(tok)) btcFound.push_back(normBtcAddress(tok));
+                tok.clear();
+            };
+            for (char ch : txt) {
+                if (std::isalnum(static_cast<unsigned char>(ch))) tok += ch;
+                else flush();
+            }
+            flush();
+        }
+        if (found.empty() && btcFound.empty()) {
+            sendMsg(cid, "Использование: /import 0x... bc1... (адреса BSC, Hyperliquid и Bitcoin через пробел, запятую или с новой строки)");
+        } else if (found.empty()) {
+            BtcImportResult br = btcImport(btcFound);
+            std::stringstream rep;
+            rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
+                << "₿ Адресов Bitcoin: <b>" << btcFound.size() << "</b>\n"
+                << "✅ Добавлено: <b>" << br.added << "</b>\n"
+                << "↩️ Уже в базе: <b>" << br.dup << "</b>\n"
+                << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+            sendMsg(cid, rep.str());
+        } else {
+            int added = 0, dup = 0, banned = 0, failed = 0;
+            for (const auto& a : found) {
+                switch (addUserWhale(SERVICE_CHAT_ID, a, a)) {
+                    case AddWhaleResult::OK:                  ++added;  break;
+                    case AddWhaleResult::ALREADY_EXISTS:      ++dup;    break;
+                    case AddWhaleResult::PERMANENTLY_BANNED:  ++banned; break;
+                    default:                                  ++failed; break;
+                }
+            }
+            refreshWatchers();
+            std::stringstream rep;
+            rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
+                << "Найдено адресов: <b>" << found.size() << "</b>\n"
+                << "✅ Добавлено: <b>" << added << "</b>\n"
+                << "↩️ Уже отслеживались: <b>" << dup << "</b>\n";
+            if (banned > 0) rep << "🤖 Помечены как боты (пропущены): <b>" << banned << "</b>\n";
+            if (failed > 0) rep << "⚠️ Не удалось добавить: <b>" << failed << "</b>\n";
+            rep << "\nВсего на сервисном аккаунте: <b>"
+                << countUserWhales(SERVICE_CHAT_ID) << "</b>";
+            if (!btcFound.empty()) {
+                BtcImportResult br = btcImport(btcFound);
+                rep << "\n\n₿ Bitcoin: найдено <b>" << btcFound.size() << "</b>, добавлено <b>"
+                    << br.added << "</b>, уже в базе <b>" << br.dup << "</b>"
+                    << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+            }
+            sendMsg(cid, rep.str());
+        }
+    }
+    else if (txt.rfind("/unban", 0) == 0) {
+        std::string arg = trim(txt.substr(6));
+        if (!isValidAddress(arg)) {
+            sendMsg(cid, "Использование: /unban 0x&lt;адрес&gt;");
+        } else if (liftPermanentBan(arg)) {
+            sendMsg(cid, "✅ Бан снят: <code>" + toLower(arg) + "</code>\nКошелёк снова может попадать в рейтинг.");
+        } else {
+            sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
+        }
+    }
+    else if (handleBeneficiaryCommand(cid, txt)) {
+    }
+    else return false;
+    return true;
+}
+
 void telegramLoop() {
     long offset=getTgOffset(); std::cout << "[TG] Restored offset: " << offset << std::endl;
     while (running.load(std::memory_order_relaxed)) {
         try {
-
             auto raw=http("https://api.telegram.org/bot"+TG_TOKEN+"/getUpdates?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%2C%22pre_checkout_query%22%5D","",35);
             if (raw.empty()) continue; auto upd=json::parse(raw);
             if (!upd.contains("result")||!upd["result"].is_array()) continue;
             int ub=0;
             for (auto& u:upd["result"]) {
                 if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
+                offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
 
+                // Кнопки старых меню в истории чата: снять «часики» и
+                // показать кнопку приложения.
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
                     const json& cq = u["callback_query"];
-                    std::string ccid;
+                    if (cq.contains("id") && cq["id"].is_string())
+                        answerCallbackQuery(cq["id"].get<std::string>());
                     if (cq.contains("message") && cq["message"].is_object() &&
                         cq["message"].contains("chat") && cq["message"]["chat"].is_object() &&
-                        cq["message"]["chat"].contains("id"))
-                        ccid = std::to_string(cq["message"]["chat"]["id"].get<long>());
-
-                    if (!ccid.empty() && !g_callbackLimiter.allow(ccid)) {
-                        if (cq.contains("id") && cq["id"].is_string())
-                            answerCallbackQuery(cq["id"].get<std::string>());
-                        offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                        cq["message"]["chat"].contains("id")) {
+                        const std::string ccid = std::to_string(cq["message"]["chat"]["id"].get<long>());
+                        if (g_rateLimiter.allow(ccid)) sendOpenApp(ccid);
                     }
-                    handleCallbackQuery(cq);
-                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                    continue;
                 }
 
                 if (u.contains("pre_checkout_query")&&u["pre_checkout_query"].is_object()) {
                     handlePreCheckoutQuery(u["pre_checkout_query"]);
-                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                    continue;
                 }
 
-                if (u.contains("message")&&u["message"].is_object()&&u["message"].contains("successful_payment")
-                    &&u["message"].contains("chat")&&u["message"]["chat"].is_object()&&u["message"]["chat"].contains("id")) {
-                    std::string pcid=std::to_string(u["message"]["chat"]["id"].get<long>());
-                    handleSuccessfulPayment(pcid, u["message"]["successful_payment"]);
-                    offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue;
+                if (!u.contains("message")||!u["message"].is_object()) continue;
+                const json& m = u["message"];
+                if (!m.contains("chat")||!m["chat"].is_object()||!m["chat"].contains("id")) continue;
+                const std::string cid=std::to_string(m["chat"]["id"].get<long>());
+
+                if (m.contains("successful_payment")) {
+                    handleSuccessfulPayment(cid, m["successful_payment"]);
+                    continue;
                 }
-                if (!u.contains("message")||!u["message"].is_object()||!u["message"].contains("text")||!u["message"]["text"].is_string()) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
-                std::string txt=u["message"]["text"].get<std::string>(), cid=std::to_string(u["message"]["chat"]["id"].get<long>());
+                if (!g_rateLimiter.allow(cid)) continue;
+
+                const std::string txt = m.contains("text") && m["text"].is_string() ? m["text"].get<std::string>() : "";
+                if (handleOwnerCommand(cid, txt)) continue;
+
                 std::string tgLang;
-                if (u["message"].contains("from") && u["message"]["from"].is_object() &&
-                    u["message"]["from"].contains("language_code") &&
-                    u["message"]["from"]["language_code"].is_string())
-                    tgLang = u["message"]["from"]["language_code"].get<std::string>();
-                if (!g_rateLimiter.allow(cid)) { offset=cuid+1; if (++ub%5==0) saveTgOffset(offset); continue; }
-
-                if (!txt.empty() && txt[0] == '/') {
-                    g_sessionManager.clearSession(cid);
-
-                    if (txt=="/menu") {
-                        ensureUser(cid, tgLang);
-                        resetViewStack(cid, "menu:main");
-                        auto msg = TelegramUI::buildMainMenu(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt=="/start") {
-                        bool isNewUser = false;
-                        {
-                            std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-                            if (prepareOrLog(db, &s, "SELECT 1 FROM users WHERE chat_id = ?")) {
-                                sqlite3_bind_text(s, 1, cid.c_str(), -1, SQLITE_TRANSIENT);
-                                isNewUser = (sqlite3_step(s) != SQLITE_ROW);
-                                sqlite3_finalize(s);
-                            }
-                        }
-
-                        if (countUsers() >= MAX_USERS && isNewUser) {
-                            sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "err_user_limit"));
-                        } else {
-                            ensureUser(cid, tgLang);
-                            resetViewStack(cid, "menu:main");
-                            if (isNewUser || cid == SERVICE_CHAT_ID) {
-                                auto msg = TelegramUI::buildWelcomeMessage(cid);
-                                sendMsg(cid, msg.text, msg.keyboard);
-                            } else {
-                                auto msg = TelegramUI::buildMainMenu(cid);
-                                sendMsg(cid, msg.text, msg.keyboard);
-                            }
-                        }
-                    }
-                    else if (txt=="/privacy") {
-                        ensureUser(cid, tgLang);
-                        resetViewStack(cid, "menu:privacy");
-                        auto msg = TelegramUI::buildPrivacyMessage(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt=="/terms") {
-                        ensureUser(cid, tgLang);
-                        resetViewStack(cid, "menu:terms");
-                        auto msg = TelegramUI::buildTermsMessage(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt=="/forgetme") {
-                        // Сначала предупреждение и кнопка подтверждения:
-                        // одна опечатка не должна стирать оплаченный премиум.
-                        auto msg = TelegramUI::buildForgetMessage(cid);
-                        resetViewStack(cid, "menu:forgetme");
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                    else if (txt=="/health") {
-                        if (cid != OWNER_CHAT_ID) {
-                            sendMsg(cid, "Access denied.");
-                        } else {
-                            size_t curIdx = rpcIndex.load(std::memory_order_relaxed) % RPC_ENDPOINTS.size();
-                            int diskFree = getDiskFreePercent();
-                            time_t lastFail = g_stats.last_rpc_failure.load(std::memory_order_relaxed);
-                            bool rpcHealthy = (lastFail==0) || (time(nullptr)-lastFail > 300);
-                            std::stringstream ss2; ss2 << "✅ <b>OK</b>\n\n"
-                                << "Block: <code>" << getLastBlock() << "</code>\n"
-                                << "Queue: <b>" << g_msgQueue.size() << "</b>\n"
-                                << "RPC: <b>" << (rpcHealthy?"healthy":"degraded") << "</b> (total failures: " << g_stats.rpc_failures.load() << ")\n"
-                                << "RPC endpoint: <code>" << safeString(RPC_ENDPOINTS[curIdx], 48) << "</code>\n"
-                                << "DB: <b>" << fileSizeMB(DB_FILE) << " MB</b> (WAL: " << fileSizeMB(DB_FILE + "-wal") << " MB)\n";
-                            if (diskFree >= 0) {
-                                ss2 << "Disk: <b>" << diskFree << "% free</b>\n";
-                                if (diskFree < 15) ss2 << "\n⚠️ <b>LOW DISK SPACE!</b>\n";
-                            } else {
-                                ss2 << "Disk: <b>unknown</b>\n";
-                            }
-                            ss2 << "Uptime: <b>" << getUptime() << "</b>";
-                            sendMsg(cid,ss2.str());
-                        }
-                    }
-                    else if (txt=="/statsbtc") {
-                        // Сеть Bitcoin — отдельной командой: в /stats и так
-                        // десятки строк про BSC и Hyperliquid.
-                        if (cid != OWNER_CHAT_ID) sendMsg(cid, "Access denied.");
-                        else sendMsg(cid, btcStatsLine());
-                    }
-                    else if (txt=="/stats") {
-                        if (cid != OWNER_CHAT_ID) {
-                            sendMsg(cid, "Access denied.");
-                        } else {
-                            size_t qs=g_msgQueue.size(); size_t uc=countUsers(); int64_t fc=0;
-                            { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s; if (prepareOrLog(db,&s,"SELECT COUNT(*) FROM deliveries WHERE status=4")) { if (sqlite3_step(s)==SQLITE_ROW) fc=sqlite3_column_int64(s,0); sqlite3_finalize(s); } }
-                            std::string langStats;
-                            {
-                                std::lock_guard<std::mutex> l(dbMutex);
-                                sqlite3_stmt* s;
-                                if (prepareOrLog(db, &s,
-                                    "SELECT COALESCE(NULLIF(TRIM(u.language), ''), 'en') AS lang, "
-                                    "COUNT(*), "
-                                    "SUM(CASE WHEN EXISTS(SELECT 1 FROM user_whales uw WHERE uw.user_id=u.chat_id) "
-                                    "THEN 1 ELSE 0 END) "
-                                    "FROM users u GROUP BY lang ORDER BY COUNT(*) DESC, lang ASC")) {
-                                    struct LangRow { std::string lang; long long users, active; };
-                                    std::vector<LangRow> rows;
-                                    long long total = 0, totalActive = 0;
-                                    while (sqlite3_step(s) == SQLITE_ROW) {
-                                        LangRow r;
-                                        r.lang = safeColumnText(s, 0);
-                                        r.users = sqlite3_column_int64(s, 1);
-                                        r.active = sqlite3_column_int64(s, 2);
-                                        total += r.users;
-                                        totalActive += r.active;
-                                        rows.push_back(std::move(r));
-                                    }
-                                    sqlite3_finalize(s);
-                                    if (!rows.empty()) {
-                                        std::ostringstream ls;
-                                        ls << "🌐 Languages (с кошельком):";
-                                        for (const auto& r : rows) {
-                                            ls << "\n· " << r.lang << ": <b>" << r.users << "</b>";
-                                            if (total > 0) ls << " (" << (r.users * 100 / total) << "%)";
-                                            ls << " → <b>" << r.active << "</b>";
-                                            if (r.users > 0) ls << " (" << (r.active * 100 / r.users) << "%)";
-                                        }
-                                        if (total > 0)
-                                            ls << "\n· всего с кошельком: <b>" << totalActive
-                                               << "</b> из " << total
-                                               << " (" << (totalActive * 100 / total) << "%)";
-                                        langStats = ls.str();
-                                    }
-                                }
-                            }
-
-                            std::stringstream ss2; ss2 << "📊 <b>Stats</b>\n\n👥 Users: <b>" << uc << "</b>\n📬 Queue: <b>" << qs << "</b>\n❌ Failed: <b>" << fc << "</b>"
-                                  << "\n🧵 Потоки: <b>" << g_msgQueue.busy() << "/"
-                                  << g_msgQueue.threads() << "</b> заняты · отправлено <b>"
-                                  << g_msgQueue.sent() << "</b>"
-                                  << "\n⏱ Uptime: <b>" << getUptime() << "</b>";
-                            if (!langStats.empty()) ss2 << "\n" << langStats;
-                            ss2 << "\n\n"
-                                << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · "
-                                << g_stats.rpc_giveups.load() << " отказов"
-                                << "\n💰 Цена: кэш " << g_stats.price_cache_hit.load()
-                                << " · пул " << g_stats.price_from_pool.load()
-                                << " · DexScreener " << g_stats.price_from_dex.load()
-                                << " · CoinGecko " << g_stats.price_from_cg.load()
-                                << "\n💰 Защита: тонкий пул " << g_stats.price_thin_pool.load()
-                                << " · устаревший кэш " << g_stats.price_fallbacks.load()
-                                << " · расхождение " << g_stats.price_divergence.load()
-                                << " · скачок " << g_stats.price_spike_reject.load()
-                                << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
-                                << "\n📨 Sent: " << g_stats.alerts_sent.load()
-                                << "\n🔍 TX: " << g_stats.tx_processed.load()
-                                << "\n⏳ Lag: " << g_stats.current_lag.load()
-                                << " blocks (max: " << g_stats.max_lag_seen.load() << ")";
-                            if (wsHeadsOk()) {
-                                ss2 << "\n🔌 WS: ✅ " << wsHeadsActiveLabel() << " · блок " << wsHeadsLatest();
-                            } else {
-                                ss2 << "\n🔌 WS: ❌ HTTP fallback"
-                                    << (wsHeadsLatest() > 0
-                                            ? (std::string(" · last ") + std::to_string(wsHeadsLatest()))
-                                            : "");
-                            }
-                            ss2 << rpcSlowSummary();
-                            {
-                                auto renderCov = [](std::stringstream& out, const char* title, CoverageSet& c) {
-                                    uint64_t buy=c.buy.load(), sell=c.sell.load(), lpAdd=c.lp_add.load(), lpRemove=c.lp_remove.load(),
-                                             wrap=c.wrap.load(), unwrap=c.unwrap.load(), xfer=c.transfer.load(),
-                                             inter=c.interaction.load(), arb=c.arbitrage.load(), unk=c.unknown.load();
-                                    uint64_t total = buy+sell+lpAdd+lpRemove+wrap+unwrap+xfer+inter+arb+unk;
-                                    out << "\n\n" << title << " (valid tx: " << total << ")\n"
-                                        << "🟢 BUY: " << buy << "\n🚨 SELL: " << sell
-                                        << "\n🌊 LP Add: " << lpAdd << "\n🌊 LP Remove: " << lpRemove
-                                        << "\n🔄 Wrap: " << wrap << "\n🔄 Unwrap: " << unwrap
-                                        << "\n📤 Transfer: " << xfer << "\n🤝 Interaction: " << inter
-                                        << "\n♻️ Arbitrage: " << arb << "\n❓ Unknown: " << unk;
-                                };
-                                renderCov(ss2, "📈 <b>Coverage — users</b>", g_covUser);
-                                renderCov(ss2, "🤖 <b>Coverage — service</b>", g_covSvc);
-                                ss2 << "\n\n🔬 <b>Signals</b>\n💱 Swap Event: " << g_stats.sig_swap_event.load()
-                                    << "\n🌐 Universal Router: " << g_stats.sig_universal_router.load()
-                                    << "\n📦 Multicall: " << g_stats.sig_multicall.load()
-                                    << "\n🔑 Permit2: " << g_stats.sig_permit2.load()
-                                    << "\n\n🌊 <b>LP signals seen</b> (regardless of outcome)\n"
-                                    << "ERC20 mint/burn: " << g_stats.sig_lp_mint_burn.load()
-                                    << "\nPool-identity: " << g_stats.sig_lp_pool_identity.load()
-                                    << "\nV3 events: " << g_stats.sig_lp_v3_event.load()
-                                    << "\n\n❓ <b>Unknown reasons</b>\n"
-                                    << "Unconfirmed opposite: " << g_stats.unk_unconfirmed_opposite.load()
-                                    << "\nLP not linked: " << g_stats.unk_lp_not_linked.load()
-                                    << "\nOther: " << g_stats.unk_other.load()
-                                    << "\n\n\xF0\x9F\xA9\xBA <b>Diagnostics</b>\n"
-                                    << "Swap w/o wallet flow: " << g_stats.unk_swap_no_wallet_flow.load()
-                                    << "\nOnly base flow: " << g_stats.unk_only_base_flow.load()
-                                    << "\nSwap inferred from flow: " << g_stats.diag_swap_inferred.load()
-                                    << "\nNative counter needs trace: " << g_stats.diag_native_counter.load()
-                                    << "\nNative from router unwrap: " << g_stats.diag_native_unwrap.load()
-                                    << "\nNative refund adjusted: " << g_stats.diag_native_refund.load()
-                                    << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
-                            }
-                            ss2 << hyperliquidStatsLine();
-                            if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
-                            sendMsg(cid,ss2.str());
-                        }
-                    }
-                    else if (txt.rfind("/import", 0) == 0) {
-                        if (cid != OWNER_CHAT_ID) {
-                            sendMsg(cid, "Access denied.");
-                        } else {
-                            std::vector<std::string> found;
-                            {
-                                std::string s = toLower(txt);
-                                size_t p = 0;
-                                while ((p = s.find("0x", p)) != std::string::npos) {
-                                    if (p + 42 <= s.size()) {
-                                        std::string cand = s.substr(p, 42);
-                                        if (isValidAddress(cand)) { found.push_back(cand); p += 42; continue; }
-                                    }
-                                    p += 2;
-                                }
-                            }
-                            // Адреса биткоина — в свою базу того же сервисного
-                            // аккаунта (btc.db). Регистр base58 значим, поэтому
-                            // разбираем исходный текст, а не строчную копию.
-                            std::vector<std::string> btcFound;
-                            {
-                                std::string tok;
-                                auto flush = [&] {
-                                    if (!tok.empty() && isBtcAddress(tok)) btcFound.push_back(normBtcAddress(tok));
-                                    tok.clear();
-                                };
-                                for (char ch : txt) {
-                                    if (std::isalnum(static_cast<unsigned char>(ch))) tok += ch;
-                                    else flush();
-                                }
-                                flush();
-                            }
-                            if (found.empty() && btcFound.empty()) {
-                                sendMsg(cid, "Использование: /import 0x... bc1... (адреса BSC, Hyperliquid и Bitcoin через пробел, запятую или с новой строки)");
-                            } else if (found.empty()) {
-                                BtcImportResult br = btcImport(btcFound);
-                                std::stringstream rep;
-                                rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
-                                    << "₿ Адресов Bitcoin: <b>" << btcFound.size() << "</b>\n"
-                                    << "✅ Добавлено: <b>" << br.added << "</b>\n"
-                                    << "↩️ Уже в базе: <b>" << br.dup << "</b>\n"
-                                    << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
-                                sendMsg(cid, rep.str());
-                            } else {
-                                int added = 0, dup = 0, banned = 0, failed = 0;
-                                for (const auto& a : found) {
-                                    switch (addUserWhale(SERVICE_CHAT_ID, a, a)) {
-                                        case AddWhaleResult::OK:                  ++added;  break;
-                                        case AddWhaleResult::ALREADY_EXISTS:      ++dup;    break;
-                                        case AddWhaleResult::PERMANENTLY_BANNED:  ++banned; break;
-                                        default:                                  ++failed; break;
-                                    }
-                                }
-                                refreshWatchers();
-                                std::stringstream rep;
-                                rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
-                                    << "Найдено адресов: <b>" << found.size() << "</b>\n"
-                                    << "✅ Добавлено: <b>" << added << "</b>\n"
-                                    << "↩️ Уже отслеживались: <b>" << dup << "</b>\n";
-                                if (banned > 0) rep << "🤖 Помечены как боты (пропущены): <b>" << banned << "</b>\n";
-                                if (failed > 0) rep << "⚠️ Не удалось добавить: <b>" << failed << "</b>\n";
-                                rep << "\nВсего на сервисном аккаунте: <b>"
-                                    << countUserWhales(SERVICE_CHAT_ID) << "</b>";
-                                if (!btcFound.empty()) {
-                                    BtcImportResult br = btcImport(btcFound);
-                                    rep << "\n\n₿ Bitcoin: найдено <b>" << btcFound.size() << "</b>, добавлено <b>"
-                                        << br.added << "</b>, уже в базе <b>" << br.dup << "</b>"
-                                        << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
-                                }
-                                sendMsg(cid, rep.str());
-                            }
-                        }
-                    }
-                    else if (txt.rfind("/unban", 0) == 0) {
-                        if (cid != OWNER_CHAT_ID) {
-                            sendMsg(cid, "Access denied.");
-                        } else {
-                            std::string arg = trim(txt.substr(6));
-                            if (!isValidAddress(arg)) {
-                                sendMsg(cid, "Использование: /unban 0x&lt;адрес&gt;");
-                            } else if (liftPermanentBan(arg)) {
-                                sendMsg(cid, "✅ Бан снят: <code>" + toLower(arg) + "</code>\nКошелёк снова может попадать в рейтинг.");
-                            } else {
-                                sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
-                            }
-                        }
-                    }
-                    else if (handleBeneficiaryCommand(cid, txt)) {
-                    }
-                    else {
-                        sendMsg(cid, tr(langFromCode(getUserLanguage(cid)), "unknown_command"));
-                        resetViewStack(cid, "menu:main");
-                        auto msg = TelegramUI::buildMainMenu(cid);
-                        sendMsg(cid, msg.text, msg.keyboard);
-                    }
-                }
-                else if (handleTextInput(cid, txt)) {
-                }
-                else {
-                    resetViewStack(cid, "menu:main");
-                    auto msg = TelegramUI::buildMainMenu(cid);
-                    sendMsg(cid, msg.text, msg.keyboard);
-                }
-
-                offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
+                if (m.contains("from") && m["from"].is_object() &&
+                    m["from"].contains("language_code") && m["from"]["language_code"].is_string())
+                    tgLang = m["from"]["language_code"].get<std::string>();
+                ensureUser(cid, tgLang);
+                sendOpenApp(cid);
             }
             if (ub>0) saveTgOffset(offset);
         } catch (...) { std::this_thread::sleep_for(std::chrono::seconds(2)); }
@@ -2460,7 +1578,6 @@ int main() {
     loadTokenCache();
     loadPairCache();
     ensureNativePrice();
-    refreshFundingCache();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();
     checkTranslations();
@@ -2526,7 +1643,6 @@ int main() {
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
                 ensureNativePrice();
-                refreshFundingCache();
                 lrt=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }

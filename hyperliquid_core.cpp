@@ -1,5 +1,5 @@
 #include "hyperliquid.h"
-#include "wallet_menu.h"
+#include "wallets.h"
 #include "ranking.h"
 
 #include <algorithm>
@@ -30,7 +30,7 @@
 #include "ru.h"
 #include "message_queue.h"
 #include "premium.h"
-#include "alert_settings.h"
+#include "telegram.h"
 
 using json = nlohmann::json;
 
@@ -40,9 +40,6 @@ extern sqlite3* db;
 extern std::mutex dbMutex;
 std::string http(const std::string& url, const std::string& post, int timeout);
 void logCritical(const std::string& msg);
-std::string getUserLanguage(const std::string& chatId);
-void rememberView(const std::string& chatId, const std::string& data);
-std::string shortAddress(const std::string& a);
 
 #include "hyperliquid_internal.h"
 

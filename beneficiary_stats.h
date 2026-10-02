@@ -1,7 +1,7 @@
 #pragma once
 
 #include <string>
-#include "alert_settings.h"
+#include "telegram.h"
 #include "tx_analyzer.h"
 #include "json.hpp"
 

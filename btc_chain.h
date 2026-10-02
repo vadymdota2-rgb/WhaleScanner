@@ -43,8 +43,6 @@ std::string normBtcAddress(const std::string& a);
 // проверяется по контрольной сумме, у base58 после строчных остаётся только
 // форма: длина, первая цифра, буквы и цифры.
 bool isBtcKey(const std::string& lowerAddr);
-// Запомнить настоящее написание адреса (для ссылок на обозреватель).
-void btcRememberCase(const std::string& addr);
 BtcImportResult btcImport(const std::vector<std::string>& addrs);
 size_t btcWatchCount();
 // Ответ на /statsbtc владельца.

@@ -24,4 +24,3 @@ const char* trKo(const std::string& key);
 const char* trZh(const std::string& key);
 const char* trJa(const std::string& key);
 
-std::string pluralRu(long long n, const std::string& one, const std::string& few, const std::string& many);
