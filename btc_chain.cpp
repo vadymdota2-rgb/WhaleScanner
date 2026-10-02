@@ -36,8 +36,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <functional>
 #include <iostream>
 #include <map>
+#include <tuple>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -118,7 +120,16 @@ bool watchWorth(long long sats, long long priceNanos) {
 }
 
 std::unordered_set<std::string> g_watch;
+// Подписки людей: адреса строчными, как в user_whales.
+std::unordered_set<std::string> g_follow;
 std::mutex g_watchMutex;
+std::function<void(const BtcAlert&)> g_alertSink;
+
+std::string lower(const std::string& a) {
+    std::string r = a;
+    for (auto& ch : r) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    return r;
+}
 
 long long nowSec() { return static_cast<long long>(std::time(nullptr)); }
 
@@ -491,6 +502,7 @@ public:
         enrich(b);
         const long long price = btcPriceNanos();
         int moves = 0, learned = 0;
+        alerts_.clear();
         {
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             execSql("BEGIN");
@@ -499,6 +511,7 @@ public:
         }
         addrStats();
         autoWatch();
+        sendAlerts();
         std::cout << "[BTC] block " << b.height << ": " << b.txs.size() << " tx, " << moves << " moves, "
                   << learned << " new labels, " << lookups_ << " lookups" << std::endl;
         return true;
@@ -507,16 +520,17 @@ public:
     // Разбор блока и запись. Вызывается под замком базы, внутри транзакции.
     void scan(const Block& b, long long price, int& moves, int& learned) {
         std::map<std::string, std::array<long long, 4>> flow;  // биржа → in, out, in_n, out_n
-        std::unordered_set<std::string> watch;
+        std::unordered_set<std::string> watch, follow;
         {
             std::lock_guard<std::mutex> w(g_watchMutex);
             watch = g_watch;
+            follow = g_follow;
         }
         for (const auto& tx : b.txs) {
             // Кошельки базы — первыми: у них пишется любое движение, а не
             // только биржевое. Та же транзакция ниже, в разборе бирж, даст
             // для них ту же строку — она отбросится по UNIQUE.
-            if (!watch.empty()) moves += watched(tx, b, price, watch);
+            if (!watch.empty() || !follow.empty()) moves += watched(tx, b, price, watch, follow);
             if (tx.coinbase || tx.in.empty() || tx.out.empty() || coinjoin(tx)) continue;
 
             std::string exIn;
@@ -647,29 +661,143 @@ private:
 
     // Движение кошелька базы в транзакции: сколько пришло минус сколько ушло.
     // Плюс — монеты пришли (покупка, если с биржи), минус — ушли.
-    int watched(const BTx& tx, const Block& b, long long price, const std::unordered_set<std::string>& watch) {
+    // Подписки людей проверяются по строчной форме: в user_whales адрес
+    // лежит строчными, а в блоке base58 — в своём регистре.
+    int watched(const BTx& tx, const Block& b, long long price, const std::unordered_set<std::string>& watch,
+                const std::unordered_set<std::string>& follow) {
+        auto mine = [&](const std::string& a) {
+            return !a.empty() && (watch.count(a) || (!follow.empty() && follow.count(lower(a))));
+        };
         std::unordered_map<std::string, long long> net;
-        for (const auto& i : tx.in) if (!i.addr.empty() && watch.count(i.addr)) net[i.addr] -= i.sats;
-        for (const auto& o : tx.out) if (!o.addr.empty() && watch.count(o.addr)) net[o.addr] += o.sats;
+        for (const auto& i : tx.in) if (mine(i.addr)) net[i.addr] -= i.sats;
+        for (const auto& o : tx.out) if (mine(o.addr)) net[o.addr] += o.sats;
         if (net.empty()) return 0;
-        std::string exIn, exOut;
-        for (const auto& i : tx.in) {
-            if (watch.count(i.addr)) continue;
-            exIn = label(i.addr);
-            if (!exIn.empty()) break;
-        }
-        long long best = 0;
-        for (const auto& o : tx.out) {
-            if (watch.count(o.addr) || o.sats <= best) continue;
-            std::string e = label(o.addr);
-            if (!e.empty()) { exOut = e; best = o.sats; }
-        }
         int n = 0;
         for (const auto& [a, v] : net) {
-            if (v > 0 && watchWorth(v, price)) { putMove(tx.txid, b, 1, a, exIn, v, price); ++n; }
-            else if (v < 0 && watchWorth(-v, price)) { putMove(tx.txid, b, 2, a, exOut, -v, price); ++n; }
+            // Биржа на другой стороне — для каждого кошелька своя: свой адрес
+            // (сдача) не в счёт, а чужой адрес из базы может оказаться
+            // кошельком биржи, и завод на него — та же продажа.
+            std::string exIn, exOut;
+            for (const auto& i : tx.in) {
+                if (i.addr == a) continue;
+                exIn = label(i.addr);
+                if (!exIn.empty()) break;
+            }
+            long long best = 0;
+            for (const auto& o : tx.out) {
+                if (o.addr == a || o.sats <= best) continue;
+                std::string e = label(o.addr);
+                if (!e.empty()) { exOut = e; best = o.sats; }
+            }
+            const long long q = v > 0 ? v : -v;
+            if (!watchWorth(q, price)) continue;
+            putMove(tx.txid, b, v > 0 ? 1 : 2, a, v > 0 ? exIn : exOut, q, price);
+            ++n;
+            const std::string key = lower(a);
+            if (follow.count(key)) {
+                BtcAlert al;
+                al.wallet = a;
+                al.key = key;
+                al.txid = tx.txid;
+                al.ex = v > 0 ? exIn : exOut;
+                al.kind = v > 0 ? (exIn.empty() ? BtcAlert::IN : BtcAlert::BUY)
+                                : (exOut.empty() ? BtcAlert::OUT : BtcAlert::SELL);
+                al.sats = q;
+                al.priceNanos = price;
+                al.usdNanos = static_cast<long long>(static_cast<long double>(q) * price / SAT);
+                al.ts = b.ts;
+                al.height = b.height;
+                alerts_.push_back(std::move(al));
+                putCase(a);
+            }
         }
         return n;
+    }
+
+    std::vector<BtcAlert> alerts_;
+
+    // Настоящее написание адреса: в user_whales он строчными, а обозреватель
+    // base58 в строчных не найдёт.
+    void putCase(const std::string& a) {
+        sqlite3_stmt* s = nullptr;
+        if (!prep(&s, "INSERT OR IGNORE INTO btc_case(lower, addr) VALUES(?,?)")) return;
+        bindText(s, 1, lower(a));
+        bindText(s, 2, a);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+
+    // Средняя цена прошлых покупок и результат продажи — по движениям
+    // кошелька в btc.db до этой транзакции. Тот же счёт по средней, что в
+    // рейтинге API, иначе алерт и доска разошлись бы в цифрах.
+    void enrichAlert(BtcAlert& a) {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (!prep(&s, "SELECT kind, sats, price_nanos FROM btc_moves WHERE wallet=? AND height < ? "
+                      "AND price_nanos > 0 ORDER BY ts, id")) return;
+        bindText(s, 1, a.wallet);
+        sqlite3_bind_int64(s, 2, a.height);
+        long double held = 0, cost = 0, boughtQ = 0, boughtV = 0;
+        while (sqlite3_step(s) == SQLITE_ROW) {
+            const long double q = static_cast<long double>(sqlite3_column_int64(s, 1)) / SAT;
+            const long double p = static_cast<long double>(sqlite3_column_int64(s, 2));
+            if (sqlite3_column_int(s, 0) == 1) {
+                held += q;
+                cost += q * p;
+                boughtQ += q;
+                boughtV += q * p;
+                ++a.priorBuys;
+            } else if (held > 0) {
+                const long double sold = std::min(q, held);
+                cost -= sold * (cost / held);
+                held -= sold;
+            }
+        }
+        sqlite3_finalize(s);
+        if (a.kind == BtcAlert::SELL || a.kind == BtcAlert::OUT) {
+            if (held > 0 && a.priceNanos > 0) {
+                const long double avg = cost / held;
+                const long double q = std::min(static_cast<long double>(a.sats) / SAT, held);
+                a.avgEntryNanos = static_cast<long long>(avg);
+                a.pnlNanos = static_cast<long long>(q * (a.priceNanos - avg));
+                a.pnlPct = avg > 0 ? static_cast<double>((a.priceNanos / avg - 1) * 100) : 0.0;
+                a.hasPnl = a.kind == BtcAlert::SELL;
+            }
+        } else if (boughtQ > 0) {
+            a.avgEntryNanos = static_cast<long long>(boughtV / boughtQ);
+        }
+    }
+
+    void sendAlerts() {
+        if (alerts_.empty()) return;
+        std::function<void(const BtcAlert&)> sink;
+        {
+            std::lock_guard<std::mutex> w(g_watchMutex);
+            sink = g_alertSink;
+        }
+        // Один алерт на кошелёк, вид и биржу за блок: суммы складываются,
+        // ссылка — на самую крупную транзакцию.
+        std::map<std::tuple<std::string, int, std::string>, BtcAlert> merged;
+        std::map<std::tuple<std::string, int, std::string>, long long> biggest;
+        for (auto& a : alerts_) {
+            auto key = std::make_tuple(a.wallet, a.kind, a.ex);
+            auto it = merged.find(key);
+            if (it == merged.end()) {
+                biggest[key] = a.sats;
+                merged.emplace(key, std::move(a));
+                continue;
+            }
+            BtcAlert& m = it->second;
+            if (a.sats > biggest[key]) { biggest[key] = a.sats; m.txid = a.txid; }
+            m.sats += a.sats;
+            m.usdNanos += a.usdNanos;
+            m.txs += 1;
+        }
+        alerts_.clear();
+        for (auto& [k, a] : merged) {
+            enrichAlert(a);
+            if (sink) sink(a);
+        }
     }
 
     // Новые киты в базу: крупный вывод с биржи и не сервис по числу
@@ -921,6 +1049,8 @@ bool openDb() {
         // владельца, auto — сканер нашёл крупный вывод с биржи.
         "CREATE TABLE IF NOT EXISTS btc_watch ("
         "  address TEXT PRIMARY KEY, src TEXT NOT NULL DEFAULT 'import', at INTEGER NOT NULL DEFAULT 0);"
+        // Как адрес пишется на самом деле: user_whales хранит строчными.
+        "CREATE TABLE IF NOT EXISTS btc_case (lower TEXT PRIMARY KEY, addr TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS btc_addr ("
         "  address TEXT PRIMARY KEY, txs INTEGER NOT NULL DEFAULT 0, bal_sats INTEGER NOT NULL DEFAULT 0,"
         "  at INTEGER NOT NULL DEFAULT 0);"
@@ -1084,6 +1214,25 @@ bool isBtcAddress(const std::string& raw) {
     return true;
 }
 
+bool isBtcKey(const std::string& a) {
+    if (a.rfind("bc1", 0) == 0) return isBtcAddress(a);
+    if ((a[0] != '1' && a[0] != '3') || a.size() < 26 || a.size() > 35) return false;
+    for (char ch : a) if (!std::isalnum(static_cast<unsigned char>(ch))) return false;
+    return true;
+}
+
+void btcRememberCase(const std::string& raw) {
+    const std::string a = normBtcAddress(raw);
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    if (!g_btcDb) return;
+    sqlite3_stmt* s = nullptr;
+    if (!prep(&s, "INSERT OR REPLACE INTO btc_case(lower, addr) VALUES(?,?)")) return;
+    bindText(s, 1, lower(a));
+    bindText(s, 2, a);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
 BtcImportResult btcImport(const std::vector<std::string>& addrs) {
     BtcImportResult r;
     std::lock_guard<std::mutex> l(g_btcDbMutex);
@@ -1107,6 +1256,16 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
     execSql("COMMIT");
     sqlite3_finalize(s);
     return r;
+}
+
+void btcSetFollowed(std::unordered_set<std::string> lowerAddrs) {
+    std::lock_guard<std::mutex> w(g_watchMutex);
+    g_follow = std::move(lowerAddrs);
+}
+
+void btcSetAlertSink(std::function<void(const BtcAlert&)> sink) {
+    std::lock_guard<std::mutex> w(g_watchMutex);
+    g_alertSink = std::move(sink);
 }
 
 size_t btcWatchCount() {

@@ -16,7 +16,9 @@
  */
 
 #include <cstddef>
+#include <functional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 void startBtcLoop();
@@ -37,7 +39,48 @@ struct BtcImportResult {
 bool isBtcAddress(const std::string& a);
 // bc1 — строчными, base58 — как есть.
 std::string normBtcAddress(const std::string& a);
+// Адрес биткоина в строчной форме — так он лежит в user_whales. bech32
+// проверяется по контрольной сумме, у base58 после строчных остаётся только
+// форма: длина, первая цифра, буквы и цифры.
+bool isBtcKey(const std::string& lowerAddr);
+// Запомнить настоящее написание адреса (для ссылок на обозреватель).
+void btcRememberCase(const std::string& addr);
 BtcImportResult btcImport(const std::vector<std::string>& addrs);
 size_t btcWatchCount();
 // Ответ на /statsbtc владельца.
 std::string btcStatsLine();
+
+// Движение кошелька, на который подписаны люди, — для алерта. Покупка или
+// продажа определяется по второй стороне: пришло с адреса биржи — покупка
+// (вывод купленного), ушло на адрес биржи — продажа (завод на продажу).
+// Без биржи с другой стороны — перевод.
+struct BtcAlert {
+    enum Kind { BUY = 0, SELL = 1, IN = 2, OUT = 3 };
+    std::string wallet;   // как в цепочке: у base58 регистр значим
+    std::string key;      // строчными — так адрес лежит в user_whales
+    std::string txid;
+    int kind = IN;
+    std::string ex;       // биржа с другой стороны, если есть
+    long long sats = 0;
+    long long usdNanos = 0;
+    long long priceNanos = 0;
+    long long ts = 0;
+    long long height = 0;
+    // Сколько транзакций одного вида склеено в этот алерт: у кошелька,
+    // который платит пачками, за блок их бывают десятки.
+    int txs = 1;
+    // По прошлым движениям кошелька в btc.db: средняя цена покупки и, для
+    // продажи, результат относительно неё.
+    long long avgEntryNanos = 0;
+    int priorBuys = 0;
+    bool hasPnl = false;
+    long long pnlNanos = 0;
+    double pnlPct = 0;
+};
+
+// Адреса BTC из user_whales (строчными) — бот обновляет их вместе со
+// списком наблюдателей. Сюда же входят адреса бесплатных, которые бот
+// отсеет при рассылке по тем же правилам, что у BSC.
+void btcSetFollowed(std::unordered_set<std::string> lowerAddrs);
+// Куда отдавать алерты: рассылка живёт в main.cpp, рядом с BSC.
+void btcSetAlertSink(std::function<void(const BtcAlert&)> sink);

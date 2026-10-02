@@ -76,6 +76,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"alert_sell_price", {"Sell Price", "Цена продажи"}},
         {"alert_spent", {"Spent", "Потрачено"}},
         {"alert_received", {"Received", "Получено"}},
+        {"alert_from_exchange", {"From exchange", "С биржи"}},
+        {"alert_to_exchange", {"To exchange", "На биржу"}},
         {"alert_contract", {"Contract", "Контракт"}},
         {"alert_wallet", {"Wallet", "Кошелёк"}},
         {"alert_transaction", {"Transaction", "Транзакция"}},

@@ -647,6 +647,10 @@ void refreshWatchers() {
                 if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
+                // Адрес биткоина: алерты по нему шлёт сканер BTC, а BSC и
+                // Hyperliquid искать его у себя незачем — Hyperliquid
+                // подписался бы на поток несуществующего счёта.
+                if (addr.rfind("0x", 0) != 0) continue;
 
                 if (hasSpot || inGrace) {
                     bscActive->insert(addr);
@@ -673,6 +677,11 @@ void refreshWatchers() {
               << " hl_active=" << hlActive->size()
               << " bsc_cold_links=" << bscOff
               << " hl_cold_links=" << hlOff << std::endl;
+    {
+        std::unordered_set<std::string> btc;
+        for (const auto& [addr, ws] : *m) if (addr.rfind("0x", 0) != 0) btc.insert(addr);
+        btcSetFollowed(std::move(btc));
+    }
     std::unique_lock l(watchersMutex);
     WATCHERS_PTR = m;
     BSC_ACTIVE_PTR = bscActive;
@@ -1301,6 +1310,76 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
                   << formatUsd(res.usdNanos) << " " << getSymbol(res.tokenAddr)
                   << " -> " << byLabelLang.size() << " label group(s)" << std::endl;
     } else std::cerr << "[WARN] Broadcast failed for " << hash << std::endl;
+}
+
+/* Алерт по кошельку биткоина. Кому слать — те же наблюдатели и те же
+   правила, что у BSC: порог человека, язык, сервисный аккаунт молчит,
+   бесплатному — только основной кошелёк (это уже сделал refreshWatchers).
+   Покупка или продажа определена сканером по второй стороне транзакции. */
+static std::string btcQty(long long sats) {
+    char buf[48];
+    std::snprintf(buf, sizeof buf, "%.8f", static_cast<double>(sats) / 1e8);
+    std::string s = buf;
+    while (!s.empty() && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
+    return s;
+}
+
+std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, Lang lang) {
+    std::string msg = "\U0001F4BC <b>" + safeString(label) + "</b>\n\n";
+    switch (a.kind) {
+        case BtcAlert::BUY:  msg += "\U0001F7E2 <b>" + tr(lang, "alert_buy") + "</b>"; break;
+        case BtcAlert::SELL: msg += "\U0001F6A8 <b>" + tr(lang, "alert_sell") + "</b>"; break;
+        case BtcAlert::IN:   msg += "\U0001F4E5 <b>" + tr(lang, "alert_transfer") + "</b>"; break;
+        default:             msg += "\U0001F4E4 <b>" + tr(lang, "alert_transfer") + "</b>"; break;
+    }
+    if (a.txs > 1) msg += " \u00D7" + std::to_string(a.txs);
+    msg += "\n\U0001F4B0 " + tr(lang, "alert_amount") + ": <b>" + formatUsd(cpp_int(a.usdNanos)) + "</b>\n";
+    msg += "\U0001FA99 " + tr(lang, "alert_token") + ": <b>BTC</b>\n";
+    msg += "\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>" + btcQty(a.sats) + "</b>\n";
+    if ((a.kind == BtcAlert::BUY || a.kind == BtcAlert::SELL) && a.priceNanos > 0)
+        msg += "\U0001F4B5 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_buy_price" : "alert_sell_price") +
+               ": <b>" + formatPriceUsd(cpp_int(a.priceNanos)) + "</b>\n";
+    if (a.avgEntryNanos > 0 && (a.kind == BtcAlert::SELL || a.priorBuys > 1))
+        msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" + formatPriceUsd(cpp_int(a.avgEntryNanos)) + "</b>\n";
+    if (a.hasPnl)
+        msg += std::string(a.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") + tr(lang, "alert_trade_pnl") + ": <b>" +
+               formatUsdNanosSigned(a.pnlNanos, true) + "</b> (" + formatPercent(a.pnlPct, true) + ")\n";
+    if (!a.ex.empty())
+        msg += "\U0001F3E6 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_from_exchange" : "alert_to_exchange") +
+               ": <b>" + safeString(a.ex, 32) + "</b>\n";
+    msg += "\U0001F194 TX: <code>" + safeString(a.txid, 66) + "</code>\n";
+    msg += "\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>" + safeString(label) + "</b>\n\n";
+    msg += "\U0001F517 <a href=\"https://mempool.space/tx/" + safeString(a.txid, 66) + "\">" +
+           tr(lang, "alert_transaction") + "</a>";
+    return msg;
+}
+
+void dispatchBtcAlert(const BtcAlert& a) {
+    std::map<std::pair<std::string, Lang>, std::vector<std::string>> byLabelLang;
+    {
+        std::shared_ptr<const std::unordered_map<std::string, std::vector<Watcher>>> watchers;
+        { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; }
+        if (!watchers) return;
+        auto wit = watchers->find(a.key);
+        if (wit == watchers->end()) return;
+        for (const auto& w : wit->second) {
+            if (a.usdNanos < static_cast<long long>(w.thresholdNanos)) continue;
+            if (w.chatId == SERVICE_CHAT_ID) continue;
+            byLabelLang[{w.label, langFromCode(getUserLanguage(w.chatId))}].push_back(w.chatId);
+        }
+    }
+    if (byLabelLang.empty()) return;
+    bool anySent = false;
+    for (auto& [labelLang, chatIds] : byLabelLang)
+        if (g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second), chatIds))
+            anySent = true;
+    if (anySent) {
+        g_stats.alerts_sent.fetch_add(byLabelLang.size());
+        static const char* kinds[] = {"BUY", "SELL", "IN", "OUT"};
+        std::cout << "[OK][BTC] " << a.wallet << " " << kinds[a.kind & 3] << " " << btcQty(a.sats) << " BTC -> "
+                  << byLabelLang.size() << " label group(s)" << std::endl;
+    }
 }
 
 void bufferSwap(const std::string& mA, const TxResult& res, const std::string& hash,
@@ -2391,6 +2470,7 @@ int main() {
     } else {
         startHyperliquidLoop();
     }
+    btcSetAlertSink(dispatchBtcAlert);
     startBtcLoop();
     setupBotCommands();
     size_t initialWatcherAddrs;

@@ -15,6 +15,7 @@
 #include "premium.h"
 #include "ranking.h"
 #include "alert_settings.h"
+#include "btc_chain.h"
 
 using json = nlohmann::json;
 
@@ -24,6 +25,39 @@ extern std::mutex dbMutex;
 namespace {
 std::mutex g_walletPageMutex;
 std::map<std::string, int> g_lastWalletPage;
+
+// Кошелёк — адрес 0x или биткоина (в базе строчными).
+bool isWalletKey(const std::string& a) { return isValidAddress(a) || (!a.empty() && isBtcKey(a)); }
+bool isBtcWallet(const std::string& a) { return a.rfind("0x", 0) != 0; }
+
+// Адрес в callback_data: у Telegram там предел 64 байта, а bc1p и P2WSH
+// длиной 62 знака с приставкой «askremove:» не влезают — и Telegram
+// отвергает всё сообщение. Длинные идут номером из whale_addresses.
+std::string cbAddr(const std::string& address) {
+    if (address.size() <= 50) return address;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s = nullptr;
+    std::string out = address;
+    if (prepareOrLog(db, &s, "SELECT id FROM whale_addresses WHERE address=?")) {
+        sqlite3_bind_text(s, 1, address.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_ROW) out = "#" + std::to_string(sqlite3_column_int64(s, 0));
+        sqlite3_finalize(s);
+    }
+    return out;
+}
+
+std::string resolveAddr(const std::string& param) {
+    if (param.empty() || param[0] != '#') return toLower(param);
+    std::string out;
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s = nullptr;
+    if (prepareOrLog(db, &s, "SELECT address FROM whale_addresses WHERE id=?")) {
+        sqlite3_bind_int64(s, 1, std::atoll(param.c_str() + 1));
+        if (sqlite3_step(s) == SQLITE_ROW) out = safeColumnText(s, 0);
+        sqlite3_finalize(s);
+    }
+    return out;
+}
 }
 
 void rememberWalletPage(const std::string& chatId, int page) {
@@ -182,7 +216,7 @@ void untrackWalletFromService(const std::string& wallet) {
 
 AddWhaleResult addUserWhale(const std::string& chatId, const std::string& addressArg, const std::string& label) {
     const std::string address = toLower(addressArg);
-    if (!isValidAddress(address)) return AddWhaleResult::BAD_ADDRESS;
+    if (!isWalletKey(address)) return AddWhaleResult::BAD_ADDRESS;
     ensureUser(chatId);
 
     if (isPermanentlyBanned(address)) {
@@ -380,8 +414,13 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
         else if (!premium) status = " ⏸ " + tr(lang, "wl_paused");
         std::string shownLabel = (toLower(label) == address) ? tr(lang, "alert_wallet") : safeString(label, 32);
         text << "👤 <b>" << shownLabel << "</b>" << status << "\n";
-        text << "<code>" << safeString(address, 42) << "</code>\n";
+        text << "<code>" << safeString(address, 90) << "</code>\n";
 
+        if (isBtcWallet(address)) {
+            // У биткоина своя сеть: рейтинги BSC и Hyperliquid к нему не
+            // относятся, алерты шлёт сканер блоков BTC.
+            text << "\n₿ <b>Bitcoin</b>\n\n";
+        } else {
         SpotRankInfo sr;
         text << "\n🟡 <b>BSC " << tr(lang, "wl_spot_rank") << "</b>";
         if (spotRankOf(address, sr) && sr.rank <= 100) {
@@ -407,15 +446,16 @@ UIMessage buildWalletsList(const std::string& chatId, int page) {
             text << ": " << tr(lang, "wl_not_ranked") << "\n";
         }
         text << "\n";
+        }
 
         json row;
         std::string btnLabel = (toLower(label) == address)
                              ? tr(lang, "alert_wallet")
                              : truncateUtf8(label, 32);
-        row.push_back({{"text", "✏️ " + btnLabel}, {"callback_data", "rename:" + address}});
+        row.push_back({{"text", "✏️ " + btnLabel}, {"callback_data", "rename:" + cbAddr(address)}});
         if (walletRows.size() > 1 && !isPrimary)
-            row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + address}});
-        row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + address}});
+            row.push_back({{"text", "🔔"}, {"callback_data", "setmain:" + cbAddr(address)}});
+        row.push_back({{"text", "🗑️"}, {"callback_data", "askremove:" + cbAddr(address)}});
         keyboard["inline_keyboard"].push_back(row);
     }
 
@@ -462,7 +502,7 @@ UIMessage buildRemoveConfirm(const std::string& chatId, const std::string& addre
     json keyboard;
     keyboard["inline_keyboard"] = json::array();
     keyboard["inline_keyboard"].push_back(json::array({
-        {{"text", tr(lang, "remove_yes")}, {"callback_data", "remove:" + address}},
+        {{"text", tr(lang, "remove_yes")}, {"callback_data", "remove:" + cbAddr(address)}},
         {{"text", tr(lang, "cancel_button")}, {"callback_data", backToWalletsData(chatId)}}
     }));
     return {text.str(), keyboard.dump()};
@@ -488,9 +528,9 @@ bool handleWalletCallbackImpl(const std::string& chatId, const std::string& acti
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "rename") {
-        std::string address = toLower(param);
+        std::string address = resolveAddr(param);
         Lang lang = langFromCode(getUserLanguage(chatId));
-        if (!isValidAddress(address)) {
+        if (!isWalletKey(address)) {
             replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), errorBackKeyboard(chatId, lang));
             return true;
         }
@@ -542,8 +582,8 @@ bool handleWalletCallbackImpl(const std::string& chatId, const std::string& acti
     }
     else if (action == "setmain") {
         const Lang lang = langFromCode(getUserLanguage(chatId));
-        const std::string address = toLower(param);
-        if (!isValidAddress(address)) {
+        const std::string address = resolveAddr(param);
+        if (!isWalletKey(address)) {
             if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_invalid_address"), true);
             return true;
         }
@@ -593,8 +633,8 @@ bool handleWalletCallbackImpl(const std::string& chatId, const std::string& acti
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "askremove") {
-        std::string address = toLower(param);
-        if (!isValidAddress(address)) {
+        std::string address = resolveAddr(param);
+        if (!isWalletKey(address)) {
             replyInPlace(chatId, messageId, tr(langFromCode(getUserLanguage(chatId)), "err_invalid_address"), errorBackKeyboard(chatId, langFromCode(getUserLanguage(chatId))));
             return true;
         }
@@ -616,9 +656,9 @@ bool handleWalletCallbackImpl(const std::string& chatId, const std::string& acti
         replyInPlace(chatId, messageId, msg.text, msg.keyboard);
     }
     else if (action == "remove") {
-        std::string address = toLower(param);
+        std::string address = resolveAddr(param);
         Lang lang = langFromCode(getUserLanguage(chatId));
-        if (!isValidAddress(address)) {
+        if (!isWalletKey(address)) {
             if (!callbackQueryId.empty()) answerOnce(callbackQueryId, tr(lang, "err_invalid_address"), true);
             replyInPlace(chatId, messageId, tr(lang, "err_invalid_address"), errorBackKeyboard(chatId, lang));
             return true;
@@ -654,8 +694,14 @@ bool handleWalletText(const std::string& chatId, const std::string& text, const 
     if (session.state == UserState::AWAITING_WALLET_ADDRESS) {
         std::string address = toLower(trim(text));
         Lang lang = langFromCode(getUserLanguage(chatId));
+        // Биткоин: регистр base58 запоминаем до того, как адрес станет
+        // строчным, — без него обозреватель адрес не найдёт.
+        if (isBtcAddress(trim(text))) {
+            btcRememberCase(trim(text));
+            address = toLower(normBtcAddress(trim(text)));
+        }
 
-        if (!isValidAddress(address)) {
+        if (!isWalletKey(address)) {
             replyInPlace(chatId, session.promptMessageId, tr(lang, "add_wallet_invalid"),
                     TelegramUI::buildCancelButton(lang));
             return true;
