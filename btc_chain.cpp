@@ -48,6 +48,9 @@
 #include <vector>
 
 #include <curl/curl.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 #include <sqlite3.h>
 
 #include "json.hpp"
@@ -548,6 +551,24 @@ public:
     }
 
     bool process(const Block& b) {
+        {
+            // Блок уже посчитан (перезапуск, повтор после сбоя сети) — второй
+            // раз его потоки не складываем: иначе суммы по биржам удваиваются.
+            std::lock_guard<std::mutex> l(g_btcDbMutex);
+            sqlite3_stmt* s = nullptr;
+            bool seen = false;
+            if (prep(&s, "SELECT 1 FROM btc_blocks WHERE height=? AND hash=?")) {
+                sqlite3_bind_int64(s, 1, b.height);
+                bindText(s, 2, b.hash);
+                seen = sqlite3_step(s) == SQLITE_ROW;
+                sqlite3_finalize(s);
+            }
+            if (seen) {
+                setState("height", std::to_string(b.height));
+                std::cout << "[BTC] block " << b.height << " уже посчитан — пропускаю" << std::endl;
+                return true;
+            }
+        }
         lookups_ = 0;
         touched_.clear();
         autoCand_.clear();
@@ -578,90 +599,127 @@ public:
             watch = g_watch;
             follow = g_follow;
         }
+        // Свои — кошельки базы и подписки людей. Для них пишется любое
+        // движение от $50, и их выход никогда не считается сдачей биржи.
+        auto mine = [&](const std::string& a) {
+            return !a.empty() && (watch.count(a) || (!follow.empty() && follow.count(lower(a))));
+        };
         for (const auto& tx : b.txs) {
-            // Кошельки базы — первыми: у них пишется любое движение, а не
-            // только биржевое. Та же транзакция ниже, в разборе бирж, даст
-            // для них ту же строку — она отбросится по UNIQUE.
-            if (!watch.empty() || !follow.empty()) moves += watched(tx, b, price, watch, follow);
-            if (tx.coinbase || tx.in.empty() || tx.out.empty() || coinjoin(tx)) continue;
+            // Кто уже записан этой транзакцией: одна транзакция — одна строка
+            // на кошелёк. Раньше кошелёк базы писался дважды — разбором бирж
+            // и отдельным проходом по базе, — и в списке стояли дубли.
+            std::unordered_set<std::string> done;
+            const bool plain = !(tx.coinbase || tx.in.empty() || tx.out.empty() || coinjoin(tx));
 
             std::string exIn;
             bool mixed = false;
-            for (const auto& i : tx.in) {
-                std::string e = label(i.addr);
-                if (e.empty()) continue;
-                if (exIn.empty()) exIn = e;
-                else if (e != exIn) mixed = true;
+            if (plain) {
+                for (const auto& i : tx.in) {
+                    std::string e = label(i.addr);
+                    if (e.empty()) continue;
+                    if (exIn.empty()) exIn = e;
+                    else if (e != exIn) mixed = true;
+                }
             }
-            if (mixed) continue;  // две биржи во входах — непонятно, кто платит
 
-            if (!exIn.empty()) {
-                // Со своих адресов биржи.
+            if (plain && !mixed && !exIn.empty()) {
+                // Со своих адресов биржи. Свой кошелёк, потраченный вместе с
+                // биржевым, биржевым не объявляем: его добавили люди.
                 for (const auto& i : tx.in)
-                    if (!i.addr.empty() && label(i.addr).empty()) { putLabel(i.addr, exIn, "cospend"); ++learned; }
+                    if (!i.addr.empty() && !mine(i.addr) && label(i.addr).empty()) {
+                        putLabel(i.addr, exIn, "cospend");
+                        ++learned;
+                    }
 
-                std::vector<const BOut*> rest;
+                // Получатели: сумма по адресу — один адрес бывает в выходах
+                // дважды, а строка на него одна.
+                std::map<std::string, long long> rest;
                 bool back = false;
                 for (const auto& o : tx.out) {
                     if (o.addr.empty() || o.sats <= 0) continue;
                     std::string e = label(o.addr);
                     if (e == exIn) back = true;
-                    else if (e.empty()) rest.push_back(&o);
+                    else if (e.empty()) rest[o.addr] += o.sats;
                     // на другую биржу — перевод между биржами, не покупка
                 }
-                if (!back && rest.size() == 1 && tx.out.size() == 1) {
+                if (!back && rest.size() == 1 && tx.out.size() == 1 && !mine(rest.begin()->first)) {
                     // Всё одним выходом без сдачи — перекладка между своими
                     // кошельками: клиенту биржа так не платит.
-                    putLabel(rest[0]->addr, exIn, "move");
+                    putLabel(rest.begin()->first, exIn, "move");
                     ++learned;
                     continue;
                 }
                 if (!back && rest.size() >= 2) {
                     // Сдача ушла на новый адрес биржи — угадываем её: тот же
-                    // тип, что у входов, и самая крупная. Не помечаем — только
-                    // не считаем выводом.
+                    // тип, что у входов, и самая крупная. Свой кошелёк сдачей
+                    // не бывает. Не помечаем — только не считаем выводом.
                     int t = addrType(tx.in[0].addr);
-                    const BOut* change = nullptr;
-                    for (const auto* o : rest)
-                        if (addrType(o->addr) == t && (!change || o->sats > change->sats)) change = o;
-                    if (change) rest.erase(std::find(rest.begin(), rest.end(), change));
+                    std::string change;
+                    long long best = 0;
+                    for (const auto& [a, v] : rest)
+                        if (!mine(a) && addrType(a) == t && v > best) { change = a; best = v; }
+                    if (!change.empty()) rest.erase(change);
                 }
-                for (const auto* o : rest) {
+                for (const auto& [a, v] : rest) {
                     auto& f = flow[exIn];
-                    f[1] += o->sats;
+                    f[1] += v;
                     f[3] += 1;
-                    if (o->sats >= MOVE_MIN_SATS) { putMove(tx.txid, b, 1, o->addr, exIn, o->sats, price); ++moves; }
-                    if (o->sats >= AUTO_MIN_SATS && !watch.count(o->addr)) autoCand_.insert(o->addr);
+                    if (v >= MOVE_MIN_SATS || (mine(a) && watchWorth(v, price))) {
+                        record(tx.txid, b, a, 1, exIn, v, price, follow);
+                        ++moves;
+                    }
+                    done.insert(a);
+                    if (v >= AUTO_MIN_SATS && !watch.count(a)) autoCand_.insert(a);
                 }
-                continue;
+            } else if (plain && !mixed) {
+                // Входы частные. Есть выход на биржу — завод. Продаёт один
+                // владелец (входы подписаны вместе), поэтому строка одна: на
+                // свой кошелёк, если он среди входов, иначе на самый крупный.
+                const BIn* sender = nullptr;
+                for (const auto& i : tx.in)
+                    if (mine(i.addr) && (!sender || i.sats > sender->sats)) sender = &i;
+                if (!sender) {
+                    sender = &tx.in[0];
+                    for (const auto& i : tx.in) if (i.sats > sender->sats) sender = &i;
+                }
+                bool sweep = false;
+                if (tx.in.size() >= 3 && tx.out.size() == 1) {
+                    std::string e = label(tx.out[0].addr);
+                    if (!e.empty()) {
+                        // Биржа сметает адреса пополнения в горячий кошелёк.
+                        sweep = true;
+                        for (const auto& i : tx.in)
+                            if (!i.addr.empty() && !mine(i.addr)) { putLabel(i.addr, e, "sweep"); ++learned; }
+                    }
+                }
+                std::map<std::string, long long> toEx;
+                for (const auto& o : tx.out) {
+                    if (o.addr.empty() || o.sats <= 0) continue;
+                    std::string e = label(o.addr);
+                    if (e.empty()) continue;
+                    auto& f = flow[e];
+                    f[0] += o.sats;
+                    f[2] += 1;
+                    toEx[e] += o.sats;
+                }
+                if (!toEx.empty() && !sender->addr.empty() && !(sweep && !mine(sender->addr))) {
+                    // Строка одна на транзакцию: вся сумма на биржи, биржа —
+                    // та, куда ушло больше.
+                    long long total = 0, best = 0;
+                    std::string ex;
+                    for (const auto& [e, v] : toEx) { total += v; if (v > best) { best = v; ex = e; } }
+                    if (total >= MOVE_MIN_SATS || (mine(sender->addr) && watchWorth(total, price))) {
+                        record(tx.txid, b, sender->addr, 2, ex, total, price, follow);
+                        ++moves;
+                    }
+                    // Остальные входы того же владельца — та же продажа.
+                    for (const auto& i : tx.in) done.insert(i.addr);
+                }
             }
 
-            // Входы частные. Есть выход на биржу — завод.
-            const BIn* sender = &tx.in[0];
-            for (const auto& i : tx.in) if (i.sats > sender->sats) sender = &i;
-            bool sweep = false;
-            if (tx.in.size() >= 3 && tx.out.size() == 1) {
-                std::string e = label(tx.out[0].addr);
-                if (!e.empty()) {
-                    // Биржа сметает адреса пополнения в горячий кошелёк.
-                    sweep = true;
-                    for (const auto& i : tx.in)
-                        if (!i.addr.empty()) { putLabel(i.addr, e, "sweep"); ++learned; }
-                }
-            }
-            for (const auto& o : tx.out) {
-                if (o.addr.empty() || o.sats <= 0) continue;
-                std::string e = label(o.addr);
-                if (e.empty()) continue;
-                auto& f = flow[e];
-                f[0] += o.sats;
-                f[2] += 1;
-                // Отправителя у сметания нет: входы — адреса самой биржи.
-                if (!sweep && o.sats >= MOVE_MIN_SATS && !sender->addr.empty()) {
-                    putMove(tx.txid, b, 2, sender->addr, e, o.sats, price);
-                    ++moves;
-                }
-            }
+            // Свои кошельки, которых разбор бирж не коснулся, — переводы:
+            // монеты пришли не с биржи или ушли не на биржу.
+            if (!watch.empty() || !follow.empty()) moves += transfers(tx, b, price, watch, follow, done);
         }
 
         for (const auto& [ex, f] : flow) {
@@ -700,6 +758,12 @@ public:
         return v;
     }
 
+    void resetData() {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        execSql("DELETE FROM btc_flow; DELETE FROM btc_moves; DELETE FROM btc_blocks; "
+                "DELETE FROM btc_state WHERE k='height';");
+    }
+
     void setStateLocked(const std::string& k, const std::string& v) {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         setState(k, v);
@@ -713,55 +777,53 @@ private:
 
     // Движение кошелька базы в транзакции: сколько пришло минус сколько ушло.
     // Плюс — монеты пришли (покупка, если с биржи), минус — ушли.
-    // Подписки людей проверяются по строчной форме: в user_whales адрес
-    // лежит строчными, а в блоке base58 — в своём регистре.
-    int watched(const BTx& tx, const Block& b, long long price, const std::unordered_set<std::string>& watch,
+    // Строка в btc_moves и, если на кошелёк подписаны люди, алерт.
+    void record(const std::string& txid, const Block& b, const std::string& wallet, int kind,
+                const std::string& ex, long long sats, long long price,
                 const std::unordered_set<std::string>& follow) {
+        putMove(txid, b, kind, wallet, ex, sats, price);
+        const std::string key = lower(wallet);
+        if (!follow.count(key)) return;
+        BtcAlert al;
+        al.wallet = wallet;
+        al.key = key;
+        al.txid = txid;
+        al.ex = ex;
+        al.kind = kind == 1 ? (ex.empty() ? BtcAlert::IN : BtcAlert::BUY)
+                            : (ex.empty() ? BtcAlert::OUT : BtcAlert::SELL);
+        al.sats = sats;
+        al.priceNanos = price;
+        al.usdNanos = static_cast<long long>(static_cast<long double>(sats) * price / SAT);
+        al.ts = b.ts;
+        al.height = b.height;
+        alerts_.push_back(std::move(al));
+        putCase(wallet);
+    }
+
+    // Переводы своих кошельков: сколько пришло минус сколько ушло, если
+    // биржи на другой стороне нет. С биржей движение уже записал разбор
+    // бирж — второй строки на него не будет.
+    int transfers(const BTx& tx, const Block& b, long long price, const std::unordered_set<std::string>& watch,
+                  const std::unordered_set<std::string>& follow, const std::unordered_set<std::string>& done) {
         auto mine = [&](const std::string& a) {
-            return !a.empty() && (watch.count(a) || (!follow.empty() && follow.count(lower(a))));
+            return !a.empty() && !done.count(a) && (watch.count(a) || (!follow.empty() && follow.count(lower(a))));
         };
         std::unordered_map<std::string, long long> net;
         for (const auto& i : tx.in) if (mine(i.addr)) net[i.addr] -= i.sats;
         for (const auto& o : tx.out) if (mine(o.addr)) net[o.addr] += o.sats;
-        if (net.empty()) return 0;
         int n = 0;
         for (const auto& [a, v] : net) {
-            // Биржа на другой стороне — для каждого кошелька своя: свой адрес
-            // (сдача) не в счёт, а чужой адрес из базы может оказаться
-            // кошельком биржи, и завод на него — та же продажа.
-            std::string exIn, exOut;
-            for (const auto& i : tx.in) {
-                if (i.addr == a) continue;
-                exIn = label(i.addr);
-                if (!exIn.empty()) break;
-            }
-            long long best = 0;
-            for (const auto& o : tx.out) {
-                if (o.addr == a || o.sats <= best) continue;
-                std::string e = label(o.addr);
-                if (!e.empty()) { exOut = e; best = o.sats; }
-            }
             const long long q = v > 0 ? v : -v;
-            if (!watchWorth(q, price)) continue;
-            putMove(tx.txid, b, v > 0 ? 1 : 2, a, v > 0 ? exIn : exOut, q, price);
+            if (!q || !watchWorth(q, price)) continue;
+            // Биржа на другой стороне есть, а разбор бирж движение не взял
+            // (две биржи во входах, CoinJoin, сметание) — не выдумываем ни
+            // покупку, ни перевод.
+            bool exSide = false;
+            if (v > 0) { for (const auto& i : tx.in) if (i.addr != a && !label(i.addr).empty()) { exSide = true; break; } }
+            else { for (const auto& o : tx.out) if (o.addr != a && !label(o.addr).empty()) { exSide = true; break; } }
+            if (exSide) continue;
+            record(tx.txid, b, a, v > 0 ? 1 : 2, "", q, price, follow);
             ++n;
-            const std::string key = lower(a);
-            if (follow.count(key)) {
-                BtcAlert al;
-                al.wallet = a;
-                al.key = key;
-                al.txid = tx.txid;
-                al.ex = v > 0 ? exIn : exOut;
-                al.kind = v > 0 ? (exIn.empty() ? BtcAlert::IN : BtcAlert::BUY)
-                                : (exOut.empty() ? BtcAlert::OUT : BtcAlert::SELL);
-                al.sats = q;
-                al.priceNanos = price;
-                al.usdNanos = static_cast<long long>(static_cast<long double>(q) * price / SAT);
-                al.ts = b.ts;
-                al.height = b.height;
-                alerts_.push_back(std::move(al));
-                putCase(a);
-            }
         }
         return n;
     }
@@ -1143,6 +1205,16 @@ void btcLoop() {
         }
     }
     sc.seed();
+    // Версия данных. Вторая — счёт без дублей: до неё кошелёк базы мог
+    // записаться двумя строками на одну продажу, а второй процесс бота —
+    // посчитать блок ещё раз. Старые суммы отличить уже нельзя, поэтому
+    // потоки и движения один раз начинаются заново. Адреса бирж, база
+    // кошельков и всё, что выучено, остаются.
+    if (sc.state("data") != "2") {
+        sc.resetData();
+        sc.setStateLocked("data", "2");
+        std::cout << "[BTC] данные потоков и движений начаты заново (версия 2)" << std::endl;
+    }
     // Номер — версия списка SEEDS: список вырос — кластеры новых адресов
     // надо спросить заново.
     if (sc.state("clusters") != "3") {
@@ -1200,6 +1272,17 @@ void startBtcLoop() {
     }
     if (g_btcRunning.exchange(true)) return;
     if (!openDb()) {
+        g_btcRunning.store(false);
+        return;
+    }
+    // Сканер один на базу. Если на сервере запущено несколько ботов (по
+    // сети на процесс) с общей btc.db, второй сканер посчитал бы каждый блок
+    // ещё раз. Кто первым взял замок файла, тот и читает блоки; остальные
+    // только отвечают на /import и /statsbtc.
+    static int lockFd = -1;
+    lockFd = ::open((btcDbFile() + ".lock").c_str(), O_RDWR | O_CREAT, 0644);
+    if (lockFd < 0 || ::flock(lockFd, LOCK_EX | LOCK_NB) != 0) {
+        std::cout << "[BTC] блоки уже читает другой процесс — здесь только база и статистика" << std::endl;
         g_btcRunning.store(false);
         return;
     }
