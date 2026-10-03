@@ -101,13 +101,14 @@ constexpr long long LEARNED_TTL = 90LL * 86400LL;
 constexpr long long ADDR_TTL = 7LL * 86400LL;
 constexpr int ADDR_PER_BLOCK = 60;
 constexpr long long SERVICE_TXS = 1000;
-// База сервисного аккаунта: сколько кошельков сканер набирает в неё сам —
-// столько же, сколько там адресов BSC и Hyperliquid. Импорт через /import
-// этим числом не ограничен: что владелец добавил руками, то и считаем.
+// База сервисного аккаунта пополняется сама без потолка: каждый, кто вывел
+// с биржи крупную сумму и не похож на сервис, остаётся в ней. Потолок можно
+// поставить WHALE_BTC_WATCH_MAX (число больше нуля); 0 или пусто — без него.
+// Импорт через /import потолком не ограничен никогда.
 const long long WATCH_MAX = [] {
     const char* v = std::getenv("WHALE_BTC_WATCH_MAX");
-    long long n = (v && *v) ? std::atoll(v) : 10000;
-    return n > 0 ? n : 10000;
+    const long long n = (v && *v) ? std::atoll(v) : 0;
+    return n > 0 ? n : 0;
 }();
 // Кто попадает в базу сам: вывел с биржи от десяти биткоинов за раз и не
 // похож на сервис.
@@ -1059,7 +1060,7 @@ private:
     }
 
     // Новые киты в базу: крупный вывод с биржи и не сервис по числу
-    // транзакций. Пока база не набрала WATCH_MAX.
+    // транзакций. Без потолка, если WATCH_MAX не задан.
     void autoWatch() {
         if (autoCand_.empty()) return;
         std::lock_guard<std::mutex> l(g_btcDbMutex);
@@ -1074,7 +1075,7 @@ private:
         for (const auto& a : autoCand_) {
             {
                 std::lock_guard<std::mutex> w(g_watchMutex);
-                if (static_cast<long long>(g_watch.size()) >= WATCH_MAX) break;
+                if (WATCH_MAX > 0 && static_cast<long long>(g_watch.size()) >= WATCH_MAX) break;
             }
             if (!label(a).empty()) continue;
             sqlite3_reset(q);
@@ -1601,8 +1602,8 @@ std::string btcStatsLine() {
     }
     out += "\nОтветов walletexplorer в памяти: " + std::to_string(one("SELECT COUNT(*) FROM btc_we"));
 
-    out += "\n\n<b>База сервисного аккаунта</b>: " + std::to_string(btcWatchCount()) + " / " +
-           std::to_string(WATCH_MAX) +
+    out += "\n\n<b>База сервисного аккаунта</b>: " + std::to_string(btcWatchCount()) +
+           (WATCH_MAX > 0 ? " / " + std::to_string(WATCH_MAX) : std::string(" (без потолка)")) +
            "\n  импорт: " + std::to_string(one("SELECT COUNT(*) FROM btc_watch WHERE src='import'")) +
            "\n  сам нашёл: " + std::to_string(one("SELECT COUNT(*) FROM btc_watch WHERE src='auto'"));
 
