@@ -395,7 +395,9 @@ void initDB() {
        если бот ещё не обновлён, — поэтому ошибка «уже есть» здесь норма. */
     for (const char* sql : {
             "ALTER TABLE users ADD COLUMN alert_tg INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE users ADD COLUMN alerts_seen_at INTEGER NOT NULL DEFAULT 0"}) {
+            "ALTER TABLE users ADD COLUMN alerts_seen_at INTEGER NOT NULL DEFAULT 0",
+            // Кнопка под алертом (бесплатному — «открыть цену входа и PnL»).
+            "ALTER TABLE alerts ADD COLUMN markup TEXT NOT NULL DEFAULT ''"}) {
         char* mErr = nullptr;
         if (sqlite3_exec(db, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] " << sql << std::endl;
@@ -536,11 +538,14 @@ std::string funnelStatsLine() {
     out << "\n\n\U0001F4B0 <b>Воронка за 7 дней</b> (людей)"
         << "\nоткрыли " << n["open"] << " → кошелёк " << n["wallet"]
         << " → замок " << n["paywall"] << " → оплата " << n["checkout"]
-        << " → купили <b>" << n["paid"] << "</b>"
-        << "\nпробных недель: " << n["trial"] << " · по приглашению: " << n["ref"];
+        << " → купили <b>" << n["paid"] << "</b>";
+    // Доля купивших от открывших — главное число воронки.
+    if (n["open"] > 0)
+        out << " (" << std::fixed << std::setprecision(1) << 100.0 * n["paid"] / n["open"] << "% открывших)";
+    out << "\nпробных недель: " << n["trial"] << " · по приглашению: " << n["ref"];
     if (prepareOrLog(db, &s,
             "SELECT src, COUNT(DISTINCT chat_id) c FROM funnel_events WHERE at >= ? AND ev='paywall' "
-            "GROUP BY src ORDER BY c DESC LIMIT 5")) {
+            "GROUP BY src ORDER BY c DESC LIMIT 8")) {
         sqlite3_bind_int64(s, 1, since);
         std::string tops;
         while (sqlite3_step(s) == SQLITE_ROW)
@@ -888,11 +893,19 @@ const std::string MINIAPP_URL = []{
     return std::string(v ? v : "");
 }();
 
-std::string openAppKeyboard(Lang lang) {
+std::string openAppKeyboard(Lang lang, const std::string& go, const char* btn) {
     if (MINIAPP_URL.empty()) return "";
+    std::string url = MINIAPP_URL;
+    if (!go.empty()) {
+        // Параметр — до «#»: после него Telegram дописывает подпись запуска.
+        const size_t hash = url.find('#');
+        const std::string tail = hash == std::string::npos ? "" : url.substr(hash);
+        if (hash != std::string::npos) url.resize(hash);
+        url += (url.find('?') == std::string::npos ? "?go=" : "&go=") + go + tail;
+    }
     json kb;
     kb["inline_keyboard"] = json::array({json::array({
-        {{"text", tr(lang, "menu_open_app")}, {"web_app", {{"url", MINIAPP_URL}}}}
+        {{"text", tr(lang, btn)}, {"web_app", {{"url", url}}}}
     })});
     return kb.dump();
 }
@@ -1003,6 +1016,14 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
     return msg;
 }
 
+/* Под бесплатным алертом, где скрыты цена входа и PnL, — кнопка прямо на
+   экран Премиума. Скрывать было нечего (первая покупка, нет цены) — кнопки
+   нет: обещать то, чего в этом алерте и так не было бы, нечестно. */
+std::string freeAlertKeyboard(const std::string& msg, Lang lang) {
+    if (msg.find(tr(lang, "alert_locked")) == std::string::npos) return "";
+    return openAppKeyboard(lang, "premium-alert", "alert_unlock_btn");
+}
+
 namespace {
 constexpr long long AGGREGATION_WINDOW_SECONDS = 180;
 
@@ -1052,9 +1073,10 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
         if (!paid.empty() &&
             g_msgQueue.enqueueToRecipients(buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, true), paid))
             anySent = true;
-        if (!free.empty() &&
-            g_msgQueue.enqueueToRecipients(buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, false), free))
-            anySent = true;
+        if (!free.empty()) {
+            const std::string m = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, false);
+            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second))) anySent = true;
+        }
     }
     if (anySent) {
         g_stats.alerts_sent.fetch_add(byLabelLang.size());
@@ -1133,9 +1155,10 @@ void dispatchBtcAlert(const BtcAlert& a) {
         if (!paid.empty() &&
             g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second, true), paid))
             anySent = true;
-        if (!free.empty() &&
-            g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second, false), free))
-            anySent = true;
+        if (!free.empty()) {
+            const std::string m = buildBtcAlertMessage(labelLang.first, a, labelLang.second, false);
+            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second))) anySent = true;
+        }
     }
     if (anySent) {
         g_stats.alerts_sent.fetch_add(byLabelLang.size());

@@ -27,8 +27,11 @@ SendResult sendMsg(const std::string& chatId, const std::string& text,
                    const std::string& reply_markup = "");
 
 // Клавиатура из одной кнопки, открывающей приложение (WHALE_MINIAPP_URL).
-// Пустая строка, если адрес приложения не задан.
-std::string openAppKeyboard(Lang lang);
+// Пустая строка, если адрес приложения не задан. `go` — куда приложению
+// открыться сразу («premium-intro»: экран Премиума, пришли за скидкой);
+// `btn` — ключ подписи кнопки. Письмо про скидку должно вести к скидке, а
+// не на главный экран, где её ещё надо искать.
+std::string openAppKeyboard(Lang lang, const std::string& go = "", const char* btn = "menu_open_app");
 
 std::string getUserLanguage(const std::string& chatId);
 void ensureUser(const std::string& chatId, const std::string& tgLangCode = "");

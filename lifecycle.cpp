@@ -162,9 +162,11 @@ long long activity(const std::string& chat, long long since, bool missedOnly) {
     return n;
 }
 
-void send(const std::string& chat, const std::string& text) {
+// Письмо о премиуме открывает приложение сразу на экране Премиума: `go` —
+// повод (заголовок экрана и замер воронки), `btn` — подпись кнопки.
+void send(const std::string& chat, const std::string& text, const char* go, const char* btn) {
     const Lang lang = langFromCode(getUserLanguage(chat));
-    sendMsg(chat, text, openAppKeyboard(lang));
+    sendMsg(chat, text, openAppKeyboard(lang, go, btn));
 }
 
 struct Row {
@@ -222,7 +224,7 @@ void digestTick() {
     std::thread([subs]() {
         for (const auto& chat : subs) {
             const Lang lang = langFromCode(getUserLanguage(chat));
-            sendMsg(chat, tr(lang, "dg_ready"), openAppKeyboard(lang));
+            sendMsg(chat, tr(lang, "dg_ready"), openAppKeyboard(lang, "digest", "dg_open_btn"));
             // Telegram пропускает около 30 сообщений в секунду.
             std::this_thread::sleep_for(std::chrono::milliseconds(45));
         }
@@ -251,10 +253,11 @@ void sendPremiumEnded(const std::string& chat) {
         const long long n = activity(chat, granted, false);
         if (n > 0) text += "\n\n" + fill(tr(lang, "lc_stats"), n);
         text += "\n\n" + tr(lang, "lc_after") + "\n\n" + tr(lang, "lc_intro");
-    } else {
-        text = tr(lang, "lc_prem_end") + "\n\n" + tr(lang, "lc_after");
+        sendMsg(chat, text, openAppKeyboard(lang, "premium-intro", "btn_intro"));
+        return;
     }
-    sendMsg(chat, text, openAppKeyboard(lang));
+    text = tr(lang, "lc_prem_end") + "\n\n" + tr(lang, "lc_after");
+    sendMsg(chat, text, openAppKeyboard(lang, "premium-ended", "btn_plans"));
 }
 
 void lifecycleTick() {
@@ -280,8 +283,8 @@ void lifecycleTick() {
         std::string text = tr(lang, "lc_trial_d5");
         const long long n = activity(r.chat, granted, false);
         if (n > 0) text += "\n\n" + fill(tr(lang, "lc_stats"), n);
-        text += "\n\n" + tr(lang, "lc_after");
-        send(r.chat, text);
+        text += "\n\n" + tr(lang, "lc_after") + "\n\n" + tr(lang, "lc_keep");
+        send(r.chat, text, "premium-trial", "btn_keep");
         sent++;
     }
 
@@ -300,7 +303,7 @@ void lifecycleTick() {
         if (r.chat == SERVICE_CHAT_ID || !claim(r.chat, "renew:" + std::to_string(r.expire))) continue;
         const Lang lang = langFromCode(getUserLanguage(r.chat));
         const long long days = (r.expire - now + DAY - 1) / DAY;
-        send(r.chat, fill(tr(lang, "lc_renew"), days < 1 ? 1 : days));
+        send(r.chat, fill(tr(lang, "lc_renew"), days < 1 ? 1 : days), "premium-renew", "btn_extend");
         sent++;
     }
 
@@ -315,7 +318,7 @@ void lifecycleTick() {
             const long long n = activity(r.chat, r.expire, true);
             if (n <= 0 || !claim(r.chat, "wb" + std::to_string(after) + ":" + std::to_string(r.expire))) continue;
             const Lang lang = langFromCode(getUserLanguage(r.chat));
-            send(r.chat, fill(tr(lang, "lc_missed"), n) + "\n\n" + tr(lang, "lc_back"));
+            send(r.chat, fill(tr(lang, "lc_missed"), n) + "\n\n" + tr(lang, "lc_back"), "premium-back", "btn_plans");
             sent++;
         }
     }

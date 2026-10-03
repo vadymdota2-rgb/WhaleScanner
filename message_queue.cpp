@@ -119,18 +119,18 @@ void SafeMessageQueue::senderLoop() {
         time_t ra=globalRetryAfter.load(std::memory_order_relaxed);
         if (ra>0&&time(nullptr)<ra) { std::this_thread::sleep_for(std::chrono::milliseconds(500)); continue; }
         if (queueSize.load(std::memory_order_relaxed)==0) { std::this_thread::sleep_for(std::chrono::milliseconds(200)); continue; }
-        std::vector<std::tuple<int64_t,std::string,std::string>> batch;
+        std::vector<std::tuple<int64_t,std::string,std::string,std::string>> batch;
         bool prepFailed=false;
         { std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
-          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.priority DESC, d.id ASC LIMIT 40")) { prepFailed=true; }
+          if (!prepareOrLog(db,&s,"SELECT d.id,d.chat_id,a.message,a.markup FROM deliveries d JOIN alerts a ON a.id=d.alert_id WHERE d.status IN (0,3) AND d.next_retry_at<=? ORDER BY d.priority DESC, d.id ASC LIMIT 40")) { prepFailed=true; }
           else {
               sqlite3_bind_int64(s,1,time(nullptr));
-              while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2));
+              while (sqlite3_step(s)==SQLITE_ROW) batch.emplace_back(sqlite3_column_int64(s,0),safeColumnText(s,1),safeColumnText(s,2),safeColumnText(s,3));
               sqlite3_finalize(s);
           }
           if (!prepFailed && !batch.empty()) {
               if (prepareOrLog(db,&s,"UPDATE deliveries SET status=5 WHERE id=? AND status IN (0,3)")) {
-                  std::vector<std::tuple<int64_t,std::string,std::string>> claimed;
+                  std::vector<std::tuple<int64_t,std::string,std::string,std::string>> claimed;
                   claimed.reserve(batch.size());
                   for (auto& t : batch) {
                       sqlite3_bind_int64(s,1,std::get<0>(t));
@@ -151,11 +151,11 @@ void SafeMessageQueue::senderLoop() {
         busyThreads.fetch_add(1, std::memory_order_relaxed);
         bool aborted=false;
         size_t sent=0;
-        for (auto& [did,cid,msg]:batch) {
+        for (auto& [did,cid,msg,markup]:batch) {
             throttleSend();
             ++sent;
             try {
-                auto res=sendMsg(cid,msg);
+                auto res=sendMsg(cid,msg,markup);
                 if (res.ok) {
                     markTerminal(did,1,0,0);
                     sentTotal.fetch_add(1, std::memory_order_relaxed);
@@ -248,7 +248,8 @@ static std::set<std::string> appOnlySubsetOf(const std::vector<std::string>& cha
     return out;
 }
 
-bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients) {
+bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients,
+                                           const std::string& markup) {
     if (recipients.empty()) return true;
     if (text.empty()) {
         std::cerr << "[QUEUE] empty message rejected for " << recipients.size()
@@ -281,8 +282,9 @@ bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::v
         return false;
     }
     sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at) VALUES(?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+    if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at,markup) VALUES(?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     sqlite3_bind_text(s,1,text.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,time(nullptr));
+    sqlite3_bind_text(s,3,markup.c_str(),-1,SQLITE_TRANSIENT);
     if (sqlite3_step(s)!=SQLITE_DONE) { std::cerr << "[QUEUE] alert insert failed: " << sqlite3_errmsg(db) << std::endl; sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
     if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at,priority) VALUES(?,?,?,0,0,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
