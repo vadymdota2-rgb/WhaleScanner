@@ -14,6 +14,9 @@
 // Порог алерта новому человеку; дальше его меняют в приложении.
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 
+// Полный адрес метода Bot API (WHALE_TG_API, по умолчанию api.telegram.org).
+std::string tgApi(const std::string& method);
+
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
 SendResult sendMsg(const std::string& chatId, const std::string& text,
                    const std::string& reply_markup = "");

@@ -369,7 +369,8 @@ void cleanupPriceHistory() {
 }
 
 void saveTokenPrice(const std::string& a, uint64_t pn) {
-    if (!pn) return; std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
+    if (!pn) return;
+    std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
     if (!prepareOrLog(db,&s,"INSERT INTO token_cache(address,price_nanos,price_ts) VALUES(?,?,?) ON CONFLICT(address) DO UPDATE SET price_nanos=excluded.price_nanos, price_ts=excluded.price_ts")) return;
     sqlite3_bind_text(s,1,a.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,pn); sqlite3_bind_int64(s,3,time(nullptr));
     sqlite3_step(s); sqlite3_finalize(s);
@@ -957,7 +958,6 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
     // мелким тот ни был, и в нём же ошибается на нестандартных парах. Цену
     // берём только у DexScreener — он сам выбирает пул поглубже и отдаёт
     // ликвидность, по которой видно, можно ли этой цене верить.
-    const uint64_t poolPx = 0;
     const double poolLiq = 0.0;
 
     uint64_t n = 0;

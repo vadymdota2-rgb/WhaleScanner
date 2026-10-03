@@ -12,7 +12,7 @@
  * выдача подписки живёт здесь, в одном месте.
  */
 
-bool initPremium(const std::string& botToken, const std::string& serviceChatId = "");
+bool initPremium(const std::string& serviceChatId = "");
 
 bool isPremium(const std::string& chatId);
 

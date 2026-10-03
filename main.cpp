@@ -258,6 +258,17 @@ const std::string TG_TOKEN = []{
     return std::string(env);
 }();
 
+// Адрес Bot API. По умолчанию — сам Telegram; WHALE_TG_API нужен для
+// своего сервера Bot API или для проверки бота на подставном.
+const std::string TG_API_BASE = []{
+    const char* v = std::getenv("WHALE_TG_API");
+    return std::string(v && *v ? v : "https://api.telegram.org");
+}();
+
+std::string tgApi(const std::string& method) {
+    return TG_API_BASE + "/bot" + TG_TOKEN + "/" + method;
+}
+
 constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
@@ -348,19 +359,33 @@ void initDB() {
             priority INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
-        CREATE INDEX IF NOT EXISTS idx_deliveries_prio ON deliveries(status, next_retry_at, priority DESC, id) WHERE status IN (0,3);
-        CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);        CREATE TABLE IF NOT EXISTS pair_cache (
+        CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
+        CREATE TABLE IF NOT EXISTS pair_cache (
             token TEXT PRIMARY KEY,
             val TEXT NOT NULL
         );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
+    // Сначала таблицы, потом добавление колонок: на новой базе ALTER до
+    // CREATE не находил таблицу, и user_whales жила без is_primary до
+    // второго запуска — список наблюдения в первый запуск не собирался.
+    // Поэтому в общем CREATE нет ничего, что опирается на колонки из ALTER.
+    char* err = nullptr;
+    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
+    }
+
     {
         char* mErr = nullptr;
         if (sqlite3_exec(db, "ALTER TABLE deliveries ADD COLUMN priority INTEGER NOT NULL DEFAULT 0",
                          nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] deliveries: added priority column" << std::endl;
         if (mErr) sqlite3_free(mErr);
+        // Индекс по priority — только после того, как колонка точно есть:
+        // в общем CREATE он ронял бы запуск на базе, созданной до неё.
+        sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_deliveries_prio ON deliveries"
+                         "(status, next_retry_at, priority DESC, id) WHERE status IN (0,3)",
+                     nullptr, nullptr, nullptr);
     }
     /* Куда слать алерты и что человек уже видел — выбирается в мини-аппе.
        alert_tg=0 — «только в приложении»: в чат алерты не идут, лежат в
@@ -394,11 +419,6 @@ void initDB() {
                          nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] user_whales: added is_primary column" << std::endl;
         if (mErr) sqlite3_free(mErr);
-    }
-
-    char* err = nullptr;
-    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::cerr << "[FATAL] Schema init failed: " << err << std::endl; sqlite3_free(err); sqlite3_close(db); std::exit(1);
     }
 
     {
@@ -758,8 +778,13 @@ class RateLimiter {
 public:
     bool allow(const std::string& c) {
         std::lock_guard<std::mutex> l(mtx); auto now=std::chrono::steady_clock::now();
-        static int cc=0; if (++cc%1000==0) for (auto it=users.begin();it!=users.end();)
-            if (std::chrono::duration_cast<std::chrono::hours>(now-it->second.last).count()>CLEANUP_H) it=users.erase(it); else ++it;
+        static int cc=0;
+        if (++cc%1000==0) {
+            for (auto it=users.begin();it!=users.end();) {
+                if (std::chrono::duration_cast<std::chrono::hours>(now-it->second.last).count()>CLEANUP_H) it=users.erase(it);
+                else ++it;
+            }
+        }
         auto& s=users[c];
         if (std::chrono::duration_cast<std::chrono::milliseconds>(now-s.last).count()<MIN_MS) return false;
         while (!s.hist.empty()&&std::chrono::duration_cast<std::chrono::seconds>(now-s.hist.front()).count()>60) s.hist.pop_front();
@@ -777,7 +802,7 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     if (!reply_markup.empty()) {
         try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
     }
-    auto r = http("https://api.telegram.org/bot" + TG_TOKEN + "/sendMessage", j.dump());
+    auto r = http(tgApi("sendMessage"), j.dump());
     try {
         auto p = json::parse(r);
         if (p.value("ok", false)) return {true, false, 0};
@@ -803,7 +828,7 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
 void answerCallbackQuery(const std::string& callbackQueryId) {
     json j;
     j["callback_query_id"] = callbackQueryId;
-    http("https://api.telegram.org/bot" + TG_TOKEN + "/answerCallbackQuery", j.dump());
+    http(tgApi("answerCallbackQuery"), j.dump());
 }
 
 const std::string MINIAPP_URL = []{
@@ -831,7 +856,7 @@ void sendOpenApp(const std::string& chatId) {
    раньше, он иначе так и висел бы со старыми командами — политика, условия
    и удаление данных теперь в приложении. */
 void setupBotCommands() {
-    http("https://api.telegram.org/bot" + TG_TOKEN + "/deleteMyCommands", "{}");
+    http(tgApi("deleteMyCommands"), "{}");
     if (MINIAPP_URL.empty())
         std::cerr << "[TG] WHALE_MINIAPP_URL не задан — кнопки «Открыть приложение» не будет" << std::endl;
 }
@@ -1383,7 +1408,8 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
                 << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
         }
         ss2 << hyperliquidStatsLine();
-        if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>"; if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
+        if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>";
+        if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
         sendMsg(cid,ss2.str());
     }
     else if (txt.rfind("/import", 0) == 0) {
@@ -1475,13 +1501,15 @@ void telegramLoop() {
     long offset=getTgOffset(); std::cout << "[TG] Restored offset: " << offset << std::endl;
     while (running.load(std::memory_order_relaxed)) {
         try {
-            auto raw=http("https://api.telegram.org/bot"+TG_TOKEN+"/getUpdates?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%2C%22pre_checkout_query%22%5D","",35);
-            if (raw.empty()) continue; auto upd=json::parse(raw);
+            auto raw=http(tgApi("getUpdates")+"?offset="+std::to_string(offset)+"&timeout=30&allowed_updates=%5B%22message%22%2C%22callback_query%22%2C%22pre_checkout_query%22%5D","",35);
+            if (raw.empty()) continue;
+            auto upd=json::parse(raw);
             if (!upd.contains("result")||!upd["result"].is_array()) continue;
             int ub=0;
             for (auto& u:upd["result"]) {
-                if (!u.contains("update_id")) continue; long cuid=u["update_id"].get<long>();
-                offset=cuid+1; if (++ub%5==0) saveTgOffset(offset);
+                if (!u.contains("update_id")) continue;
+                offset=u["update_id"].get<long>()+1;
+                if (++ub%5==0) saveTgOffset(offset);
 
                 // Кнопки старых меню в истории чата: снять «часики» и
                 // показать кнопку приложения.
@@ -1572,7 +1600,7 @@ int main() {
         g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
     initDB(); initRankingDB();
-    if (!initPremium(TG_TOKEN, SERVICE_CHAT_ID)) {
+    if (!initPremium(SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     loadTokenCache();

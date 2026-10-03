@@ -48,12 +48,10 @@ constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниже сч
 constexpr size_t FREE_MAX_WALLETS    = 1;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
 
-std::string g_botToken;
-
 std::string g_serviceChatId;
 
 std::string apiUrl(const char* method) {
-    return "https://api.telegram.org/bot" + g_botToken + "/" + method;
+    return tgApi(method);
 }
 
 bool readPremiumRowLocked(const std::string& chatId,
@@ -78,8 +76,7 @@ std::atomic<bool> g_premiumSchemaOk{false};
 
 }
 
-bool initPremium(const std::string& botToken, const std::string& serviceChatId) {
-    g_botToken = botToken;
+bool initPremium(const std::string& serviceChatId) {
     g_serviceChatId = serviceChatId;
 
     std::lock_guard<std::mutex> l(dbMutex);
