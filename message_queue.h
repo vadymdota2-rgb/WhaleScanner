@@ -42,9 +42,10 @@ public:
     int threads() const { return SENDER_THREADS; }
     unsigned long long sent() const { return sentTotal.load(std::memory_order_relaxed); }
     void syncSize();
-    // markup — клавиатура под сообщением (пусто — без кнопок).
+    // markup — клавиатура под сообщением (пусто — без кнопок); data — тот же
+    // алерт полями (JSON) для карточки в приложении.
     bool enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients,
-                             const std::string& markup = "");
+                             const std::string& markup = "", const std::string& data = "");
 };
 
 extern SafeMessageQueue g_msgQueue;

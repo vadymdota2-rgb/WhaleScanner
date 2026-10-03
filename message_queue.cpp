@@ -249,7 +249,7 @@ static std::set<std::string> appOnlySubsetOf(const std::vector<std::string>& cha
 }
 
 bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::vector<std::string>& recipients,
-                                           const std::string& markup) {
+                                           const std::string& markup, const std::string& data) {
     if (recipients.empty()) return true;
     if (text.empty()) {
         std::cerr << "[QUEUE] empty message rejected for " << recipients.size()
@@ -282,9 +282,10 @@ bool SafeMessageQueue::enqueueToRecipients(const std::string& text, const std::v
         return false;
     }
     sqlite3_stmt* s;
-    if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at,markup) VALUES(?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
+    if (!prepareOrLog(db,&s,"INSERT INTO alerts(message,created_at,markup,data) VALUES(?,?,?,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     sqlite3_bind_text(s,1,text.c_str(),-1,SQLITE_TRANSIENT); sqlite3_bind_int64(s,2,time(nullptr));
     sqlite3_bind_text(s,3,markup.c_str(),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(s,4,data.c_str(),-1,SQLITE_TRANSIENT);
     if (sqlite3_step(s)!=SQLITE_DONE) { std::cerr << "[QUEUE] alert insert failed: " << sqlite3_errmsg(db) << std::endl; sqlite3_finalize(s); sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }
     int64_t aid=sqlite3_last_insert_rowid(db); sqlite3_finalize(s);
     if (!prepareOrLog(db,&s,"INSERT INTO deliveries(alert_id,chat_id,status,retry_count,next_retry_at,priority) VALUES(?,?,?,0,0,?)")) { sqlite3_exec(db,"ROLLBACK",nullptr,nullptr,nullptr); return false; }

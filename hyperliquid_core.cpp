@@ -1035,6 +1035,27 @@ std::string buildHlAlert(const std::string& label, const HlAlertData& a, Lang la
     return m.str();
 }
 
+/* Тот же алерт полями, без языка: из них приложение рисует карточку
+   (alerts.data). Деньги — в долларах, цены — числом. */
+json hlAlertCard(const std::string& label, const std::string& wallet, const HlAlertData& a) {
+    json c;
+    c["v"] = 1; c["k"] = "hl"; c["a"] = a.dirKey; c["w"] = wallet; c["n"] = label;
+    c["sym"] = a.coin.empty() ? "?" : a.coin;
+    c["usd"] = a.notionalNanos / 1e9;
+    if (a.avgPxNanos > 0) c["px"] = a.avgPxNanos / 1e9;
+    if (a.qtyNanos > 0) c["qty"] = a.qtyNanos / 1e9;
+    if (a.fillCount > 1) c["fills"] = a.fillCount;
+    if (a.closedPnlNanos != 0) c["pnl"] = a.closedPnlNanos / 1e9;
+    const PositionInfo& p = a.pos;
+    if (p.known && p.leverage > 0) { c["lev"] = p.leverage; c["iso"] = p.isolated; }
+    if (p.stillOpen && p.positionValueNanos > 0) c["pos"] = p.positionValueNanos / 1e9;
+    if (p.stillOpen && p.marginUsedNanos > 0) c["margin"] = p.marginUsedNanos / 1e9;
+    if (p.stillOpen && p.liquidationPxNanos > 0) c["liq"] = p.liquidationPxNanos / 1e9;
+    if (p.known && !p.stillOpen) c["closed"] = true;
+    if (a.accountValueNanos > 0) c["acct"] = a.accountValueNanos / 1e9;
+    return c;
+}
+
 constexpr long long HL_ALERT_IDLE_SEC = 12;
 constexpr long long HL_ALERT_AGGREGATION_SEC = 60;
 
@@ -1100,7 +1121,7 @@ void dispatchHlAlert(const std::string& wallet, const HlAlertData& a) {
 
     for (auto& entry : byLabelLang) {
         std::string msg = buildHlAlert(entry.first.first, a, entry.first.second);
-        if (g_msgQueue.enqueueToRecipients(msg, entry.second))
+        if (g_msgQueue.enqueueToRecipients(msg, entry.second, "", hlAlertCard(entry.first.first, wallet, a).dump()))
             g_alertsSent.fetch_add(1, std::memory_order_relaxed);
     }
 }

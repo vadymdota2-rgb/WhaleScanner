@@ -397,7 +397,9 @@ void initDB() {
             "ALTER TABLE users ADD COLUMN alert_tg INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE users ADD COLUMN alerts_seen_at INTEGER NOT NULL DEFAULT 0",
             // Кнопка под алертом (бесплатному — «открыть цену входа и PnL»).
-            "ALTER TABLE alerts ADD COLUMN markup TEXT NOT NULL DEFAULT ''"}) {
+            "ALTER TABLE alerts ADD COLUMN markup TEXT NOT NULL DEFAULT ''",
+            // Тот же алерт полями (JSON) — из него приложение рисует карточку.
+            "ALTER TABLE alerts ADD COLUMN data TEXT NOT NULL DEFAULT ''"}) {
         char* mErr = nullptr;
         if (sqlite3_exec(db, sql, nullptr, nullptr, &mErr) == SQLITE_OK)
             std::cout << "[STARTUP] " << sql << std::endl;
@@ -926,93 +928,144 @@ void setupBotCommands() {
         std::cerr << "[TG] WHALE_MINIAPP_URL не задан — кнопки «Открыть приложение» не будет" << std::endl;
 }
 
-/* `full` — алерт подписчика. Бесплатному уходит тот же алерт без средней
+// Арабский пишется справа налево: метка в начале строки, чтобы эмодзи и
+// числа не перескакивали на другой край (как в алертах Hyperliquid).
+static const char* rtlMark(Lang lang) { return lang == Lang::AR ? "‏" : ""; }
+
+static double nanosToUsd(const cpp_int& n) { return n.convert_to<double>() / 1e9; }
+
+/* Алерт BSC — в том же виде, что у Hyperliquid: кто, что и на сколько одной
+   строкой сверху, ниже только то, по чему решают: цена, количество, что
+   отдал или получил, средний вход и результат. Длинный хэш и второй раз
+   кошелёк из текста ушли: транзакция — ссылкой, рядом график монеты.
+
+   `full` — алерт подписчика. Бесплатному уходит тот же алерт без средней
    цены входа, PnL сделки и прошлой покупки — и одной строкой сказано, что
-   это есть в премиуме. Строка появляется, только если было что скрыть. */
+   это есть в премиуме. Строка появляется, только если было что скрыть.
+
+   `card` — те же данные полями, без языка: приложение рисует из них
+   карточку на языке человека (alerts.data). */
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
-                              const TxResult& res, const std::string& hash, Lang lang, bool full = true) {
+                              const TxResult& res, const std::string& hash, Lang lang, bool full = true,
+                              json* card = nullptr) {
+    const char* const dm = rtlMark(lang);
     bool locked = false;
-    bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
-    std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
-    int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
-    std::string msg="\U0001F4BC <b>"+safeString(label)+"</b>\n\n";
-    if (res.venue == "Add Liquidity") msg+="\U0001F30A <b>" + tr(lang, "alert_add_liquidity") + "</b>";
-    else if (res.venue == "Remove Liquidity") msg+="\U0001F30A <b>" + tr(lang, "alert_remove_liquidity") + "</b>";
-    else if (res.venue == "Collect Fees") msg+="\U0001F4B8 <b>" + tr(lang, "alert_collect_fees") + "</b>";
-    else if (res.venue == "Wrap") msg+="\U0001F504 <b>" + tr(lang, "alert_wrap") + " " + chainCtx().nativeSymbol + "</b>";
-    else if (res.venue == "Unwrap") msg+="\U0001F504 <b>" + tr(lang, "alert_unwrap") + " " + chainCtx().nativeSymbol + "</b>";
-    else if (res.venue == "Bridge Out") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_out") + "</b>";
-    else if (res.venue == "Bridge In") msg+="\U0001F309 <b>" + tr(lang, "alert_bridge_in") + "</b>";
-    else if (res.venue == "Arbitrage") msg+="\u267B\uFE0F <b>" + tr(lang, "alert_arbitrage") + "</b>";
-    else msg+=res.isSwap?(res.isBuy?"\U0001F7E2 <b>"+tr(lang,"alert_buy")+"</b>":"\U0001F6A8 <b>"+tr(lang,"alert_sell")+"</b>"):"\U0001F4E4 <b>"+tr(lang,"alert_transfer")+"</b>";
-    msg+="\n\U0001F4B0 " + tr(lang, "alert_amount") + ": <b>"+formatUsd(res.usdNanos)+"</b>\n";
-    msg+="\U0001FA99 " + tr(lang, "alert_token") + ": <b>"+tokenSymbol+"</b>\n";
-    msg+="\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>"+formatAmount(res.rawAmount,tokenDecimals)+"</b>\n";
-    if (res.isSwap) {
-        cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
-        std::string priceLabel = tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price");
-        msg += "\U0001F4B5 " + priceLabel + ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+    const bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
+    const std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
+    const int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
 
-        if (!res.isBuy) {
-            SellPnl pnl;
-            if (!sellOutcome(wallet, res.tokenAddr,
-                             static_cast<long long>(res.usdNanos),
-                             res.rawAmount.convert_to<std::string>(), hash, pnl)) {
-            } else if (!full) {
-                locked = true;
-            } else {
-                if (pnl.avgEntryNanos > 0)
-                    msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
-                         + formatPriceUsd(cpp_int(pnl.avgEntryNanos)) + "</b>\n";
-                msg += (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
-                     + tr(lang, "alert_trade_pnl") + ": <b>"
-                     + formatUsdNanosSigned(pnl.pnlNanos, true) + "</b> ("
-                     + formatPercent(pnl.pnlPercent, true) + ")\n";
-            }
-        }
+    // Что произошло: значок, слово и код для приложения.
+    std::string icon, word, act;
+    if (res.venue == "Add Liquidity")         { icon = "\U0001F30A"; word = tr(lang, "alert_add_liquidity"); act = "add_liq"; }
+    else if (res.venue == "Remove Liquidity") { icon = "\U0001F30A"; word = tr(lang, "alert_remove_liquidity"); act = "rm_liq"; }
+    else if (res.venue == "Collect Fees")     { icon = "\U0001F4B8"; word = tr(lang, "alert_collect_fees"); act = "fees"; }
+    else if (res.venue == "Wrap")             { icon = "\U0001F504"; word = tr(lang, "alert_wrap"); act = "wrap"; }
+    else if (res.venue == "Unwrap")           { icon = "\U0001F504"; word = tr(lang, "alert_unwrap"); act = "unwrap"; }
+    else if (res.venue == "Bridge Out")       { icon = "\U0001F309"; word = tr(lang, "alert_bridge_out"); act = "bridge_out"; }
+    else if (res.venue == "Bridge In")        { icon = "\U0001F309"; word = tr(lang, "alert_bridge_in"); act = "bridge_in"; }
+    else if (res.venue == "Arbitrage")        { icon = "♻️"; word = tr(lang, "alert_arbitrage"); act = "arb"; }
+    else if (res.isSwap && res.isBuy)         { icon = "\U0001F7E2"; word = tr(lang, "alert_buy"); act = "buy"; }
+    else if (res.isSwap)                      { icon = "\U0001F534"; word = tr(lang, "alert_sell"); act = "sell"; }
+    else                                      { icon = "\U0001F4E4"; word = tr(lang, "alert_transfer"); act = "transfer"; }
 
-        if (res.isBuy) {
-            PriorBuy prior;
-            const bool priorOk = lastBuyOutcome(wallet, res.tokenAddr, hash,
-                                                static_cast<long long>(unitPriceNanos), prior);
-            const bool priorShown = priorOk && ((prior.avgEntryNanos > 0 && prior.buyCount > 1) ||
-                (prior.changePercent != 0.0 && prior.changePercent < 1000000.0 && prior.changePercent > -1000000.0));
-            if (priorShown && !full) {
-                locked = true;
-            } else if (priorOk) {
-                if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
-                    msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
-                         + formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
-                if (prior.changePercent != 0.0 &&
-                    prior.changePercent < 1000000.0 && prior.changePercent > -1000000.0) {
-                    msg += (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ")
-                         + tr(lang, "alert_prior_buy") + ": <b>"
-                         + formatPriceUsd(cpp_int(prior.thenPriceNanos)) + "</b> "
-                         + formatHoldTime(prior.ageSeconds, lang) + " "
-                         + tr(lang, "alert_prior_ago") + " \u2192 <b>"
-                         + formatPercent(prior.changePercent, true) + "</b>\n";
-                }
-            }
-        }
+    json c;
+    if (card) {
+        c["v"] = 1; c["k"] = "bsc"; c["a"] = act; c["w"] = wallet; c["n"] = label;
+        c["sym"] = tokenSymbol; c["usd"] = nanosToUsd(res.usdNanos); c["tx"] = hash;
+        if (tokenDecimals >= 0 && tokenDecimals <= 36)
+            c["qty"] = res.rawAmount.convert_to<double>() / std::pow(10.0, tokenDecimals);
+        if (!tokenIsNative) c["ca"] = res.tokenAddr;
     }
+
+    std::string msg = std::string(dm) + "\U0001F4BC <b>" + safeString(label) + "</b>\n\n";
+    msg += std::string(dm) + icon + " <b>" + word + " " + tokenSymbol + "</b> · <b>" + formatUsdNanosSigned(static_cast<long long>(res.usdNanos), false) + "</b>\n";
+
+    if (res.isSwap) {
+        const cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
+        msg += std::string(dm) + "\U0001F4B5 " + tr(lang, res.isBuy ? "alert_buy_price" : "alert_sell_price") +
+               ": <b>" + formatPriceUsd(unitPriceNanos) + "</b>\n";
+        if (card && unitPriceNanos > 0) c["px"] = nanosToUsd(unitPriceNanos);
+    }
+    msg += std::string(dm) + "\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>" +
+           formatAmount(res.rawAmount, tokenDecimals) + " " + tokenSymbol + "</b>\n";
+
+    // Что отдал за покупку или получил за продажу.
     if (res.isSwap && !res.counterAddr.empty()) {
-        std::string counterLabel = tr(lang, res.isBuy ? "alert_spent" : "alert_received");
         std::string counterAmountStr, counterSymbol;
+        int counterDec = 18;
         if (res.counterAddr == chainCtx().nativeMarker) {
-            counterAmountStr = formatAmount(res.counterAmount, 18);
             counterSymbol = chainCtx().nativeSymbol;
         } else {
-            counterAmountStr = formatAmount(res.counterAmount, getDecimals(res.counterAddr));
+            counterDec = getDecimals(res.counterAddr);
             counterSymbol = safeString(getSymbol(res.counterAddr), 16);
         }
-        msg += (res.isBuy ? "\U0001F4C9 " : "\U0001F4C8 ") + counterLabel + ": <b>" +
-               counterAmountStr + " " + counterSymbol + "</b>\n";
+        counterAmountStr = formatAmount(res.counterAmount, counterDec);
+        msg += std::string(dm) + "\U0001F4B1 " + tr(lang, res.isBuy ? "alert_spent" : "alert_received") +
+               ": <b>" + counterAmountStr + " " + counterSymbol + "</b>\n";
+        if (card && counterDec >= 0 && counterDec <= 36) {
+            c["cq"] = res.counterAmount.convert_to<double>() / std::pow(10.0, counterDec);
+            c["cs"] = counterSymbol;
+        }
     }
-    if (!tokenIsNative) msg+="\U0001F4DC " + tr(lang, "alert_contract") + ": <code>"+safeString(res.tokenAddr)+"</code>\n";
-    if (locked) msg += "\U0001F512 " + tr(lang, "alert_locked") + "\n";
-    msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
-    msg+="\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>"+safeString(label)+"</b>\n\n";
-    msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">" + tr(lang, "alert_transaction") + "</a>";
+
+    if (res.isSwap && !res.isBuy) {
+        SellPnl pnl;
+        if (sellOutcome(wallet, res.tokenAddr, static_cast<long long>(res.usdNanos),
+                        res.rawAmount.convert_to<std::string>(), hash, pnl)) {
+            if (!full) {
+                locked = true;
+            } else {
+                if (pnl.avgEntryNanos > 0) {
+                    msg += std::string(dm) + "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" +
+                           formatPriceUsd(cpp_int(pnl.avgEntryNanos)) + "</b>\n";
+                    if (card) c["avg"] = pnl.avgEntryNanos / 1e9;
+                }
+                msg += std::string(dm) + (pnl.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") +
+                       tr(lang, "alert_trade_pnl") + ": <b>" + formatUsdNanosSigned(pnl.pnlNanos, true) +
+                       "</b> (" + formatPercent(pnl.pnlPercent, true) + ")\n";
+                if (card) { c["pnl"] = pnl.pnlNanos / 1e9; c["pnlPct"] = pnl.pnlPercent; }
+            }
+        }
+    }
+
+    if (res.isSwap && res.isBuy) {
+        const cpp_int unitPriceNanos = calcUnitPriceNanos(res.usdNanos, res.rawAmount, tokenDecimals);
+        PriorBuy prior;
+        const bool priorOk = lastBuyOutcome(wallet, res.tokenAddr, hash,
+                                            static_cast<long long>(unitPriceNanos), prior);
+        const bool showAvg = priorOk && prior.avgEntryNanos > 0 && prior.buyCount > 1;
+        const bool showPrior = priorOk && prior.changePercent != 0.0 &&
+                               prior.changePercent < 1000000.0 && prior.changePercent > -1000000.0;
+        if ((showAvg || showPrior) && !full) {
+            locked = true;
+        } else {
+            if (showAvg) {
+                msg += std::string(dm) + "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" +
+                       formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
+                if (card) c["avg"] = prior.avgEntryNanos / 1e9;
+            }
+            if (showPrior) {
+                msg += std::string(dm) + (prior.changePercent >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") +
+                       tr(lang, "alert_prior_buy") + " <b>" + formatPriceUsd(cpp_int(prior.thenPriceNanos)) +
+                       "</b> " + formatHoldTime(prior.ageSeconds, lang) + " " + tr(lang, "alert_prior_ago") +
+                       " → <b>" + formatPercent(prior.changePercent, true) + "</b>\n";
+                if (card) c["prior"] = {{"px", prior.thenPriceNanos / 1e9}, {"ago", prior.ageSeconds},
+                                        {"chg", prior.changePercent}};
+            }
+        }
+    }
+
+    if (locked) {
+        msg += std::string(dm) + "\U0001F512 " + tr(lang, "alert_locked") + "\n";
+        if (card) c["lock"] = true;
+    }
+    if (!tokenIsNative)
+        msg += std::string(dm) + "\U0001F4DC <code>" + safeString(res.tokenAddr) + "</code>\n";
+    msg += "\n" + std::string(dm) + "\U0001F517 <a href=\"" + chainCtx().explorerUrl + "/tx/" + hash + "\">" +
+           tr(lang, "alert_transaction") + "</a>";
+    if (!tokenIsNative)
+        msg += " · <a href=\"https://dexscreener.com/bsc/" + safeString(res.tokenAddr) + "\">DexScreener</a>";
+    if (card) *card = std::move(c);
     return msg;
 }
 
@@ -1070,12 +1123,16 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
         const std::set<std::string> prem = premiumSubsetOf(chatIds);
         std::vector<std::string> paid, free;
         for (const auto& c : chatIds) (prem.count(c) ? paid : free).push_back(c);
-        if (!paid.empty() &&
-            g_msgQueue.enqueueToRecipients(buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, true), paid))
-            anySent = true;
+        // Карточка для приложения — теми же данными, что и текст (alerts.data).
+        if (!paid.empty()) {
+            json card;
+            const std::string m = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, true, &card);
+            if (g_msgQueue.enqueueToRecipients(m, paid, "", card.dump())) anySent = true;
+        }
         if (!free.empty()) {
-            const std::string m = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, false);
-            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second))) anySent = true;
+            json card;
+            const std::string m = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, false, &card);
+            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second), card.dump())) anySent = true;
         }
     }
     if (anySent) {
@@ -1099,36 +1156,56 @@ static std::string btcQty(long long sats) {
     return s;
 }
 
-std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, Lang lang, bool full = true) {
-    std::string msg = "\U0001F4BC <b>" + safeString(label) + "</b>\n\n";
+/* Алерт по биткоин-кошельку — тот же вид, что у BSC и Hyperliquid: что и на
+   сколько одной строкой, ниже цена, количество, биржа на той стороне и,
+   подписчику, средний вход и результат. `card` — те же данные полями для
+   карточки в приложении. */
+std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, Lang lang, bool full = true,
+                                 json* card = nullptr) {
+    const char* const dm = rtlMark(lang);
+    std::string icon, word, act;
     switch (a.kind) {
-        case BtcAlert::BUY:  msg += "\U0001F7E2 <b>" + tr(lang, "alert_buy") + "</b>"; break;
-        case BtcAlert::SELL: msg += "\U0001F6A8 <b>" + tr(lang, "alert_sell") + "</b>"; break;
-        case BtcAlert::IN:   msg += "\U0001F4E5 <b>" + tr(lang, "alert_transfer") + "</b>"; break;
-        default:             msg += "\U0001F4E4 <b>" + tr(lang, "alert_transfer") + "</b>"; break;
+        case BtcAlert::BUY:  icon = "\U0001F7E2"; word = tr(lang, "alert_buy"); act = "buy"; break;
+        case BtcAlert::SELL: icon = "\U0001F534"; word = tr(lang, "alert_sell"); act = "sell"; break;
+        case BtcAlert::IN:   icon = "\U0001F4E5"; word = tr(lang, "alert_transfer"); act = "in"; break;
+        default:             icon = "\U0001F4E4"; word = tr(lang, "alert_transfer"); act = "out"; break;
     }
-    if (a.txs > 1) msg += " \u00D7" + std::to_string(a.txs);
-    msg += "\n\U0001F4B0 " + tr(lang, "alert_amount") + ": <b>" + formatUsd(cpp_int(a.usdNanos)) + "</b>\n";
-    msg += "\U0001FA99 " + tr(lang, "alert_token") + ": <b>BTC</b>\n";
-    msg += "\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>" + btcQty(a.sats) + "</b>\n";
-    if ((a.kind == BtcAlert::BUY || a.kind == BtcAlert::SELL) && a.priceNanos > 0)
-        msg += "\U0001F4B5 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_buy_price" : "alert_sell_price") +
+    std::string msg = std::string(dm) + "\U0001F4BC <b>" + safeString(label) + "</b>\n\n";
+    msg += std::string(dm) + icon + " <b>" + word + " BTC</b> \u00B7 <b>" + formatUsdNanosSigned(a.usdNanos, false) + "</b>";
+    if (a.txs > 1) msg += " \u00B7 \u00D7" + std::to_string(a.txs);
+    msg += "\n";
+    const bool trade = a.kind == BtcAlert::BUY || a.kind == BtcAlert::SELL;
+    if (trade && a.priceNanos > 0)
+        msg += std::string(dm) + "\U0001F4B5 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_buy_price" : "alert_sell_price") +
                ": <b>" + formatPriceUsd(cpp_int(a.priceNanos)) + "</b>\n";
+    msg += std::string(dm) + "\U0001F4E6 " + tr(lang, "alert_qty") + ": <b>" + btcQty(a.sats) + " BTC</b>\n";
+    if (!a.ex.empty())
+        msg += std::string(dm) + "\U0001F3E6 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_from_exchange" : "alert_to_exchange") +
+               ": <b>" + safeString(a.ex, 32) + "</b>\n";
     // Цена входа и PnL — подписчику; бесплатному — строка, что они есть.
     const bool hasAvg = a.avgEntryNanos > 0 && (a.kind == BtcAlert::SELL || a.priorBuys > 1);
     if (full && hasAvg)
-        msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" + formatPriceUsd(cpp_int(a.avgEntryNanos)) + "</b>\n";
+        msg += std::string(dm) + "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" +
+               formatPriceUsd(cpp_int(a.avgEntryNanos)) + "</b>\n";
     if (full && a.hasPnl)
-        msg += std::string(a.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") + tr(lang, "alert_trade_pnl") + ": <b>" +
-               formatUsdNanosSigned(a.pnlNanos, true) + "</b> (" + formatPercent(a.pnlPct, true) + ")\n";
-    if (!a.ex.empty())
-        msg += "\U0001F3E6 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_from_exchange" : "alert_to_exchange") +
-               ": <b>" + safeString(a.ex, 32) + "</b>\n";
-    if (!full && (hasAvg || a.hasPnl)) msg += "\U0001F512 " + tr(lang, "alert_locked") + "\n";
-    msg += "\U0001F194 TX: <code>" + safeString(a.txid, 66) + "</code>\n";
-    msg += "\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>" + safeString(label) + "</b>\n\n";
-    msg += "\U0001F517 <a href=\"https://mempool.space/tx/" + safeString(a.txid, 66) + "\">" +
+        msg += std::string(dm) + (a.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") + tr(lang, "alert_trade_pnl") +
+               ": <b>" + formatUsdNanosSigned(a.pnlNanos, true) + "</b> (" + formatPercent(a.pnlPct, true) + ")\n";
+    const bool locked = !full && (hasAvg || a.hasPnl);
+    if (locked) msg += std::string(dm) + "\U0001F512 " + tr(lang, "alert_locked") + "\n";
+    msg += "\n" + std::string(dm) + "\U0001F517 <a href=\"https://mempool.space/tx/" + safeString(a.txid, 66) + "\">" +
            tr(lang, "alert_transaction") + "</a>";
+    if (card) {
+        json c;
+        c["v"] = 1; c["k"] = "btc"; c["a"] = act; c["w"] = a.wallet; c["n"] = label;
+        c["sym"] = "BTC"; c["usd"] = a.usdNanos / 1e9; c["qty"] = a.sats / 1e8; c["tx"] = a.txid;
+        if (a.txs > 1) c["txs"] = a.txs;
+        if (trade && a.priceNanos > 0) c["px"] = a.priceNanos / 1e9;
+        if (!a.ex.empty()) c["ex"] = a.ex;
+        if (full && hasAvg) c["avg"] = a.avgEntryNanos / 1e9;
+        if (full && a.hasPnl) { c["pnl"] = a.pnlNanos / 1e9; c["pnlPct"] = a.pnlPct; }
+        if (locked) c["lock"] = true;
+        *card = std::move(c);
+    }
     return msg;
 }
 
@@ -1152,12 +1229,15 @@ void dispatchBtcAlert(const BtcAlert& a) {
         const std::set<std::string> prem = premiumSubsetOf(chatIds);
         std::vector<std::string> paid, free;
         for (const auto& c : chatIds) (prem.count(c) ? paid : free).push_back(c);
-        if (!paid.empty() &&
-            g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second, true), paid))
-            anySent = true;
+        if (!paid.empty()) {
+            json card;
+            const std::string m = buildBtcAlertMessage(labelLang.first, a, labelLang.second, true, &card);
+            if (g_msgQueue.enqueueToRecipients(m, paid, "", card.dump())) anySent = true;
+        }
         if (!free.empty()) {
-            const std::string m = buildBtcAlertMessage(labelLang.first, a, labelLang.second, false);
-            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second))) anySent = true;
+            json card;
+            const std::string m = buildBtcAlertMessage(labelLang.first, a, labelLang.second, false, &card);
+            if (g_msgQueue.enqueueToRecipients(m, free, freeAlertKeyboard(m, labelLang.second), card.dump())) anySent = true;
         }
     }
     if (anySent) {
