@@ -26,9 +26,32 @@ std::string http(const std::string& url, const std::string& post, int timeout);
 
 namespace {
 
-constexpr long long PREMIUM_DURATION_SECONDS = 30LL * 86400LL;
-constexpr int       PREMIUM_PRICE_STARS      = 250;
-const char* const   PREMIUM_PAYLOAD          = "premium_30_days";
+/* Тарифы в звёздах. Счёт выставляет API (whale_api.py, STAR_PLANS) — там те
+   же полезная нагрузка, цена и срок; здесь их сверяют перед выдачей.
+
+   Месяц оплачивается подпиской Telegram: звёзды списываются сами каждые
+   30 дней, и каждое списание приходит сюда обычным successful_payment с той
+   же нагрузкой. Год — разовая оплата со скидкой. Вводная цена месяца —
+   предложение тем, у кого только что кончилась пробная неделя; кому его
+   показывать, решает API, бот лишь узнаёт нагрузку. */
+struct StarPlan { const char* payload; long long stars; int days; };
+constexpr StarPlan STAR_PLANS[] = {
+    {"premium_30_days", 250, 30},
+    {"premium_365_days", 1990, 365},
+    {"premium_30_intro", 150, 30},
+};
+// «{n}» в тексте — число дней тарифа: месяц и год пишутся одной строкой.
+std::string withDays(std::string text, int days) {
+    const size_t at = text.find("{n}");
+    if (at != std::string::npos) text.replace(at, 3, std::to_string(days));
+    return text;
+}
+
+const StarPlan* starPlan(const std::string& payload) {
+    for (const auto& p : STAR_PLANS)
+        if (payload == p.payload) return &p;
+    return nullptr;
+}
 
 // Цена подписки в USD₮ и срок жизни счёта. Оплата монетой TON убрана: цена
 // в долларах равна цене в USD₮, и курс, который мог не прийти, больше не
@@ -127,7 +150,8 @@ bool initPremium(const std::string& serviceChatId) {
             created_at INTEGER NOT NULL,
             paid_at INTEGER NOT NULL DEFAULT 0,
             tx_hash TEXT NOT NULL DEFAULT '',
-            kind TEXT NOT NULL DEFAULT 'ton'
+            kind TEXT NOT NULL DEFAULT 'ton',
+            days INTEGER NOT NULL DEFAULT 30
         );
         CREATE INDEX IF NOT EXISTS idx_ton_active ON ton_invoices(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_ton_chat ON ton_invoices(chat_id);
@@ -139,11 +163,20 @@ bool initPremium(const std::string& serviceChatId) {
         ok = false;
     }
     if (perr) sqlite3_free(perr);
+    // Срок счёта USD₮: месяц или год. Старые счета без колонки — месяц.
+    {
+        char* aerr = nullptr;
+        if (sqlite3_exec(db, "ALTER TABLE ton_invoices ADD COLUMN days INTEGER NOT NULL DEFAULT 30",
+                         nullptr, nullptr, &aerr) == SQLITE_OK)
+            std::cout << "[PREMIUM] ton_invoices: added days column" << std::endl;
+        if (aerr) sqlite3_free(aerr);
+    }
 
     g_premiumSchemaOk = ok;
     if (ok) {
-        std::cout << "[PREMIUM] Module initialized (price: " << PREMIUM_PRICE_STARS
-                  << " Stars / 30 days)" << std::endl;
+        std::cout << "[PREMIUM] Module initialized (plans: " << STAR_PLANS[0].stars << " Stars / "
+                  << STAR_PLANS[0].days << " days, " << STAR_PLANS[1].stars << " / " << STAR_PLANS[1].days
+                  << ")" << std::endl;
     } else {
         std::cerr << "[PREMIUM][FATAL] Module init failed — payments are DISABLED until fixed" << std::endl;
     }
@@ -232,12 +265,12 @@ void cleanupExpiredPremium() {
 
 namespace {
 
-bool extendPremiumLocked(const std::string& chatId, long long now, bool& wasAlreadyActive) {
+bool extendPremiumLocked(const std::string& chatId, long long now, int days, bool& wasAlreadyActive) {
     int flag = 0; long long start = 0, expire = 0;
     if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
 
     wasAlreadyActive = (flag != 0 && expire > now);
-    long long newExpire = (wasAlreadyActive ? expire : now) + PREMIUM_DURATION_SECONDS;
+    long long newExpire = (wasAlreadyActive ? expire : now) + static_cast<long long>(days) * 86400LL;
     long long newStart = wasAlreadyActive ? (start > 0 ? start : now) : now;
 
     sqlite3_stmt* s;
@@ -339,16 +372,19 @@ void pollUsdtPayments() {
 
         std::string chatId;
         long long need = 0;
+        int days = 30;
         {
             std::lock_guard<std::mutex> l(dbMutex);
             sqlite3_stmt* s;
             if (!prepareOrLog(db, &s,
-                "SELECT chat_id, nano_amount FROM ton_invoices "
+                "SELECT chat_id, nano_amount, days FROM ton_invoices "
                 "WHERE memo=? AND status='active' AND kind='usdt'")) continue;
             sqlite3_bind_text(s, 1, clean.c_str(), -1, SQLITE_TRANSIENT);
             if (sqlite3_step(s) == SQLITE_ROW) {
                 chatId = safeColumnText(s, 0);
                 need = sqlite3_column_int64(s, 1);
+                const int d = sqlite3_column_int(s, 2);
+                if (d == 30 || d == 365) days = d;
             }
             sqlite3_finalize(s);
         }
@@ -377,17 +413,17 @@ void pollUsdtPayments() {
         }
         if (!claimed) continue;
 
-        if (!grantPremiumDays(chatId, 30)) {
+        if (!grantPremiumDays(chatId, days)) {
             std::cerr << "[USDT] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << chatId
                       << " memo=" << clean << " — выдать вручную" << std::endl;
             continue;
         }
         trackFunnel(chatId, "paid", "usdt");
-        std::cout << "[USDT] premium 30d выдан: chat=" << chatId
+        std::cout << "[USDT] premium " << days << "d выдан: chat=" << chatId
                   << " memo=" << clean << " " << (got / 1e6) << " USDT" << std::endl;
 
         const Lang lang = langFromCode(getUserLanguage(chatId));
-        sendMsg(chatId, tr(lang, "ton_paid_ok"));
+        sendMsg(chatId, withDays(tr(lang, "ton_paid_ok"), days), openAppKeyboard(lang));
     }
 }
 void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
@@ -468,13 +504,14 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
         return PaymentApplyResult::Rejected;
     }
 
-    if (payload != PREMIUM_PAYLOAD) {
+    const StarPlan* plan = starPlan(payload);
+    if (!plan) {
         std::cerr << "[PREMIUM] successful_payment with unknown payload: "
                   << payload << " (chat " << chatId << ")" << std::endl;
         return PaymentApplyResult::Rejected;
     }
 
-    if (currency != "XTR" || amount != PREMIUM_PRICE_STARS) {
+    if (currency != "XTR" || amount != plan->stars) {
         std::cerr << "[PREMIUM] successful_payment amount/currency mismatch: "
                   << amount << " " << currency << " (chat " << chatId << ")" << std::endl;
         return PaymentApplyResult::Rejected;
@@ -535,7 +572,7 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     }
 
     bool wasAlreadyActive = false;
-    if (!extendPremiumLocked(chatId, paidAt, wasAlreadyActive)) {
+    if (!extendPremiumLocked(chatId, paidAt, plan->days, wasAlreadyActive)) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         std::cerr << "[PREMIUM] apply: extend failed for " << chatId
                   << " (charge " << chargeId << "), payment record rolled back too" << std::endl;
@@ -582,7 +619,8 @@ void handlePreCheckoutQuery(const json& q) {
     json a;
     a["pre_checkout_query_id"] = q["id"].get<std::string>();
     bool schemaReady = g_premiumSchemaOk.load();
-    bool valid = parseOk && schemaReady && payload == PREMIUM_PAYLOAD && currency == "XTR" && amount == PREMIUM_PRICE_STARS;
+    const StarPlan* plan = starPlan(payload);
+    bool valid = parseOk && schemaReady && plan && currency == "XTR" && amount == plan->stars;
     if (valid) {
         a["ok"] = true;
     } else {
@@ -621,20 +659,15 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     refreshWatchers();
 
     Lang lang = langFromCode(getUserLanguage(chatId));
-    json j;
-    j["chat_id"] = chatId;
-    j["text"] = tr(lang, "payment_success_title") + "\n\n" +
-                tr(lang, "payment_success_activated") + "\n\n" +
-                tr(lang, "payment_success_duration");
-    auto r = http(apiUrl("sendMessage"), j.dump(), 10);
-    try {
-        auto p = json::parse(r);
-        if (!p.value("ok", false)) {
-            std::cerr << "[PREMIUM] success notification failed for " << chatId
-                      << ": " << p.value("description", "(no description)") << std::endl;
-        }
-    } catch (...) {
-        std::cerr << "[PREMIUM] success notification: bad API response for " << chatId << std::endl;
-    }
+    const StarPlan* plan = starPlan(sp.value("invoice_payload", std::string()));
+    // Ежемесячное списание по подписке Telegram — не новая покупка, а
+    // продление: человеку достаточно короткого «продлено на 30 дней».
+    const bool renewal = sp.value("is_recurring", false) && !sp.value("is_first_recurring", false);
+    const std::string text = renewal
+        ? withDays(tr(lang, "payment_renewed"), plan ? plan->days : 30)
+        : tr(lang, "payment_success_title") + "\n\n" + tr(lang, "payment_success_activated") + "\n\n" +
+          withDays(tr(lang, "payment_success_duration"), plan ? plan->days : 30);
+    if (!sendMsg(chatId, text, openAppKeyboard(lang)).ok)
+        std::cerr << "[PREMIUM] success notification failed for " << chatId << std::endl;
     return true;
 }
