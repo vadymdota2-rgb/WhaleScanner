@@ -484,6 +484,10 @@ void initDB() {
                 src TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (comment_id, lang)
             );
+            CREATE TABLE IF NOT EXISTS digest_subs (
+                chat_id TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS digest_mute (
                 chat_id TEXT PRIMARY KEY,
                 at INTEGER NOT NULL
@@ -533,7 +537,7 @@ std::string funnelStatsLine() {
         << "\nоткрыли " << n["open"] << " → кошелёк " << n["wallet"]
         << " → замок " << n["paywall"] << " → оплата " << n["checkout"]
         << " → купили <b>" << n["paid"] << "</b>"
-        << "\nпробных недель: " << n["trial"];
+        << "\nпробных недель: " << n["trial"] << " · по приглашению: " << n["ref"];
     if (prepareOrLog(db, &s,
             "SELECT src, COUNT(DISTINCT chat_id) c FROM funnel_events WHERE at >= ? AND ev='paywall' "
             "GROUP BY src ORDER BY c DESC LIMIT 5")) {

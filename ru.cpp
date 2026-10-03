@@ -84,6 +84,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"menu_open_app", {"📱 Open App", "📱 Открыть приложение"}},
         {"payment_renewed", {"✅ Premium renewed for another {n} days.",
             "✅ Премиум продлён ещё на {n} дней."}},
+        {"dg_ready", {"📰 Today's whale digest is out: the day's signals, market, Bitcoin on exchanges, BSC whales and the ranking leaders.",
+            "📰 Вышел дайджест китов за сегодня: сигналы дня, рынок, Bitcoin на биржах, киты BSC и лидеры рейтинга."}},
         {"lc_trial_d5", {"⏳ Your Premium trial ends in 2 days.",
             "⏳ Пробный Премиум закончится через 2 дня."}},
         {"lc_trial_end", {"⏳ Your Premium trial week is over.",

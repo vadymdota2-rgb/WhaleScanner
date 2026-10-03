@@ -1,7 +1,10 @@
 #include "lifecycle.h"
 
+#include <chrono>
+#include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <thread>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -182,6 +185,50 @@ std::vector<Row> select(const char* sql, long long a, long long b) {
     return out;
 }
 
+/* Новый выпуск дайджеста — тем, кто попросил присылать (digest_subs; кнопка
+   в приложении). Выпуск собирает API раз в сутки; бот видит новую строку в
+   digests и рассылает отдельным потоком, чтобы не держать чтение блоков.
+   Номер последнего разосланного выпуска — в state: после перезапуска старый
+   выпуск второй раз не уйдёт, а при первом запуске рассылки нет вовсе. */
+void digestTick() {
+    long long last = -1, newest = 0;
+    std::vector<std::string> subs;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT MAX(id) FROM digests")) {
+            if (sqlite3_step(s) == SQLITE_ROW) newest = sqlite3_column_int64(s, 0);
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s, "SELECT value FROM state WHERE key='digest_notified'")) {
+            if (sqlite3_step(s) == SQLITE_ROW) last = std::atoll(safeColumnText(s, 0).c_str());
+            sqlite3_finalize(s);
+        }
+        if (newest <= 0 || newest == last) return;
+        if (prepareOrLog(db, &s, "INSERT OR REPLACE INTO state(key, value) VALUES('digest_notified', ?)")) {
+            const std::string v = std::to_string(newest);
+            sqlite3_bind_text(s, 1, v.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+        if (last < 0) return;
+        if (prepareOrLog(db, &s, "SELECT chat_id FROM digest_subs")) {
+            while (sqlite3_step(s) == SQLITE_ROW) subs.push_back(safeColumnText(s, 0));
+            sqlite3_finalize(s);
+        }
+    }
+    if (subs.empty()) return;
+    std::cout << "[DIGEST] выпуск " << newest << " — уведомляю " << subs.size() << std::endl;
+    std::thread([subs]() {
+        for (const auto& chat : subs) {
+            const Lang lang = langFromCode(getUserLanguage(chat));
+            sendMsg(chat, tr(lang, "dg_ready"), openAppKeyboard(lang));
+            // Telegram пропускает около 30 сообщений в секунду.
+            std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        }
+    }).detach();
+}
+
 }  // namespace
 
 void initLifecycle() { schema(); }
@@ -211,6 +258,7 @@ void sendPremiumEnded(const std::string& chat) {
 }
 
 void lifecycleTick() {
+    digestTick();
     const long long now = static_cast<long long>(time(nullptr));
     int sent = 0;
 
