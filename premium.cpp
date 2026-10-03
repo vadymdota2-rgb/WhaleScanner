@@ -45,7 +45,7 @@ const char* const USDT_MASTER =
     "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE";
 constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниже счёт не бывает
 
-constexpr size_t FREE_MAX_WALLETS    = 1;
+constexpr size_t FREE_MAX_WALLETS    = 3;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
 
 std::string g_serviceChatId;
@@ -382,6 +382,7 @@ void pollUsdtPayments() {
                       << " memo=" << clean << " — выдать вручную" << std::endl;
             continue;
         }
+        trackFunnel(chatId, "paid", "usdt");
         std::cout << "[USDT] premium 30d выдан: chat=" << chatId
                   << " memo=" << clean << " " << (got / 1e6) << " USDT" << std::endl;
 
@@ -389,6 +390,27 @@ void pollUsdtPayments() {
         sendMsg(chatId, tr(lang, "ton_paid_ok"));
     }
 }
+void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
+    // Та же таблица, что ведёт API (whale_api.py, track): событие раз в сутки
+    // на человека, вид и источник. Оплату видит только бот — пишем её здесь.
+    const long long t = static_cast<long long>(time(nullptr));
+    char day[16];
+    const time_t tt = static_cast<time_t>(t);
+    struct tm g{};
+    gmtime_r(&tt, &g);
+    std::strftime(day, sizeof day, "%Y-%m-%d", &g);
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "INSERT OR IGNORE INTO funnel_events(chat_id, ev, src, day, at) VALUES(?,?,?,?,?)")) return;
+    sqlite3_bind_text(s, 1, chatId.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 2, ev, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 3, src, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s, 4, day, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(s, 5, t);
+    sqlite3_step(s);
+    sqlite3_finalize(s);
+}
+
 bool grantPremiumDays(const std::string& chatId, int days) {
     if (chatId.empty() || days <= 0 || days > 3650) return false;
     if (!g_premiumSchemaOk) return false;
@@ -594,6 +616,7 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
         return false;
     }
     if (result == PaymentApplyResult::Duplicate) return true;
+    trackFunnel(chatId, "paid", "stars");
 
     refreshWatchers();
 

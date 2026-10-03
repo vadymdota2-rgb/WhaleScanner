@@ -26,6 +26,9 @@ void pollUsdtPayments();
 
 bool grantPremiumDays(const std::string& chatId, int days);
 
+/** Событие воронки продаж (таблица funnel_events, её же пишет API). */
+void trackFunnel(const std::string& chatId, const char* ev, const char* src = "");
+
 size_t premiumMaxWallets(const std::string& chatId);
 
 void handlePreCheckoutQuery(const nlohmann::json& preCheckoutQuery);

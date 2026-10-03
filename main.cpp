@@ -274,6 +274,10 @@ const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
 
+// Бесплатный тариф: алерты с первых трёх кошельков (основной, потом по дате
+// добавления). Тот же порядок и то же число — FREE_ALERT_WALLETS в API.
+constexpr size_t FREE_ALERT_WALLETS = 3;
+
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
 const long long TX_TTL_BLOCKS = 6700;
@@ -497,6 +501,53 @@ void initDB() {
             sqlite3_free(gerr);
         }
     }
+
+    // Воронка продаж: события пишут API (открыл, увидел замок, нажал оплату)
+    // и премиум бота (оплатил). Та же схема, что FUNNEL_SCHEMA в API.
+    {
+        char* ferr = nullptr;
+        if (sqlite3_exec(db,
+                "CREATE TABLE IF NOT EXISTS funnel_events ("
+                " chat_id TEXT NOT NULL, ev TEXT NOT NULL, src TEXT NOT NULL DEFAULT '',"
+                " day TEXT NOT NULL, at INTEGER NOT NULL,"
+                " PRIMARY KEY (chat_id, ev, src, day));"
+                "CREATE INDEX IF NOT EXISTS idx_funnel_day ON funnel_events(day, ev);",
+                nullptr, nullptr, &ferr) != SQLITE_OK) {
+            std::cerr << "[STARTUP] funnel schema failed: " << (ferr ? ferr : "") << std::endl;
+            sqlite3_free(ferr);
+        }
+    }
+}
+
+/* Воронка за неделю для /stats: сколько разных людей дошли до каждого шага
+   и где чаще всего упираются в замок. */
+std::string funnelStatsLine() {
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    const time_t since = time(nullptr) - 7 * 86400;
+    std::map<std::string, long long> n;
+    if (prepareOrLog(db, &s, "SELECT ev, COUNT(DISTINCT chat_id) FROM funnel_events WHERE at >= ? GROUP BY ev")) {
+        sqlite3_bind_int64(s, 1, since);
+        while (sqlite3_step(s) == SQLITE_ROW) n[safeColumnText(s, 0)] = sqlite3_column_int64(s, 1);
+        sqlite3_finalize(s);
+    }
+    std::ostringstream out;
+    out << "\n\n\U0001F4B0 <b>Воронка за 7 дней</b> (людей)"
+        << "\nоткрыли " << n["open"] << " → кошелёк " << n["wallet"]
+        << " → замок " << n["paywall"] << " → оплата " << n["checkout"]
+        << " → купили <b>" << n["paid"] << "</b>"
+        << "\nпробных недель: " << n["trial"];
+    if (prepareOrLog(db, &s,
+            "SELECT src, COUNT(DISTINCT chat_id) c FROM funnel_events WHERE at >= ? AND ev='paywall' "
+            "GROUP BY src ORDER BY c DESC LIMIT 5")) {
+        sqlite3_bind_int64(s, 1, since);
+        std::string tops;
+        while (sqlite3_step(s) == SQLITE_ROW)
+            tops += (tops.empty() ? "" : " · ") + safeColumnText(s, 0) + " " + std::to_string(sqlite3_column_int64(s, 1));
+        sqlite3_finalize(s);
+        if (!tops.empty()) out << "\nзамки: " << tops;
+    }
+    return out.str();
 }
 
 void walCheckpoint(int mode = SQLITE_CHECKPOINT_TRUNCATE) { std::lock_guard<std::mutex> l(dbMutex); sqlite3_wal_checkpoint_v2(db,nullptr,mode,nullptr,nullptr); }
@@ -660,7 +711,7 @@ void refreshWatchers() {
                 const bool hasHl = hasHlFill.count(addr) > 0;
 
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
-                if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= 1) continue;
+                if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= FREE_ALERT_WALLETS) continue;
                 (*m)[addr].push_back(Watcher{uid,label,nanos});
                 loadedForUser++;
                 // Адрес биткоина: алерты по нему шлёт сканер BTC, а BSC и
@@ -1408,6 +1459,7 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
                 << "\nVault flow attributed (Bot Trade): " << g_stats.diag_vault_flow_attributed.load();
         }
         ss2 << hyperliquidStatsLine();
+        ss2 << funnelStatsLine();
         if (qs>1000) ss2 << "\n\n⚠️ <b>QUEUE HIGH!</b>";
         if (fc>0) ss2 << "\n⚠️ <b>FAILED DELIVERIES!</b>";
         sendMsg(cid,ss2.str());
