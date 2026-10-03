@@ -1,5 +1,6 @@
 #include "premium.h"
 #include "telegram.h"
+#include "lifecycle.h"
 #include <climits>
 
 #include <sqlite3.h>
@@ -163,6 +164,15 @@ bool initPremium(const std::string& serviceChatId) {
         ok = false;
     }
     if (perr) sqlite3_free(perr);
+    // Подписка Telegram: до какого времени оплачен текущий период. У разовой
+    // оплаты ноль — по нему напоминание о продлении знает, кому писать.
+    {
+        char* aerr = nullptr;
+        if (sqlite3_exec(db, "ALTER TABLE premium_payments ADD COLUMN sub_until INTEGER NOT NULL DEFAULT 0",
+                         nullptr, nullptr, &aerr) == SQLITE_OK)
+            std::cout << "[PREMIUM] premium_payments: added sub_until column" << std::endl;
+        if (aerr) sqlite3_free(aerr);
+    }
     // Срок счёта USD₮: месяц или год. Старые счета без колонки — месяц.
     {
         char* aerr = nullptr;
@@ -255,11 +265,10 @@ void cleanupExpiredPremium() {
         std::cout << "[PREMIUM] Expired -> Free: " << changed << " user(s)" << std::endl;
         refreshWatchers();
 
-        for (const std::string& cid : expired) {
-            if (cid == g_serviceChatId) continue;
-            Lang lang = langFromCode(getUserLanguage(cid));
-            sendMsg(cid, tr(lang, "premium_expired_notice"), openAppKeyboard(lang));
-        }
+        // Письмо об окончании: после пробной недели — с итогом и вводной
+        // ценой, после оплаченного срока — что остаётся бесплатно.
+        for (const std::string& cid : expired)
+            if (cid != g_serviceChatId) sendPremiumEnded(cid);
     }
 }
 
@@ -492,7 +501,9 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
 
     std::string payload, currency, chargeId, providerChargeId;
     long long amount = 0;
+    long long subUntil = 0;
     try {
+        subUntil = sp.value("subscription_expiration_date", 0LL);
         payload = sp.value("invoice_payload", "");
         currency = sp.value("currency", "");
         amount = sp.value("total_amount", 0);
@@ -543,7 +554,7 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     if (!prepareOrLog(db, &s,
         "INSERT INTO premium_payments"
         "(chat_id,telegram_payment_charge_id,provider_payment_charge_id,"
-        "payload,amount,currency,paid_at) VALUES(?,?,?,?,?,?,?)")) {
+        "payload,amount,currency,paid_at,sub_until) VALUES(?,?,?,?,?,?,?,?)")) {
         sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
         return PaymentApplyResult::Error;
     }
@@ -554,6 +565,7 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
     sqlite3_bind_int64(s, 5, amount);
     sqlite3_bind_text(s, 6, currency.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(s, 7, paidAt);
+    sqlite3_bind_int64(s, 8, subUntil);
     int rc = sqlite3_step(s);
     int extendedRc = sqlite3_extended_errcode(db);
     sqlite3_finalize(s);

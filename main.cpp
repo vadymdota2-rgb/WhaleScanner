@@ -39,6 +39,7 @@
 #include "tx_analyzer.h"
 #include "beneficiary_stats.h"
 #include "btc_chain.h"
+#include "lifecycle.h"
 #include "hyperliquid.h"
 #include "hyperliquid_internal.h"
 #include "ws_heads.h"
@@ -273,10 +274,6 @@ constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
-
-// Бесплатный тариф: алерты с первых трёх кошельков (основной, потом по дате
-// добавления). Тот же порядок и то же число — FREE_ALERT_WALLETS в API.
-constexpr size_t FREE_ALERT_WALLETS = 3;
 
 const long long FAST_SYNC_LAG = 1000;
 const long long REORG_ROLLBACK = 5;
@@ -912,8 +909,12 @@ void setupBotCommands() {
         std::cerr << "[TG] WHALE_MINIAPP_URL не задан — кнопки «Открыть приложение» не будет" << std::endl;
 }
 
+/* `full` — алерт подписчика. Бесплатному уходит тот же алерт без средней
+   цены входа, PnL сделки и прошлой покупки — и одной строкой сказано, что
+   это есть в премиуме. Строка появляется, только если было что скрыть. */
 std::string buildAlertMessage(const std::string& label, const std::string& wallet,
-                              const TxResult& res, const std::string& hash, Lang lang) {
+                              const TxResult& res, const std::string& hash, Lang lang, bool full = true) {
+    bool locked = false;
     bool tokenIsNative = (res.tokenAddr == chainCtx().nativeMarker);
     std::string tokenSymbol = tokenIsNative ? chainCtx().nativeSymbol : safeString(getSymbol(res.tokenAddr), 32);
     int tokenDecimals = tokenIsNative ? 18 : getDecimals(res.tokenAddr);
@@ -937,9 +938,12 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
 
         if (!res.isBuy) {
             SellPnl pnl;
-            if (sellOutcome(wallet, res.tokenAddr,
-                            static_cast<long long>(res.usdNanos),
-                            res.rawAmount.convert_to<std::string>(), hash, pnl)) {
+            if (!sellOutcome(wallet, res.tokenAddr,
+                             static_cast<long long>(res.usdNanos),
+                             res.rawAmount.convert_to<std::string>(), hash, pnl)) {
+            } else if (!full) {
+                locked = true;
+            } else {
                 if (pnl.avgEntryNanos > 0)
                     msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
                          + formatPriceUsd(cpp_int(pnl.avgEntryNanos)) + "</b>\n";
@@ -952,8 +956,13 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
 
         if (res.isBuy) {
             PriorBuy prior;
-                if (lastBuyOutcome(wallet, res.tokenAddr, hash,
-                                   static_cast<long long>(unitPriceNanos), prior)) {
+            const bool priorOk = lastBuyOutcome(wallet, res.tokenAddr, hash,
+                                                static_cast<long long>(unitPriceNanos), prior);
+            const bool priorShown = priorOk && ((prior.avgEntryNanos > 0 && prior.buyCount > 1) ||
+                (prior.changePercent != 0.0 && prior.changePercent < 1000000.0 && prior.changePercent > -1000000.0));
+            if (priorShown && !full) {
+                locked = true;
+            } else if (priorOk) {
                 if (prior.avgEntryNanos > 0 && prior.buyCount > 1)
                     msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>"
                          + formatPriceUsd(cpp_int(prior.avgEntryNanos)) + "</b>\n";
@@ -983,6 +992,7 @@ std::string buildAlertMessage(const std::string& label, const std::string& walle
                counterAmountStr + " " + counterSymbol + "</b>\n";
     }
     if (!tokenIsNative) msg+="\U0001F4DC " + tr(lang, "alert_contract") + ": <code>"+safeString(res.tokenAddr)+"</code>\n";
+    if (locked) msg += "\U0001F512 " + tr(lang, "alert_locked") + "\n";
     msg+="\U0001F194 TX: <code>"+safeString(hash,66)+"</code>\n";
     msg+="\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>"+safeString(label)+"</b>\n\n";
     msg+="\U0001F517 <a href=\""+chainCtx().explorerUrl+"/tx/"+hash+"\">" + tr(lang, "alert_transaction") + "</a>";
@@ -1031,8 +1041,16 @@ void dispatchAlert(const std::string& mA, const TxResult& res, const std::string
 
     bool anySent = false;
     for (auto& [labelLang, chatIds] : byLabelLang) {
-        std::string msg = buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second);
-        if (g_msgQueue.enqueueToRecipients(msg, chatIds)) anySent = true;
+        // Подписчикам — полный алерт, бесплатным — без цены входа и PnL.
+        const std::set<std::string> prem = premiumSubsetOf(chatIds);
+        std::vector<std::string> paid, free;
+        for (const auto& c : chatIds) (prem.count(c) ? paid : free).push_back(c);
+        if (!paid.empty() &&
+            g_msgQueue.enqueueToRecipients(buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, true), paid))
+            anySent = true;
+        if (!free.empty() &&
+            g_msgQueue.enqueueToRecipients(buildAlertMessage(labelLang.first, mA, res, hash, labelLang.second, false), free))
+            anySent = true;
     }
     if (anySent) {
         g_stats.alerts_sent.fetch_add(byLabelLang.size());
@@ -1055,7 +1073,7 @@ static std::string btcQty(long long sats) {
     return s;
 }
 
-std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, Lang lang) {
+std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, Lang lang, bool full = true) {
     std::string msg = "\U0001F4BC <b>" + safeString(label) + "</b>\n\n";
     switch (a.kind) {
         case BtcAlert::BUY:  msg += "\U0001F7E2 <b>" + tr(lang, "alert_buy") + "</b>"; break;
@@ -1070,14 +1088,17 @@ std::string buildBtcAlertMessage(const std::string& label, const BtcAlert& a, La
     if ((a.kind == BtcAlert::BUY || a.kind == BtcAlert::SELL) && a.priceNanos > 0)
         msg += "\U0001F4B5 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_buy_price" : "alert_sell_price") +
                ": <b>" + formatPriceUsd(cpp_int(a.priceNanos)) + "</b>\n";
-    if (a.avgEntryNanos > 0 && (a.kind == BtcAlert::SELL || a.priorBuys > 1))
+    // Цена входа и PnL — подписчику; бесплатному — строка, что они есть.
+    const bool hasAvg = a.avgEntryNanos > 0 && (a.kind == BtcAlert::SELL || a.priorBuys > 1);
+    if (full && hasAvg)
         msg += "\U0001F4CA " + tr(lang, "alert_avg_entry") + ": <b>" + formatPriceUsd(cpp_int(a.avgEntryNanos)) + "</b>\n";
-    if (a.hasPnl)
+    if (full && a.hasPnl)
         msg += std::string(a.pnlNanos >= 0 ? "\U0001F4C8 " : "\U0001F4C9 ") + tr(lang, "alert_trade_pnl") + ": <b>" +
                formatUsdNanosSigned(a.pnlNanos, true) + "</b> (" + formatPercent(a.pnlPct, true) + ")\n";
     if (!a.ex.empty())
         msg += "\U0001F3E6 " + tr(lang, a.kind == BtcAlert::BUY ? "alert_from_exchange" : "alert_to_exchange") +
                ": <b>" + safeString(a.ex, 32) + "</b>\n";
+    if (!full && (hasAvg || a.hasPnl)) msg += "\U0001F512 " + tr(lang, "alert_locked") + "\n";
     msg += "\U0001F194 TX: <code>" + safeString(a.txid, 66) + "</code>\n";
     msg += "\U0001F4BC " + tr(lang, "alert_wallet") + ": <b>" + safeString(label) + "</b>\n\n";
     msg += "\U0001F517 <a href=\"https://mempool.space/tx/" + safeString(a.txid, 66) + "\">" +
@@ -1101,9 +1122,17 @@ void dispatchBtcAlert(const BtcAlert& a) {
     }
     if (byLabelLang.empty()) return;
     bool anySent = false;
-    for (auto& [labelLang, chatIds] : byLabelLang)
-        if (g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second), chatIds))
+    for (auto& [labelLang, chatIds] : byLabelLang) {
+        const std::set<std::string> prem = premiumSubsetOf(chatIds);
+        std::vector<std::string> paid, free;
+        for (const auto& c : chatIds) (prem.count(c) ? paid : free).push_back(c);
+        if (!paid.empty() &&
+            g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second, true), paid))
             anySent = true;
+        if (!free.empty() &&
+            g_msgQueue.enqueueToRecipients(buildBtcAlertMessage(labelLang.first, a, labelLang.second, false), free))
+            anySent = true;
+    }
     if (anySent) {
         g_stats.alerts_sent.fetch_add(byLabelLang.size());
         static const char* kinds[] = {"BUY", "SELL", "IN", "OUT"};
@@ -1655,6 +1684,7 @@ int main() {
     if (!initPremium(SERVICE_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
+    initLifecycle();
     loadTokenCache();
     loadPairCache();
     ensureNativePrice();
@@ -1683,6 +1713,12 @@ int main() {
     g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
     auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     auto ltp=std::chrono::steady_clock::now();
+    // Письма жизненного цикла и чистка истёкших подписок — уже в первом
+    // проходе: бот перезапускают часто, и без этого письмо о конце пробной
+    // недели могло ждать лишние полчаса. Повторов не будет: каждое письмо
+    // отмечается в lifecycle_sent до отправки.
+    auto llc=std::chrono::steady_clock::now()-std::chrono::minutes(10);
+    lcl=std::chrono::steady_clock::now()-std::chrono::minutes(30);
     auto lrt=std::chrono::steady_clock::now()-std::chrono::minutes(10);
     while (running.load(std::memory_order_relaxed)) {
         try {
@@ -1724,6 +1760,11 @@ int main() {
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
                 ensureNativePrice();
                 lrt=std::chrono::steady_clock::now();
+            }
+            // Письма жизненного цикла: конец пробной недели, продление, возврат.
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-llc).count()>=10) {
+                lifecycleTick();
+                llc=std::chrono::steady_clock::now();
             }
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {

@@ -7,9 +7,14 @@
  * отвечает владельцу на служебные команды.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include "ru.h"
+
+// Бесплатный тариф: алерты с первых трёх кошельков (основной, потом по дате
+// добавления). Тот же порядок и то же число — FREE_ALERT_WALLETS в API.
+constexpr size_t FREE_ALERT_WALLETS = 3;
 
 // Порог алерта новому человеку; дальше его меняют в приложении.
 constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
