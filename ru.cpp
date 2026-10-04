@@ -84,8 +84,6 @@ const std::unordered_map<std::string, Entry>& table() {
         {"menu_open_app", {"📱 Open App", "📱 Открыть приложение"}},
         {"tk_open_btn", {"🪙 Token details",
             "🪙 Подробнее о токене"}},
-        {"rs_gift", {"🎁 <b>14 days of Premium — on us</b>\n\nThe whole app is open again: alerts from all your wallets, whale trades with no delay, Hyperliquid futures, analytics and the daily digest. Nothing to pay — Premium is already on.",
-            "🎁 <b>Дарим 14 дней Премиума</b>\n\nВсё приложение снова открыто: алерты со всех ваших кошельков, сделки китов без задержки, фьючерсы Hyperliquid, аналитика и дайджест. Платить ничего не нужно — Премиум уже включён."}},
         {"tk_ready", {"🪙 <b>The Wallet Tracker token is ready to launch.</b>\n\nTokenomics, the smart contract address, the network and the launch date are in the app, under «Project token».\n\n⚠️ We publish the official contract address only there. Ignore any other addresses, presales and «airdrops».",
             "🪙 <b>Токен Wallet Tracker готов к запуску.</b>\n\nТокеномика, адрес смарт-контракта, сеть и дата запуска — в приложении, в разделе «Токен проекта».\n\n⚠️ Официальный адрес контракта мы публикуем только там. Любые другие адреса, «пресейлы» и «аирдропы» — подделка."}},
         {"dg_open_btn", {"📰 Open the digest",
