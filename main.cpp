@@ -1509,6 +1509,123 @@ void tokenCast(const std::string& owner, const std::string& arg) {
     }).detach();
 }
 
+/* Перезапуск пробы: всем, кроме сервисного аккаунта, — Премиум на
+   TRIAL_RESET_DAYS дней от сегодня. Срок не сокращается никому: у кого
+   оплачено дольше, тот остаётся при своём. Отметка пробы (trial_granted)
+   ставится на сегодня, а письмо «проба кончается через 2 дня» снова
+   разрешено — иначе после новой пробы не было бы ни письма, ни скидки на
+   48 часов (intro_until в API считает её от конца этой пробы).
+   /trialreset — предпросмотр, /trialreset go — выдать и написать всем,
+   /trialreset go silent — выдать без писем. */
+constexpr long long TRIAL_RESET_DAYS = 14;
+
+void trialReset(const std::string& owner, const std::string& arg) {
+    const long long now = static_cast<long long>(time(nullptr));
+    const long long end = now + TRIAL_RESET_DAYS * 86400;
+    long long total = 0, active = 0, longer = 0;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "SELECT COUNT(*), "
+                "  COALESCE(SUM(is_premium=1 AND premium_expire>?1), 0), "
+                "  COALESCE(SUM(is_premium=1 AND premium_expire>=?2), 0) "
+                "FROM users WHERE chat_id<>?3")) {
+            sqlite3_bind_int64(s, 1, now);
+            sqlite3_bind_int64(s, 2, end);
+            sqlite3_bind_text(s, 3, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                total = sqlite3_column_int64(s, 0);
+                active = sqlite3_column_int64(s, 1);
+                longer = sqlite3_column_int64(s, 2);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    const bool go = arg == "go" || arg == "go silent";
+    const bool silent = arg == "go silent";
+    const Lang ol = langFromCode(getUserLanguage(owner));
+    if (!go) {
+        sendMsg(owner,
+            "🎁 <b>Перезапуск пробы: " + std::to_string(TRIAL_RESET_DAYS) + " дней Премиума всем</b>\n\n"
+            "Пользователей: <b>" + std::to_string(total) + "</b> (сервисный аккаунт не считается)\n"
+            "Сейчас с Премиумом: <b>" + std::to_string(active) + "</b>\n"
+            "Оплачено дольше " + std::to_string(TRIAL_RESET_DAYS) + " дней — срок не тронем: <b>" +
+            std::to_string(longer) + "</b>\n"
+            "Получат Премиум до " + std::to_string(TRIAL_RESET_DAYS) + " дней от сегодня: <b>" +
+            std::to_string(total - longer) + "</b>\n\n"
+            "Письмо (ваш язык):\n\n" + tr(ol, "rs_gift") +
+            "\n\nВыдать и написать всем: <code>/trialreset go</code>\n"
+            "Выдать без писем: <code>/trialreset go silent</code>",
+            openAppKeyboard(ol, "", "menu_open_app"));
+        return;
+    }
+    std::vector<std::string> chats;
+    bool ok = true;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        auto run = [&](const char* sql, bool bindEnd) {
+            sqlite3_stmt* s;
+            if (!prepareOrLog(db, &s, sql)) { ok = false; return; }
+            int i = 1;
+            sqlite3_bind_int64(s, i++, now);
+            if (bindEnd) sqlite3_bind_int64(s, i++, end);
+            sqlite3_bind_text(s, i, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) != SQLITE_DONE) ok = false;
+            sqlite3_finalize(s);
+        };
+        if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) ok = false;
+        // Письмо — только тем, кому срок правда прибавится: у кого оплачено
+        // дольше, подарок ничего не меняет.
+        sqlite3_stmt* q;
+        if (ok && prepareOrLog(db, &q,
+                "SELECT chat_id FROM users WHERE chat_id<>?1 AND NOT (is_premium=1 AND premium_expire>=?2)")) {
+            sqlite3_bind_text(q, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(q, 2, end);
+            while (sqlite3_step(q) == SQLITE_ROW) chats.push_back(safeColumnText(q, 0));
+            sqlite3_finalize(q);
+        }
+        if (ok) run(
+            "UPDATE users SET "
+            "  premium_start = CASE WHEN is_premium=1 AND premium_expire>?1 THEN premium_start ELSE ?1 END, "
+            "  premium_expire = MAX(CASE WHEN is_premium=1 AND premium_expire>?1 THEN premium_expire ELSE 0 END, ?2), "
+            "  is_premium = 1 "
+            "WHERE chat_id<>?3", true);
+        if (ok) run("INSERT OR REPLACE INTO trial_granted(chat_id, granted_at) "
+                    "SELECT chat_id, ?1 FROM users WHERE chat_id<>?2", false);
+        if (ok && sqlite3_exec(db, "DELETE FROM lifecycle_sent WHERE kind='trial_d5'",
+                               nullptr, nullptr, nullptr) != SQLITE_OK) ok = false;
+        sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
+    }
+    if (!ok) {
+        std::cerr << "[TRIAL] reset failed: " << sqlite3_errmsg(db) << std::endl;
+        sendMsg(owner, "⚠️ Перезапуск пробы не удался — база не изменена. Подробности в логе бота.");
+        return;
+    }
+    refreshWatchers();
+    std::cout << "[TRIAL] reset: " << chats.size() << " users got " << TRIAL_RESET_DAYS << " days" << std::endl;
+    const std::string kept = longer > 0
+        ? " У " + std::to_string(longer) + " оплачено дольше — их срок не тронут." : "";
+    if (silent) {
+        sendMsg(owner, "🎁 Готово: Премиум на " + std::to_string(TRIAL_RESET_DAYS) + " дней у " +
+                       std::to_string(chats.size()) + " пользователей." + kept + " Писем не отправляли.");
+        return;
+    }
+    sendMsg(owner, "🎁 Премиум выдан " + std::to_string(chats.size()) + " пользователям." + kept +
+                   " Рассылка началась.");
+    std::thread([chats, owner]() {
+        size_t sent = 0;
+        for (const auto& chat : chats) {
+            const Lang lang = langFromCode(getUserLanguage(chat));
+            if (sendMsg(chat, tr(lang, "rs_gift"), openAppKeyboard(lang, "", "menu_open_app")).ok) ++sent;
+            // Telegram пропускает около 30 сообщений в секунду.
+            std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        }
+        sendMsg(owner, "🎁 Рассылка о подарке закончена: доставлено " + std::to_string(sent) + " из " +
+                       std::to_string(chats.size()) + ".");
+    }).detach();
+}
+
 bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
     if (txt=="/health") {
@@ -1734,6 +1851,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     }
     else if (txt.rfind("/tokencast", 0) == 0) {
         tokenCast(cid, trim(txt.substr(10)));
+    }
+    else if (txt.rfind("/trialreset", 0) == 0) {
+        trialReset(cid, trim(txt.substr(11)));
     }
     else if (handleBeneficiaryCommand(cid, txt)) {
     }
