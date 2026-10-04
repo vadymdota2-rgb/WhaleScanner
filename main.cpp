@@ -492,6 +492,10 @@ void initDB() {
                 chat_id TEXT PRIMARY KEY,
                 at INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS token_subs (
+                chat_id TEXT PRIMARY KEY,
+                at INTEGER NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS digest_mute (
                 chat_id TEXT PRIMARY KEY,
                 at INTEGER NOT NULL
@@ -544,7 +548,11 @@ std::string funnelStatsLine() {
     // Доля купивших от открывших — главное число воронки.
     if (n["open"] > 0)
         out << " (" << std::fixed << std::setprecision(1) << 100.0 * n["paid"] / n["open"] << "% открывших)";
-    out << "\nпробных недель: " << n["trial"] << " · по приглашению: " << n["ref"];
+    out << "\nпробных: " << n["trial"] << " · по приглашению: " << n["ref"];
+    if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM token_subs")) {
+        if (sqlite3_step(s) == SQLITE_ROW) out << " · ждут токен: " << sqlite3_column_int64(s, 0);
+        sqlite3_finalize(s);
+    }
     if (prepareOrLog(db, &s,
             "SELECT src, COUNT(DISTINCT chat_id) c FROM funnel_events WHERE at >= ? AND ev='paywall' "
             "GROUP BY src ORDER BY c DESC LIMIT 8")) {
@@ -1456,6 +1464,51 @@ void alertFlushLoop() {
 /* Служебные команды владельца: состояние сканера, импорт кошельков в
    сервисный аккаунт, снятие бана. Остальным они не видны — на любой текст
    человек получает кнопку приложения. */
+/* Уведомление о запуске токена — тем, кто нажал «Сообщить о запуске» в
+   приложении (token_subs). Без аргумента — предпросмотр владельцу и число
+   получателей, ничего не уходит. «go» — разослать готовый текст на языке
+   каждого (tk_ready): подробности — токеномика, контракт, сеть, дата — живут
+   в приложении, в разделе «Токен проекта», куда ведёт кнопка. «go <текст>» —
+   разослать свой текст как есть (на одном языке). */
+void tokenCast(const std::string& owner, const std::string& arg) {
+    std::vector<std::string> subs;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT chat_id FROM token_subs ORDER BY at")) {
+            while (sqlite3_step(s) == SQLITE_ROW) subs.push_back(safeColumnText(s, 0));
+            sqlite3_finalize(s);
+        }
+    }
+    const bool go = arg == "go" || arg.rfind("go ", 0) == 0;
+    const std::string custom = arg.size() > 3 && go ? trim(arg.substr(3)) : "";
+    const Lang ol = langFromCode(getUserLanguage(owner));
+    if (!go) {
+        sendMsg(owner, "🪙 <b>Рассылка о токене</b>\nПолучателей: <b>" + std::to_string(subs.size()) +
+                       "</b>\n\nТак увидят (ваш язык):\n\n" + tr(ol, "tk_ready") +
+                       "\n\nОтправить всем: <code>/tokencast go</code>\nСвоим текстом: <code>/tokencast go текст</code>",
+                openAppKeyboard(ol, "token", "tk_open_btn"));
+        return;
+    }
+    if (subs.empty()) {
+        sendMsg(owner, "🪙 Подписавшихся на токен пока нет — отправлять некому.");
+        return;
+    }
+    sendMsg(owner, "🪙 Рассылка о токене началась: " + std::to_string(subs.size()) + " получателей.");
+    std::thread([subs, custom, owner]() {
+        size_t ok = 0;
+        for (const auto& chat : subs) {
+            const Lang lang = langFromCode(getUserLanguage(chat));
+            if (sendMsg(chat, custom.empty() ? tr(lang, "tk_ready") : custom,
+                        openAppKeyboard(lang, "token", "tk_open_btn")).ok) ++ok;
+            // Telegram пропускает около 30 сообщений в секунду.
+            std::this_thread::sleep_for(std::chrono::milliseconds(45));
+        }
+        sendMsg(owner, "🪙 Рассылка о токене закончена: доставлено " + std::to_string(ok) + " из " +
+                       std::to_string(subs.size()) + ".");
+    }).detach();
+}
+
 bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
     if (txt=="/health") {
@@ -1678,6 +1731,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
         } else {
             sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
         }
+    }
+    else if (txt.rfind("/tokencast", 0) == 0) {
+        tokenCast(cid, trim(txt.substr(10)));
     }
     else if (handleBeneficiaryCommand(cid, txt)) {
     }
