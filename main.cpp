@@ -548,7 +548,7 @@ std::string funnelStatsLine() {
     // Доля купивших от открывших — главное число воронки.
     if (n["open"] > 0)
         out << " (" << std::fixed << std::setprecision(1) << 100.0 * n["paid"] / n["open"] << "% открывших)";
-    out << "\nпробных: " << n["trial"] << " · по приглашению: " << n["ref"];
+    out << "\nпробных: " << n["trial"] << " · по приглашению: " << n["ref"] << " · бонусы за соцсети: " << n["bonus"];
     if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM token_subs")) {
         if (sqlite3_step(s) == SQLITE_ROW) out << " · ждут токен: " << sqlite3_column_int64(s, 0);
         sqlite3_finalize(s);
