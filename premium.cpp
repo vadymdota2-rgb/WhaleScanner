@@ -182,6 +182,17 @@ bool initPremium(const std::string& serviceChatId) {
         if (aerr) sqlite3_free(aerr);
     }
 
+    // Сервисному аккаунту Премиума не бывает: старую отметку в базе снимаем,
+    // чтобы он не считался подписчиком ни в /stats, ни в API.
+    if (ok && !g_serviceChatId.empty()) {
+        sqlite3_stmt* s = nullptr;
+        if (prepareOrLog(db, &s, "UPDATE users SET is_premium=0, premium_expire=0 WHERE chat_id=?")) {
+            sqlite3_bind_text(s, 1, g_serviceChatId.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+
     g_premiumSchemaOk = ok;
     if (ok) {
         std::cout << "[PREMIUM] Module initialized (plans: " << STAR_PLANS[0].stars << " Stars / "
@@ -199,9 +210,6 @@ std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds) {
 
     const long long now = static_cast<long long>(time(nullptr));
 
-    for (const auto& c : chatIds)
-        if (!g_serviceChatId.empty() && c == g_serviceChatId) out.insert(c);
-
     std::string sql =
         "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire>? AND chat_id IN (";
     for (size_t i = 0; i < chatIds.size(); i++) sql += (i ? ",?" : "?");
@@ -215,12 +223,18 @@ std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds) {
         sqlite3_bind_text(s, static_cast<int>(i + 2), chatIds[i].c_str(), -1, SQLITE_TRANSIENT);
     while (sqlite3_step(s) == SQLITE_ROW) out.insert(safeColumnText(s, 0));
     sqlite3_finalize(s);
+    // Сервисный аккаунт — не подписчик, даже если в базе осталась отметка.
+    if (!g_serviceChatId.empty()) out.erase(g_serviceChatId);
     return out;
 }
 
+/* Сервисный аккаунт держит всю базу кошельков, но Премиума у него нет и быть
+   не может. Всё, что ему нужно, сделано отдельно: кошельки без лимита
+   (addUserWhale), сканирование всех его адресов (refreshWatchers), и алерты
+   ему не уходят вовсе. */
 bool isPremium(const std::string& chatId) {
 
-    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return true;
+    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return false;
 
     long long now = static_cast<long long>(time(nullptr));
 
@@ -458,6 +472,7 @@ void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
 
 bool grantPremiumDays(const std::string& chatId, int days) {
     if (chatId.empty() || days <= 0 || days > 3650) return false;
+    if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return false;
     if (!g_premiumSchemaOk) return false;
 
     ensureUser(chatId);
