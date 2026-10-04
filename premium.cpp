@@ -48,10 +48,29 @@ std::string withDays(std::string text, int days) {
     return text;
 }
 
+// Нагрузка бывает с хвостом после «:» — у вводной цены там покупатель и
+// срок (introBinding). Тариф определяет начало.
 const StarPlan* starPlan(const std::string& payload) {
+    const std::string base = payload.substr(0, payload.find(':'));
     for (const auto& p : STAR_PLANS)
-        if (payload == p.payload) return &p;
+        if (base == p.payload) return &p;
     return nullptr;
+}
+
+/* Вводная цена привязана к человеку и к сроку: «premium_30_intro:<chat>:<до>».
+   Ссылку на счёт можно сохранить или переслать, а Telegram её не гасит —
+   без привязки по ней платили бы 150 звёзд вместо 250 кто угодно и сколько
+   угодно раз. Скидка — только тому, кому её выдал API, и только в её окно
+   (плюс INTRO_GRACE_SEC: счёт могли открыть за минуту до конца). */
+constexpr long long INTRO_GRACE_SEC = 900;
+bool introBinding(const std::string& payload, std::string& chat, long long& until) {
+    const size_t a = payload.find(':');
+    if (a == std::string::npos) return false;
+    const size_t b = payload.find(':', a + 1);
+    if (b == std::string::npos) return false;
+    chat = payload.substr(a + 1, b - a - 1);
+    try { until = std::stoll(payload.substr(b + 1)); } catch (...) { return false; }
+    return !chat.empty() && until > 0;
 }
 
 // Цена подписки в USD₮ и срок жизни счёта. Оплата монетой TON убрана: цена
@@ -479,8 +498,17 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     const long long now = static_cast<long long>(time(nullptr));
     std::unique_lock<std::mutex> lock(dbMutex);
 
+    // Чтение срока и запись нового — одной транзакцией. Без неё API, в ту же
+    // секунду прибавивший дни за бонус или приглашение (extend_premium), мог
+    // оказаться между чтением и записью — и одно из продлений затиралось.
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM] grant: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    auto fail = [&]() { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; };
+
     int flag = 0; long long start = 0, expire = 0;
-    if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
+    if (!readPremiumRowLocked(chatId, flag, start, expire)) return fail();
 
     const bool active = (flag != 0 && expire > now);
     const long long base = active ? expire : now;
@@ -488,7 +516,7 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     if (base > LLONG_MAX - addSec) {
         std::cerr << "[PREMIUM] grant: expire overflow for " << chatId
                   << " (base=" << base << "), rejected" << std::endl;
-        return false;
+        return fail();
     }
     const long long newExpire = base + addSec;
     const long long newStart  = active ? (start > 0 ? start : now) : now;
@@ -496,13 +524,17 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
         "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?"))
-        return false;
+        return fail();
     sqlite3_bind_int64(s, 1, newStart);
     sqlite3_bind_int64(s, 2, newExpire);
     sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
     const int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) return false;
+    if (rc != SQLITE_DONE) return fail();
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM] grant: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        return fail();
+    }
 
     lock.unlock();
     refreshWatchers();
@@ -637,9 +669,10 @@ void handlePreCheckoutQuery(const json& q) {
     }
 
     Lang lang = Lang::EN;
+    std::string buyerChatId;
     if (q.contains("from") && q["from"].is_object() &&
         q["from"].contains("id") && q["from"]["id"].is_number_integer()) {
-        std::string buyerChatId = std::to_string(q["from"]["id"].get<long long>());
+        buyerChatId = std::to_string(q["from"]["id"].get<long long>());
         lang = langFromCode(getUserLanguage(buyerChatId));
     }
 
@@ -648,11 +681,24 @@ void handlePreCheckoutQuery(const json& q) {
     bool schemaReady = g_premiumSchemaOk.load();
     const StarPlan* plan = starPlan(payload);
     bool valid = parseOk && schemaReady && plan && currency == "XTR" && amount == plan->stars;
+    // Вводная цена — только своему покупателю и только в её окно.
+    bool introGone = false;
+    if (valid && std::string(plan->payload) == "premium_30_intro") {
+        std::string introChat;
+        long long introUntil = 0;
+        const long long now = static_cast<long long>(time(nullptr));
+        if (!introBinding(payload, introChat, introUntil) || introChat != buyerChatId ||
+            now > introUntil + INTRO_GRACE_SEC) {
+            valid = false;
+            introGone = true;
+        }
+    }
     if (valid) {
         a["ok"] = true;
     } else {
         a["ok"] = false;
-        a["error_message"] = schemaReady ? tr(lang, "invoice_unknown_product") : tr(lang, "payments_unavailable");
+        a["error_message"] = introGone ? tr(lang, "intro_gone")
+                           : schemaReady ? tr(lang, "invoice_unknown_product") : tr(lang, "payments_unavailable");
         std::cerr << "[PREMIUM] pre_checkout rejected: schemaReady=" << schemaReady
                   << " payload=" << payload << " currency=" << currency << " amount=" << amount << std::endl;
     }

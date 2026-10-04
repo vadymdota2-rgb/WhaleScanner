@@ -133,6 +133,8 @@ const std::unordered_map<std::string, Entry>& table() {
         {"ton_paid_ok", {"✅ Payment received — Premium is active for {n} days.\n\nAll wallets, Hyperliquid futures and the full Top-100 are back on.",
                          "✅ Оплата получена — премиум активен {n} дней.\n\nВсе кошельки, фьючерсы Hyperliquid и полный Топ-100 снова включены."}},
         {"invoice_unknown_product", {"Unknown product. Please try again.", "Неизвестный товар. Попробуйте ещё раз."}},
+        {"intro_gone", {"The first-month discount is no longer available. Open Premium in the app to see the current prices.",
+            "Скидка на первый месяц больше недоступна. Откройте Премиум в приложении — там актуальные цены."}},
         {"payments_unavailable", {"Payments are temporarily unavailable. Please try again later.",
                                   "Платежи временно недоступны. Пожалуйста, попробуйте позже."}},
         {"payment_success_title", {"✅ Payment successful!", "✅ Оплата прошла успешно!"}},
