@@ -751,22 +751,8 @@ void refreshWatchers() {
     constexpr long long MARKET_WATCH_GRACE_SEC = 30LL * 86400LL;
     const long long graceAfter = now - MARKET_WATCH_GRACE_SEC;
     bool queryOk = false;
-    size_t bscOff = 0, hlOff = 0;
+    size_t bscOff = 0;
 
-    std::unordered_set<std::string> hasHlFill;
-    {
-        std::lock_guard<std::mutex> hlLock(hl::g_hlDbMutex);
-        if (hl::g_hlDb) {
-            sqlite3_stmt* hs = nullptr;
-            if (prepareOrLog(hl::g_hlDb, &hs, "SELECT DISTINCT lower(wallet) FROM hl_fills")) {
-                while (sqlite3_step(hs) == SQLITE_ROW) {
-                    std::string w = safeColumnText(hs, 0);
-                    if (!w.empty()) hasHlFill.insert(std::move(w));
-                }
-                sqlite3_finalize(hs);
-            }
-        }
-    }
 
     {
         std::lock_guard<std::mutex> l(dbMutex); sqlite3_stmt* s;
@@ -793,7 +779,6 @@ void refreshWatchers() {
                 long long createdAt = sqlite3_column_int64(s,5);
                 bool hasSpot = sqlite3_column_int(s,6) != 0;
                 const bool inGrace = (createdAt <= 0) || (createdAt >= graceAfter);
-                const bool hasHl = hasHlFill.count(addr) > 0;
 
                 if (uid != prevUser) { prevUser = uid; loadedForUser = 0; }
                 if (!prem && uid != SERVICE_CHAT_ID && loadedForUser >= FREE_ALERT_WALLETS) continue;
@@ -804,16 +789,20 @@ void refreshWatchers() {
                 // подписался бы на поток несуществующего счёта.
                 if (addr.rfind("0x", 0) != 0) continue;
 
+                // BSC: «тёплые» (есть сделки или добавлены меньше 30 дней
+                // назад) ловятся и по входящим транзакциям. «Холодные» — только
+                // по своим исходящим (processBlock): своп кошелёк всегда
+                // начинает сам, так он вернётся в тёплые, когда снова торгует.
                 if (hasSpot || inGrace) {
                     bscActive->insert(addr);
                 } else {
                     ++bscOff;
                 }
-                if (hasHl || inGrace) {
-                    hlActive->insert(addr);
-                } else {
-                    ++hlOff;
-                }
+                // Hyperliquid: смотрим все. Общий поток сделок бесплатный,
+                // а сделки кошелька подтягиваются, только когда он торгует.
+                // Раньше брали лишь тех, у кого уже были сделки в hl_fills, —
+                // остальные не попадали в поток и не могли туда попасть.
+                hlActive->insert(addr);
             }
             queryOk = (stepRc == SQLITE_DONE);
             if (!queryOk) std::cerr << "[WATCHERS] refresh query step failed mid-read (rc=" << stepRc << "): " << sqlite3_errmsg(db) << std::endl;
@@ -827,8 +816,7 @@ void refreshWatchers() {
     std::cout << "[WATCHERS] total=" << m->size()
               << " bsc_active=" << bscActive->size()
               << " hl_active=" << hlActive->size()
-              << " bsc_cold_links=" << bscOff
-              << " hl_cold_links=" << hlOff << std::endl;
+              << " bsc_cold_links=" << bscOff << std::endl;
     {
         std::unordered_set<std::string> btc;
         for (const auto& [addr, ws] : *m) if (addr.rfind("0x", 0) != 0) btc.insert(addr);
@@ -1559,7 +1547,8 @@ std::string serviceBaseSummary(std::string& totals) {
     t << "📦 <b>Вся база сервисного аккаунта</b>"
       << "\nBSC и Hyperliquid (адрес один на обе сети): <b>" << thousands(evm) << "</b>"
       << "\n   импорт: " << thousands(evm - evmAuto) << " · найдено поиском: " << thousands(evmAuto)
-      << "\n   следим сейчас: на BSC " << thousands(onBsc) << " · на Hyperliquid " << thousands(onHl)
+      << "\n   следим: на Hyperliquid все " << thousands(onHl) << " · на BSC постоянно " << thousands(onBsc)
+      << ", остальные " << thousands(evm - onBsc) << " — по их собственным транзакциям"
       << "\nBitcoin: <b>" << thousands(btc) << "</b>"
       << "\n   импорт: " << thousands(btc - btcAuto) << " · найдено поиском: " << thousands(btcAuto)
       << "\nИмпорт за бездействие не удаляется никогда; убрать его может только бан бота.";
@@ -1695,6 +1684,11 @@ bool processBlock(long long bn) {
         if (bscActive && watchers) {
             if (bscActive->count(from) && watchers->count(from)) mA=from;
             else if (bscActive->count(to) && watchers->count(to)) mA=to;
+            // «Холодный» кошелёк базы сам отправил транзакцию — проверяем:
+            // окажется своп, сделка запишется, и при следующей сборке списка
+            // он снова тёплый. Входящие холодным не смотрим: пыль и рассылки
+            // на мёртвые адреса стоили бы запросов впустую.
+            else if (watchers->count(from)) mA=from;
         }
         if (mA.empty()) continue;
         if (isTxProcessed(hash)) continue;
@@ -1793,11 +1787,18 @@ void dbMaintenanceLoop() {
             {
                 static std::string lastFp = watchersFingerprint();
                 const std::string fp = watchersFingerprint();
+                // Раз в час — и без изменений: проснувшиеся холодные кошельки
+                // (первая сделка за долгое время) переходят в тёплые.
+                static auto lastFull = std::chrono::steady_clock::now();
                 if (fp != lastFp) {
                     lastFp = fp;
                     refreshWatchers();
+                    lastFull = std::chrono::steady_clock::now();
                     std::cout << "[WATCHERS] база изменилась мимо бота — список наблюдения обновлён"
                               << std::endl;
+                } else if (std::chrono::steady_clock::now() - lastFull >= std::chrono::hours(1)) {
+                    refreshWatchers();
+                    lastFull = std::chrono::steady_clock::now();
                 }
             }
 
