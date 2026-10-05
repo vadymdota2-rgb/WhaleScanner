@@ -11,6 +11,7 @@
 #include <sqlite3.h>
 
 #include "telegram.h"
+#include "hyperliquid.h"
 #include "utils.h"
 
 extern sqlite3* db;
@@ -180,6 +181,10 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         } else {
             t << money(minUsd()[i]);
         }
+        // Сегодняшнее число берётся из базы при запуске: в нём и то, что
+        // добавили до лимита (версии без лимита), поэтому бывает больше.
+        if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
+        if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\nВключить: <code>/autobase bsc on</code>"

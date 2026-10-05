@@ -1617,7 +1617,16 @@ const char* const HL_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainn
 const double HL_LB_MIN_ACCOUNT = autoMinUsd(AutoNet::HL);
 constexpr double HL_LB_MAX_TURNOVER = 30.0;
 constexpr long long HL_LB_EVERY_SEC = 24 * 3600;
-constexpr long long HL_LB_FIRST_DELAY_SEC = 300;
+constexpr long long HL_LB_FIRST_DELAY_SEC = 60;
+// Не скачался — повтор скоро, а не через сутки: без рейтинга стоят оба
+// источника (крупные сделки сверяются с ним).
+constexpr long long HL_LB_RETRY_SEC = 600;
+
+// Состояние рейтинга — для /autobase: когда загружен, сколько прошли отбор,
+// когда следующая попытка.
+std::mutex g_lbStatMutex;
+long long g_lbOkAt = 0, g_lbFailAt = 0, g_lbNextAt = 0;
+size_t g_lbCount = 0;
 
 // Число после ключа в куске [from, to): "key":"123.4" или "key": 123.4.
 double lbNum(const std::string& s, size_t from, size_t to, const char* key) {
@@ -1641,10 +1650,12 @@ bool autoAdd(const std::string& addr, const char* why) {
 }
 
 int leaderboardSweep() {
-    const std::string body = http(HL_LEADERBOARD_URL, "", 90);
-    if (body.size() < 1000) {
-        std::cerr << "[HL] рейтинг трейдеров не скачался" << std::endl;
-        return 0;
+    const std::string body = http(HL_LEADERBOARD_URL, "", 120);
+    if (body.size() < 1000 || body.find("\"ethAddress\"") == std::string::npos) {
+        std::cerr << "[HL] рейтинг трейдеров не скачался (" << body.size() << " байт)" << std::endl;
+        std::lock_guard<std::mutex> l(g_lbStatMutex);
+        g_lbFailAt = nowSec();
+        return -1;
     }
     struct Cand { std::string addr; double acct; };
     std::vector<Cand> cands;
@@ -1668,6 +1679,11 @@ int leaderboardSweep() {
             }
         }
         pos = next;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_lbStatMutex);
+        g_lbOkAt = nowSec();
+        g_lbCount = good.size();
     }
     {
         std::lock_guard<std::mutex> l(g_autoMutex);
@@ -1704,8 +1720,13 @@ void autoLoop() {
         if (!autoEnabled(AutoNet::HL)) {
             nextSweep = std::max(nextSweep, nowSec() + 60);
         } else if (nowSec() >= nextSweep) {
-            pending += leaderboardSweep();
-            nextSweep = nowSec() + HL_LB_EVERY_SEC;
+            const int r = leaderboardSweep();
+            if (r > 0) pending += r;
+            nextSweep = nowSec() + (r < 0 ? HL_LB_RETRY_SEC : HL_LB_EVERY_SEC);
+        }
+        {
+            std::lock_guard<std::mutex> l(g_lbStatMutex);
+            g_lbNextAt = nextSweep;
         }
         if (pending > 0 && nowSec() - lastRefresh >= 60) {
             refreshWatchers();
@@ -1914,6 +1935,30 @@ void feedLoop() {
 }
 
 using namespace hl;
+
+std::string hlAutoStatus() {
+    std::lock_guard<std::mutex> l(g_lbStatMutex);
+    auto hhmm = [](long long t) {
+        char b[16];
+        const time_t tt = static_cast<time_t>(t);
+        struct tm g;
+        gmtime_r(&tt, &g);
+        strftime(b, sizeof b, "%H:%M", &g);
+        return std::string(b);
+    };
+    const long long now = nowSec();
+    std::string out;
+    if (g_lbOkAt > 0)
+        out = "рейтинг трейдеров обновлён в " + hhmm(g_lbOkAt) + " UTC, прошли отбор " + std::to_string(g_lbCount);
+    else
+        out = "рейтинг трейдеров ещё не загружен";
+    if (g_lbFailAt > g_lbOkAt) out += "; не скачался в " + hhmm(g_lbFailAt) + " UTC";
+    if (g_lbNextAt > now) {
+        const long long m = (g_lbNextAt - now + 59) / 60;
+        out += "; следующая загрузка через " + (m >= 60 ? std::to_string(m / 60) + " ч" : std::to_string(m) + " мин");
+    }
+    return out;
+}
 
 void hlAutoForget(const std::string& addressLower) {
     std::lock_guard<std::mutex> l(g_autoMutex);
