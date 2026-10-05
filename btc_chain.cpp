@@ -26,6 +26,7 @@
  *   там входы чужие друг другу.
  */
 #include "btc_chain.h"
+#include "autobase.h"
 
 #include <algorithm>
 #include <array>
@@ -110,9 +111,9 @@ const long long WATCH_MAX = [] {
     const long long n = (v && *v) ? std::atoll(v) : 0;
     return n > 0 ? n : 0;
 }();
-// Кто попадает в базу сам: вывел с биржи от десяти биткоинов за раз и не
-// похож на сервис.
-const long long AUTO_MIN_SATS = envSats("WHALE_BTC_AUTO_MIN", 10.0);
+// Кто попадает в базу сам: вывел с биржи от одного биткоина за раз и не
+// похож на сервис. Не больше 100 в сутки, поиск выключается /autobase.
+const long long AUTO_MIN_SATS = envSats("WHALE_BTC_AUTO_MIN", 1.0);
 // Движения кошельков базы пишутся с пятидесяти долларов — тот же порог, что
 // у сделок BSC (MIN_TRADE_USD_NANOS в ranking.cpp) и у алертов. Цены нет —
 // запасной порог в монетах: тысячная биткоина.
@@ -1063,6 +1064,7 @@ private:
     // транзакций. Без потолка, если WATCH_MAX не задан.
     void autoWatch() {
         if (autoCand_.empty()) return;
+        if (!autoRoom(AutoNet::BTC)) return;  // поиск выключен или лимит дня выбран
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         sqlite3_stmt* q = nullptr;
         sqlite3_stmt* ins = nullptr;
@@ -1073,6 +1075,7 @@ private:
         }
         int added = 0;
         for (const auto& a : autoCand_) {
+            if (!autoRoom(AutoNet::BTC)) break;
             {
                 std::lock_guard<std::mutex> w(g_watchMutex);
                 if (WATCH_MAX > 0 && static_cast<long long>(g_watch.size()) >= WATCH_MAX) break;
@@ -1088,6 +1091,7 @@ private:
                 std::lock_guard<std::mutex> w(g_watchMutex);
                 g_watch.insert(a);
                 ++added;
+                autoCounted(AutoNet::BTC);
             }
         }
         sqlite3_finalize(q);
@@ -1442,8 +1446,21 @@ void startBtcLoop() {
         g_btcRunning.store(false);
         return;
     }
+    // Сколько кошельков поиск добавил сегодня — для суточного лимита.
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (sqlite3_prepare_v2(g_btcDb, "SELECT COUNT(*) FROM btc_watch WHERE src='auto' AND at>=?", -1, &s,
+                               nullptr) == SQLITE_OK) {
+            sqlite3_bind_int64(s, 1, static_cast<long long>(time(nullptr)) / 86400 * 86400);
+            if (sqlite3_step(s) == SQLITE_ROW) autoSeed(AutoNet::BTC, sqlite3_column_int(s, 0));
+            sqlite3_finalize(s);
+        }
+    }
     g_btcThread = std::thread(btcLoop);
 }
+
+double btcAutoMinBtc() { return static_cast<double>(AUTO_MIN_SATS) / 1e8; }
 
 void stopBtc() {
     g_btcRunning.store(false);

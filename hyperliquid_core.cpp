@@ -32,6 +32,7 @@
 #include "message_queue.h"
 #include "premium.h"
 #include "telegram.h"
+#include "autobase.h"
 
 using json = nlohmann::json;
 
@@ -1575,21 +1576,12 @@ void waitReadable(CURL* c, int timeoutMs) {
    • раз в сутки — публичный рейтинг трейдеров (stats-data, отдельный адрес,
      в бюджет не входит): счёт, объём за неделю и месяц у 47 тыс. трейдеров;
    • в реальном времени — сделки из потока, который бот и так слушает:
-     сделка от HL_AUTO_MIN_USD (по умолчанию $100 тыс., WHALE_HL_AUTO_MIN)
+     сделка от autoMinUsd(HL) (по умолчанию $10 тыс., WHALE_HL_AUTO_MIN)
      незнакомого кошелька. «Не сервис» проверяем по тому же рейтингу в
      памяти, без запроса: кошелёк должен в нём быть и пройти отбор.
-   За сутки — не больше HL_AUTO_DAILY новых кошельков на оба источника
-   (WHALE_HL_AUTO_DAILY, по умолчанию 100): следить за каждым — уже бюджет. */
-const long long HL_AUTO_MIN_NANOS = [] {
-    const char* v = std::getenv("WHALE_HL_AUTO_MIN");
-    const double usd = (v && *v) ? std::atof(v) : 100000.0;
-    return static_cast<long long>((usd > 0 ? usd : 100000.0) * 1e9);
-}();
-const int HL_AUTO_DAILY = [] {
-    const char* v = std::getenv("WHALE_HL_AUTO_DAILY");
-    const int n = (v && *v) ? std::atoi(v) : 100;
-    return n > 0 ? n : 100;
-}();
+   Лимит в сутки (100 на оба источника) и выключатель — autobase.h,
+   команда /autobase: следить за каждым кошельком — уже бюджет. */
+const long long HL_AUTO_MIN_NANOS = static_cast<long long>(autoMinUsd(AutoNet::HL) * 1e9);
 constexpr size_t HL_AUTO_QUEUE_MAX = 500;
 constexpr size_t HL_AUTO_SEEN_MAX = 200000;
 std::mutex g_autoMutex;
@@ -1602,6 +1594,7 @@ std::thread g_autoThread;
 std::unordered_map<std::string, double> g_lbGood;
 
 void autoCandidate(const std::string& addr) {
+    if (!autoRoom(AutoNet::HL)) return;  // поиск выключен или лимит дня выбран
     std::lock_guard<std::mutex> l(g_autoMutex);
     if (!g_lbGood.count(addr)) return;  // нет в рейтинге или не прошёл отбор
     if (g_autoQueue.size() >= HL_AUTO_QUEUE_MAX) return;
@@ -1618,7 +1611,9 @@ void autoCandidate(const std::string& addr) {
    суточного лимита. Файл — около 40 МБ; разбираем его поиском по строке,
    без построения дерева JSON, иначе на сервере ушли бы сотни мегабайт. */
 const char* const HL_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
-constexpr double HL_LB_MIN_ACCOUNT = 500000.0;
+// Счёт — от того же порога, что и сделка ($10 тыс.): лимит дня всё равно
+// берёт самых крупных первыми.
+const double HL_LB_MIN_ACCOUNT = autoMinUsd(AutoNet::HL);
 constexpr double HL_LB_MAX_TURNOVER = 30.0;
 constexpr long long HL_LB_EVERY_SEC = 24 * 3600;
 constexpr long long HL_LB_FIRST_DELAY_SEC = 300;
@@ -1634,23 +1629,11 @@ double lbNum(const std::string& s, size_t from, size_t to, const char* key) {
     return std::strtod(s.c_str() + i, nullptr);
 }
 
-// Сколько добавлено за текущие сутки (оба источника вместе).
-long long g_autoDay = 0;
-int g_autoToday = 0;
-
 bool autoAdd(const std::string& addr, const char* why) {
-    {
-        std::lock_guard<std::mutex> l(g_autoMutex);
-        const long long day = nowSec() / 86400;
-        if (day != g_autoDay) { g_autoDay = day; g_autoToday = 0; }
-        if (g_autoToday >= HL_AUTO_DAILY) return false;
-    }
+    if (!autoRoom(AutoNet::HL)) return false;
     if (watchedSnapshot()->count(addr) || bannedSnapshot()->count(addr)) return false;
     if (addUserWhale(SERVICE_CHAT_ID, addr, "auto-hl") != AddWhaleResult::OK) return false;
-    {
-        std::lock_guard<std::mutex> l(g_autoMutex);
-        ++g_autoToday;
-    }
+    autoCounted(AutoNet::HL);
     g_autoAdded.fetch_add(1, std::memory_order_relaxed);
     std::cout << "[HL] в базу сервисного аккаунта: " << addr << " (" << why << ")" << std::endl;
     return true;
@@ -1696,11 +1679,8 @@ int leaderboardSweep() {
     int added = 0;
     for (const auto& c : cands) {
         if (!keepGoing()) break;
+        if (!autoRoom(AutoNet::HL)) break;
         if (autoAdd(c.addr, "рейтинг трейдеров")) ++added;
-        else {
-            std::lock_guard<std::mutex> l(g_autoMutex);
-            if (g_autoToday >= HL_AUTO_DAILY) break;
-        }
     }
     std::cout << "[HL] рейтинг трейдеров: подходят " << cands.size() << ", в базу сервисного аккаунта +" << added
               << std::endl;
@@ -1714,7 +1694,11 @@ void autoLoop() {
     long long nextSweep = nowSec() + HL_LB_FIRST_DELAY_SEC;
     while (keepGoing()) {
         interruptibleSleep(4);
-        if (nowSec() >= nextSweep) {
+        // Поиск выключен (/autobase) — рейтинг не качаем вовсе; включат —
+        // первый проход через минуту.
+        if (!autoEnabled(AutoNet::HL)) {
+            nextSweep = std::max(nextSweep, nowSec() + 60);
+        } else if (nowSec() >= nextSweep) {
             pending += leaderboardSweep();
             nextSweep = nowSec() + HL_LB_EVERY_SEC;
         }

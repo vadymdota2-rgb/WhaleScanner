@@ -29,6 +29,7 @@
 #include "utils.h"
 #include "ranking.h"
 #include "token_prices.h"
+#include "autobase.h"
 #include "telegram.h"
 #include "rpc_client.h"
 #include "chains.h"
@@ -1376,17 +1377,13 @@ void flushPendingAlerts(bool force) {
    • Вывод с биржи: отправитель — горячий кошелёк (порядковый номер его
      транзакций, nonce, от BSC_HOT_NONCE; видно прямо в блоке, без запросов),
      сама транзакция — перевод BNB или transfer() стейблкоина.
-   • Крупный: от BSC_AUTO_MIN_USD (по умолчанию $10 тыс., WHALE_BSC_AUTO_MIN).
+   • Крупный: от autoMinUsd(BSC) — по умолчанию $10 тыс. (WHALE_BSC_AUTO_MIN).
+   • Не больше 100 новых в сутки, и поиск можно остановить: /autobase.
    • Не сервис: получатель — обычный кошелёк, не контракт, и у него меньше
      BSC_AUTO_MAX_NONCE исходящих транзакций (биржи и боты — миллионы).
    Разбор блока только складывает кандидатов; проверка (два запроса к RPC)
    идёт отдельным потоком и сканер не задерживает. Кошельки, которые за
    месяц не сделали ни одной сделки, убирает pruneAutoWallets. */
-const long double BSC_AUTO_MIN_USD = [] {
-    const char* v = std::getenv("WHALE_BSC_AUTO_MIN");
-    const double usd = (v && *v) ? std::atof(v) : 10000.0;
-    return static_cast<long double>(usd > 0 ? usd : 10000.0);
-}();
 constexpr long long BSC_HOT_NONCE = 300000;
 constexpr long long BSC_AUTO_MAX_NONCE = 1000;
 constexpr size_t BSC_AUTO_QUEUE_MAX = 500;
@@ -1411,6 +1408,7 @@ static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
                             const std::unordered_map<std::string, std::vector<Watcher>>* watchers) {
     static const bool onBsc = chainCtx().coingeckoPlatform == "binance-smart-chain";
     if (!onBsc || to.empty() || !tx.contains("nonce") || !tx["nonce"].is_string()) return;
+    if (!autoRoom(AutoNet::BSC)) return;  // поиск выключен или лимит дня выбран
     const std::string nonceHex = tx["nonce"].get<std::string>();
     if (nonceHex.size() < 7) return;  // меньше 0x100000 — точно не горячий кошелёк
     if (hexToLD(nonceHex, 2) < BSC_HOT_NONCE) return;
@@ -1433,7 +1431,7 @@ static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
     } else {
         return;
     }
-    if (usd < BSC_AUTO_MIN_USD || rcpt.size() != 42) return;
+    if (usd < static_cast<long double>(autoMinUsd(AutoNet::BSC)) || rcpt.size() != 42) return;
     if (watchers && watchers->count(rcpt)) return;
     std::lock_guard<std::mutex> l(g_bscAutoMutex);
     if (g_bscAutoQueue.size() >= BSC_AUTO_QUEUE_MAX) return;
@@ -1457,6 +1455,7 @@ void bscAutoLoop() {
             }
         }
         for (const auto& a : batch) {
+            if (!autoRoom(AutoNet::BSC)) break;
             if (isPermanentlyBanned(a)) continue;
             auto code = rpc("eth_getCode", {a, "latest"});
             if (!code.is_string() || code.get<std::string>() != "0x") continue;  // контракт
@@ -1464,6 +1463,7 @@ void bscAutoLoop() {
             long long n = 0;
             if (!cnt.is_string() || !hexToLL(cnt.get<std::string>(), n) || n >= BSC_AUTO_MAX_NONCE) continue;
             if (addUserWhale(SERVICE_CHAT_ID, a, "auto-bsc") == AddWhaleResult::OK) {
+                autoCounted(AutoNet::BSC);
                 std::cout << "[BSC] в базу сервисного аккаунта: " << a << " (транзакций " << n << ")" << std::endl;
                 ++pending;
             }
@@ -2293,6 +2293,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
         // Проверить и отменить автопродления звёздами, если какие-то остались.
         std::thread([cid]{ cancelStarSubscriptions(cid, true); }).detach();
     }
+    else if (txt == "/autobase" || txt.rfind("/autobase ", 0) == 0) {
+        autobaseCommand(cid, trim(txt.substr(9)));
+    }
     else if (txt == "/okx") {
         exchPending(cid);
     }
@@ -2413,6 +2416,7 @@ int main() {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     initLifecycle();
+    initAutobase();
     loadTokenCache();
     loadPairCache();
     ensureNativePrice();
