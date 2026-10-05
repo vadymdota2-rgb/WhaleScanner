@@ -17,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1568,6 +1569,172 @@ void waitReadable(CURL* c, int timeoutMs) {
     poll(&pfd, 1, timeoutMs);
 }
 
+/* Автопополнение базы сервисного аккаунта — как у биткоина (autoWatch в
+   btc_chain.cpp): кто крупно торгует и не похож на сервис, остаётся в базе
+   сам. Поиск не тратит бюджет запросов к бирже (тот общий с алертами):
+   • раз в сутки — публичный рейтинг трейдеров (stats-data, отдельный адрес,
+     в бюджет не входит): счёт, объём за неделю и месяц у 47 тыс. трейдеров;
+   • в реальном времени — сделки из потока, который бот и так слушает:
+     сделка от HL_AUTO_MIN_USD (по умолчанию $100 тыс., WHALE_HL_AUTO_MIN)
+     незнакомого кошелька. «Не сервис» проверяем по тому же рейтингу в
+     памяти, без запроса: кошелёк должен в нём быть и пройти отбор.
+   За сутки — не больше HL_AUTO_DAILY новых кошельков на оба источника
+   (WHALE_HL_AUTO_DAILY, по умолчанию 100): следить за каждым — уже бюджет. */
+const long long HL_AUTO_MIN_NANOS = [] {
+    const char* v = std::getenv("WHALE_HL_AUTO_MIN");
+    const double usd = (v && *v) ? std::atof(v) : 100000.0;
+    return static_cast<long long>((usd > 0 ? usd : 100000.0) * 1e9);
+}();
+const int HL_AUTO_DAILY = [] {
+    const char* v = std::getenv("WHALE_HL_AUTO_DAILY");
+    const int n = (v && *v) ? std::atoi(v) : 100;
+    return n > 0 ? n : 100;
+}();
+constexpr size_t HL_AUTO_QUEUE_MAX = 500;
+constexpr size_t HL_AUTO_SEEN_MAX = 200000;
+std::mutex g_autoMutex;
+std::vector<std::string> g_autoQueue;
+std::unordered_set<std::string> g_autoSeen;   // уже проверяли — второй раз не спрашиваем
+std::atomic<long long> g_autoAdded{0};
+std::thread g_autoThread;
+
+// Прошедшие отбор по рейтингу (обновляется раз в сутки): адрес → счёт.
+std::unordered_map<std::string, double> g_lbGood;
+
+void autoCandidate(const std::string& addr) {
+    std::lock_guard<std::mutex> l(g_autoMutex);
+    if (!g_lbGood.count(addr)) return;  // нет в рейтинге или не прошёл отбор
+    if (g_autoQueue.size() >= HL_AUTO_QUEUE_MAX) return;
+    if (g_autoSeen.size() >= HL_AUTO_SEEN_MAX) g_autoSeen.clear();
+    if (!g_autoSeen.insert(addr).second) return;
+    g_autoQueue.push_back(addr);
+}
+
+/* Рейтинг трейдеров Hyperliquid (47 тыс. строк: размер счёта, объём и
+   прибыль за день, неделю, месяц). Отбор: счёт от HL_LB_MIN_ACCOUNT, торговал
+   на этой неделе, оборот за месяц не больше HL_LB_MAX_TURNOVER размеров
+   счёта (у маркетмейкеров — сотни). Прошедшие — в g_lbGood (по ним же
+   проверяются сделки из потока), в базу — самые крупные, в пределах
+   суточного лимита. Файл — около 40 МБ; разбираем его поиском по строке,
+   без построения дерева JSON, иначе на сервере ушли бы сотни мегабайт. */
+const char* const HL_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard";
+constexpr double HL_LB_MIN_ACCOUNT = 500000.0;
+constexpr double HL_LB_MAX_TURNOVER = 30.0;
+constexpr long long HL_LB_EVERY_SEC = 24 * 3600;
+constexpr long long HL_LB_FIRST_DELAY_SEC = 300;
+
+// Число после ключа в куске [from, to): "key":"123.4" или "key": 123.4.
+double lbNum(const std::string& s, size_t from, size_t to, const char* key) {
+    const size_t k = s.find(key, from);
+    if (k == std::string::npos || k >= to) return -1;
+    size_t i = s.find(':', k);
+    if (i == std::string::npos || i >= to) return -1;
+    ++i;
+    while (i < to && (s[i] == ' ' || s[i] == '"')) ++i;
+    return std::strtod(s.c_str() + i, nullptr);
+}
+
+// Сколько добавлено за текущие сутки (оба источника вместе).
+long long g_autoDay = 0;
+int g_autoToday = 0;
+
+bool autoAdd(const std::string& addr, const char* why) {
+    {
+        std::lock_guard<std::mutex> l(g_autoMutex);
+        const long long day = nowSec() / 86400;
+        if (day != g_autoDay) { g_autoDay = day; g_autoToday = 0; }
+        if (g_autoToday >= HL_AUTO_DAILY) return false;
+    }
+    if (watchedSnapshot()->count(addr) || bannedSnapshot()->count(addr)) return false;
+    if (addUserWhale(SERVICE_CHAT_ID, addr, "auto-hl") != AddWhaleResult::OK) return false;
+    {
+        std::lock_guard<std::mutex> l(g_autoMutex);
+        ++g_autoToday;
+    }
+    g_autoAdded.fetch_add(1, std::memory_order_relaxed);
+    std::cout << "[HL] в базу сервисного аккаунта: " << addr << " (" << why << ")" << std::endl;
+    return true;
+}
+
+int leaderboardSweep() {
+    const std::string body = http(HL_LEADERBOARD_URL, "", 90);
+    if (body.size() < 1000) {
+        std::cerr << "[HL] рейтинг трейдеров не скачался" << std::endl;
+        return 0;
+    }
+    struct Cand { std::string addr; double acct; };
+    std::vector<Cand> cands;
+    std::unordered_map<std::string, double> good;
+    const std::string tag = "\"ethAddress\"";
+    size_t pos = body.find(tag);
+    while (pos != std::string::npos) {
+        const size_t next = body.find(tag, pos + tag.size());
+        const size_t end = next == std::string::npos ? body.size() : next;
+        const size_t q = body.find("0x", pos);
+        if (q != std::string::npos && q + 42 <= end) {
+            const std::string addr = toLower(body.substr(q, 42));
+            const double acct = lbNum(body, pos, end, "\"accountValue\"");
+            const size_t wk = body.find("\"week\"", pos);
+            const size_t mo = body.find("\"month\"", pos);
+            const double wkVlm = wk < end ? lbNum(body, wk, end, "\"vlm\"") : -1;
+            const double moVlm = mo < end ? lbNum(body, mo, end, "\"vlm\"") : -1;
+            if (acct >= HL_LB_MIN_ACCOUNT && wkVlm > 0 && moVlm > 0 && moVlm / acct <= HL_LB_MAX_TURNOVER) {
+                cands.push_back({addr, acct});
+                good.emplace(addr, acct);
+            }
+        }
+        pos = next;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_autoMutex);
+        g_lbGood.swap(good);
+        // Отбор обновился — кошельки, которых мы раньше не пускали, можно
+        // проверить снова, когда они снова крупно поторгуют.
+        g_autoSeen.clear();
+    }
+    std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.acct > b.acct; });
+    int added = 0;
+    for (const auto& c : cands) {
+        if (!keepGoing()) break;
+        if (autoAdd(c.addr, "рейтинг трейдеров")) ++added;
+        else {
+            std::lock_guard<std::mutex> l(g_autoMutex);
+            if (g_autoToday >= HL_AUTO_DAILY) break;
+        }
+    }
+    std::cout << "[HL] рейтинг трейдеров: подходят " << cands.size() << ", в базу сервисного аккаунта +" << added
+              << std::endl;
+    return added;
+}
+
+void autoLoop() {
+    // Список отслеживаемых пересобираем не на каждый новый кошелёк, а раз в
+    // минуту, если что-то добавилось: пересборка читает всю базу.
+    long long pending = 0, lastRefresh = nowSec();
+    long long nextSweep = nowSec() + HL_LB_FIRST_DELAY_SEC;
+    while (keepGoing()) {
+        interruptibleSleep(4);
+        if (nowSec() >= nextSweep) {
+            pending += leaderboardSweep();
+            nextSweep = nowSec() + HL_LB_EVERY_SEC;
+        }
+        if (pending > 0 && nowSec() - lastRefresh >= 60) {
+            refreshWatchers();
+            pending = 0;
+            lastRefresh = nowSec();
+        }
+        std::vector<std::string> batch;
+        {
+            std::lock_guard<std::mutex> l(g_autoMutex);
+            batch.swap(g_autoQueue);
+        }
+        // Кандидаты из потока сделок уже сверены с рейтингом в памяти —
+        // запросов к бирже здесь нет.
+        for (const auto& addr : batch)
+            if (autoAdd(addr, "крупная сделка")) ++pending;
+    }
+}
+
 void handleTrades(const json& data) {
     if (!data.is_array()) return;
 
@@ -1575,21 +1742,24 @@ void handleTrades(const json& data) {
     const auto bannedPtr = bannedSnapshot();
     const AddressSet& watched = *watchedPtr;
     const AddressSet& banned = *bannedPtr;
-    if (watched.empty()) {
-        g_tradesSeen.fetch_add(data.size(), std::memory_order_relaxed);
-        return;
-    }
 
     for (const auto& t : data) {
         if (!t.is_object()) continue;
         g_tradesSeen.fetch_add(1, std::memory_order_relaxed);
         if (!t.contains("users") || !t["users"].is_array()) continue;
+        long long tradeNotional = 0;
+        const bool big = notionalNanos(jstr(t, "px", "0"), jstr(t, "sz", "0"), tradeNotional) &&
+                         tradeNotional >= HL_AUTO_MIN_NANOS;
 
         for (const auto& u : t["users"]) {
             if (!u.is_string()) continue;
             const std::string addr = toLower(u.get<std::string>());
-            if (!watched.count(addr)) continue;
             if (banned.count(addr)) continue;
+            if (!watched.count(addr)) {
+                // Крупная сделка незнакомого кошелька — кандидат в базу.
+                if (big) autoCandidate(addr);
+                continue;
+            }
 
             g_hits.fetch_add(1, std::memory_order_relaxed);
 
@@ -1911,12 +2081,14 @@ void startHyperliquidLoop() {
     reloadWatchedWallets();
     g_feedThread = std::thread(feedLoop);
     g_enrichThread = std::thread(enricherLoop);
+    g_autoThread = std::thread(autoLoop);
 }
 
 void stopHyperliquid() {
     g_hlRunning.store(false);
     if (g_feedThread.joinable()) g_feedThread.join();
     if (g_enrichThread.joinable()) g_enrichThread.join();
+    if (g_autoThread.joinable()) g_autoThread.join();
     flushHlAlerts(true);
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (g_hlDb) {

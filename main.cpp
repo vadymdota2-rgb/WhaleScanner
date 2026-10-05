@@ -602,13 +602,17 @@ std::string funnelStatsLine() {
                 << " · наград за друзей отклонено " << sqlite3_column_int64(s, 1);
         sqlite3_finalize(s);
     }
-    // Автопополнение базы китов BSC (биткоин — отдельно, /statsbtc).
-    if (prepareOrLog(db, &s, "SELECT SUM(created_at>=?), COUNT(*) FROM user_whales WHERE user_id=? AND label='auto-bsc'")) {
-        sqlite3_bind_int64(s, 1, time(nullptr) - 86400);
-        sqlite3_bind_text(s, 2, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+    // Автопополнение базы китов (BSC и Hyperliquid; биткоин — отдельно, /statsbtc).
+    if (prepareOrLog(db, &s, "SELECT SUM(label='auto-bsc' AND created_at>=?), SUM(label='auto-hl' AND created_at>=?), "
+                             "SUM(label='auto-bsc'), SUM(label='auto-hl') FROM user_whales WHERE user_id=?")) {
+        const long long day = time(nullptr) - 86400;
+        sqlite3_bind_int64(s, 1, day);
+        sqlite3_bind_int64(s, 2, day);
+        sqlite3_bind_text(s, 3, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
         if (sqlite3_step(s) == SQLITE_ROW)
-            out << "\n🐋 Автобаза BSC: за сутки +" << sqlite3_column_int64(s, 0)
-                << " · всего " << sqlite3_column_int64(s, 1);
+            out << "\n🐋 Автобаза за сутки: BSC +" << sqlite3_column_int64(s, 0) << " · Hyperliquid +"
+                << sqlite3_column_int64(s, 1) << " (всего авто: " << sqlite3_column_int64(s, 2) << " / "
+                << sqlite3_column_int64(s, 3) << ")";
         sqlite3_finalize(s);
     }
     if (prepareOrLog(db, &s, "SELECT SUM(status='wait'), SUM(status='ok') FROM exch_claims")) {
@@ -1473,14 +1477,12 @@ void bscAutoLoop() {
     }
 }
 
-/* Автокошельки BSC, которые за месяц так и не торговали (нет сделок в
-   trades), базе не нужны. Убирается только строка сервисного аккаунта; у
-   людей, следящих за адресом, он остаётся.
-   Hyperliquid сам базу не пополняет: каждый его кошелёк тратит общий с
-   алертами бюджет запросов к бирже. Строки «auto-hl», которые успела
-   добавить прошлая версия, убираются здесь же. */
+/* Автокошельки, которые за месяц так и не торговали, базе не нужны: BSC —
+   без сделок в trades, Hyperliquid — без сделок в hl_fills. Убирается только
+   строка сервисного аккаунта; у людей, следящих за адресом, он остаётся. */
 void pruneAutoWallets() {
     const long long cut = static_cast<long long>(time(nullptr)) - 30LL * 86400LL;
+    std::vector<std::pair<long long, std::string>> hl;
     int removed = 0;
     {
         std::lock_guard<std::mutex> l(dbMutex);
@@ -1494,14 +1496,43 @@ void pruneAutoWallets() {
             if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
             sqlite3_finalize(s);
         }
-        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label='auto-hl'")) {
+        if (prepareOrLog(db, &s,
+                "SELECT uw.whale_id, lower(wa.address) FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                "WHERE uw.user_id=? AND uw.label='auto-hl' AND uw.created_at>0 AND uw.created_at<?")) {
             sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+            sqlite3_bind_int64(s, 2, cut);
+            while (sqlite3_step(s) == SQLITE_ROW) hl.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
+            sqlite3_finalize(s);
+        }
+    }
+    std::vector<long long> idle;
+    {
+        std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (hl::g_hlDb && !hl.empty() && prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE lower(wallet)=? LIMIT 1")) {
+            for (const auto& [id, a] : hl) {
+                sqlite3_reset(s);
+                sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) != SQLITE_ROW) idle.push_back(id);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (!idle.empty()) {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label='auto-hl' AND whale_id=?")) {
+            for (long long id : idle) {
+                sqlite3_reset(s);
+                sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, id);
+                if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+            }
             sqlite3_finalize(s);
         }
     }
     if (removed > 0) {
-        std::cout << "[AUTO] убраны автокошельки: " << removed << std::endl;
+        std::cout << "[AUTO] убраны автокошельки без сделок за месяц: " << removed << std::endl;
         refreshWatchers();
     }
 }
