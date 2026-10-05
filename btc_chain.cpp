@@ -531,6 +531,33 @@ void execSql(const char* sql) {
     }
 }
 
+// Число транзакций и остаток адреса — с mempool.space, запасной blockstream.
+bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
+    json j;
+    for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
+        j = json::parse(fetch(host + a, 10), nullptr, false);
+        if (j.is_object() && j.contains("chain_stats")) break;
+    }
+    if (!j.is_object() || !j.contains("chain_stats") || !j["chain_stats"].is_object()) return false;
+    const auto& c = j["chain_stats"];
+    txs = jll(c, "tx_count");
+    bal = jll(c, "funded_txo_sum") - jll(c, "spent_txo_sum");
+    return true;
+}
+
+void saveAddrStats(const std::string& a, long long txs, long long bal) {
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    sqlite3_stmt* s = nullptr;
+    if (prep(&s, "INSERT OR REPLACE INTO btc_addr(address, txs, bal_sats, at) VALUES(?,?,?,?)")) {
+        bindText(s, 1, a);
+        sqlite3_bind_int64(s, 2, txs);
+        sqlite3_bind_int64(s, 3, bal);
+        sqlite3_bind_int64(s, 4, nowSec());
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+}
+
 class Scanner {
 public:
     bool init() {
@@ -1119,25 +1146,9 @@ private:
         int n = 0;
         for (const auto& a : ask) {
             if (++n > ADDR_PER_BLOCK) break;
-            json j;
-            for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
-                j = json::parse(fetch(host + a, 10), nullptr, false);
-                if (j.is_object() && j.contains("chain_stats")) break;
-            }
-            if (!j.is_object() || !j.contains("chain_stats") || !j["chain_stats"].is_object()) continue;
-            const auto& c = j["chain_stats"];
-            long long txs = jll(c, "tx_count");
-            long long bal = jll(c, "funded_txo_sum") - jll(c, "spent_txo_sum");
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            sqlite3_stmt* s = nullptr;
-            if (prep(&s, "INSERT OR REPLACE INTO btc_addr(address, txs, bal_sats, at) VALUES(?,?,?,?)")) {
-                bindText(s, 1, a);
-                sqlite3_bind_int64(s, 2, txs);
-                sqlite3_bind_int64(s, 3, bal);
-                sqlite3_bind_int64(s, 4, nowSec());
-                sqlite3_step(s);
-                sqlite3_finalize(s);
-            }
+            long long txs = 0, bal = 0;
+            if (!fetchAddrStats(a, txs, bal)) continue;
+            saveAddrStats(a, txs, bal);
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
     }
@@ -1349,6 +1360,48 @@ void cleanup() {
              "DELETE FROM btc_we WHERE wid = '' AND label = '' AND at < " + w + ";").c_str());
 }
 
+// Тот же срок, что AUTO_IDLE_SEC в main.cpp: столько без движений —
+// кандидат на удаление из базы.
+constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
+constexpr int STALE_PER_PASS = 100;
+
+// Найденный поиском кошелёк без движений месяц остаётся в базе, пока на нём
+// от AUTO_MIN_SATS (1 BTC). Остаток в btc_addr верен, если снят после
+// последнего движения кошелька. Кто двигал деньги после снимка (снимок
+// обновляется не чаще раза в неделю), тому снимаем заново здесь — в потоке
+// биткоина, не в главном: это запросы в сеть.
+void refreshIdleBalances() {
+    const long long cut = nowSec() - AUTO_IDLE_SEC;
+    std::vector<std::string> ask;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (!prep(&s, "SELECT w.address FROM btc_watch w LEFT JOIN btc_addr a ON a.address=w.address "
+                      "WHERE w.src='auto' AND w.at>0 AND w.at<? "
+                      "AND NOT EXISTS (SELECT 1 FROM btc_moves m WHERE m.wallet=w.address AND m.ts>=?) "
+                      "AND (a.address IS NULL OR a.at < "
+                      "     COALESCE((SELECT MAX(m.ts) FROM btc_moves m WHERE m.wallet=w.address), 0)) "
+                      "LIMIT ?"))
+            return;
+        sqlite3_bind_int64(s, 1, cut);
+        sqlite3_bind_int64(s, 2, cut);
+        sqlite3_bind_int(s, 3, STALE_PER_PASS);
+        while (sqlite3_step(s) == SQLITE_ROW) ask.push_back(colText(s, 0));
+        sqlite3_finalize(s);
+    }
+    int done = 0;
+    for (const auto& a : ask) {
+        if (!g_btcRunning.load()) break;
+        long long txs = 0, bal = 0;
+        if (fetchAddrStats(a, txs, bal)) {
+            saveAddrStats(a, txs, bal);
+            ++done;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+    if (done) std::cout << "[BTC] остаток перепроверен у " << done << " неактивных кошельков базы" << std::endl;
+}
+
 void btcLoop() {
     Scanner sc;
     {
@@ -1376,6 +1429,7 @@ void btcLoop() {
         sc.setStateLocked("clusters", "3");
     }
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
+    auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
 
     while (running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
         try {
@@ -1410,6 +1464,10 @@ void btcLoop() {
                     continue;
                 }
                 last = b.height;
+            }
+            if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
+                refreshIdleBalances();
+                lastBal = std::chrono::steady_clock::now();
             }
             if (std::chrono::steady_clock::now() - lastClean > std::chrono::hours(1)) {
                 cleanup();
@@ -1478,15 +1536,23 @@ int btcPruneAuto(long long cut) {
     // Найденные поиском (src='auto') и ни разу не двигавшие деньги с `cut`:
     // убрать из базы, не банить — крупно выведут с биржи снова, поиск
     // добавит их снова. Импортированные вручную не трогаем.
+    // Держателей не трогаем: пока на кошельке от AUTO_MIN_SATS (1 BTC), он
+    // остаётся, сколько бы ни лежал. Остаток берём, только если снимок
+    // свежий — снят после последнего движения; несвежий сначала обновит
+    // refreshIdleBalances, до тех пор кошелёк остаётся.
     std::vector<std::string> gone;
     {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         if (!g_btcDb) return 0;
         sqlite3_stmt* s = nullptr;
-        if (prep(&s, "SELECT address FROM btc_watch w WHERE src='auto' AND at>0 AND at<? "
-                     "AND NOT EXISTS (SELECT 1 FROM btc_moves m WHERE m.wallet=w.address AND m.ts>=?)")) {
+        if (prep(&s, "SELECT w.address FROM btc_watch w JOIN btc_addr a ON a.address=w.address "
+                     "WHERE w.src='auto' AND w.at>0 AND w.at<? "
+                     "AND NOT EXISTS (SELECT 1 FROM btc_moves m WHERE m.wallet=w.address AND m.ts>=?) "
+                     "AND a.bal_sats < ? "
+                     "AND a.at >= COALESCE((SELECT MAX(m.ts) FROM btc_moves m WHERE m.wallet=w.address), 0)")) {
             sqlite3_bind_int64(s, 1, cut);
             sqlite3_bind_int64(s, 2, cut);
+            sqlite3_bind_int64(s, 3, AUTO_MIN_SATS);
             while (sqlite3_step(s) == SQLITE_ROW) gone.push_back(colText(s, 0));
             sqlite3_finalize(s);
         }
@@ -1504,6 +1570,42 @@ int btcPruneAuto(long long cut) {
         for (const auto& a : gone) g_watch.erase(a);
     }
     return static_cast<int>(gone.size());
+}
+
+int btcBanServices() {
+    // Найденный поиском кошелёк набрал SERVICE_TXS транзакций — это уже не
+    // кит, а сервис, платёжный шлюз или биржа без разметки. Убираем из базы
+    // навсегда: поиск такой адрес не возьмёт снова — autoWatch отсекает его
+    // по тому же числу транзакций в btc_addr, а оно только растёт.
+    // Импортированные вручную не трогаем.
+    std::vector<std::pair<std::string, long long>> bad;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        if (!g_btcDb) return 0;
+        sqlite3_stmt* s = nullptr;
+        if (prep(&s, "SELECT w.address, a.txs FROM btc_watch w JOIN btc_addr a ON a.address=w.address "
+                     "WHERE w.src='auto' AND a.txs>=?")) {
+            sqlite3_bind_int64(s, 1, SERVICE_TXS);
+            while (sqlite3_step(s) == SQLITE_ROW) bad.emplace_back(colText(s, 0), sqlite3_column_int64(s, 1));
+            sqlite3_finalize(s);
+        }
+        if (!bad.empty() && prep(&s, "DELETE FROM btc_watch WHERE address=? AND src='auto'")) {
+            for (const auto& b : bad) {
+                sqlite3_reset(s);
+                bindText(s, 1, b.first);
+                sqlite3_step(s);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (!bad.empty()) {
+        std::lock_guard<std::mutex> w(g_watchMutex);
+        for (const auto& b : bad) g_watch.erase(b.first);
+    }
+    for (const auto& b : bad)
+        std::cout << "[BTC] сервис, не кит: " << b.first << " (" << b.second << " транзакций) — убран из базы навсегда"
+                  << std::endl;
+    return static_cast<int>(bad.size());
 }
 
 void stopBtc() {

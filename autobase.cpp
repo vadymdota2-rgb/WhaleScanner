@@ -201,7 +201,7 @@ std::pair<long long, long long> tallyOf(const Tally& t, int i) {
 
 void autoPruned(AutoNet n, int count) { bump(g_pruned, n, count); }
 
-void autoBanned(AutoNet n) { bump(g_banned, n, 1); }
+void autoBanned(AutoNet n, int count) { bump(g_banned, n, count); }
 
 int autoLimit(AutoNet n) { return limits()[static_cast<int>(n)]; }
 
@@ -256,18 +256,16 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         } else {
             t << money(minUsd()[i]);
         }
-        const bool ban = n != AutoNet::BTC;  // в Bitcoin ботов не банит: сервисы отсекаются до добавления
         std::pair<long long, long long> pr, bn;
         {
             std::lock_guard<std::mutex> m(g_mx);
             pr = tallyOf(g_pruned, i);
             bn = tallyOf(g_banned, i);
         }
-        t << "\n   Сегодня: добавлено " << autoToday(n) << "/" << limits()[i] << " · удалено " << pr.first;
-        if (ban) t << " · забанено " << bn.first;
-        t << "\n   Всего: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second;
-        if (ban) t << " · забанено " << bn.second;
-        t << " · в базе " << inBase[i];
+        t << "\n   Сегодня: добавлено " << autoToday(n) << "/" << limits()[i] << " · удалено " << pr.first
+          << " · забанено " << bn.first;
+        t << "\n   Всего: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second
+          << " · забанено " << bn.second << " · в базе " << inBase[i];
         // Сегодняшнее число берётся из базы при запуске: в нём и то, что
         // добавили до лимита (версии без лимита), поэтому бывает больше.
         if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
@@ -275,8 +273,9 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
     }
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\nВключить: <code>/autobase bsc on</code>"
-         "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова."
-         "\nЗабанено — боты (слишком много сделок): навсегда."
-         "\nВ Bitcoin банить некого: биржи и сервисы отсекаются ещё до добавления.";
+         "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова. "
+         "Bitcoin-кошелёк, на котором 1 BTC и больше, не удаляется, даже если лежит без движения."
+         "\nЗабанено навсегда: на BSC и Hyperliquid — боты (слишком много сделок), "
+         "в Bitcoin — сервисы и биржи (1000+ транзакций).";
     sendMsg(owner, t.str());
 }

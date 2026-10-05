@@ -1498,13 +1498,16 @@ void bscAutoLoop() {
 
 /* Неактивные автокошельки убираются из базы, но не банятся: кто 30 дней
    (AUTO_IDLE_SEC) не торговал — BSC без сделок в trades, Hyperliquid без
-   сделок в hl_fills, Bitcoin без движений в btc_moves — тот уходит из базы
+   сделок в hl_fills, Bitcoin без движений в btc_moves и с остатком меньше
+   1 BTC (держателей не трогаем) — тот уходит из базы
    сервисного аккаунта, а поиск его «забывает», чтобы снова добавить, когда
    кошелёк вернётся к крупной торговле. Смотрим только на тех, кто в базе
    дольше AUTO_IDLE_SEC: свежему ещё не было когда поторговать. У людей,
    следящих за адресом, он остаётся.
    Боты — другое дело: их банит разбор сделок (ignored_wallets на BSC,
-   hl_banned на Hyperliquid) навсегда, и ни импорт, ни поиск их не вернут. */
+   hl_banned на Hyperliquid) навсегда, и ни импорт, ни поиск их не вернут.
+   В Bitcoin так же навсегда убираем сервисы: найденный поиском адрес набрал
+   1000+ транзакций (btcBanServices). */
 constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
 
 void pruneAutoWallets() {
@@ -1577,6 +1580,9 @@ void pruneAutoWallets() {
         for (const auto& w : bsc) g_bscAutoSeen.erase(w.addr);
     }
     for (const auto& w : hl) hlAutoForget(w.addr);
+    // Сначала бан сервисов: иначе тихий сервис ушёл бы как «удалён» и поиск
+    // мог бы счесть его забытым.
+    autoBanned(AutoNet::BTC, btcBanServices());
     const int btc = btcPruneAuto(cut);
     // Счётчик для /autobase: сколько убрано за бездействие сегодня и всего.
     autoPruned(AutoNet::BSC, removedBsc);

@@ -33,8 +33,9 @@ int autoToday(AutoNet n);
 // Убраны из базы за бездействие (pruneAutoWallets) — учесть. Счётчик за
 // сегодня и за всё время хранится в таблице state и переживает перезапуск.
 void autoPruned(AutoNet n, int count);
-// Бот из найденных поиском забанен (BSC или Hyperliquid) — для счётчика.
-void autoBanned(AutoNet n);
+// Найденные поиском забанены — для счётчика: боты на BSC и Hyperliquid,
+// сервисы (1000+ транзакций) в Bitcoin.
+void autoBanned(AutoNet n, int count = 1);
 int autoLimit(AutoNet n);
 
 // Порог в долларах для BSC и Hyperliquid (WHALE_BSC_AUTO_MIN,
