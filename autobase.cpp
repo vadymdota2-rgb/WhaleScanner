@@ -35,9 +35,20 @@ double envUsd(const char* key, double def) {
     return n > 0 ? n : def;
 }
 
-const int LIMIT[NETS] = {envInt("WHALE_BSC_AUTO_DAILY", 100), envInt("WHALE_HL_AUTO_DAILY", 100),
-                         envInt("WHALE_BTC_AUTO_DAILY", 100)};
-const double MIN_USD[NETS] = {envUsd("WHALE_BSC_AUTO_MIN", 10000.0), envUsd("WHALE_HL_AUTO_MIN", 10000.0), 0};
+// Лимиты и пороги — внутри функций, а не глобальными массивами: их читают
+// глобальные константы других файлов (HL_AUTO_MIN_NANOS в
+// hyperliquid_core.cpp) ещё до main, а порядок инициализации глобальных
+// переменных между файлами не определён — массив мог оказаться нулями.
+// Статическая переменная функции заполняется при первом вызове.
+const int* limits() {
+    static const int v[NETS] = {envInt("WHALE_BSC_AUTO_DAILY", 500), envInt("WHALE_HL_AUTO_DAILY", 500),
+                                envInt("WHALE_BTC_AUTO_DAILY", 500)};
+    return v;
+}
+const double* minUsd() {
+    static const double v[NETS] = {envUsd("WHALE_BSC_AUTO_MIN", 10000.0), envUsd("WHALE_HL_AUTO_MIN", 10000.0), 0};
+    return v;
+}
 
 std::atomic<bool> g_on[NETS] = {true, true, true};
 std::mutex g_mx;
@@ -116,7 +127,7 @@ bool autoRoom(AutoNet n) {
     if (!g_on[i].load(std::memory_order_relaxed)) return false;
     std::lock_guard<std::mutex> m(g_mx);
     rollDay();
-    return g_today[i] < LIMIT[i];
+    return g_today[i] < limits()[i];
 }
 
 void autoCounted(AutoNet n) {
@@ -131,9 +142,9 @@ int autoToday(AutoNet n) {
     return g_today[static_cast<int>(n)];
 }
 
-int autoLimit(AutoNet n) { return LIMIT[static_cast<int>(n)]; }
+int autoLimit(AutoNet n) { return limits()[static_cast<int>(n)]; }
 
-double autoMinUsd(AutoNet n) { return MIN_USD[static_cast<int>(n)]; }
+double autoMinUsd(AutoNet n) { return minUsd()[static_cast<int>(n)]; }
 
 void autobaseCommand(const std::string& owner, const std::string& arg) {
     std::istringstream in(arg);
@@ -161,13 +172,13 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
     for (int i = 0; i < NETS; i++) {
         const AutoNet n = static_cast<AutoNet>(i);
         t << "\n" << (g_on[i] ? "🟢 " : "⚪️ ") << "<b>" << NAME[i] << "</b> — " << (g_on[i] ? "ищет" : "остановлен")
-          << " · сегодня " << autoToday(n) << "/" << LIMIT[i] << " · порог ";
+          << " · сегодня " << autoToday(n) << "/" << limits()[i] << " · порог ";
         if (n == AutoNet::BTC) {
             std::ostringstream b;
             b << btcAutoMinBtc();
             t << b.str() << " BTC";
         } else {
-            t << money(MIN_USD[i]);
+            t << money(minUsd()[i]);
         }
     }
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"

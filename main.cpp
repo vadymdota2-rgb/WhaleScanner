@@ -1378,7 +1378,7 @@ void flushPendingAlerts(bool force) {
      транзакций, nonce, от BSC_HOT_NONCE; видно прямо в блоке, без запросов),
      сама транзакция — перевод BNB или transfer() стейблкоина.
    • Крупный: от autoMinUsd(BSC) — по умолчанию $10 тыс. (WHALE_BSC_AUTO_MIN).
-   • Не больше 100 новых в сутки, и поиск можно остановить: /autobase.
+   • Не больше 500 новых в сутки, и поиск можно остановить: /autobase.
    • Не сервис: получатель — обычный кошелёк, не контракт, и у него меньше
      BSC_AUTO_MAX_NONCE исходящих транзакций (биржи и боты — миллионы).
    Разбор блока только складывает кандидатов; проверка (два запроса к RPC)
@@ -1408,10 +1408,11 @@ static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
                             const std::unordered_map<std::string, std::vector<Watcher>>* watchers) {
     static const bool onBsc = chainCtx().coingeckoPlatform == "binance-smart-chain";
     if (!onBsc || to.empty() || !tx.contains("nonce") || !tx["nonce"].is_string()) return;
-    if (!autoRoom(AutoNet::BSC)) return;  // поиск выключен или лимит дня выбран
+    // Сначала дешёвые проверки — они отсекают почти все транзакции блока.
     const std::string nonceHex = tx["nonce"].get<std::string>();
-    if (nonceHex.size() < 7) return;  // меньше 0x100000 — точно не горячий кошелёк
+    if (nonceHex.size() < 7) return;  // не больше четырёх знаков (< 0x10000) — точно не горячий кошелёк
     if (hexToLD(nonceHex, 2) < BSC_HOT_NONCE) return;
+    if (!autoRoom(AutoNet::BSC)) return;  // поиск выключен или лимит дня выбран
     const std::string input = tx.contains("input") && tx["input"].is_string() ? tx["input"].get<std::string>() : "";
     std::string rcpt;
     long double usd = 0;
@@ -1454,15 +1455,33 @@ void bscAutoLoop() {
                 g_bscAutoQueue.pop_back();
             }
         }
-        for (const auto& a : batch) {
-            if (!autoRoom(AutoNet::BSC)) break;
+        // Не проверен из-за сбоя (сеть, база) — забыть, чтобы следующий
+        // крупный вывод проверил его снова. Отказ по делу (контракт, сервис,
+        // бот) — помнить: второй раз спрашивать незачем.
+        auto retryLater = [](const std::string& a) {
+            std::lock_guard<std::mutex> l(g_bscAutoMutex);
+            g_bscAutoSeen.erase(a);
+        };
+        for (size_t i = 0; i < batch.size(); i++) {
+            const std::string& a = batch[i];
+            if (!autoRoom(AutoNet::BSC)) {
+                // Лимит дня выбран или поиск выключили — непроверенных
+                // вернуть в очередь, а не потерять.
+                std::lock_guard<std::mutex> l(g_bscAutoMutex);
+                for (size_t j = i; j < batch.size(); j++) g_bscAutoQueue.push_back(batch[j]);
+                break;
+            }
             if (isPermanentlyBanned(a)) continue;
             auto code = rpc("eth_getCode", {a, "latest"});
-            if (!code.is_string() || code.get<std::string>() != "0x") continue;  // контракт
+            if (!code.is_string()) { retryLater(a); continue; }
+            if (code.get<std::string>() != "0x") continue;  // контракт
             auto cnt = rpc("eth_getTransactionCount", {a, "latest"});
             long long n = 0;
-            if (!cnt.is_string() || !hexToLL(cnt.get<std::string>(), n) || n >= BSC_AUTO_MAX_NONCE) continue;
-            if (addUserWhale(SERVICE_CHAT_ID, a, "auto-bsc") == AddWhaleResult::OK) {
+            if (!cnt.is_string() || !hexToLL(cnt.get<std::string>(), n)) { retryLater(a); continue; }
+            if (n >= BSC_AUTO_MAX_NONCE) continue;
+            const AddWhaleResult r = addUserWhale(SERVICE_CHAT_ID, a, "auto-bsc");
+            if (r == AddWhaleResult::ERROR) retryLater(a);
+            if (r == AddWhaleResult::OK) {
                 autoCounted(AutoNet::BSC);
                 std::cout << "[BSC] в базу сервисного аккаунта: " << a << " (транзакций " << n << ")" << std::endl;
                 ++pending;
@@ -1520,7 +1539,10 @@ void pruneAutoWallets() {
         std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
         sqlite3_stmt* s = nullptr;
         if (hl::g_hlDb && !hlc.empty() &&
-            prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE lower(wallet)=? AND ts>=? LIMIT 1")) {
+            // wallet=? (адреса пишутся строчными), а не lower(wallet)=?: так
+            // идёт индекс (wallet, ts), а не перебор всех сделок за месяц на
+            // каждый из тысяч кошельков.
+            prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE wallet=? AND ts>=? LIMIT 1")) {
             for (const auto& w : hlc) {
                 sqlite3_reset(s);
                 sqlite3_bind_text(s, 1, w.addr.c_str(), -1, SQLITE_TRANSIENT);

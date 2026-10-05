@@ -1579,8 +1579,9 @@ void waitReadable(CURL* c, int timeoutMs) {
      сделка от autoMinUsd(HL) (по умолчанию $10 тыс., WHALE_HL_AUTO_MIN)
      незнакомого кошелька. «Не сервис» проверяем по тому же рейтингу в
      памяти, без запроса: кошелёк должен в нём быть и пройти отбор.
-   Лимит в сутки (100 на оба источника) и выключатель — autobase.h,
-   команда /autobase: следить за каждым кошельком — уже бюджет. */
+   Лимит в сутки (500 на оба источника, рейтингу — не больше половины) и
+   выключатель — autobase.h, команда /autobase: следить за каждым
+   кошельком — уже бюджет. */
 const long long HL_AUTO_MIN_NANOS = static_cast<long long>(autoMinUsd(AutoNet::HL) * 1e9);
 constexpr size_t HL_AUTO_QUEUE_MAX = 500;
 constexpr size_t HL_AUTO_SEEN_MAX = 200000;
@@ -1676,9 +1677,13 @@ int leaderboardSweep() {
         g_autoSeen.clear();
     }
     std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.acct > b.acct; });
+    // Рейтингу — не больше половины суточного лимита: вторая половина
+    // остаётся крупным сделкам из потока, иначе проход в начале суток
+    // выбирал бы лимит целиком и живые сделки весь день ничего не давали.
+    const int share = std::max(1, autoLimit(AutoNet::HL) / 2);
     int added = 0;
     for (const auto& c : cands) {
-        if (!keepGoing()) break;
+        if (!keepGoing() || added >= share) break;
         if (!autoRoom(AutoNet::HL)) break;
         if (autoAdd(c.addr, "рейтинг трейдеров")) ++added;
     }
