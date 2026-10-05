@@ -1567,7 +1567,7 @@ static std::string exchClaimText(const ExchClaim& c) {
         t += "Пользователь: <a href=\"tg://user?id=" + escapeHtml(c.chat) + "\">" + escapeHtml(c.chat) + "</a>\n";
     if (c.status == "ok") t += "\n✅ <b>Одобрено</b> — дни Премиума придут человеку в течение минуты.";
     else if (c.status == "no") t += "\n❌ <b>Отклонено</b> — человеку придёт сообщение.";
-    else t += "\nПроверьте UID среди приглашённых в кабинете партнёра.";
+    else t += "\nПроверьте в кабинете партнёра: UID среди приглашённых, депозит и покупка от 200 €.";
     return t;
 }
 
