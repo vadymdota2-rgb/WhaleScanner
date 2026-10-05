@@ -544,6 +544,27 @@ void initDB() {
             sqlite3_free(eerr);
         }
     }
+
+    // Каналы партнёров: заводит владелец (/partner), подписки и пришедших по
+    // ссылке блогера пишет API. Та же схема, что PARTNER_SCHEMA в API.
+    {
+        char* perr = nullptr;
+        if (sqlite3_exec(db,
+                "CREATE TABLE IF NOT EXISTS partner_channels ("
+                " handle TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', days INTEGER NOT NULL DEFAULT 2,"
+                " active INTEGER NOT NULL DEFAULT 1, slug TEXT NOT NULL DEFAULT '', added_at INTEGER NOT NULL DEFAULT 0);"
+                "CREATE TABLE IF NOT EXISTS partner_claims ("
+                " chat_id TEXT NOT NULL, handle TEXT NOT NULL, joined_at INTEGER NOT NULL, check_at INTEGER NOT NULL,"
+                " status TEXT NOT NULL DEFAULT 'wait', done_at INTEGER NOT NULL DEFAULT 0, days INTEGER NOT NULL DEFAULT 0,"
+                " PRIMARY KEY (chat_id, handle));"
+                "CREATE INDEX IF NOT EXISTS idx_partner_claims_due ON partner_claims(status, check_at);"
+                "CREATE TABLE IF NOT EXISTS partner_refs (chat_id TEXT PRIMARY KEY, slug TEXT NOT NULL, at INTEGER NOT NULL);"
+                "CREATE INDEX IF NOT EXISTS idx_partner_refs_slug ON partner_refs(slug);",
+                nullptr, nullptr, &perr) != SQLITE_OK) {
+            std::cerr << "[STARTUP] partner schema failed: " << (perr ? perr : "") << std::endl;
+            sqlite3_free(perr);
+        }
+    }
 }
 
 /* Воронка за неделю для /stats: сколько разных людей дошли до каждого шага
@@ -1686,6 +1707,170 @@ void exchPending(const std::string& owner) {
     }
 }
 
+/* Каналы партнёров — взаимная реклама с блогерами. Владелец заводит канал
+   (/partner add @канал 2): в «Бонусах» приложения появляется «подпишись —
+   +2 дня» (дни через 3 дня, если человек ещё подписан; проверяет и начисляет
+   API, partner_settle). Блогер получает ссылку t.me/<бот>?startapp=p_<канал>:
+   кто пришёл по ней — в partner_refs. /partner — каналы и цифры по каждому. */
+static json tgCall(const std::string& method, const json& body) {
+    try {
+        auto p = json::parse(http(tgApi(method), body.dump()));
+        if (p.value("ok", false) && p.contains("result")) return p["result"];
+    } catch (...) {}
+    return nullptr;
+}
+
+static std::string botUsername() {
+    static std::string name;
+    if (name.empty()) {
+        json me = tgCall("getMe", json::object());
+        if (me.is_object() && me.contains("username") && me["username"].is_string())
+            name = me["username"].get<std::string>();
+    }
+    return name;
+}
+
+// Бот — админ канала? Без этого подписку не проверить. -1 — канал недоступен.
+static int botIsAdmin(const std::string& handle) {
+    const std::string botId = TG_TOKEN.substr(0, TG_TOKEN.find(':'));
+    json m;
+    try { m = tgCall("getChatMember", {{"chat_id", handle}, {"user_id", std::stoll(botId)}}); } catch (...) { return -1; }
+    if (!m.is_object()) return -1;
+    const std::string st = m.value("status", "");
+    return st == "administrator" || st == "creator" ? 1 : 0;
+}
+
+static std::string partnerLink(const std::string& slug) {
+    const std::string bot = botUsername();
+    return bot.empty() ? "(имя бота не получено)" : "https://t.me/" + bot + "?startapp=p_" + slug;
+}
+
+static void partnerList(const std::string& owner) {
+    struct Ch { std::string handle, title, slug; long long days = 0, active = 0, subs = 0, ok = 0, wait = 0, left = 0, refs = 0, paid = 0; };
+    std::vector<Ch> rows;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "SELECT c.handle, c.title, c.slug, c.days, c.active, "
+                "(SELECT COUNT(*) FROM partner_claims p WHERE p.handle=c.handle), "
+                "(SELECT COUNT(*) FROM partner_claims p WHERE p.handle=c.handle AND p.status IN ('ok','cap')), "
+                "(SELECT COUNT(*) FROM partner_claims p WHERE p.handle=c.handle AND p.status='wait'), "
+                "(SELECT COUNT(*) FROM partner_claims p WHERE p.handle=c.handle AND p.status='left'), "
+                "(SELECT COUNT(*) FROM partner_refs r WHERE r.slug=c.slug), "
+                "(SELECT COUNT(*) FROM partner_refs r WHERE r.slug=c.slug AND ("
+                "  EXISTS (SELECT 1 FROM premium_payments pp WHERE pp.chat_id=r.chat_id) OR "
+                "  EXISTS (SELECT 1 FROM ton_invoices ti WHERE ti.chat_id=r.chat_id AND ti.status='paid'))) "
+                "FROM partner_channels c ORDER BY c.active DESC, c.added_at")) {
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                Ch c;
+                c.handle = safeColumnText(s, 0); c.title = safeColumnText(s, 1); c.slug = safeColumnText(s, 2);
+                c.days = sqlite3_column_int64(s, 3); c.active = sqlite3_column_int64(s, 4);
+                c.subs = sqlite3_column_int64(s, 5); c.ok = sqlite3_column_int64(s, 6);
+                c.wait = sqlite3_column_int64(s, 7); c.left = sqlite3_column_int64(s, 8);
+                c.refs = sqlite3_column_int64(s, 9); c.paid = sqlite3_column_int64(s, 10);
+                rows.push_back(c);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (rows.empty()) {
+        sendMsg(owner, "🤝 <b>Каналы партнёров</b>\nПока нет ни одного.\n\n"
+                       "Добавить: <code>/partner add @канал 2</code> — 2 дня Премиума за подписку.\n"
+                       "Сначала блогер добавляет бота админом своего канала (права не нужны).");
+        return;
+    }
+    std::string t = "🤝 <b>Каналы партнёров</b>\n";
+    for (const auto& c : rows) {
+        const int admin = c.active ? botIsAdmin(c.handle) : 1;
+        t += "\n" + std::string(c.active ? "🟢 " : "⚪️ ") + "<b>" + escapeHtml(c.title.empty() ? c.handle : c.title) +
+             "</b> " + escapeHtml(c.handle) + " · +" + std::to_string(c.days) + " дн." + (c.active ? "" : " · выключен") + "\n";
+        if (admin == 0) t += "⚠️ бот не админ канала — подписку не проверить\n";
+        if (admin < 0) t += "⚠️ канал недоступен боту\n";
+        t += "Наши → к нему: подписались " + std::to_string(c.subs) + ", засчитано " + std::to_string(c.ok) +
+             ", ждут проверки " + std::to_string(c.wait) + ", отписались " + std::to_string(c.left) + "\n";
+        t += "Его → к нам: пришли " + std::to_string(c.refs) + ", из них платят " + std::to_string(c.paid) + "\n";
+        t += "Ссылка для блогера: " + escapeHtml(partnerLink(c.slug)) + "\n";
+    }
+    t += "\nДобавить или поменять дни: <code>/partner add @канал 2</code>\nВыключить: <code>/partner off @канал</code>";
+    sendMsg(owner, t);
+}
+
+static void partnerAdd(const std::string& owner, std::string handle, long long days) {
+    if (!handle.empty() && handle[0] != '@') handle = "@" + handle;
+    handle = toLower(handle);
+    bool okName = handle.size() >= 5 && handle.size() <= 33;
+    for (size_t i = 1; i < handle.size() && okName; i++)
+        okName = std::isalnum(static_cast<unsigned char>(handle[i])) || handle[i] == '_';
+    if (!okName || days < 1 || days > 7) {
+        sendMsg(owner, "Использование: <code>/partner add @канал 2</code>\nДней — от 1 до 7.");
+        return;
+    }
+    json chat = tgCall("getChat", {{"chat_id", handle}});
+    if (!chat.is_object()) {
+        sendMsg(owner, "❌ Канал " + escapeHtml(handle) + " не найден или закрыт. Нужен публичный канал с @именем.");
+        return;
+    }
+    const std::string title = chat.value("title", handle);
+    const std::string slug = handle.substr(1);
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "INSERT INTO partner_channels(handle, title, days, active, slug, added_at) VALUES(?,?,?,1,?,?) "
+                "ON CONFLICT(handle) DO UPDATE SET title=excluded.title, days=excluded.days, active=1")) {
+            sqlite3_bind_text(s, 1, handle.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s, 2, title.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 3, days);
+            sqlite3_bind_text(s, 4, slug.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 5, static_cast<long long>(time(nullptr)));
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
+    }
+    const int admin = botIsAdmin(handle);
+    std::string t = "✅ <b>" + escapeHtml(title) + "</b> " + escapeHtml(handle) + " — в «Бонусах»: +" +
+                    std::to_string(days) + " дн. за подписку (дни через 3 дня, если человек ещё подписан).\n\n" +
+                    "Ссылка для блогера на наше приложение:\n" + escapeHtml(partnerLink(slug)) +
+                    "\nКто придёт по ней — видно в /partner.";
+    if (admin != 1)
+        t += "\n\n⚠️ Бот ещё не админ канала — проверка подписки не сработает. Пусть блогер добавит @" +
+             escapeHtml(botUsername()) + " в администраторы канала (никакие права не нужны).";
+    sendMsg(owner, t);
+}
+
+static void partnerOff(const std::string& owner, std::string handle) {
+    if (!handle.empty() && handle[0] != '@') handle = "@" + handle;
+    handle = toLower(handle);
+    int changed = 0;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "UPDATE partner_channels SET active=0 WHERE handle=?")) {
+            sqlite3_bind_text(s, 1, handle.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_DONE) changed = sqlite3_changes(db);
+            sqlite3_finalize(s);
+        }
+    }
+    sendMsg(owner, changed ? "⚪️ " + escapeHtml(handle) + " выключен: из «Бонусов» убран. Уже подписавшимся "
+                             "проверка через 3 дня всё равно пройдёт, цифры остаются в /partner."
+                           : "Канала " + escapeHtml(handle) + " нет в списке. Список: /partner");
+}
+
+void partnerCommand(const std::string& owner, const std::string& arg) {
+    std::istringstream in(arg);
+    std::string sub, handle, days;
+    in >> sub >> handle >> days;
+    if (sub.empty()) return partnerList(owner);
+    if (sub == "add") {
+        long long d = 2;
+        try { if (!days.empty()) d = std::stoll(days); } catch (...) { d = 0; }
+        return partnerAdd(owner, handle, d);
+    }
+    if (sub == "off") return partnerOff(owner, handle);
+    sendMsg(owner, "Команды: <code>/partner</code> · <code>/partner add @канал 2</code> · <code>/partner off @канал</code>");
+}
+
 bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
     if (txt=="/health") {
@@ -1908,6 +2093,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
         } else {
             sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
         }
+    }
+    else if (txt == "/partner" || txt.rfind("/partner ", 0) == 0) {
+        partnerCommand(cid, trim(txt.substr(8)));
     }
     else if (txt == "/okx") {
         exchPending(cid);
