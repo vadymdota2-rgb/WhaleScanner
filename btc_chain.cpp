@@ -1462,6 +1462,38 @@ void startBtcLoop() {
 
 double btcAutoMinBtc() { return static_cast<double>(AUTO_MIN_SATS) / 1e8; }
 
+int btcPruneAuto(long long cut) {
+    // Найденные поиском (src='auto') и ни разу не двигавшие деньги с `cut`:
+    // убрать из базы, не банить — крупно выведут с биржи снова, поиск
+    // добавит их снова. Импортированные вручную не трогаем.
+    std::vector<std::string> gone;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        if (!g_btcDb) return 0;
+        sqlite3_stmt* s = nullptr;
+        if (prep(&s, "SELECT address FROM btc_watch w WHERE src='auto' AND at>0 AND at<? "
+                     "AND NOT EXISTS (SELECT 1 FROM btc_moves m WHERE m.wallet=w.address AND m.ts>=?)")) {
+            sqlite3_bind_int64(s, 1, cut);
+            sqlite3_bind_int64(s, 2, cut);
+            while (sqlite3_step(s) == SQLITE_ROW) gone.push_back(colText(s, 0));
+            sqlite3_finalize(s);
+        }
+        if (!gone.empty() && prep(&s, "DELETE FROM btc_watch WHERE address=? AND src='auto'")) {
+            for (const auto& a : gone) {
+                sqlite3_reset(s);
+                bindText(s, 1, a);
+                sqlite3_step(s);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (!gone.empty()) {
+        std::lock_guard<std::mutex> w(g_watchMutex);
+        for (const auto& a : gone) g_watch.erase(a);
+    }
+    return static_cast<int>(gone.size());
+}
+
 void stopBtc() {
     g_btcRunning.store(false);
     if (g_btcThread.joinable()) g_btcThread.join();

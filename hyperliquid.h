@@ -22,5 +22,9 @@ void startHyperliquidLoop();
 
 void stopHyperliquid();
 
+// Автокошелёк убран из базы за бездействие — поиск должен снова его
+// заметить, когда он вернётся к торговле.
+void hlAutoForget(const std::string& addressLower);
+
 // Ответ на /stats владельца.
 std::string hyperliquidStatsLine();

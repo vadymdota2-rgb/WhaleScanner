@@ -1477,23 +1477,32 @@ void bscAutoLoop() {
     }
 }
 
-/* Автокошельки, которые за месяц так и не торговали, базе не нужны: BSC —
-   без сделок в trades, Hyperliquid — без сделок в hl_fills. Убирается только
-   строка сервисного аккаунта; у людей, следящих за адресом, он остаётся. */
+/* Неактивные автокошельки убираются из базы, но не банятся: кто 30 дней
+   (AUTO_IDLE_SEC) не торговал — BSC без сделок в trades, Hyperliquid без
+   сделок в hl_fills, Bitcoin без движений в btc_moves — тот уходит из базы
+   сервисного аккаунта, а поиск его «забывает», чтобы снова добавить, когда
+   кошелёк вернётся к крупной торговле. Смотрим только на тех, кто в базе
+   дольше AUTO_IDLE_SEC: свежему ещё не было когда поторговать. У людей,
+   следящих за адресом, он остаётся.
+   Боты — другое дело: их банит разбор сделок (ignored_wallets на BSC,
+   hl_banned на Hyperliquid) навсегда, и ни импорт, ни поиск их не вернут. */
+constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
+
 void pruneAutoWallets() {
-    const long long cut = static_cast<long long>(time(nullptr)) - 30LL * 86400LL;
-    std::vector<std::pair<long long, std::string>> hl;
-    int removed = 0;
+    const long long cut = static_cast<long long>(time(nullptr)) - AUTO_IDLE_SEC;
+    struct W { long long id; std::string addr; };
+    std::vector<W> bsc, hlc;
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (prepareOrLog(db, &s,
-                "DELETE FROM user_whales WHERE user_id=? AND label='auto-bsc' AND created_at>0 AND created_at<? "
-                "AND NOT EXISTS (SELECT 1 FROM trades t, whale_addresses wa "
-                "                WHERE wa.id=user_whales.whale_id AND t.wallet=lower(wa.address))")) {
+                "SELECT uw.whale_id, lower(wa.address) FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                "WHERE uw.user_id=? AND uw.label='auto-bsc' AND uw.created_at>0 AND uw.created_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.wallet=lower(wa.address) AND t.timestamp>=?)")) {
             sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(s, 2, cut);
-            if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+            sqlite3_bind_int64(s, 3, cut);
+            while (sqlite3_step(s) == SQLITE_ROW) bsc.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
             sqlite3_finalize(s);
         }
         if (prepareOrLog(db, &s,
@@ -1501,39 +1510,55 @@ void pruneAutoWallets() {
                 "WHERE uw.user_id=? AND uw.label='auto-hl' AND uw.created_at>0 AND uw.created_at<?")) {
             sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(s, 2, cut);
-            while (sqlite3_step(s) == SQLITE_ROW) hl.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
+            while (sqlite3_step(s) == SQLITE_ROW) hlc.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
             sqlite3_finalize(s);
         }
     }
-    std::vector<long long> idle;
+    // Hyperliquid: сделки в своей базе, время — в миллисекундах.
+    std::vector<W> hl;
     {
         std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
         sqlite3_stmt* s = nullptr;
-        if (hl::g_hlDb && !hl.empty() && prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE lower(wallet)=? LIMIT 1")) {
-            for (const auto& [id, a] : hl) {
+        if (hl::g_hlDb && !hlc.empty() &&
+            prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE lower(wallet)=? AND ts>=? LIMIT 1")) {
+            for (const auto& w : hlc) {
                 sqlite3_reset(s);
-                sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(s) != SQLITE_ROW) idle.push_back(id);
+                sqlite3_bind_text(s, 1, w.addr.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, cut * 1000);
+                if (sqlite3_step(s) != SQLITE_ROW) hl.push_back(w);
             }
             sqlite3_finalize(s);
         }
     }
-    if (!idle.empty()) {
+    int removed = 0;
+    {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
-        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label='auto-hl' AND whale_id=?")) {
-            for (long long id : idle) {
-                sqlite3_reset(s);
-                sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(s, 2, id);
-                if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label=? AND whale_id=?")) {
+            for (const auto* list : {&bsc, &hl}) {
+                const char* label = list == &bsc ? "auto-bsc" : "auto-hl";
+                for (const auto& w : *list) {
+                    sqlite3_reset(s);
+                    sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(s, 2, label, -1, SQLITE_STATIC);
+                    sqlite3_bind_int64(s, 3, w.id);
+                    if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+                }
             }
             sqlite3_finalize(s);
         }
     }
-    if (removed > 0) {
-        std::cout << "[AUTO] убраны автокошельки без сделок за месяц: " << removed << std::endl;
-        refreshWatchers();
+    // Поиск их «забывает»: вернутся к крупной торговле — добавит снова.
+    {
+        std::lock_guard<std::mutex> l(g_bscAutoMutex);
+        for (const auto& w : bsc) g_bscAutoSeen.erase(w.addr);
+    }
+    for (const auto& w : hl) hlAutoForget(w.addr);
+    const int btc = btcPruneAuto(cut);
+    if (removed > 0 || btc > 0) {
+        std::cout << "[AUTO] убраны неактивные 30 дней (не баним): BSC " << bsc.size() << ", Hyperliquid " << hl.size()
+                  << ", Bitcoin " << btc << std::endl;
+        if (removed > 0) refreshWatchers();
     }
 }
 
