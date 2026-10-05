@@ -523,6 +523,8 @@ static uint64_t cachedNativePriceNanos() {
     return it->second.first;
 }
 
+uint64_t nativePriceCachedNanos() { return cachedNativePriceNanos(); }
+
 static bool quoteV2Pair(const std::string& token, const std::string& base, uint64_t basePriceNanos,
                         const std::string& pair, bool tokenIsZero,
                         uint64_t& priceOut, double& liqUsdOut) {

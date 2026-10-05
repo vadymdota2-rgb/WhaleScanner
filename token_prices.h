@@ -19,6 +19,8 @@ enum class PriceSource : int {
 int         getDecimals(const std::string& token);
 std::string getSymbol(const std::string& addr);
 uint64_t    getPriceNanos(const std::string& token);
+// Цена нативной монеты из кэша, без запросов к сети; 0 — кэш пуст или устарел.
+uint64_t    nativePriceCachedNanos();
 /** То же + явный источник. source может быть nullptr. */
 uint64_t    getPriceNanosEx(const std::string& token, PriceSource* source);
 double      getPoolLiquidityUsd(const std::string& token);

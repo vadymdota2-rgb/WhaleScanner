@@ -602,6 +602,19 @@ std::string funnelStatsLine() {
                 << " · наград за друзей отклонено " << sqlite3_column_int64(s, 1);
         sqlite3_finalize(s);
     }
+    // Автопополнение базы китов (BSC и Hyperliquid; биткоин — отдельно, /statsbtc).
+    if (prepareOrLog(db, &s, "SELECT SUM(label='auto-bsc' AND created_at>=?), SUM(label='auto-hl' AND created_at>=?), "
+                             "SUM(label='auto-bsc'), SUM(label='auto-hl') FROM user_whales WHERE user_id=?")) {
+        const long long day = time(nullptr) - 86400;
+        sqlite3_bind_int64(s, 1, day);
+        sqlite3_bind_int64(s, 2, day);
+        sqlite3_bind_text(s, 3, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(s) == SQLITE_ROW)
+            out << "\n🐋 Автобаза за сутки: BSC +" << sqlite3_column_int64(s, 0) << " · Hyperliquid +"
+                << sqlite3_column_int64(s, 1) << " (всего авто: " << sqlite3_column_int64(s, 2) << " / "
+                << sqlite3_column_int64(s, 3) << ")";
+        sqlite3_finalize(s);
+    }
     if (prepareOrLog(db, &s, "SELECT SUM(status='wait'), SUM(status='ok') FROM exch_claims")) {
         if (sqlite3_step(s) == SQLITE_ROW)
             out << "\nOKX: ждут проверки " << sqlite3_column_int64(s, 0) << " · одобрено " << sqlite3_column_int64(s, 1)
@@ -1357,6 +1370,173 @@ void flushPendingAlerts(bool force) {
     }
 }
 
+/* Автопополнение базы сервисного аккаунта на BSC — как у биткоина
+   (autoWatch в btc_chain.cpp): кто крупно вывел с биржи и не похож на
+   сервис, остаётся в базе сам.
+   • Вывод с биржи: отправитель — горячий кошелёк (порядковый номер его
+     транзакций, nonce, от BSC_HOT_NONCE; видно прямо в блоке, без запросов),
+     сама транзакция — перевод BNB или transfer() стейблкоина.
+   • Крупный: от BSC_AUTO_MIN_USD (по умолчанию $100 тыс., WHALE_BSC_AUTO_MIN).
+   • Не сервис: получатель — обычный кошелёк, не контракт, и у него меньше
+     BSC_AUTO_MAX_NONCE исходящих транзакций (биржи и боты — миллионы).
+   Разбор блока только складывает кандидатов; проверка (два запроса к RPC)
+   идёт отдельным потоком и сканер не задерживает. Кошельки, которые за
+   месяц не сделали ни одной сделки, убирает pruneAutoWallets. */
+const long double BSC_AUTO_MIN_USD = [] {
+    const char* v = std::getenv("WHALE_BSC_AUTO_MIN");
+    const double usd = (v && *v) ? std::atof(v) : 100000.0;
+    return static_cast<long double>(usd > 0 ? usd : 100000.0);
+}();
+constexpr long long BSC_HOT_NONCE = 300000;
+constexpr long long BSC_AUTO_MAX_NONCE = 1000;
+constexpr size_t BSC_AUTO_QUEUE_MAX = 500;
+constexpr size_t BSC_AUTO_SEEN_MAX = 200000;
+std::mutex g_bscAutoMutex;
+std::vector<std::string> g_bscAutoQueue;
+std::unordered_set<std::string> g_bscAutoSeen;
+
+static long double hexToLD(const std::string& h, size_t from = 0, size_t len = std::string::npos) {
+    long double v = 0;
+    const size_t end = len == std::string::npos ? h.size() : std::min(h.size(), from + len);
+    for (size_t i = from; i < end; i++) {
+        const char c = h[i];
+        int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (d < 0) continue;
+        v = v * 16 + d;
+    }
+    return v;
+}
+
+static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
+                            const std::unordered_map<std::string, std::vector<Watcher>>* watchers) {
+    static const bool onBsc = chainCtx().coingeckoPlatform == "binance-smart-chain";
+    if (!onBsc || to.empty() || !tx.contains("nonce") || !tx["nonce"].is_string()) return;
+    const std::string nonceHex = tx["nonce"].get<std::string>();
+    if (nonceHex.size() < 7) return;  // меньше 0x100000 — точно не горячий кошелёк
+    if (hexToLD(nonceHex, 2) < BSC_HOT_NONCE) return;
+    const std::string input = tx.contains("input") && tx["input"].is_string() ? tx["input"].get<std::string>() : "";
+    std::string rcpt;
+    long double usd = 0;
+    if (input == "0x" || input.empty()) {
+        const std::string val = tx.contains("value") && tx["value"].is_string() ? tx["value"].get<std::string>() : "0x0";
+        const long double bnb = hexToLD(val, 2) / 1e18L;
+        if (bnb <= 0) return;
+        const uint64_t px = nativePriceCachedNanos();
+        if (!px) return;
+        usd = bnb * static_cast<long double>(px) / 1e9L;
+        rcpt = to;
+    } else if (input.size() >= 138 && input.compare(0, 10, "0xa9059cbb") == 0 && chainCtx().stablecoins.count(to)) {
+        // transfer(address,uint256): адрес — последние 40 знаков первого
+        // слова, сумма — второе слово. У стейблкоинов BSC 18 знаков.
+        rcpt = "0x" + toLower(input.substr(34, 40));
+        usd = hexToLD(input, 74, 64) / 1e18L;
+    } else {
+        return;
+    }
+    if (usd < BSC_AUTO_MIN_USD || rcpt.size() != 42) return;
+    if (watchers && watchers->count(rcpt)) return;
+    std::lock_guard<std::mutex> l(g_bscAutoMutex);
+    if (g_bscAutoQueue.size() >= BSC_AUTO_QUEUE_MAX) return;
+    if (g_bscAutoSeen.size() >= BSC_AUTO_SEEN_MAX) g_bscAutoSeen.clear();
+    if (!g_bscAutoSeen.insert(rcpt).second) return;
+    g_bscAutoQueue.push_back(rcpt);
+}
+
+void bscAutoLoop() {
+    long long pending = 0;
+    auto lastRefresh = std::chrono::steady_clock::now();
+    while (running.load(std::memory_order_relaxed)) {
+        for (int i = 0; i < 50 && running.load(std::memory_order_relaxed); i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        std::vector<std::string> batch;
+        {
+            std::lock_guard<std::mutex> l(g_bscAutoMutex);
+            while (!g_bscAutoQueue.empty() && batch.size() < 10) {
+                batch.push_back(g_bscAutoQueue.back());
+                g_bscAutoQueue.pop_back();
+            }
+        }
+        for (const auto& a : batch) {
+            if (isPermanentlyBanned(a)) continue;
+            auto code = rpc("eth_getCode", {a, "latest"});
+            if (!code.is_string() || code.get<std::string>() != "0x") continue;  // контракт
+            auto cnt = rpc("eth_getTransactionCount", {a, "latest"});
+            long long n = 0;
+            if (!cnt.is_string() || !hexToLL(cnt.get<std::string>(), n) || n >= BSC_AUTO_MAX_NONCE) continue;
+            if (addUserWhale(SERVICE_CHAT_ID, a, "auto-bsc") == AddWhaleResult::OK) {
+                std::cout << "[BSC] в базу сервисного аккаунта: " << a << " (транзакций " << n << ")" << std::endl;
+                ++pending;
+            }
+        }
+        // Список отслеживаемых — раз в минуту, если что-то добавилось.
+        if (pending > 0 && std::chrono::steady_clock::now() - lastRefresh >= std::chrono::seconds(60)) {
+            refreshWatchers();
+            pending = 0;
+            lastRefresh = std::chrono::steady_clock::now();
+        }
+    }
+}
+
+/* Автокошельки, которые за месяц так и не торговали, базе не нужны: BSC —
+   без сделок в trades, Hyperliquid — без сделок в hl_fills. Убирается только
+   строка сервисного аккаунта; у людей, следящих за адресом, он остаётся. */
+void pruneAutoWallets() {
+    const long long cut = static_cast<long long>(time(nullptr)) - 30LL * 86400LL;
+    std::vector<std::pair<long long, std::string>> hl;
+    int removed = 0;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "DELETE FROM user_whales WHERE user_id=? AND label='auto-bsc' AND created_at>0 AND created_at<? "
+                "AND NOT EXISTS (SELECT 1 FROM trades t, whale_addresses wa "
+                "                WHERE wa.id=user_whales.whale_id AND t.wallet=lower(wa.address))")) {
+            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, cut);
+            if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s,
+                "SELECT uw.whale_id, lower(wa.address) FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                "WHERE uw.user_id=? AND uw.label='auto-hl' AND uw.created_at>0 AND uw.created_at<?")) {
+            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, cut);
+            while (sqlite3_step(s) == SQLITE_ROW) hl.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
+            sqlite3_finalize(s);
+        }
+    }
+    std::vector<long long> idle;
+    {
+        std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (hl::g_hlDb && !hl.empty() && prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE lower(wallet)=? LIMIT 1")) {
+            for (const auto& [id, a] : hl) {
+                sqlite3_reset(s);
+                sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+                if (sqlite3_step(s) != SQLITE_ROW) idle.push_back(id);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (!idle.empty()) {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label='auto-hl' AND whale_id=?")) {
+            for (long long id : idle) {
+                sqlite3_reset(s);
+                sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, id);
+                if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    if (removed > 0) {
+        std::cout << "[AUTO] убраны автокошельки без сделок за месяц: " << removed << std::endl;
+        refreshWatchers();
+    }
+}
+
 bool processBlock(long long bn) {
     std::stringstream ss; ss << "0x" << std::hex << bn;
     auto block=rpc("eth_getBlockByNumber",{ss.str(),true});
@@ -1388,6 +1568,8 @@ bool processBlock(long long bn) {
         g_stats.tx_processed.fetch_add(1);
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
+        // Крупный вывод с биржи — кандидат в базу (без запросов к сети).
+        bscAutoConsider(tx, to, watchers.get());
         std::string mA;
         if (bscActive && watchers) {
             if (bscActive->count(from) && watchers->count(from)) mA=from;
@@ -2260,6 +2442,7 @@ int main() {
     // запуске (отменять нечего — молча). Отдельным потоком: Telegram может
     // отвечать небыстро, а сканер ждать этого не должен.
     std::thread([]{ std::this_thread::sleep_for(std::chrono::seconds(5)); cancelStarSubscriptions(OWNER_CHAT_ID, false); }).detach();
+    std::thread(bscAutoLoop).detach();
     g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
     auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     auto ltp=std::chrono::steady_clock::now();
@@ -2322,7 +2505,7 @@ int main() {
                 lifecycleTick();
                 llc=std::chrono::steady_clock::now();
             }
-            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); lcl=std::chrono::steady_clock::now(); }
+            if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lcl).count()>=30) { cleanupOldAlerts(); cleanupOldTrades(); cleanupExpiredPremium(); pruneAutoWallets(); lcl=std::chrono::steady_clock::now(); }
             if (std::chrono::duration_cast<std::chrono::hours>(std::chrono::steady_clock::now()-lst).count()>=1) {
                 std::cout << "[STATS] rpc_fail=" << g_stats.rpc_failures.load() << " price_fb=" << g_stats.price_fallbacks.load()
                     << " reorg=" << g_stats.reorg_verifications.load() << " tx=" << g_stats.tx_processed.load() << " sent=" << g_stats.alerts_sent.load()
