@@ -5,6 +5,8 @@
 
 #include <sqlite3.h>
 #include <mutex>
+#include <thread>
+#include <chrono>
 #include <ctime>
 #include <cstdio>
 #include <iostream>
@@ -30,9 +32,10 @@ namespace {
 /* Тарифы в звёздах. Счёт выставляет API (whale_api.py, STAR_PLANS) — там те
    же полезная нагрузка, цена и срок; здесь их сверяют перед выдачей.
 
-   Месяц оплачивается подпиской Telegram: звёзды списываются сами каждые
-   30 дней, и каждое списание приходит сюда обычным successful_payment с той
-   же нагрузкой. Год — разовая оплата со скидкой. Вводная цена месяца —
+   Все тарифы — разовые: автопродления (подписки Telegram) нет, продлевать
+   или нет решает человек. Подписки, оформленные раньше, бот отменяет сам
+   (cancelStarSubscriptions); списание, успевшее прийти, засчитывается как
+   обычная оплата. Год — разовая оплата со скидкой. Вводная цена месяца —
    предложение тем, у кого только что кончилась пробная неделя; кому его
    показывать, решает API, бот лишь узнаёт нагрузку. */
 struct StarPlan { const char* payload; long long stars; int days; };
@@ -743,4 +746,64 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     if (!sendMsg(chatId, text, openAppKeyboard(lang)).ok)
         std::cerr << "[PREMIUM] success notification failed for " << chatId << std::endl;
     return true;
+}
+
+int cancelStarSubscriptions(const std::string& reportTo, bool sayNone) {
+    // Действующая подписка — последний платёж человека с sub_until в будущем.
+    struct Sub { std::string chat, charge; long long until = 0; };
+    std::vector<Sub> subs;
+    const long long now = static_cast<long long>(time(nullptr));
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s,
+                "SELECT p.chat_id, p.telegram_payment_charge_id, p.sub_until FROM premium_payments p "
+                "WHERE p.sub_until > ? AND p.paid_at = (SELECT MAX(q.paid_at) FROM premium_payments q "
+                "WHERE q.chat_id = p.chat_id AND q.sub_until > 0)")) {
+            sqlite3_bind_int64(s, 1, now);
+            while (sqlite3_step(s) == SQLITE_ROW)
+                subs.push_back({safeColumnText(s, 0), safeColumnText(s, 1), sqlite3_column_int64(s, 2)});
+            sqlite3_finalize(s);
+        }
+    }
+    if (subs.empty()) {
+        if (!reportTo.empty() && sayNone) sendMsg(reportTo, "🔁 Автопродлений звёздами нет — ничего не списывается само.");
+        return 0;
+    }
+    int ok = 0, failed = 0;
+    for (const auto& sub : subs) {
+        nlohmann::json j;
+        try { j["user_id"] = std::stoll(sub.chat); } catch (...) { ++failed; continue; }
+        j["telegram_payment_charge_id"] = sub.charge;
+        j["is_canceled"] = true;
+        bool done = false;
+        try {
+            auto r = nlohmann::json::parse(http(tgApi("editUserStarSubscription"), j.dump(), 15));
+            done = r.value("ok", false);
+            if (!done) std::cerr << "[PREMIUM] cancel subscription " << sub.chat << ": "
+                                 << r.value("description", std::string("?")) << std::endl;
+        } catch (...) {}
+        if (!done) { ++failed; continue; }
+        ++ok;
+        // Отменённую больше не считаем действующей: второй проход её не тронет.
+        {
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            if (prepareOrLog(db, &s, "UPDATE premium_payments SET sub_until=0 WHERE chat_id=?")) {
+                sqlite3_bind_text(s, 1, sub.chat.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
+        }
+        const Lang lang = langFromCode(getUserLanguage(sub.chat));
+        sendMsg(sub.chat, tr(lang, "autorenew_off"), openAppKeyboard(lang, "premium-renew", "btn_extend"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+    std::cout << "[PREMIUM] автопродления отменены: " << ok << ", не вышло: " << failed << std::endl;
+    if (!reportTo.empty())
+        sendMsg(reportTo, "🔁 <b>Автопродления звёздами отменены</b>: " + std::to_string(ok) +
+                          (failed ? "\n⚠️ Не вышло: " + std::to_string(failed) + " — повтор: /autorenew" : "") +
+                          "\nКаждому пришло сообщение: Премиум действует до конца оплаченного срока, "
+                          "дальше — только если сам продлит.");
+    return ok;
 }

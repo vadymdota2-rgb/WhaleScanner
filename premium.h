@@ -26,6 +26,12 @@ void pollUsdtPayments();
 
 bool grantPremiumDays(const std::string& chatId, int days);
 
+/** Отменить автопродление у всех, кто когда-то оформил подписку звёздами:
+ *  звёзды больше не списываются сами. Каждому — сообщение, владельцу
+ *  (reportTo) — отчёт; sayNone=false — молчать, если отменять нечего (так
+ *  зовётся при каждом запуске бота). Возвращает, сколько подписок отменено. */
+int cancelStarSubscriptions(const std::string& reportTo, bool sayNone = true);
+
 /** Событие воронки продаж (таблица funnel_events, её же пишет API). */
 void trackFunnel(const std::string& chatId, const char* ev, const char* src = "");
 

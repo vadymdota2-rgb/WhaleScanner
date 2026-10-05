@@ -2097,6 +2097,10 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     else if (txt == "/partner" || txt.rfind("/partner ", 0) == 0) {
         partnerCommand(cid, trim(txt.substr(8)));
     }
+    else if (txt == "/autorenew") {
+        // Проверить и отменить автопродления звёздами, если какие-то остались.
+        std::thread([cid]{ cancelStarSubscriptions(cid, true); }).detach();
+    }
     else if (txt == "/okx") {
         exchPending(cid);
     }
@@ -2242,6 +2246,10 @@ int main() {
         if (cid != SERVICE_CHAT_ID) removeUser(cid);
         else std::cout << "[USERS] Skip removing service account" << std::endl;
     });
+    // Автопродлений нет: подписки звёздами, оформленные раньше, отменяем при
+    // запуске (отменять нечего — молча). Отдельным потоком: Telegram может
+    // отвечать небыстро, а сканер ждать этого не должен.
+    std::thread([]{ std::this_thread::sleep_for(std::chrono::seconds(5)); cancelStarSubscriptions(OWNER_CHAT_ID, false); }).detach();
     g_msgQueue.start(); std::thread tg(telegramLoop); std::thread rk(rankingCacheLoop); std::thread af(alertFlushLoop); std::thread dm(dbMaintenanceLoop);
     auto lst=std::chrono::steady_clock::now(), lsq=std::chrono::steady_clock::now(), lcl=std::chrono::steady_clock::now();
     auto ltp=std::chrono::steady_clock::now();

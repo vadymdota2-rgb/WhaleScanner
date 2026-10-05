@@ -326,16 +326,13 @@ void lifecycleTick() {
         sent++;
     }
 
-    // 2. Оплаченный срок кончается через 3 дня, а автопродления нет: разовая
-    //    оплата (год, USD₮ или месяц до подписок). У подписки Telegram
-    //    sub_until последнего платежа покрывает срок — ей не пишем.
+    // 2. Оплаченный срок кончается через 3 дня. Автопродления нет ни у кого
+    //    (все тарифы разовые), поэтому напоминаем каждому, кто платил.
     for (const Row& r : select(
             "SELECT u.chat_id, u.premium_expire FROM users u "
             "WHERE u.is_premium=1 AND u.premium_expire BETWEEN ? AND ? "
             "AND (EXISTS (SELECT 1 FROM premium_payments p WHERE p.chat_id=u.chat_id) "
-            "  OR EXISTS (SELECT 1 FROM ton_invoices i WHERE i.chat_id=u.chat_id AND i.status='paid')) "
-            "AND NOT EXISTS (SELECT 1 FROM premium_payments p WHERE p.chat_id=u.chat_id "
-            "  AND p.sub_until >= u.premium_expire - 86400)",
+            "  OR EXISTS (SELECT 1 FROM ton_invoices i WHERE i.chat_id=u.chat_id AND i.status='paid'))",
             now, now + 3 * DAY)) {
         if (sent >= MAX_PER_TICK) return;
         if (r.chat == SERVICE_CHAT_ID || !claim(r.chat, "renew:" + std::to_string(r.expire))) continue;

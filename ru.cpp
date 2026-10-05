@@ -100,6 +100,8 @@ const std::unordered_map<std::string, Entry>& table() {
             "🎁 Забрать скидку"}},
         {"payment_renewed", {"✅ Premium renewed for another {n} days.",
             "✅ Премиум продлён ещё на {n} дней."}},
+        {"autorenew_off", {"🔁 Premium auto-renewal is now off: Stars will no longer be charged automatically. Your Premium stays active until the end of the paid period; extend it in the app whenever you want.",
+            "🔁 Автопродление Премиума отключено: звёзды больше не будут списываться сами. Премиум действует до конца оплаченного срока, а продлить можно в приложении, когда захотите."}},
         {"dg_ready", {"📰 Today's whale digest is out: the day's signals, market, Bitcoin on exchanges, BSC whales and the ranking leaders.",
             "📰 Вышел дайджест китов за сегодня: сигналы дня, рынок, Bitcoin на биржах, киты BSC и лидеры рейтинга."}},
         {"lc_trial_d5", {"⏳ Your Premium trial ends in 2 days.",
