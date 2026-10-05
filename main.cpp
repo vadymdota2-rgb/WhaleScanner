@@ -588,14 +588,24 @@ std::string funnelStatsLine() {
     if (n["open"] > 0)
         out << " (" << std::fixed << std::setprecision(1) << 100.0 * n["paid"] / n["open"] << "% открывших)";
     out << "\nпробных: " << n["trial"] << " · по приглашению: " << n["ref"] << " · бонусы за соцсети: " << n["bonus"];
+    if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM token_subs")) {
+        if (sqlite3_step(s) == SQLITE_ROW) out << " · ждут токен: " << sqlite3_column_int64(s, 0);
+        sqlite3_finalize(s);
+    }
+    // Защита от накруток (API): сколько проб не выдано (3+ новых аккаунта с
+    // одного IP за сутки) и сколько наград за друзей отклонено (общий IP).
+    if (prepareOrLog(db, &s, "SELECT SUM(src='trial_ip'), SUM(src='ref_ip') FROM funnel_events "
+                             "WHERE ev='abuse' AND at >= ?")) {
+        sqlite3_bind_int64(s, 1, since);
+        if (sqlite3_step(s) == SQLITE_ROW)
+            out << "\n🛡 Накрутки: проб не выдано " << sqlite3_column_int64(s, 0)
+                << " · наград за друзей отклонено " << sqlite3_column_int64(s, 1);
+        sqlite3_finalize(s);
+    }
     if (prepareOrLog(db, &s, "SELECT SUM(status='wait'), SUM(status='ok') FROM exch_claims")) {
         if (sqlite3_step(s) == SQLITE_ROW)
             out << "\nOKX: ждут проверки " << sqlite3_column_int64(s, 0) << " · одобрено " << sqlite3_column_int64(s, 1)
                 << (sqlite3_column_int64(s, 0) ? " (/okx)" : "");
-        sqlite3_finalize(s);
-    }
-    if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM token_subs")) {
-        if (sqlite3_step(s) == SQLITE_ROW) out << " · ждут токен: " << sqlite3_column_int64(s, 0);
         sqlite3_finalize(s);
     }
     if (prepareOrLog(db, &s,
