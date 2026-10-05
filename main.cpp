@@ -1607,7 +1607,10 @@ bool handleExchCallback(const json& cq) {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (id > 0 && prepareOrLog(db, &s,
-                "UPDATE exch_claims SET status=?, decided_at=? WHERE id=? AND status='wait'")) {
+                "UPDATE exch_claims SET status=?, decided_at=? WHERE id=? AND status='wait' "
+                // Один UID — одна награда: второй раз тот же UID не одобрить.
+                "AND (?1 != 'ok' OR NOT EXISTS (SELECT 1 FROM exch_claims o WHERE o.ex=exch_claims.ex "
+                "AND o.uid=exch_claims.uid AND o.status='ok' AND o.id!=exch_claims.id))")) {
             sqlite3_bind_text(s, 1, approve ? "ok" : "no", -1, SQLITE_STATIC);
             sqlite3_bind_int64(s, 2, (sqlite3_int64)time(nullptr));
             sqlite3_bind_int64(s, 3, id);
@@ -1620,9 +1623,14 @@ bool handleExchCallback(const json& cq) {
         if (!qid.empty()) answerCallbackQuery(qid, "Заявка не найдена");
         return true;
     }
+    // Не изменилась, а всё ещё ждёт — значит, этот UID уже одобрен в другой
+    // заявке: эту владелец может только отклонить.
+    const bool dupUid = !changed && c.status == "wait";
     if (!qid.empty())
         answerCallbackQuery(qid, changed ? (approve ? "Одобрено" : "Отклонено")
-                                         : (c.status == "ok" ? "Уже одобрено" : "Уже отклонено"));
+                                 : dupUid ? "Этот UID уже получил награду — одобрить нельзя"
+                                 : (c.status == "ok" ? "Уже одобрено" : "Уже отклонено"));
+    if (dupUid) return true;
     // Сообщение с заявкой — с итогом и без кнопок, чтобы не нажать дважды.
     if (cq.contains("message") && cq["message"].is_object() && cq["message"].contains("message_id") &&
         cq["message"].contains("chat") && cq["message"]["chat"].is_object() &&
