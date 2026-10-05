@@ -1511,8 +1511,8 @@ std::string thousands(long long n) {
 
 // Вся база сервисного аккаунта, не только найденное поиском: импорт (/import)
 // плюс поиск. Адрес BSC и Hyperliquid один (0x…), поэтому кошелёк один на обе
-// сети; «следим» — сеть, где у него есть сделки или он добавлен меньше 30
-// дней назад (как решает refreshWatchers).
+// сети. Холодные — давно в базе и без сделок в сети; проснувшиеся — те из
+// них, кто снова торгует (autoWoke).
 std::string serviceBaseSummary(std::string& totals) {
     long long evm = 0, evmAuto = 0;
     {
@@ -1529,26 +1529,67 @@ std::string serviceBaseSummary(std::string& totals) {
             sqlite3_finalize(s);
         }
     }
-    long long onBsc = 0, onHl = 0;
+    // Холодные — в базе больше 30 дней и без сделок в сети: на BSC не в
+    // тёплых (BSC_ACTIVE_PTR) и ещё не проснулись (тёплыми проснувшиеся
+    // станут при пересборке списка, раз в час); на Hyperliquid сделок ни разу
+    // не подтягивали (нет засеянного hl_wallet_state).
+    long long bscCold = 0, hlCold = 0;
     {
-        std::shared_lock l(watchersMutex);
-        if (WATCHERS_PTR && BSC_ACTIVE_PTR && HL_ACTIVE_PTR)
-            for (const auto& [addr, ws] : *WATCHERS_PTR) {
-                if (addr.rfind("0x", 0) != 0) continue;
-                bool svc = false;
-                for (const auto& w : ws) if (w.chatId == SERVICE_CHAT_ID) { svc = true; break; }
-                if (!svc) continue;
-                onBsc += BSC_ACTIVE_PTR->count(addr);
-                onHl += HL_ACTIVE_PTR->count(addr);
+        std::shared_ptr<const std::unordered_set<std::string>> warm;
+        { std::shared_lock l(watchersMutex); warm = BSC_ACTIVE_PTR; }
+        std::unordered_set<std::string> wokeBsc;
+        std::unordered_set<std::string> seeded;
+        {
+            std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
+            sqlite3_stmt* s = nullptr;
+            if (hl::g_hlDb && prepareOrLog(hl::g_hlDb, &s, "SELECT wallet FROM hl_wallet_state WHERE seeded=1")) {
+                while (sqlite3_step(s) == SQLITE_ROW) seeded.insert(toLower(safeColumnText(s, 0)));
+                sqlite3_finalize(s);
             }
+        }
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT address FROM auto_woke WHERE net='bsc'")) {
+            while (sqlite3_step(s) == SQLITE_ROW) wokeBsc.insert(safeColumnText(s, 0));
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s, "SELECT wa.address FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                                 "WHERE uw.user_id=? AND wa.address LIKE '0x%' AND uw.created_at>0 AND uw.created_at<?")) {
+            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, static_cast<long long>(time(nullptr)) - 30LL * 86400LL);
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                const std::string a = safeColumnText(s, 0);
+                if (!seeded.count(a)) ++hlCold;
+                if (!(warm && warm->count(a)) && !wokeBsc.count(a)) ++bscCold;
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    // Проснулись — холодные, которые снова торгуют (auto_woke, autoWoke).
+    long long wokeToday[2] = {0, 0}, wokeAll[2] = {0, 0};
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT net, SUM(at>=?), COUNT(*) FROM auto_woke GROUP BY net")) {
+            sqlite3_bind_int64(s, 1, static_cast<long long>(time(nullptr)) / 86400 * 86400);
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                const std::string net = safeColumnText(s, 0);
+                const int k = net == "bsc" ? 0 : net == "hl" ? 1 : -1;
+                if (k < 0) continue;
+                wokeToday[k] = sqlite3_column_int64(s, 1);
+                wokeAll[k] = sqlite3_column_int64(s, 2);
+            }
+            sqlite3_finalize(s);
+        }
     }
     const long long btc = btcWatchCount(false), btcAuto = btcWatchCount(true);
     std::ostringstream t;
     t << "📦 <b>Вся база сервисного аккаунта</b>"
       << "\nBSC и Hyperliquid (адрес один на обе сети): <b>" << thousands(evm) << "</b>"
       << "\n   импорт: " << thousands(evm - evmAuto) << " · найдено поиском: " << thousands(evmAuto)
-      << "\n   следим: на Hyperliquid все " << thousands(onHl) << " · на BSC постоянно " << thousands(onBsc)
-      << ", остальные " << thousands(evm - onBsc) << " — по их собственным транзакциям"
+      << "\n   холодные (давно без сделок): BSC " << thousands(bscCold) << " · Hyperliquid " << thousands(hlCold)
+      << "\n   проснулись и начали торговать: сегодня BSC " << thousands(wokeToday[0]) << " · Hyperliquid "
+      << thousands(wokeToday[1]) << "; всего BSC " << thousands(wokeAll[0]) << " · Hyperliquid " << thousands(wokeAll[1])
       << "\nBitcoin: <b>" << thousands(btc) << "</b>"
       << "\n   импорт: " << thousands(btc - btcAuto) << " · найдено поиском: " << thousands(btcAuto)
       << "\nИмпорт за бездействие не удаляется никогда; убрать его может только бан бота.";
@@ -1669,7 +1710,7 @@ bool processBlock(long long bn) {
     std::shared_ptr<const std::unordered_set<std::string>> bscActive;
     { std::shared_lock l(watchersMutex); watchers = WATCHERS_PTR; bscActive = BSC_ACTIVE_PTR; }
 
-    struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; };
+    struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; bool cold; };
     std::vector<Matched> matched;
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
@@ -1681,6 +1722,7 @@ bool processBlock(long long bn) {
         // Крупный вывод с биржи — кандидат в базу (без запросов к сети).
         bscAutoConsider(tx, to, watchers.get());
         std::string mA;
+        bool cold = false;
         if (bscActive && watchers) {
             if (bscActive->count(from) && watchers->count(from)) mA=from;
             else if (bscActive->count(to) && watchers->count(to)) mA=to;
@@ -1688,11 +1730,11 @@ bool processBlock(long long bn) {
             // окажется своп, сделка запишется, и при следующей сборке списка
             // он снова тёплый. Входящие холодным не смотрим: пыль и рассылки
             // на мёртвые адреса стоили бы запросов впустую.
-            else if (watchers->count(from)) mA=from;
+            else if (watchers->count(from)) { mA=from; cold=true; }
         }
         if (mA.empty()) continue;
         if (isTxProcessed(hash)) continue;
-        matched.push_back({&tx, hash, mA});
+        matched.push_back({&tx, hash, mA, cold});
     }
 
     std::vector<nlohmann::json> receipts(matched.size());
@@ -1725,6 +1767,7 @@ bool processBlock(long long bn) {
             return false;
         }
         TxResult res=analyzeTx(tx,receipt,mA); if (!res.valid) { markTxProcessed(hash,bn); continue; }
+        if (matched[i].cold && res.isSwap) autoWoke(AutoNet::BSC, mA);
         bool svcOnly = false;
         { auto cw = watchers->find(mA);
           if (cw != watchers->end() && !cw->second.empty()) {

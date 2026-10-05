@@ -8,6 +8,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <unordered_set>
 
 #include <sqlite3.h>
 
@@ -103,6 +104,10 @@ std::string money(double usd) {
 void initAutobase() {
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
+    sqlite3_exec(db,
+                 "CREATE TABLE IF NOT EXISTS auto_woke (net TEXT NOT NULL, address TEXT NOT NULL, "
+                 "at INTEGER NOT NULL, PRIMARY KEY (net, address))",
+                 nullptr, nullptr, nullptr);
     for (int i = 0; i < NETS; i++) {
         if (prepareOrLog(db, &s, "SELECT value FROM state WHERE key=?")) {
             sqlite3_bind_text(s, 1, KEY[i], -1, SQLITE_STATIC);
@@ -202,6 +207,42 @@ std::pair<long long, long long> tallyOf(const Tally& t, int i) {
 void autoPruned(AutoNet n, int count) { bump(g_pruned, n, count); }
 
 void autoBanned(AutoNet n, int count) { bump(g_banned, n, count); }
+
+void autoWoke(AutoNet n, const std::string& addr) {
+    // До пересборки списка (раз в час) проснувшийся ещё числится холодным, и
+    // каждая его сделка зовёт сюда — в базу идём один раз за запуск.
+    static std::mutex mx;
+    static std::unordered_set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> m(mx);
+        if (!seen.insert(ARG[static_cast<int>(n)] + std::string(":") + addr).second) return;
+    }
+    constexpr long long COLD_SEC = 30LL * 86400LL;  // как MARKET_WATCH_GRACE_SEC в main.cpp
+    const long long now = static_cast<long long>(time(nullptr));
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    bool cold = false;
+    if (prepareOrLog(db, &s, "SELECT 1 FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                             "WHERE uw.user_id=? AND wa.address=? AND uw.created_at>0 AND uw.created_at<? LIMIT 1")) {
+        sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s, 2, addr.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 3, now - COLD_SEC);
+        cold = sqlite3_step(s) == SQLITE_ROW;
+        sqlite3_finalize(s);
+    }
+    if (!cold) return;
+    if (prepareOrLog(db, &s, "INSERT INTO auto_woke(net, address, at) VALUES(?,?,?) "
+                             "ON CONFLICT(net, address) DO UPDATE SET at=excluded.at "
+                             "WHERE auto_woke.at < excluded.at - ?")) {
+        sqlite3_bind_text(s, 1, ARG[static_cast<int>(n)], -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 2, addr.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s, 3, now);
+        sqlite3_bind_int64(s, 4, COLD_SEC);
+        if (sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0)
+            std::cout << "[AUTO] холодный кошелёк проснулся (" << NAME[static_cast<int>(n)] << "): " << addr << std::endl;
+        sqlite3_finalize(s);
+    }
+}
 
 int autoLimit(AutoNet n) { return limits()[static_cast<int>(n)]; }
 

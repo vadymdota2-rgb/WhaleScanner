@@ -1321,6 +1321,7 @@ void enrichWallet(const std::string& wallet) {
                   << jstr(fills[0], "coin", "?")
                   << " - сверь с именами рынков из meta." << std::endl;
     } else if (stored > 0 && !wasSeeded) {
+        autoWoke(AutoNet::HL, wallet);  // засчитается, только если кошелёк давно в базе
         std::cout << "[HL] первичное наполнение " << wallet << ": " << stored
                   << " сделок записано молча" << std::endl;
     }

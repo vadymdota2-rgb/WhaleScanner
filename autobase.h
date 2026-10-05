@@ -45,6 +45,12 @@ double autoMinUsd(AutoNet n);
 double btcAutoMinBtc();
 long long btcAutoCount();  // найденные поиском и ещё в базе (btc_chain.cpp)
 long long btcWatchCount(bool autoOnly);  // вся база Bitcoin или только найденные
+// Холодный кошелёк сервисного аккаунта (в базе больше 30 дней, сделок в сети
+// не было) совершил сделку — запомнить в auto_woke для /autobase. BSC — своп
+// по исходящей транзакции, Hyperliquid — первые сделки кошелька. Повторно
+// тот же кошелёк считается, только если со времени прошлого раза прошло 30
+// дней. Не под dbMutex.
+void autoWoke(AutoNet n, const std::string& addr);
 // Вся база сервисного аккаунта (импорт и поиск) — строки для /autobase (main.cpp).
 // В totals — итог по сетям и всего, для самого низа сообщения.
 std::string serviceBaseSummary(std::string& totals);
