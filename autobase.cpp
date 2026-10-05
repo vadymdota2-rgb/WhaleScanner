@@ -52,14 +52,19 @@ const double* minUsd() {
     return v;
 }
 
-const char* const PRUNED_KEY[NETS] = {"pruned_bsc", "pruned_hl", "pruned_btc"};
-
 std::atomic<bool> g_on[NETS] = {true, true, true};
-// Убраны за бездействие: сегодня (UTC) и всего. В state хранится как
-// "<день>:<сегодня>:<всего>".
-long long g_prDay[NETS] = {-1, -1, -1};
-long long g_prToday[NETS] = {0, 0, 0}, g_prTotal[NETS] = {0, 0, 0};
 std::mutex g_mx;
+
+// Счётчик событий «сегодня (UTC) и всего». В state хранится как
+// "<день>:<сегодня>:<всего>", поэтому переживает перезапуск.
+struct Tally {
+    const char* key[NETS];
+    long long day[NETS] = {-1, -1, -1};
+    long long today[NETS] = {0, 0, 0};
+    long long total[NETS] = {0, 0, 0};
+};
+Tally g_pruned{{"pruned_bsc", "pruned_hl", "pruned_btc"}};  // убраны за бездействие
+Tally g_banned{{"banned_bsc", "banned_hl", "banned_btc"}};  // забанены как боты
 long long g_day = -1;
 int g_today[NETS] = {0, 0, 0};
 
@@ -105,16 +110,16 @@ void initAutobase() {
             sqlite3_finalize(s);
         }
     }
-    for (int i = 0; i < NETS; i++) {
-        if (prepareOrLog(db, &s, "SELECT value FROM state WHERE key=?")) {
-            sqlite3_bind_text(s, 1, PRUNED_KEY[i], -1, SQLITE_STATIC);
-            if (sqlite3_step(s) == SQLITE_ROW) {
-                long long d = -1, t = 0, all = 0;
-                if (std::sscanf(safeColumnText(s, 0).c_str(), "%lld:%lld:%lld", &d, &t, &all) == 3) {
-                    g_prDay[i] = d;
-                    g_prToday[i] = t;
-                    g_prTotal[i] = all;
-                }
+    for (Tally* t : {&g_pruned, &g_banned}) {
+        for (int i = 0; i < NETS; i++) {
+            if (!prepareOrLog(db, &s, "SELECT value FROM state WHERE key=?")) continue;
+            sqlite3_bind_text(s, 1, t->key[i], -1, SQLITE_STATIC);
+            long long d = -1, today = 0, all = 0;
+            if (sqlite3_step(s) == SQLITE_ROW &&
+                std::sscanf(safeColumnText(s, 0).c_str(), "%lld:%lld:%lld", &d, &today, &all) == 3) {
+                t->day[i] = d;
+                t->today[i] = today;
+                t->total[i] = all;
             }
             sqlite3_finalize(s);
         }
@@ -164,33 +169,60 @@ int autoToday(AutoNet n) {
     return g_today[static_cast<int>(n)];
 }
 
-void autoPruned(AutoNet n, int count) {
+namespace {
+// Не под dbMutex: пишет в state сама.
+void bump(Tally& t, AutoNet n, int count) {
     if (count <= 0) return;
     const int i = static_cast<int>(n);
     std::string v;
     {
         std::lock_guard<std::mutex> m(g_mx);
         const long long d = utcDay();
-        if (g_prDay[i] != d) { g_prDay[i] = d; g_prToday[i] = 0; }
-        g_prToday[i] += count;
-        g_prTotal[i] += count;
-        v = std::to_string(g_prDay[i]) + ":" + std::to_string(g_prToday[i]) + ":" + std::to_string(g_prTotal[i]);
+        if (t.day[i] != d) { t.day[i] = d; t.today[i] = 0; }
+        t.today[i] += count;
+        t.total[i] += count;
+        v = std::to_string(t.day[i]) + ":" + std::to_string(t.today[i]) + ":" + std::to_string(t.total[i]);
     }
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
     if (prepareOrLog(db, &s, "INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)")) {
-        sqlite3_bind_text(s, 1, PRUNED_KEY[i], -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 1, t.key[i], -1, SQLITE_STATIC);
         sqlite3_bind_text(s, 2, v.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(s);
         sqlite3_finalize(s);
     }
 }
 
+// Сегодня и всего — под g_mx.
+std::pair<long long, long long> tallyOf(const Tally& t, int i) {
+    return {t.day[i] == utcDay() ? t.today[i] : 0, t.total[i]};
+}
+}  // namespace
+
+void autoPruned(AutoNet n, int count) { bump(g_pruned, n, count); }
+
+void autoBanned(AutoNet n) { bump(g_banned, n, 1); }
+
 int autoLimit(AutoNet n) { return limits()[static_cast<int>(n)]; }
 
 double autoMinUsd(AutoNet n) { return minUsd()[static_cast<int>(n)]; }
 
 void autobaseCommand(const std::string& owner, const std::string& arg) {
+    // Сейчас в базе: найденные поиском и ещё не убранные. Всего добавлено =
+    // в базе + удалено + забанено (повторно найденный считается дважды).
+    long long inBase[NETS] = {0, 0, btcAutoCount()};
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT SUM(label='auto-bsc'), SUM(label='auto-hl') FROM user_whales WHERE user_id=?")) {
+            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                inBase[0] = sqlite3_column_int64(s, 0);
+                inBase[1] = sqlite3_column_int64(s, 1);
+            }
+            sqlite3_finalize(s);
+        }
+    }
     std::istringstream in(arg);
     std::string net, act;
     in >> net >> act;
@@ -216,7 +248,7 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
     for (int i = 0; i < NETS; i++) {
         const AutoNet n = static_cast<AutoNet>(i);
         t << "\n" << (g_on[i] ? "🟢 " : "⚪️ ") << "<b>" << NAME[i] << "</b> — " << (g_on[i] ? "ищет" : "остановлен")
-          << " · сегодня " << autoToday(n) << "/" << limits()[i] << " · порог ";
+          << " · порог ";
         if (n == AutoNet::BTC) {
             std::ostringstream b;
             b << btcAutoMinBtc();
@@ -224,18 +256,27 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         } else {
             t << money(minUsd()[i]);
         }
+        const bool ban = n != AutoNet::BTC;  // в Bitcoin ботов не банит: сервисы отсекаются до добавления
+        std::pair<long long, long long> pr, bn;
+        {
+            std::lock_guard<std::mutex> m(g_mx);
+            pr = tallyOf(g_pruned, i);
+            bn = tallyOf(g_banned, i);
+        }
+        t << "\n   Сегодня: добавлено " << autoToday(n) << "/" << limits()[i] << " · удалено " << pr.first;
+        if (ban) t << " · забанено " << bn.first;
+        t << "\n   Всего: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second;
+        if (ban) t << " · забанено " << bn.second;
+        t << " · в базе " << inBase[i];
         // Сегодняшнее число берётся из базы при запуске: в нём и то, что
         // добавили до лимита (версии без лимита), поэтому бывает больше.
         if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
-        {
-            std::lock_guard<std::mutex> m(g_mx);
-            const long long today = g_prDay[i] == utcDay() ? g_prToday[i] : 0;
-            t << "\n   убрано за бездействие: сегодня " << today << " · всего " << g_prTotal[i];
-        }
         if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\nВключить: <code>/autobase bsc on</code>"
-         "\nУже найденные кошельки остаются в базе; на BSC и Hyperliquid те, кто месяц не торговал, убираются сами.";
+         "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова."
+         "\nЗабанено — боты (слишком много сделок): навсегда."
+         "\nВ Bitcoin банить некого: биржи и сервисы отсекаются ещё до добавления.";
     sendMsg(owner, t.str());
 }

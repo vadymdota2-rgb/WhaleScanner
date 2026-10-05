@@ -8,6 +8,7 @@
 #include <vector>
 #include <sqlite3.h>
 
+#include "autobase.h"
 #include "utils.h"
 #include "premium.h"
 #include "ranking.h"
@@ -130,6 +131,13 @@ void untrackWalletFromService(const std::string& wallet) {
     std::cout << "[WATCHERS] Bot wallet untracked from " << removed
               << " watchlist(s): " << addr << std::endl;
     refreshWatchers();
+
+    // Бот из найденных поиском — в счётчик банов /autobase.
+    for (const auto& [cid, label] : recipients) {
+        if (cid != SERVICE_CHAT_ID) continue;
+        if (label == "auto-bsc") autoBanned(AutoNet::BSC);
+        else if (label == "auto-hl") autoBanned(AutoNet::HL);
+    }
 
     for (const auto& [cid, label] : recipients) {
         if (cid == SERVICE_CHAT_ID) continue;

@@ -33,6 +33,8 @@ int autoToday(AutoNet n);
 // Убраны из базы за бездействие (pruneAutoWallets) — учесть. Счётчик за
 // сегодня и за всё время хранится в таблице state и переживает перезапуск.
 void autoPruned(AutoNet n, int count);
+// Бот из найденных поиском забанен (BSC или Hyperliquid) — для счётчика.
+void autoBanned(AutoNet n);
 int autoLimit(AutoNet n);
 
 // Порог в долларах для BSC и Hyperliquid (WHALE_BSC_AUTO_MIN,
@@ -40,6 +42,7 @@ int autoLimit(AutoNet n);
 double autoMinUsd(AutoNet n);
 // Порог Bitcoin в биткоинах (WHALE_BTC_AUTO_MIN, по умолчанию 1).
 double btcAutoMinBtc();
+long long btcAutoCount();  // найденные поиском и ещё в базе (btc_chain.cpp)
 
 // /autobase — состояние; /autobase bsc|hl|btc|all on|off — включить/выключить.
 void autobaseCommand(const std::string& owner, const std::string& arg);

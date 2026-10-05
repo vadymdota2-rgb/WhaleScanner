@@ -1462,6 +1462,18 @@ void startBtcLoop() {
 
 double btcAutoMinBtc() { return static_cast<double>(AUTO_MIN_SATS) / 1e8; }
 
+long long btcAutoCount() {
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    if (!g_btcDb) return 0;
+    sqlite3_stmt* s = nullptr;
+    long long n = 0;
+    if (prep(&s, "SELECT COUNT(*) FROM btc_watch WHERE src='auto'")) {
+        if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int64(s, 0);
+        sqlite3_finalize(s);
+    }
+    return n;
+}
+
 int btcPruneAuto(long long cut) {
     // Найденные поиском (src='auto') и ни разу не двигавшие деньги с `cut`:
     // убрать из базы, не банить — крупно выведут с биржи снова, поиск
