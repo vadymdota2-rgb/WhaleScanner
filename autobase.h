@@ -44,6 +44,9 @@ double autoMinUsd(AutoNet n);
 // Порог Bitcoin в биткоинах (WHALE_BTC_AUTO_MIN, по умолчанию 1).
 double btcAutoMinBtc();
 long long btcAutoCount();  // найденные поиском и ещё в базе (btc_chain.cpp)
+long long btcWatchCount(bool autoOnly);  // вся база Bitcoin или только найденные
+// Вся база сервисного аккаунта (импорт и поиск) — строки для /autobase (main.cpp).
+std::string serviceBaseSummary();
 
 // /autobase — состояние; /autobase bsc|hl|btc|all on|off — включить/выключить.
 void autobaseCommand(const std::string& owner, const std::string& arg);

@@ -1510,6 +1510,62 @@ void bscAutoLoop() {
    1000+ транзакций (btcBanServices). */
 constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
 
+namespace {
+std::string thousands(long long n) {
+    std::string d = std::to_string(n), out;
+    for (size_t i = 0; i < d.size(); i++) {
+        if (i && (d.size() - i) % 3 == 0) out += ' ';
+        out += d[i];
+    }
+    return out;
+}
+}  // namespace
+
+// Вся база сервисного аккаунта, не только найденное поиском: импорт (/import)
+// плюс поиск. Адрес BSC и Hyperliquid один (0x…), поэтому кошелёк один на обе
+// сети; «следим» — сеть, где у него есть сделки или он добавлен меньше 30
+// дней назад (как решает refreshWatchers).
+std::string serviceBaseSummary() {
+    long long evm = 0, evmAuto = 0;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT SUM(wa.address LIKE '0x%'), "
+                                 "SUM(wa.address LIKE '0x%' AND uw.label IN ('auto-bsc','auto-hl')) "
+                                 "FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id WHERE uw.user_id=?")) {
+            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                evm = sqlite3_column_int64(s, 0);
+                evmAuto = sqlite3_column_int64(s, 1);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    long long onBsc = 0, onHl = 0;
+    {
+        std::shared_lock l(watchersMutex);
+        if (WATCHERS_PTR && BSC_ACTIVE_PTR && HL_ACTIVE_PTR)
+            for (const auto& [addr, ws] : *WATCHERS_PTR) {
+                if (addr.rfind("0x", 0) != 0) continue;
+                bool svc = false;
+                for (const auto& w : ws) if (w.chatId == SERVICE_CHAT_ID) { svc = true; break; }
+                if (!svc) continue;
+                onBsc += BSC_ACTIVE_PTR->count(addr);
+                onHl += HL_ACTIVE_PTR->count(addr);
+            }
+    }
+    const long long btc = btcWatchCount(false), btcAuto = btcWatchCount(true);
+    std::ostringstream t;
+    t << "📦 <b>Вся база сервисного аккаунта</b>"
+      << "\nBSC и Hyperliquid (адрес один на обе сети): <b>" << thousands(evm) << "</b>"
+      << "\n   импорт: " << thousands(evm - evmAuto) << " · найдено поиском: " << thousands(evmAuto)
+      << "\n   следим сейчас: на BSC " << thousands(onBsc) << " · на Hyperliquid " << thousands(onHl)
+      << "\nBitcoin: <b>" << thousands(btc) << "</b>"
+      << "\n   импорт: " << thousands(btc - btcAuto) << " · найдено поиском: " << thousands(btcAuto)
+      << "\nИмпорт за бездействие не удаляется никогда; убрать его может только бан бота.";
+    return t.str();
+}
+
 void pruneAutoWallets() {
     const long long cut = static_cast<long long>(time(nullptr)) - AUTO_IDLE_SEC;
     struct W { long long id; std::string addr; };

@@ -264,13 +264,14 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         }
         t << "\n   Сегодня: добавлено " << autoToday(n) << "/" << limits()[i] << " · удалено " << pr.first
           << " · забанено " << bn.first;
-        t << "\n   Всего: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second
-          << " · забанено " << bn.second << " · в базе " << inBase[i];
+        t << "\n   Всего поиском: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second
+          << " · забанено " << bn.second << " · сейчас в базе " << inBase[i];
         // Сегодняшнее число берётся из базы при запуске: в нём и то, что
         // добавили до лимита (версии без лимита), поэтому бывает больше.
         if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
         if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
+    t << "\n\n" << serviceBaseSummary();
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\nВключить: <code>/autobase bsc on</code>"
          "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова. "

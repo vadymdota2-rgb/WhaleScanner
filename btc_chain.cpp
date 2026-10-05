@@ -1520,12 +1520,14 @@ void startBtcLoop() {
 
 double btcAutoMinBtc() { return static_cast<double>(AUTO_MIN_SATS) / 1e8; }
 
-long long btcAutoCount() {
+long long btcAutoCount() { return btcWatchCount(true); }
+
+long long btcWatchCount(bool autoOnly) {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     if (!g_btcDb) return 0;
     sqlite3_stmt* s = nullptr;
     long long n = 0;
-    if (prep(&s, "SELECT COUNT(*) FROM btc_watch WHERE src='auto'")) {
+    if (prep(&s, autoOnly ? "SELECT COUNT(*) FROM btc_watch WHERE src='auto'" : "SELECT COUNT(*) FROM btc_watch")) {
         if (sqlite3_step(s) == SQLITE_ROW) n = sqlite3_column_int64(s, 0);
         sqlite3_finalize(s);
     }
