@@ -2062,6 +2062,7 @@ int main() {
     // недели могло ждать лишние полчаса. Повторов не будет: каждое письмо
     // отмечается в lifecycle_sent до отправки.
     auto llc=std::chrono::steady_clock::now()-std::chrono::minutes(10);
+    auto lwc=std::chrono::steady_clock::now()-std::chrono::minutes(1);
     lcl=std::chrono::steady_clock::now()-std::chrono::minutes(30);
     auto lrt=std::chrono::steady_clock::now()-std::chrono::minutes(10);
     while (running.load(std::memory_order_relaxed)) {
@@ -2104,6 +2105,11 @@ int main() {
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-lrt).count()>=5) {
                 ensureNativePrice();
                 lrt=std::chrono::steady_clock::now();
+            }
+            // Приветствие новым — быстро: человек только что открыл приложение.
+            if (std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-lwc).count()>=60) {
+                welcomeTick();
+                lwc=std::chrono::steady_clock::now();
             }
             // Письма жизненного цикла: конец пробной недели, продление, возврат.
             if (std::chrono::duration_cast<std::chrono::minutes>(std::chrono::steady_clock::now()-llc).count()>=10) {

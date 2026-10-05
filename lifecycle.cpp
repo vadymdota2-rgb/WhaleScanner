@@ -54,6 +54,22 @@ bool claim(const std::string& chat, const std::string& kind) {
     return ok;
 }
 
+/* «21 дней» → «21 день»: приветствие пишет и 14, и 21 день (по
+   приглашению), а словарь знает одну форму. Склоняем там, где число с
+   существительным согласуется по-разному (русский и украинский). */
+std::string dayForm(Lang lang, std::string text, long long n) {
+    const char* many = lang == Lang::RU ? "дней" : lang == Lang::UK ? "днів" : nullptr;
+    if (!many) return text;
+    const long long d10 = n % 10, d100 = n % 100;
+    const char* w = d10 == 1 && d100 != 11 ? "день"
+                  : d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14) ? (lang == Lang::RU ? "дня" : "дні")
+                  : many;
+    const std::string from = std::to_string(n) + " " + many;
+    const size_t at = text.find(from);
+    if (at != std::string::npos) text.replace(at, from.size(), std::to_string(n) + " " + w);
+    return text;
+}
+
 std::string fill(std::string text, long long n) {
     const size_t at = text.find("{n}");
     if (at != std::string::npos) text.replace(at, 3, std::to_string(n));
@@ -258,6 +274,28 @@ void sendPremiumEnded(const std::string& chat) {
     }
     text = tr(lang, "lc_prem_end") + "\n\n" + tr(lang, "lc_after");
     sendMsg(chat, text, openAppKeyboard(lang, "premium-ended", "btn_plans"));
+}
+
+/* Приветствие: пробный Премиум выдаёт API при первом открытии приложения
+   (trial_granted). Только недавним — за последние 3 часа: после обновления
+   бота старые пользователи приветствия не получат. Число дней — по сроку
+   Премиума: пришедшему по приглашению подарено больше. */
+void welcomeTick() {
+    const long long now = static_cast<long long>(time(nullptr));
+    int sent = 0;
+    for (const Row& r : select(
+            "SELECT t.chat_id, u.premium_expire FROM trial_granted t JOIN users u ON u.chat_id=t.chat_id "
+            "WHERE t.granted_at BETWEEN ? AND ? "
+            "AND NOT EXISTS (SELECT 1 FROM lifecycle_sent l WHERE l.chat_id=t.chat_id AND l.kind='welcome')",
+            now - 3 * 3600, now)) {
+        if (sent >= MAX_PER_TICK) return;
+        if (r.chat == SERVICE_CHAT_ID || r.expire <= now || !claim(r.chat, "welcome")) continue;
+        const Lang lang = langFromCode(getUserLanguage(r.chat));
+        const long long days = (r.expire - now + DAY / 2) / DAY;
+        const long long n = days < 1 ? 1 : days;
+        sendMsg(r.chat, dayForm(lang, fill(tr(lang, "lc_welcome"), n), n), openAppKeyboard(lang));
+        sent++;
+    }
 }
 
 void lifecycleTick() {

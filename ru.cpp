@@ -104,6 +104,8 @@ const std::unordered_map<std::string, Entry>& table() {
             "📰 Вышел дайджест китов за сегодня: сигналы дня, рынок, Bitcoin на биржах, киты BSC и лидеры рейтинга."}},
         {"lc_trial_d5", {"⏳ Your Premium trial ends in 2 days.",
             "⏳ Пробный Премиум закончится через 2 дня."}},
+        {"lc_welcome", {"🎁 <b>Welcome to Wallet Tracker!</b>\n\nHere's a gift: <b>{n} days of Premium</b> for free. Everything is unlocked:\n\n🔔 alerts on your wallets' trades — right here, in this chat\n🏆 top-trader rankings\n📊 market analytics: flows, Long/Short, liquidations\n📰 a daily digest\n\nStart with the main thing: add a wallet you want to follow.",
+            "🎁 <b>Добро пожаловать в Wallet Tracker!</b>\n\nВам подарок — <b>{n} дней Премиума</b> бесплатно. Открыто всё:\n\n🔔 алерты о сделках ваших кошельков — прямо сюда, в этот чат\n🏆 рейтинг лучших трейдеров\n📊 аналитика рынка: потоки, Long/Short, ликвидации\n📰 ежедневный дайджест\n\nНачните с главного — добавьте кошелёк, за которым хотите следить."}},
         {"lc_trial_end", {"⏳ Your Premium trial is over.",
             "⏳ Пробный Премиум закончился."}},
         {"lc_prem_end", {"⭐ Your Premium has ended.",
