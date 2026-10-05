@@ -526,6 +526,24 @@ void initDB() {
             sqlite3_free(ferr);
         }
     }
+
+    // Заявки на бонус за регистрацию на бирже: кладёт API, решение владельца
+    // пишет бот. Та же схема, что EXCH_SCHEMA в API.
+    {
+        char* eerr = nullptr;
+        if (sqlite3_exec(db,
+                "CREATE TABLE IF NOT EXISTS exch_claims ("
+                " id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, ex TEXT NOT NULL,"
+                " uid TEXT NOT NULL, at INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'wait',"
+                " decided_at INTEGER NOT NULL DEFAULT 0, granted_at INTEGER NOT NULL DEFAULT 0,"
+                " days INTEGER NOT NULL DEFAULT 0, notified INTEGER NOT NULL DEFAULT 0);"
+                "CREATE INDEX IF NOT EXISTS idx_exch_chat ON exch_claims(chat_id, ex);"
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_exch_uid ON exch_claims(ex, uid) WHERE status!='no';",
+                nullptr, nullptr, &eerr) != SQLITE_OK) {
+            std::cerr << "[STARTUP] exch schema failed: " << (eerr ? eerr : "") << std::endl;
+            sqlite3_free(eerr);
+        }
+    }
 }
 
 /* Воронка за неделю для /stats: сколько разных людей дошли до каждого шага
@@ -549,6 +567,12 @@ std::string funnelStatsLine() {
     if (n["open"] > 0)
         out << " (" << std::fixed << std::setprecision(1) << 100.0 * n["paid"] / n["open"] << "% открывших)";
     out << "\nпробных: " << n["trial"] << " · по приглашению: " << n["ref"] << " · бонусы за соцсети: " << n["bonus"];
+    if (prepareOrLog(db, &s, "SELECT SUM(status='wait'), SUM(status='ok') FROM exch_claims")) {
+        if (sqlite3_step(s) == SQLITE_ROW)
+            out << "\nOKX: ждут проверки " << sqlite3_column_int64(s, 0) << " · одобрено " << sqlite3_column_int64(s, 1)
+                << (sqlite3_column_int64(s, 0) ? " (/okx)" : "");
+        sqlite3_finalize(s);
+    }
     if (prepareOrLog(db, &s, "SELECT COUNT(*) FROM token_subs")) {
         if (sqlite3_step(s) == SQLITE_ROW) out << " · ждут токен: " << sqlite3_column_int64(s, 0);
         sqlite3_finalize(s);
@@ -892,9 +916,10 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     } catch (...) { return {false, false, 0}; }
 }
 
-void answerCallbackQuery(const std::string& callbackQueryId) {
+void answerCallbackQuery(const std::string& callbackQueryId, const std::string& text = "") {
     json j;
     j["callback_query_id"] = callbackQueryId;
+    if (!text.empty()) j["text"] = text;
     http(tgApi("answerCallbackQuery"), j.dump());
 }
 
@@ -1509,6 +1534,150 @@ void tokenCast(const std::string& owner, const std::string& arg) {
     }).detach();
 }
 
+/* Бонус за регистрацию на бирже по нашей ссылке. Заявку (UID человека)
+   кладёт в exch_claims API приложения и шлёт владельцу сообщение с кнопками
+   «ex:ok:<id>» / «ex:no:<id>». Здесь — только решение владельца: status
+   меняется один раз (wait → ok / no). Дни и сообщение человеку — за фоновым
+   проходом API (exch_settle): там начисление идёт одной транзакцией с
+   отметкой о нём. */
+struct ExchClaim { long long id = 0; std::string chat, ex, uid, status; };
+
+static bool loadExchClaim(long long id, ExchClaim& c) {
+    sqlite3_stmt* s;
+    if (!prepareOrLog(db, &s, "SELECT id, chat_id, ex, uid, status FROM exch_claims WHERE id=?")) return false;
+    sqlite3_bind_int64(s, 1, id);
+    bool ok = sqlite3_step(s) == SQLITE_ROW;
+    if (ok) {
+        c.id = sqlite3_column_int64(s, 0);
+        c.chat = safeColumnText(s, 1);
+        c.ex = safeColumnText(s, 2);
+        c.uid = safeColumnText(s, 3);
+        c.status = safeColumnText(s, 4);
+    }
+    sqlite3_finalize(s);
+    return ok;
+}
+
+static std::string exchName(const std::string& ex) { return ex == "okx" ? "OKX" : ex; }
+
+static std::string exchClaimText(const ExchClaim& c) {
+    std::string t = "\U0001F3E6 <b>" + escapeHtml(exchName(c.ex)) + ": заявка #" + std::to_string(c.id) + "</b>\n"
+                    "UID: <code>" + escapeHtml(c.uid) + "</code>\n";
+    if (!c.chat.empty())
+        t += "Пользователь: <a href=\"tg://user?id=" + escapeHtml(c.chat) + "\">" + escapeHtml(c.chat) + "</a>\n";
+    if (c.status == "ok") t += "\n✅ <b>Одобрено</b> — дни Премиума придут человеку в течение минуты.";
+    else if (c.status == "no") t += "\n❌ <b>Отклонено</b> — человеку придёт сообщение.";
+    else t += "\nПроверьте UID среди приглашённых в кабинете партнёра.";
+    return t;
+}
+
+static std::string exchClaimKeyboard(long long id) {
+    json kb;
+    kb["inline_keyboard"] = json::array({json::array({
+        {{"text", "✅ Одобрить"}, {"callback_data", "ex:ok:" + std::to_string(id)}},
+        {{"text", "❌ Отклонить"}, {"callback_data", "ex:no:" + std::to_string(id)}}})});
+    return kb.dump();
+}
+
+/* Кнопка под заявкой. true — нажатие разобрано (чужое или нет). */
+bool handleExchCallback(const json& cq) {
+    const std::string data = cq.contains("data") && cq["data"].is_string() ? cq["data"].get<std::string>() : "";
+    if (data.rfind("ex:", 0) != 0) return false;
+    const std::string qid = cq.contains("id") && cq["id"].is_string() ? cq["id"].get<std::string>() : "";
+    const std::string from = cq.contains("from") && cq["from"].is_object() && cq["from"].contains("id") &&
+                             cq["from"]["id"].is_number_integer()
+                             ? std::to_string(cq["from"]["id"].get<long long>()) : "";
+    // Решает только владелец: кнопку из пересланного сообщения нажать может
+    // кто угодно.
+    if (from != OWNER_CHAT_ID) {
+        if (!qid.empty()) answerCallbackQuery(qid);
+        return true;
+    }
+    const bool approve = data.rfind("ex:ok:", 0) == 0;
+    if (!approve && data.rfind("ex:no:", 0) != 0) {
+        if (!qid.empty()) answerCallbackQuery(qid);
+        return true;
+    }
+    long long id = 0;
+    try { id = std::stoll(data.substr(6)); } catch (...) { id = 0; }
+    ExchClaim c;
+    int changed = 0;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (id > 0 && prepareOrLog(db, &s,
+                "UPDATE exch_claims SET status=?, decided_at=? WHERE id=? AND status='wait'")) {
+            sqlite3_bind_text(s, 1, approve ? "ok" : "no", -1, SQLITE_STATIC);
+            sqlite3_bind_int64(s, 2, (sqlite3_int64)time(nullptr));
+            sqlite3_bind_int64(s, 3, id);
+            if (sqlite3_step(s) == SQLITE_DONE) changed = sqlite3_changes(db);
+            sqlite3_finalize(s);
+        }
+        found = id > 0 && loadExchClaim(id, c);
+    }
+    if (!found) {
+        if (!qid.empty()) answerCallbackQuery(qid, "Заявка не найдена");
+        return true;
+    }
+    if (!qid.empty())
+        answerCallbackQuery(qid, changed ? (approve ? "Одобрено" : "Отклонено")
+                                         : (c.status == "ok" ? "Уже одобрено" : "Уже отклонено"));
+    // Сообщение с заявкой — с итогом и без кнопок, чтобы не нажать дважды.
+    if (cq.contains("message") && cq["message"].is_object() && cq["message"].contains("message_id") &&
+        cq["message"].contains("chat") && cq["message"]["chat"].is_object() &&
+        cq["message"]["chat"].contains("id")) {
+        json j;
+        j["chat_id"] = cq["message"]["chat"]["id"];
+        j["message_id"] = cq["message"]["message_id"];
+        j["text"] = exchClaimText(c);
+        j["parse_mode"] = "HTML";
+        j["disable_web_page_preview"] = true;
+        http(tgApi("editMessageText"), j.dump());
+    }
+    std::cout << "[EXCH] #" << id << " " << c.ex << " uid " << c.uid << " chat " << c.chat
+              << " -> " << c.status << (changed ? "" : " (already)") << std::endl;
+    return true;
+}
+
+/* /okx — заявки, ждущие решения: каждая отдельным сообщением с кнопками
+   (на случай, если первое сообщение не дошло или затерялось). */
+void exchPending(const std::string& owner) {
+    std::vector<ExchClaim> rows;
+    long long nOk = 0, nNo = 0;
+    {
+        std::lock_guard<std::mutex> l(dbMutex);
+        sqlite3_stmt* s;
+        if (prepareOrLog(db, &s, "SELECT id, chat_id, ex, uid, status FROM exch_claims "
+                                 "WHERE status='wait' ORDER BY id LIMIT 20")) {
+            while (sqlite3_step(s) == SQLITE_ROW) {
+                ExchClaim c;
+                c.id = sqlite3_column_int64(s, 0);
+                c.chat = safeColumnText(s, 1);
+                c.ex = safeColumnText(s, 2);
+                c.uid = safeColumnText(s, 3);
+                c.status = safeColumnText(s, 4);
+                rows.push_back(c);
+            }
+            sqlite3_finalize(s);
+        }
+        if (prepareOrLog(db, &s, "SELECT SUM(status='ok'), SUM(status='no') FROM exch_claims")) {
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                nOk = sqlite3_column_int64(s, 0);
+                nNo = sqlite3_column_int64(s, 1);
+            }
+            sqlite3_finalize(s);
+        }
+    }
+    sendMsg(owner, "\U0001F3E6 <b>Заявки с бирж</b>\nЖдут решения: <b>" + std::to_string(rows.size()) +
+                   (rows.size() >= 20 ? "+" : "") + "</b> · одобрено: " + std::to_string(nOk) +
+                   " · отклонено: " + std::to_string(nNo));
+    for (const auto& c : rows) {
+        sendMsg(owner, exchClaimText(c), exchClaimKeyboard(c.id));
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
+}
+
 bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
     if (txt=="/health") {
@@ -1732,6 +1901,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
             sendMsg(cid, "ℹ️ У этого адреса нет пожизненного бана: <code>" + toLower(arg) + "</code>");
         }
     }
+    else if (txt == "/okx") {
+        exchPending(cid);
+    }
     else if (txt.rfind("/tokencast", 0) == 0) {
         tokenCast(cid, trim(txt.substr(10)));
     }
@@ -1759,6 +1931,7 @@ void telegramLoop() {
                 // показать кнопку приложения.
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
                     const json& cq = u["callback_query"];
+                    if (handleExchCallback(cq)) continue;
                     if (cq.contains("id") && cq["id"].is_string())
                         answerCallbackQuery(cq["id"].get<std::string>());
                     if (cq.contains("message") && cq["message"].is_object() &&
