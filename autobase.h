@@ -46,7 +46,8 @@ double btcAutoMinBtc();
 long long btcAutoCount();  // найденные поиском и ещё в базе (btc_chain.cpp)
 long long btcWatchCount(bool autoOnly);  // вся база Bitcoin или только найденные
 // Вся база сервисного аккаунта (импорт и поиск) — строки для /autobase (main.cpp).
-std::string serviceBaseSummary();
+// В totals — итог по сетям и всего, для самого низа сообщения.
+std::string serviceBaseSummary(std::string& totals);
 
 // /autobase — состояние; /autobase bsc|hl|btc|all on|off — включить/выключить.
 void autobaseCommand(const std::string& owner, const std::string& arg);

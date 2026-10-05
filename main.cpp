@@ -1525,7 +1525,7 @@ std::string thousands(long long n) {
 // плюс поиск. Адрес BSC и Hyperliquid один (0x…), поэтому кошелёк один на обе
 // сети; «следим» — сеть, где у него есть сделки или он добавлен меньше 30
 // дней назад (как решает refreshWatchers).
-std::string serviceBaseSummary() {
+std::string serviceBaseSummary(std::string& totals) {
     long long evm = 0, evmAuto = 0;
     {
         std::lock_guard<std::mutex> l(dbMutex);
@@ -1563,6 +1563,13 @@ std::string serviceBaseSummary() {
       << "\nBitcoin: <b>" << thousands(btc) << "</b>"
       << "\n   импорт: " << thousands(btc - btcAuto) << " · найдено поиском: " << thousands(btcAuto)
       << "\nИмпорт за бездействие не удаляется никогда; убрать его может только бан бота.";
+    // Кошелёк 0x… — один и тот же на BSC и Hyperliquid: в каждой сети он
+    // считается, а во «всего» — один раз.
+    std::ostringstream tot;
+    tot << "📊 <b>Кошельков в базе</b>"
+        << "\nBSC: " << thousands(evm) << " · Hyperliquid: " << thousands(evm) << " · Bitcoin: " << thousands(btc)
+        << "\n<b>Всего: " << thousands(evm + btc) << "</b> (адрес BSC и Hyperliquid один — считается один раз)";
+    totals = tot.str();
     return t.str();
 }
 

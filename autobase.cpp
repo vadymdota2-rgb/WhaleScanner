@@ -271,12 +271,14 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
         if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
-    t << "\n\n" << serviceBaseSummary();
+    std::string totals;
+    t << "\n\n" << serviceBaseSummary(totals);
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\nВключить: <code>/autobase bsc on</code>"
          "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова. "
          "Bitcoin-кошелёк, на котором 1 BTC и больше, не удаляется, даже если лежит без движения."
          "\nЗабанено навсегда: на BSC и Hyperliquid — боты (слишком много сделок), "
          "в Bitcoin — сервисы и биржи (1000+ транзакций).";
+    t << "\n\n" << totals;
     sendMsg(owner, t.str());
 }
