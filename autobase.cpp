@@ -1,6 +1,7 @@
 #include "autobase.h"
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <iomanip>
@@ -51,7 +52,13 @@ const double* minUsd() {
     return v;
 }
 
+const char* const PRUNED_KEY[NETS] = {"pruned_bsc", "pruned_hl", "pruned_btc"};
+
 std::atomic<bool> g_on[NETS] = {true, true, true};
+// Убраны за бездействие: сегодня (UTC) и всего. В state хранится как
+// "<день>:<сегодня>:<всего>".
+long long g_prDay[NETS] = {-1, -1, -1};
+long long g_prToday[NETS] = {0, 0, 0}, g_prTotal[NETS] = {0, 0, 0};
 std::mutex g_mx;
 long long g_day = -1;
 int g_today[NETS] = {0, 0, 0};
@@ -95,6 +102,20 @@ void initAutobase() {
         if (prepareOrLog(db, &s, "SELECT value FROM state WHERE key=?")) {
             sqlite3_bind_text(s, 1, KEY[i], -1, SQLITE_STATIC);
             if (sqlite3_step(s) == SQLITE_ROW) g_on[i].store(safeColumnText(s, 0) != "0");
+            sqlite3_finalize(s);
+        }
+    }
+    for (int i = 0; i < NETS; i++) {
+        if (prepareOrLog(db, &s, "SELECT value FROM state WHERE key=?")) {
+            sqlite3_bind_text(s, 1, PRUNED_KEY[i], -1, SQLITE_STATIC);
+            if (sqlite3_step(s) == SQLITE_ROW) {
+                long long d = -1, t = 0, all = 0;
+                if (std::sscanf(safeColumnText(s, 0).c_str(), "%lld:%lld:%lld", &d, &t, &all) == 3) {
+                    g_prDay[i] = d;
+                    g_prToday[i] = t;
+                    g_prTotal[i] = all;
+                }
+            }
             sqlite3_finalize(s);
         }
     }
@@ -143,6 +164,28 @@ int autoToday(AutoNet n) {
     return g_today[static_cast<int>(n)];
 }
 
+void autoPruned(AutoNet n, int count) {
+    if (count <= 0) return;
+    const int i = static_cast<int>(n);
+    std::string v;
+    {
+        std::lock_guard<std::mutex> m(g_mx);
+        const long long d = utcDay();
+        if (g_prDay[i] != d) { g_prDay[i] = d; g_prToday[i] = 0; }
+        g_prToday[i] += count;
+        g_prTotal[i] += count;
+        v = std::to_string(g_prDay[i]) + ":" + std::to_string(g_prToday[i]) + ":" + std::to_string(g_prTotal[i]);
+    }
+    std::lock_guard<std::mutex> l(dbMutex);
+    sqlite3_stmt* s;
+    if (prepareOrLog(db, &s, "INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)")) {
+        sqlite3_bind_text(s, 1, PRUNED_KEY[i], -1, SQLITE_STATIC);
+        sqlite3_bind_text(s, 2, v.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(s);
+        sqlite3_finalize(s);
+    }
+}
+
 int autoLimit(AutoNet n) { return limits()[static_cast<int>(n)]; }
 
 double autoMinUsd(AutoNet n) { return minUsd()[static_cast<int>(n)]; }
@@ -184,6 +227,11 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         // Сегодняшнее число берётся из базы при запуске: в нём и то, что
         // добавили до лимита (версии без лимита), поэтому бывает больше.
         if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
+        {
+            std::lock_guard<std::mutex> m(g_mx);
+            const long long today = g_prDay[i] == utcDay() ? g_prToday[i] : 0;
+            t << "\n   убрано за бездействие: сегодня " << today << " · всего " << g_prTotal[i];
+        }
         if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
     t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"

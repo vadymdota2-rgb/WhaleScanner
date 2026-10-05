@@ -1552,24 +1552,25 @@ void pruneAutoWallets() {
             sqlite3_finalize(s);
         }
     }
-    int removed = 0;
+    int removedBsc = 0, removedHl = 0;
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label=? AND whale_id=?")) {
             for (const auto* list : {&bsc, &hl}) {
-                const char* label = list == &bsc ? "auto-bsc" : "auto-hl";
+                const bool isBsc = list == &bsc;
                 for (const auto& w : *list) {
                     sqlite3_reset(s);
                     sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(s, 2, label, -1, SQLITE_STATIC);
+                    sqlite3_bind_text(s, 2, isBsc ? "auto-bsc" : "auto-hl", -1, SQLITE_STATIC);
                     sqlite3_bind_int64(s, 3, w.id);
-                    if (sqlite3_step(s) == SQLITE_DONE) removed += sqlite3_changes(db);
+                    if (sqlite3_step(s) == SQLITE_DONE) (isBsc ? removedBsc : removedHl) += sqlite3_changes(db);
                 }
             }
             sqlite3_finalize(s);
         }
     }
+    const int removed = removedBsc + removedHl;
     // Поиск их «забывает»: вернутся к крупной торговле — добавит снова.
     {
         std::lock_guard<std::mutex> l(g_bscAutoMutex);
@@ -1577,8 +1578,12 @@ void pruneAutoWallets() {
     }
     for (const auto& w : hl) hlAutoForget(w.addr);
     const int btc = btcPruneAuto(cut);
+    // Счётчик для /autobase: сколько убрано за бездействие сегодня и всего.
+    autoPruned(AutoNet::BSC, removedBsc);
+    autoPruned(AutoNet::HL, removedHl);
+    autoPruned(AutoNet::BTC, btc);
     if (removed > 0 || btc > 0) {
-        std::cout << "[AUTO] убраны неактивные 30 дней (не баним): BSC " << bsc.size() << ", Hyperliquid " << hl.size()
+        std::cout << "[AUTO] убраны неактивные 30 дней (не баним): BSC " << removedBsc << ", Hyperliquid " << removedHl
                   << ", Bitcoin " << btc << std::endl;
         if (removed > 0) refreshWatchers();
     }

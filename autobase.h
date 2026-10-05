@@ -30,6 +30,9 @@ bool autoRoom(AutoNet n);
 // Кошелёк добавлен — учесть в сегодняшнем лимите.
 void autoCounted(AutoNet n);
 int autoToday(AutoNet n);
+// Убраны из базы за бездействие (pruneAutoWallets) — учесть. Счётчик за
+// сегодня и за всё время хранится в таблице state и переживает перезапуск.
+void autoPruned(AutoNet n, int count);
 int autoLimit(AutoNet n);
 
 // Порог в долларах для BSC и Hyperliquid (WHALE_BSC_AUTO_MIN,
