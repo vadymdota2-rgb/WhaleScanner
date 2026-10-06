@@ -525,6 +525,19 @@ static uint64_t cachedNativePriceNanos() {
 
 uint64_t nativePriceCachedNanos() { return cachedNativePriceNanos(); }
 
+int decimalsCached(const std::string& token) {
+    std::lock_guard<std::mutex> l(cacheMutex);
+    auto it = TOKEN_DECIMALS.find(toLower(token));
+    return it == TOKEN_DECIMALS.end() ? -1 : it->second;
+}
+
+uint64_t priceCachedNanos(const std::string& token, long long maxAgeSec) {
+    std::lock_guard<std::mutex> l(cacheMutex);
+    auto it = PRICE_NANOS_CACHE.find(toLower(token));
+    if (it == PRICE_NANOS_CACHE.end()) return 0;
+    return time(nullptr) - it->second.second <= maxAgeSec ? it->second.first : 0;
+}
+
 static bool quoteV2Pair(const std::string& token, const std::string& base, uint64_t basePriceNanos,
                         const std::string& pair, bool tokenIsZero,
                         uint64_t& priceOut, double& liqUsdOut) {
@@ -929,6 +942,13 @@ uint64_t getPriceNanosEx(const std::string& token, PriceSource* sourceOut) {
 
     bool thinPoolSeen = false;
     std::string a = toLower(token);
+    // Стейблкоин — доллар. С рынка его цена бралась по чужой паре и бывала
+    // дикой (USDT по $6,44): переводы USDT в алерты не попадали, и этого не
+    // было видно, пока не появились заводы на биржи и выводы с бирж.
+    if (chainCtx().stablecoins.count(a)) {
+        if (sourceOut) *sourceOut = PriceSource::Cache;
+        return 1000000000ULL;
+    }
     uint64_t prevCached = 0;
     {
         std::lock_guard<std::mutex> l(cacheMutex);

@@ -30,6 +30,7 @@
 #include "ranking.h"
 #include "token_prices.h"
 #include "autobase.h"
+#include "bsc_exchanges.h"
 #include "telegram.h"
 #include "rpc_client.h"
 #include "chains.h"
@@ -1614,6 +1615,7 @@ void pruneAutoWallets() {
     // Сначала бан сервисов: иначе тихий сервис ушёл бы как «удалён» и поиск
     // мог бы счесть его забытым.
     autoBanned(AutoNet::BTC, btcBanServices());
+    bscExCleanup();
     const int btc = btcPruneAuto(cut);
     autoPruned(AutoNet::BTC, btc);
     if (btc > 0) std::cout << "[AUTO] Bitcoin: убраны неактивные 30 дней с остатком меньше 1 BTC: " << btc << std::endl;
@@ -1643,6 +1645,12 @@ bool processBlock(long long bn) {
 
     struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; bool cold; };
     std::vector<Matched> matched;
+    // Биржевой разбор (поток, выученные адреса, заводы и выводы кошельков) —
+    // один раз на блок: при повторе того же блока после сбоя поток
+    // посчитался бы дважды. Алертов он не шлёт — только записывает.
+    static long long s_exBlock = -1;
+    const bool exFresh = bn > s_exBlock;
+    auto isWatched = [&](const std::string& a) { return watchers && watchers->count(a) > 0; };
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -1653,6 +1661,7 @@ bool processBlock(long long bn) {
         // Крупный вывод с биржи — кандидат в базу или побудка спящего (без
         // запросов к сети).
         const std::string wokeBy = bscAutoConsider(tx, to, watchers.get(), bscActive.get());
+        if (exFresh) bscExObserve(tx, from, to, bn, blockTs, hash, isWatched);
         std::string mA;
         bool cold = false;
         if (bscActive && watchers) {
@@ -1671,6 +1680,8 @@ bool processBlock(long long bn) {
         if (isTxProcessed(hash)) continue;
         matched.push_back({&tx, hash, mA, cold});
     }
+    if (exFresh) s_exBlock = bn;
+    bscExFlush();
 
     std::vector<nlohmann::json> receipts(matched.size());
     if (!matched.empty()) {
@@ -2393,6 +2404,12 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
         // Проверить и отменить автопродления звёздами, если какие-то остались.
         std::thread([cid]{ cancelStarSubscriptions(cid, true); }).detach();
     }
+    else if (txt == "/exlabel" || txt.rfind("/exlabel ", 0) == 0) {
+        sendMsg(cid, bscExLabelCommand(txt.size() > 9 ? txt.substr(9) : ""));
+    }
+    else if (txt == "/exunknown") {
+        sendMsg(cid, bscExUnknownCommand());
+    }
     else if (txt == "/autobase" || txt.rfind("/autobase ", 0) == 0) {
         autobaseCommand(cid, trim(txt.substr(9)));
     }
@@ -2517,6 +2534,7 @@ int main() {
     }
     initLifecycle();
     initAutobase();
+    initBscExchanges();
     loadTokenCache();
     loadPairCache();
     ensureNativePrice();
