@@ -108,6 +108,12 @@ constexpr int ADDR_PER_BLOCK = 60;
 // следующих блоков до 6 часов, очередь — не длиннее 5000.
 constexpr int AUTO_ADDR_PER_BLOCK = 80;
 constexpr long long AUTO_PEND_TTL = 6LL * 3600LL;
+// Круг: кошелёк получил с биржи и за сутки вернул ей ту же сумму (минус
+// комиссия сети, допуск — 1% или 0,0002 BTC). Это не покупка и продажа, а
+// перекладка биржи через свой адрес: у Kraken так ходило 9 «выводов» из 10.
+// Пара снимается; со второго круга адрес помечается адресом биржи.
+constexpr long long BOUNCE_SEC = 86400;
+constexpr long long BOUNCE_TOL_SATS = 20000;
 constexpr size_t AUTO_PEND_MAX = 5000;
 constexpr long long SERVICE_TXS = 1000;
 // База сервисного аккаунта пополняется сама без потолка: каждый, кто вывел
@@ -855,6 +861,7 @@ public:
                     }
                 }
                 std::map<std::string, long long> toEx;
+                std::map<std::string, long long> toExN;
                 for (const auto& o : tx.out) {
                     if (o.addr.empty() || o.sats <= 0) continue;
                     std::string e = label(o.addr);
@@ -864,6 +871,7 @@ public:
                     f[0] += o.sats;
                     f[2] += 1;
                     toEx[e] += o.sats;
+                    toExN[e] += 1;
                 }
                 if (!toEx.empty() && !sender->addr.empty() && !(sweep && !mine(sender->addr))) {
                     // Строка одна на транзакцию: вся сумма на биржи, биржа —
@@ -871,7 +879,23 @@ public:
                     long long total = 0, best = 0;
                     std::string ex;
                     for (const auto& [e, v] : toEx) { total += v; if (v > best) { best = v; ex = e; } }
-                    if (total >= MOVE_MIN_SATS || (mine(sender->addr) && watchWorth(total, price))) {
+                    const bool round = toEx.size() == 1 && unBounce(sender->addr, ex, total, b, flow);
+                    if (round) {
+                        // Круг: ни вывода, ни завода не было — потоки назад.
+                        auto& f = flow[ex];
+                        f[0] = std::max<long long>(0, f[0] - total);
+                        f[2] = std::max<long long>(0, f[2] - toExN[ex]);
+                        if (bounces_.size() > 100000) bounces_.clear();
+                        if (!mine(sender->addr) && ++bounces_[sender->addr] >= 2) {
+                            for (const auto& i : tx.in)
+                                if (!i.addr.empty() && !mine(i.addr) && label(i.addr).empty()) {
+                                    putLabel(i.addr, ex, "bounce");
+                                    forgetAuto(i.addr);
+                                    purgeWallet(i.addr, b.ts, &flow);
+                                    ++learned;
+                                }
+                        }
+                    } else if (total >= MOVE_MIN_SATS || (mine(sender->addr) && watchWorth(total, price))) {
                         record(tx.txid, b, sender->addr, 2, ex, total, price, follow);
                         ++moves;
                     }
@@ -938,6 +962,92 @@ public:
         return v;
     }
 
+    // Разовая чистка: круги «с биржи и обратно», записанные до того, как
+    // сканер научился их видеть (см. BOUNCE_SEC). Обе строки пары удаляются,
+    // потоки возвращаются; кто сделал два круга и больше — адрес биржи.
+    // Возвращает, сколько пар снято.
+    int cancelBounces() {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        struct Mv { long long id, ts, sats; int kind; };
+        std::map<std::pair<std::string, std::string>, std::vector<Mv>> by;
+        sqlite3_stmt* q = nullptr;
+        if (!prep(&q, "SELECT id, wallet, ex, kind, sats, ts FROM btc_moves WHERE ex != '' ORDER BY ts, id"))
+            return 0;
+        while (sqlite3_step(q) == SQLITE_ROW)
+            by[{colText(q, 1), colText(q, 2)}].push_back(
+                {sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 5), sqlite3_column_int64(q, 4),
+                 sqlite3_column_int(q, 3)});
+        sqlite3_finalize(q);
+
+        std::unordered_set<std::string> keep;  // импорт и подписки — не биржа
+        if (prep(&q, "SELECT address FROM btc_watch WHERE src != 'auto'")) {
+            while (sqlite3_step(q) == SQLITE_ROW) keep.insert(colText(q, 0));
+            sqlite3_finalize(q);
+        }
+        {
+            std::lock_guard<std::mutex> w(g_watchMutex);
+            for (const auto& f : g_follow) keep.insert(f);
+        }
+
+        sqlite3_stmt* del = nullptr;
+        sqlite3_stmt* fo = nullptr;
+        sqlite3_stmt* fi = nullptr;
+        if (!prep(&del, "DELETE FROM btc_moves WHERE id=?") ||
+            !prep(&fo, "UPDATE btc_flow SET out_sats=MAX(0, out_sats-?), out_n=MAX(0, out_n-1) WHERE ts=? AND ex=?") ||
+            !prep(&fi, "UPDATE btc_flow SET in_sats=MAX(0, in_sats-?), in_n=MAX(0, in_n-1) WHERE ts=? AND ex=?")) {
+            for (auto* x : {del, fo, fi}) if (x) sqlite3_finalize(x);
+            return 0;
+        }
+        auto drop = [&](sqlite3_stmt* f, const Mv& m, const std::string& ex) {
+            sqlite3_reset(del);
+            sqlite3_bind_int64(del, 1, m.id);
+            sqlite3_step(del);
+            sqlite3_reset(f);
+            sqlite3_bind_int64(f, 1, m.sats);
+            sqlite3_bind_int64(f, 2, m.ts);
+            bindText(f, 3, ex);
+            sqlite3_step(f);
+        };
+        int pairs = 0, labeled = 0, purged = 0;
+        std::vector<std::pair<std::string, std::string>> mark;
+        execSql("BEGIN");
+        for (auto& [key, mv] : by) {
+            const auto& [wallet, ex] = key;
+            std::vector<bool> used(mv.size(), false);
+            int n = 0;
+            for (size_t i = 0; i < mv.size(); ++i) {
+                if (mv[i].kind != 2) continue;
+                const long long tol = std::max<long long>(mv[i].sats / 100, BOUNCE_TOL_SATS);
+                for (size_t j = i; j-- > 0;) {
+                    const Mv& w = mv[j];
+                    if (mv[i].ts - w.ts > BOUNCE_SEC) break;
+                    if (used[j] || w.kind != 1 || w.sats < mv[i].sats || w.sats > mv[i].sats + tol) continue;
+                    used[j] = used[i] = true;
+                    drop(fo, w, ex);
+                    drop(fi, mv[i], ex);
+                    ++pairs;
+                    ++n;
+                    break;
+                }
+            }
+            if (n >= 2 && !keep.count(wallet) && !keep.count(lower(wallet)) && label(wallet).empty())
+                mark.emplace_back(wallet, ex);
+        }
+        for (auto* x : {del, fo, fi}) sqlite3_finalize(x);
+        for (const auto& [wallet, ex] : mark) {
+            if (!label(wallet).empty()) continue;
+            putLabel(wallet, ex, "bounce");
+            forgetAuto(wallet);
+            purged += purgeWallet(wallet, 0, nullptr);
+            ++labeled;
+        }
+        execSql("COMMIT");
+        if (pairs)
+            std::cout << "[BTC] сняты круги «с биржи и обратно»: " << pairs << " пар, адресов бирж +" << labeled
+                      << ", их прочих строк снято " << purged << std::endl;
+        return pairs;
+    }
+
     void resetData() {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         execSql("DELETE FROM btc_flow; DELETE FROM btc_moves; DELETE FROM btc_blocks; "
@@ -960,6 +1070,115 @@ private:
     // Кому и по какой транзакции алерт уже ушёл: после отката перестроенного
     // блока его транзакции приходят снова, второй алерт на них не нужен.
     std::unordered_set<std::string> alerted_;
+    // Сколько кругов «с биржи и обратно» сделал адрес (см. BOUNCE_SEC).
+    std::unordered_map<std::string, int> bounces_;
+
+    // Снять вывод, который кошелёк сейчас возвращает той же бирже: строку
+    // удалить, поток вывода вернуть. true — круг найден.
+    bool unBounce(const std::string& wallet, const std::string& ex, long long sats, const Block& b,
+                  std::map<std::string, std::array<long long, 4>>& flow) {
+        sqlite3_stmt* q = nullptr;
+        if (!prep(&q, "SELECT id, ts, sats FROM btc_moves WHERE wallet=? AND ex=? AND kind=1 "
+                      "AND ts BETWEEN ? AND ? AND sats BETWEEN ? AND ? ORDER BY ts DESC, id DESC LIMIT 1"))
+            return false;
+        const long long tol = std::max<long long>(sats / 100, BOUNCE_TOL_SATS);
+        bindText(q, 1, wallet);
+        bindText(q, 2, ex);
+        sqlite3_bind_int64(q, 3, b.ts - BOUNCE_SEC);
+        sqlite3_bind_int64(q, 4, b.ts);
+        sqlite3_bind_int64(q, 5, sats);
+        sqlite3_bind_int64(q, 6, sats + tol);
+        long long id = 0, ts = 0, out = 0;
+        if (sqlite3_step(q) == SQLITE_ROW) {
+            id = sqlite3_column_int64(q, 0);
+            ts = sqlite3_column_int64(q, 1);
+            out = sqlite3_column_int64(q, 2);
+        }
+        sqlite3_finalize(q);
+        if (!id) return false;
+        if (prep(&q, "DELETE FROM btc_moves WHERE id=?")) {
+            sqlite3_bind_int64(q, 1, id);
+            sqlite3_step(q);
+            sqlite3_finalize(q);
+        }
+        if (ts == b.ts) {
+            auto& f = flow[ex];
+            f[1] = std::max<long long>(0, f[1] - out);
+            f[3] = std::max<long long>(0, f[3] - 1);
+        } else if (prep(&q, "UPDATE btc_flow SET out_sats=MAX(0, out_sats-?), out_n=MAX(0, out_n-1) "
+                            "WHERE ts=? AND ex=?")) {
+            sqlite3_bind_int64(q, 1, out);
+            sqlite3_bind_int64(q, 2, ts);
+            bindText(q, 3, ex);
+            sqlite3_step(q);
+            sqlite3_finalize(q);
+        }
+        return true;
+    }
+
+    // Адрес оказался адресом биржи: его прошлые строки — перекладки той же
+    // биржи, а не сделки. Строки удаляются, потоки возвращаются. Строки
+    // текущего блока ещё не записаны в btc_flow — их правим в `flow`.
+    // Возвращает, сколько строк снято.
+    int purgeWallet(const std::string& a, long long blockTs,
+                    std::map<std::string, std::array<long long, 4>>* flow) {
+        struct Row { long long id, ts, sats; int kind; std::string ex; };
+        std::vector<Row> rows;
+        sqlite3_stmt* q = nullptr;
+        if (!prep(&q, "SELECT id, ts, sats, kind, ex FROM btc_moves WHERE wallet=?")) return 0;
+        bindText(q, 1, a);
+        while (sqlite3_step(q) == SQLITE_ROW)
+            rows.push_back({sqlite3_column_int64(q, 0), sqlite3_column_int64(q, 1), sqlite3_column_int64(q, 2),
+                            sqlite3_column_int(q, 3), colText(q, 4)});
+        sqlite3_finalize(q);
+        sqlite3_stmt* del = nullptr;
+        sqlite3_stmt* fo = nullptr;
+        sqlite3_stmt* fi = nullptr;
+        if (!prep(&del, "DELETE FROM btc_moves WHERE id=?") ||
+            !prep(&fo, "UPDATE btc_flow SET out_sats=MAX(0, out_sats-?), out_n=MAX(0, out_n-1) WHERE ts=? AND ex=?") ||
+            !prep(&fi, "UPDATE btc_flow SET in_sats=MAX(0, in_sats-?), in_n=MAX(0, in_n-1) WHERE ts=? AND ex=?")) {
+            for (auto* x : {del, fo, fi}) if (x) sqlite3_finalize(x);
+            return 0;
+        }
+        for (const auto& r : rows) {
+            sqlite3_reset(del);
+            sqlite3_bind_int64(del, 1, r.id);
+            sqlite3_step(del);
+            if (r.ex.empty()) continue;  // перевод кошелька базы — в потоки бирж не входил
+            if (flow && r.ts == blockTs) {
+                auto& f = (*flow)[r.ex];
+                const int k = r.kind == 1 ? 1 : 0;
+                f[k] = std::max<long long>(0, f[k] - r.sats);
+                f[k + 2] = std::max<long long>(0, f[k + 2] - 1);
+                continue;
+            }
+            sqlite3_stmt* f = r.kind == 1 ? fo : fi;
+            sqlite3_reset(f);
+            sqlite3_bind_int64(f, 1, r.sats);
+            sqlite3_bind_int64(f, 2, r.ts);
+            bindText(f, 3, r.ex);
+            sqlite3_step(f);
+        }
+        for (auto* x : {del, fo, fi}) sqlite3_finalize(x);
+        return static_cast<int>(rows.size());
+    }
+
+    // Адрес оказался адресом биржи: из базы сервисного аккаунта его, если
+    // туда взял поиск, — вон, и в кандидаты он больше не идёт.
+    void forgetAuto(const std::string& a) {
+        autoCand_.erase(a);
+        sqlite3_stmt* q = nullptr;
+        if (prep(&q, "DELETE FROM btc_watch WHERE address=? AND src='auto'")) {
+            bindText(q, 1, a);
+            sqlite3_step(q);
+            const bool gone = sqlite3_changes(g_btcDb) > 0;
+            sqlite3_finalize(q);
+            if (gone) {
+                std::lock_guard<std::mutex> w(g_watchMutex);
+                g_watch.erase(a);
+            }
+        }
+    }
 
     // Движение кошелька базы в транзакции: сколько пришло минус сколько ушло.
     // Плюс — монеты пришли (покупка, если с биржи), минус — ушли.
@@ -1462,6 +1681,10 @@ void btcLoop() {
         sc.resetData();
         sc.setStateLocked("data", "2");
         std::cout << "[BTC] данные потоков и движений начаты заново (версия 2)" << std::endl;
+    }
+    if (sc.state("bounce") != "1") {
+        sc.cancelBounces();
+        sc.setStateLocked("bounce", "1");
     }
     // Номер — версия списка SEEDS: список вырос — кластеры новых адресов
     // надо спросить заново.
