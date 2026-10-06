@@ -1511,7 +1511,7 @@ void bscAutoLoop() {
    Hyperliquid: поток сделок бесплатный, поэтому спящий ничего не стоит.
    Первая сделка будит его в этой сети (autoWoke). Нет сделок ни там ни
    там — спит полностью. Удаляем за бездействие только Bitcoin: найденный
-   поиском кошелёк без движений месяц и с остатком меньше 1 BTC.
+   поиском кошелёк без движений месяц и с остатком меньше 0,2 BTC.
    Боты — другое дело: их банит разбор сделок (ignored_wallets на BSC,
    hl_banned на Hyperliquid) навсегда, и ни импорт, ни поиск их не вернут.
    В Bitcoin так же навсегда убираем сервисы: найденный поиском адрес набрал
@@ -1618,7 +1618,7 @@ void pruneAutoWallets() {
     bscExCleanup();
     const int btc = btcPruneAuto(cut);
     autoPruned(AutoNet::BTC, btc);
-    if (btc > 0) std::cout << "[AUTO] Bitcoin: убраны неактивные 30 дней с остатком меньше 1 BTC: " << btc << std::endl;
+    if (btc > 0) std::cout << "[AUTO] Bitcoin: убраны неактивные 30 дней с остатком меньше 0.2 BTC: " << btc << std::endl;
 }
 
 bool processBlock(long long bn) {
