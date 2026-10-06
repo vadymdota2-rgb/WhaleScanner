@@ -22,6 +22,7 @@
 
 #include <sqlite3.h>
 
+#include "rpc_client.h"
 #include "token_prices.h"
 #include "tx_analyzer.h"
 #include "utils.h"
@@ -773,15 +774,55 @@ std::string bscExUnknownCommand() {
             if (n >= 10 && !g_labels.count(a) && !NOT_EXCHANGE.count(a)) top.emplace_back(n, a);
     }
     std::sort(top.rbegin(), top.rend());
-    if (top.size() > 15) top.resize(15);
+    if (top.size() > 30) top.resize(30);
+
+    // Сколько сборщик отправил сам. Биржа сметает депозиты и столько же
+    // платит клиентам — у её горячего кошелька сотни тысяч и миллионы
+    // отправок. Ферма аирдропов и копилка только принимают: у них десятки,
+    // сотни, а то и ноль. Так видно, что подписывать, а что пропустить.
+    struct Row { long long sweeps; std::string a; long long sent; };
+    std::vector<Row> exLike, farm, unclear;
+    for (const auto& [n, a] : top) {
+        long long sent = -1;
+        try {
+            const json r = rpc("eth_getTransactionCount", json::array({a, "latest"}), 1);
+            if (r.is_string()) sent = static_cast<long long>(hexLD(r.get<std::string>(), 2, std::string::npos));
+        } catch (...) {}
+        Row row{n, a, sent};
+        if (sent >= 50000) exLike.push_back(row);
+        else if (sent >= 0 && sent < 5000) farm.push_back(row);
+        else unclear.push_back(row);
+    }
+    auto grp = [](long long v) {
+        std::string d = std::to_string(v), out;
+        for (size_t k = 0; k < d.size(); ++k) {
+            if (k && (d.size() - k) % 3 == 0) out += ' ';
+            out += d[k];
+        }
+        return out;
+    };
+    auto line = [&grp](std::ostringstream& o, const Row& r) {
+        o << "\n<a href=\"https://bscscan.com/address/" << r.a << "\">" << r.a.substr(0, 10) << "…" << r.a.substr(36)
+          << "</a> — " << grp(r.sweeps) << " сливов, отправил " << (r.sent < 0 ? std::string("?") : grp(r.sent))
+          << " · <code>" << r.a << "</code>";
+    };
     std::ostringstream o;
     o << "🔎 <b>Сборщики без подписи</b> (сегодня, UTC)\n"
-         "Сюда сливают деньги молодые кошельки — так биржа собирает деньги с адресов пополнения. "
-         "Бывает и ферма аирдропов: проверьте адрес на BscScan.\n";
+         "Сюда сливают деньги молодые кошельки. Проверьте адрес на BscScan и подпишите биржу.\n";
     if (top.empty()) o << "\nПока никого — загляните позже.";
-    for (const auto& [n, a] : top)
-        o << "\n<a href=\"https://bscscan.com/address/" << a << "\">" << a.substr(0, 10) << "…" << a.substr(36)
-          << "</a> — " << n << " сливов · <code>" << a << "</code>";
+    if (!exLike.empty()) {
+        o << "\n🏦 <b>Похожи на биржи</b> — сами отправили от 50 000 транзакций:";
+        for (const auto& r : exLike) line(o, r);
+    }
+    if (!unclear.empty()) {
+        o << "\n\n❔ <b>Неясно</b>:";
+        for (const auto& r : unclear) line(o, r);
+    }
+    if (!farm.empty()) {
+        o << "\n\n🌾 <b>Похожи на фермы и копилки</b> — почти ничего не отправляют, подписывать не нужно:";
+        for (size_t k = 0; k < farm.size() && k < 8; ++k) line(o, farm[k]);
+        if (farm.size() > 8) o << "\n… и ещё " << farm.size() - 8;
+    }
     o << "\n\nПодписать: <code>/exlabel 0x… Binance</code>";
     return o.str();
 }
