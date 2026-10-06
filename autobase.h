@@ -41,7 +41,7 @@ int autoLimit(AutoNet n);
 // Порог в долларах для BSC и Hyperliquid (WHALE_BSC_AUTO_MIN,
 // WHALE_HL_AUTO_MIN; по умолчанию $10 тыс.).
 double autoMinUsd(AutoNet n);
-// Порог Bitcoin в биткоинах (WHALE_BTC_AUTO_MIN, по умолчанию 1).
+// Порог Bitcoin в биткоинах (WHALE_BTC_AUTO_MIN, по умолчанию 0,2).
 double btcAutoMinBtc();
 long long btcAutoCount();  // найденные поиском и ещё в базе (btc_chain.cpp)
 long long btcWatchCount(bool autoOnly);  // вся база Bitcoin или только найденные

@@ -101,6 +101,13 @@ constexpr long long LEARNED_TTL = 90LL * 86400LL;
 // или биржа, которой нет в разметке. API убирает такие из досок.
 constexpr long long ADDR_TTL = 7LL * 86400LL;
 constexpr int ADDR_PER_BLOCK = 60;
+// Кандидаты автопоиска проверяются своей очередью и раньше остальных: с
+// порогом 0,2 BTC их в блоке сотни, и в общие 60 проверок они не влезали —
+// а без проверки «не сервис ли» в базу никого не берём. Непроверенные ждут
+// следующих блоков до 6 часов, очередь — не длиннее 5000.
+constexpr int AUTO_ADDR_PER_BLOCK = 80;
+constexpr long long AUTO_PEND_TTL = 6LL * 3600LL;
+constexpr size_t AUTO_PEND_MAX = 5000;
 constexpr long long SERVICE_TXS = 1000;
 // База сервисного аккаунта пополняется сама без потолка: каждый, кто вывел
 // с биржи крупную сумму и не похож на сервис, остаётся в ней. Потолок можно
@@ -638,7 +645,6 @@ public:
         }
         lookups_ = 0;
         touched_.clear();
-        autoCand_.clear();
         touchLabel_.clear();
         enrich(b);
         reloadWatch();
@@ -817,7 +823,8 @@ public:
                         ++moves;
                     }
                     done.insert(a);
-                    if (v >= AUTO_MIN_SATS && !watch.count(a)) autoCand_.insert(a);
+                    if (v >= AUTO_MIN_SATS && !watch.count(a) && autoCand_.size() < AUTO_PEND_MAX)
+                        autoCand_.emplace(a, nowSec());
                 }
             } else if (plain && !mixed) {
                 // Входы частные. Есть выход на биржу — завод. Продаёт один
@@ -939,7 +946,9 @@ private:
     Db db_;
     int lookups_ = 0;
     std::vector<std::string> touched_;
-    std::unordered_set<std::string> autoCand_;
+    // Кандидаты автопоиска → когда найдены. Живут между блоками, пока их не
+    // проверят (AUTO_PEND_TTL).
+    std::unordered_map<std::string, long long> autoCand_;
     std::unordered_set<std::string> touchLabel_;
     // Кому и по какой транзакции алерт уже ушёл: после отката перестроенного
     // блока его транзакции приходят снова, второй алерт на них не нужен.
@@ -1102,16 +1111,24 @@ private:
             return;
         }
         int added = 0;
-        for (const auto& a : autoCand_) {
+        const long long now = nowSec();
+        for (auto it = autoCand_.begin(); it != autoCand_.end();) {
+            const std::string a = it->first;
+            if (now - it->second > AUTO_PEND_TTL) { it = autoCand_.erase(it); continue; }
             if (!autoRoom(AutoNet::BTC)) break;
             {
                 std::lock_guard<std::mutex> w(g_watchMutex);
                 if (WATCH_MAX > 0 && static_cast<long long>(g_watch.size()) >= WATCH_MAX) break;
+                if (g_watch.count(a)) { it = autoCand_.erase(it); continue; }
             }
-            if (!label(a).empty()) continue;
+            if (!label(a).empty()) { it = autoCand_.erase(it); continue; }
             sqlite3_reset(q);
             bindText(q, 1, a);
-            if (sqlite3_step(q) != SQLITE_ROW || sqlite3_column_int64(q, 0) >= SERVICE_TXS) continue;
+            // Ещё не проверен — ждёт своей очереди в addrStats.
+            if (sqlite3_step(q) != SQLITE_ROW) { ++it; continue; }
+            const bool service = sqlite3_column_int64(q, 0) >= SERVICE_TXS;
+            it = autoCand_.erase(it);
+            if (service) continue;
             sqlite3_reset(ins);
             bindText(ins, 1, a);
             sqlite3_bind_int64(ins, 2, nowSec());
@@ -1130,11 +1147,26 @@ private:
     // Число транзакций и остаток кошельков, попавших в btc_moves этим блоком.
     void addrStats() {
         std::vector<std::string> ask;
+        // Кандидаты автопоиска — первыми и своим счётом, старшие раньше.
+        // Поиск выключен или лимит дня выбран — их не проверяем вовсе.
+        std::vector<std::pair<long long, std::string>> cand;
+        if (!autoCand_.empty() && autoRoom(AutoNet::BTC))
+            for (const auto& [a, at] : autoCand_) cand.emplace_back(at, a);
+        std::sort(cand.begin(), cand.end());
+        std::vector<std::string> askAuto;
         {
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             std::unordered_set<std::string> seen;
             sqlite3_stmt* s = nullptr;
             if (!prep(&s, "SELECT at FROM btc_addr WHERE address=?")) return;
+            for (const auto& c : cand) {
+                if (static_cast<int>(askAuto.size()) >= AUTO_ADDR_PER_BLOCK) break;
+                if (!seen.insert(c.second).second) continue;
+                sqlite3_reset(s);
+                bindText(s, 1, c.second);
+                if (sqlite3_step(s) == SQLITE_ROW && nowSec() - sqlite3_column_int64(s, 0) < ADDR_TTL) continue;
+                askAuto.push_back(c.second);
+            }
             for (const auto& a : touched_) {
                 if (!seen.insert(a).second) continue;
                 sqlite3_reset(s);
@@ -1144,9 +1176,10 @@ private:
             }
             sqlite3_finalize(s);
         }
-        int n = 0;
+        if (static_cast<int>(ask.size()) > ADDR_PER_BLOCK) ask.resize(ADDR_PER_BLOCK);
+        ask.insert(ask.begin(), askAuto.begin(), askAuto.end());
         for (const auto& a : ask) {
-            if (++n > ADDR_PER_BLOCK) break;
+            if (!running) break;
             long long txs = 0, bal = 0;
             if (!fetchAddrStats(a, txs, bal)) continue;
             saveAddrStats(a, txs, bal);
