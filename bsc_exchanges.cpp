@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <thread>
 #include <map>
 #include <sstream>
 #include <cmath>
@@ -128,6 +130,14 @@ constexpr size_t COLLECT_MAX = 50000;
 std::unordered_map<std::string, long long> g_collect;
 long long g_collectDay = -1;
 long long g_lastFlush = 0;
+
+// Монеты, прошедшие через биржу, у которых в памяти нет цены или знаков: без
+// них перевод не оценить, и монета выпадает из потока. Дозаполняет фоновый
+// поток (цена, знаки, тикер — с запросами к сети), сканер блоков не ждёт.
+constexpr size_t UNPRICED_MAX = 5000;
+constexpr long long PRICE_RETRY_SEC = 6 * 3600;
+std::unordered_set<std::string> g_unpriced;
+std::unordered_map<std::string, long long> g_priceTried;
 long long g_learned = 0, g_moves = 0;
 
 long long now() { return static_cast<long long>(time(nullptr)); }
@@ -238,9 +248,43 @@ void expirePendingLocked(long long t) {
     }
 }
 
+void pricerLoop() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(20));
+        std::vector<std::string> batch;
+        {
+            std::lock_guard<std::mutex> m(g_mx);
+            for (auto it = g_unpriced.begin(); it != g_unpriced.end() && batch.size() < 30;) {
+                batch.push_back(*it);
+                g_priceTried[*it] = now();
+                it = g_unpriced.erase(it);
+            }
+            if (g_priceTried.size() > 50000) g_priceTried.clear();
+        }
+        int ok = 0;
+        for (const auto& tok : batch) {
+            try {
+                // Кладут в память и в token_cache: следующий перевод оценится,
+                // а API покажет тикер.
+                if (getDecimals(tok) < 0) continue;
+                getSymbol(tok);
+                if (getPriceNanos(tok) > 0) ++ok;
+            } catch (const std::exception& e) {
+                std::cerr << "[BSC-EX] цена " << tok << ": " << e.what() << std::endl;
+            }
+        }
+        if (ok) std::cout << "[BSC-EX] узнали цену монет, прошедших через биржи: " << ok << std::endl;
+    }
+}
+
 }  // namespace
 
 void initBscExchanges() {
+    static bool pricer = false;
+    if (!pricer) {
+        pricer = true;
+        std::thread(pricerLoop).detach();
+    }
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_exec(db,
                  "CREATE TABLE IF NOT EXISTS bsc_ex_labels (address TEXT PRIMARY KEY, ex TEXT NOT NULL, "
@@ -300,6 +344,7 @@ BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const s
     long long usd = 0;
     if (!parseTransfer(tx, to, token, rcpt, qty, usd)) return hit;
     const long long t = blockTs > 0 ? blockTs : now();
+    const bool unpriced = usd == 0 && token != chainCtx().nativeMarker;
 
     std::vector<Pend> late;  // заводы, засчитанные задним числом
     std::string exFrom, exTo;
@@ -321,6 +366,11 @@ BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const s
         // Слив на кошелёк биржи из списка с незнакомого адреса — это адрес
         // пополнения той биржи. Наблюдаемые кошельки не учим: человек мог
         // отправить прямо на горячий кошелёк, и он не станет «биржей».
+        // Монета без цены прошла через биржу — в очередь на дозаполнение.
+        if (unpriced && (lf || lt) && g_unpriced.size() < UNPRICED_MAX) {
+            auto tr = g_priceTried.find(token);
+            if (tr == g_priceTried.end() || t - tr->second > PRICE_RETRY_SEC) g_unpriced.insert(token);
+        }
         if (lt && lt->seed && !lf && !watched(from)) {
             g_labels[from] = Label{exTo, false, t};
             g_dirty.insert(from);
