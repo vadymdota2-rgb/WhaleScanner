@@ -343,6 +343,10 @@ void initDB() {
             FOREIGN KEY(whale_id) REFERENCES whale_addresses(id)
         );
         CREATE INDEX IF NOT EXISTS idx_user_whales_whale ON user_whales(whale_id);
+        -- Спавшие кошельки базы, которые снова торгуют (autoWoke); refreshWatchers
+        -- читает её при каждой сборке — должна быть раньше первой.
+        CREATE TABLE IF NOT EXISTS auto_woke (net TEXT NOT NULL, address TEXT NOT NULL,
+            at INTEGER NOT NULL, PRIMARY KEY (net, address));
         CREATE TABLE IF NOT EXISTS processed_tx (tx_hash TEXT PRIMARY KEY, block_number INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS idx_processed_block ON processed_tx(block_number);
         CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
@@ -759,14 +763,16 @@ void refreshWatchers() {
 
         if (prepareOrLog(db,&s,
             "SELECT wa.address, uw.user_id, uw.label, u.threshold_nanos, "
-            "       CASE WHEN u.is_premium=1 AND u.premium_expire>? THEN 1 ELSE 0 END, "
+            "       CASE WHEN u.is_premium=1 AND u.premium_expire>?1 THEN 1 ELSE 0 END, "
             "       uw.created_at, "
-            "       EXISTS(SELECT 1 FROM trades t WHERE t.wallet = lower(wa.address) LIMIT 1) "
+            "       EXISTS(SELECT 1 FROM trades t WHERE t.wallet = lower(wa.address) AND t.timestamp >= ?2 LIMIT 1) "
+            "       OR EXISTS(SELECT 1 FROM auto_woke w WHERE w.net = 'bsc' AND w.address = lower(wa.address) AND w.at >= ?2) "
             "FROM user_whales uw "
             "JOIN whale_addresses wa ON wa.id = uw.whale_id "
             "JOIN users u ON u.chat_id = uw.user_id "
             "ORDER BY uw.user_id ASC, uw.is_primary DESC, uw.created_at ASC, uw.rowid ASC")) {
             sqlite3_bind_int64(s,1,now);
+            sqlite3_bind_int64(s,2,graceAfter);
             std::string prevUser;
             size_t loadedForUser = 0;
             int stepRc;
@@ -789,11 +795,12 @@ void refreshWatchers() {
                 // подписался бы на поток несуществующего счёта.
                 if (addr.rfind("0x", 0) != 0) continue;
 
-                // BSC: «тёплые» (есть сделки или добавлены меньше 30 дней
-                // назад) ловятся и по входящим транзакциям. «Холодные» — только
-                // по своим исходящим (processBlock): своп кошелёк всегда
-                // начинает сам, так он вернётся в тёплые, когда снова торгует.
-                if (hasSpot || inGrace) {
+                // BSC: бодрствуют — сделки за 30 дней, добавлены меньше 30
+                // дней назад или кошелёк чей-то личный (люди получают и
+                // входящие). Спящие кошельки базы ловятся только по своим
+                // исходящим (processBlock): своп кошелёк начинает сам, так он
+                // проснётся, когда снова торгует.
+                if (hasSpot || inGrace || uid != SERVICE_CHAT_ID) {
                     bscActive->insert(addr);
                 } else {
                     ++bscOff;
@@ -1484,14 +1491,14 @@ void bscAutoLoop() {
     }
 }
 
-/* Неактивные автокошельки убираются из базы, но не банятся: кто 30 дней
-   (AUTO_IDLE_SEC) не торговал — BSC без сделок в trades, Hyperliquid без
-   сделок в hl_fills, Bitcoin без движений в btc_moves и с остатком меньше
-   1 BTC (держателей не трогаем) — тот уходит из базы
-   сервисного аккаунта, а поиск его «забывает», чтобы снова добавить, когда
-   кошелёк вернётся к крупной торговле. Смотрим только на тех, кто в базе
-   дольше AUTO_IDLE_SEC: свежему ещё не было когда поторговать. У людей,
-   следящих за адресом, он остаётся.
+/* Сон вместо удаления. Кошелёк сервисного аккаунта (импорт или поиск),
+   у которого 30 дней (AUTO_IDLE_SEC) нет сделок в сети, в этой сети
+   засыпает, а не удаляется; в другой сети он может торговать и не спать.
+   BSC: спящий ловится только по своим исходящим транзакциям (processBlock),
+   Hyperliquid: поток сделок бесплатный, поэтому спящий ничего не стоит.
+   Первая сделка будит его в этой сети (autoWoke). Нет сделок ни там ни
+   там — спит полностью. Удаляем за бездействие только Bitcoin: найденный
+   поиском кошелёк без движений месяц и с остатком меньше 1 BTC.
    Боты — другое дело: их банит разбор сделок (ignored_wallets на BSC,
    hl_banned на Hyperliquid) навсегда, и ни импорт, ни поиск их не вернут.
    В Bitcoin так же навсегда убираем сервисы: найденный поиском адрес набрал
@@ -1500,8 +1507,8 @@ constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
 
 // Вся база сервисного аккаунта, не только найденное поиском: импорт (/import)
 // плюс поиск. Адрес BSC и Hyperliquid один (0x…), поэтому кошелёк один на обе
-// сети. Холодные — давно в базе и без сделок в сети; проснувшиеся — те из
-// них, кто снова торгует (autoWoke).
+// сети. Спящие — давно в базе и без сделок в сети за 30 дней; проснувшиеся —
+// те из них, кто снова торгует (autoWoke).
 ServiceBaseStats serviceBaseStats() {
     long long evm = 0, evmAuto = 0;
     {
@@ -1518,43 +1525,47 @@ ServiceBaseStats serviceBaseStats() {
             sqlite3_finalize(s);
         }
     }
-    // Холодные — в базе больше 30 дней и без сделок в сети: на BSC не в
-    // тёплых (BSC_ACTIVE_PTR) и ещё не проснулись (тёплыми проснувшиеся
-    // станут при пересборке списка, раз в час); на Hyperliquid сделок ни разу
-    // не подтягивали (нет засеянного hl_wallet_state).
-    long long bscCold = 0, hlCold = 0;
+    // Спят — в базе больше 30 дней и без сделок в сети за 30 дней. BSC —
+    // по trades, Hyperliquid — по hl_fills (у каждого адреса проба индекса
+    // wallet, ts). Свежие (меньше 30 дней в базе) не спят нигде.
+    long long bscSleep = 0, hlSleep = 0, bothSleep = 0;
     {
-        std::shared_ptr<const std::unordered_set<std::string>> warm;
-        { std::shared_lock l(watchersMutex); warm = BSC_ACTIVE_PTR; }
-        std::unordered_set<std::string> wokeBsc;
-        std::unordered_set<std::string> seeded;
+        const long long cut = static_cast<long long>(time(nullptr)) - AUTO_IDLE_SEC;
+        std::vector<std::pair<std::string, bool>> old;  // адрес, есть сделки на BSC
         {
-            std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
-            sqlite3_stmt* s = nullptr;
-            if (hl::g_hlDb && prepareOrLog(hl::g_hlDb, &s, "SELECT wallet FROM hl_wallet_state WHERE seeded=1")) {
-                while (sqlite3_step(s) == SQLITE_ROW) seeded.insert(toLower(safeColumnText(s, 0)));
+            std::lock_guard<std::mutex> l(dbMutex);
+            sqlite3_stmt* s;
+            // Проснувшийся на BSC (auto_woke) бодрствует сразу: своп пишется в
+            // trades через 3 минуты (сборка серии), а мельче $50 — никогда.
+            if (prepareOrLog(db, &s, "SELECT wa.address, EXISTS(SELECT 1 FROM trades t WHERE t.wallet=wa.address "
+                                     "AND t.timestamp>=?1) OR EXISTS(SELECT 1 FROM auto_woke w WHERE w.net='bsc' "
+                                     "AND w.address=wa.address AND w.at>=?1) "
+                                     "FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
+                                     "WHERE uw.user_id=?2 AND wa.address LIKE '0x%' AND uw.created_at>0 AND uw.created_at<?1")) {
+                sqlite3_bind_int64(s, 1, cut);
+                sqlite3_bind_text(s, 2, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
+                while (sqlite3_step(s) == SQLITE_ROW) old.emplace_back(safeColumnText(s, 0), sqlite3_column_int(s, 1) != 0);
                 sqlite3_finalize(s);
             }
         }
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (prepareOrLog(db, &s, "SELECT address FROM auto_woke WHERE net='bsc'")) {
-            while (sqlite3_step(s) == SQLITE_ROW) wokeBsc.insert(safeColumnText(s, 0));
-            sqlite3_finalize(s);
-        }
-        if (prepareOrLog(db, &s, "SELECT wa.address FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
-                                 "WHERE uw.user_id=? AND wa.address LIKE '0x%' AND uw.created_at>0 AND uw.created_at<?")) {
-            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(s, 2, static_cast<long long>(time(nullptr)) - 30LL * 86400LL);
-            while (sqlite3_step(s) == SQLITE_ROW) {
-                const std::string a = safeColumnText(s, 0);
-                if (!seeded.count(a)) ++hlCold;
-                if (!(warm && warm->count(a)) && !wokeBsc.count(a)) ++bscCold;
+        std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
+        sqlite3_stmt* s = nullptr;
+        const bool hlOk = hl::g_hlDb && prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE wallet=? AND ts>=? LIMIT 1");
+        for (const auto& [a, bscTrades] : old) {
+            bool hlTrades = false;
+            if (hlOk) {
+                sqlite3_reset(s);
+                sqlite3_bind_text(s, 1, a.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(s, 2, cut * 1000);
+                hlTrades = sqlite3_step(s) == SQLITE_ROW;
             }
-            sqlite3_finalize(s);
+            bscSleep += !bscTrades;
+            hlSleep += !hlTrades;
+            bothSleep += !bscTrades && !hlTrades;
         }
+        if (s) sqlite3_finalize(s);
     }
-    // Проснулись — холодные, которые снова торгуют (auto_woke, autoWoke).
+    // Проснулись — спящие, которые снова торгуют (auto_woke, autoWoke).
     long long wokeToday[2] = {0, 0}, wokeAll[2] = {0, 0};
     {
         std::lock_guard<std::mutex> l(dbMutex);
@@ -1576,8 +1587,9 @@ ServiceBaseStats serviceBaseStats() {
     r.evmAuto = evmAuto;
     r.btc = btcWatchCount(false);
     r.btcAuto = btcWatchCount(true);
-    r.bscCold = bscCold;
-    r.hlCold = hlCold;
+    r.bscSleep = bscSleep;
+    r.hlSleep = hlSleep;
+    r.bothSleep = bothSleep;
     for (int k = 0; k < 2; k++) {
         r.wokeToday[k] = wokeToday[k];
         r.wokeAll[k] = wokeAll[k];
@@ -1587,87 +1599,12 @@ ServiceBaseStats serviceBaseStats() {
 
 void pruneAutoWallets() {
     const long long cut = static_cast<long long>(time(nullptr)) - AUTO_IDLE_SEC;
-    struct W { long long id; std::string addr; };
-    std::vector<W> bsc, hlc;
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (prepareOrLog(db, &s,
-                "SELECT uw.whale_id, lower(wa.address) FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
-                "WHERE uw.user_id=? AND uw.label='auto-bsc' AND uw.created_at>0 AND uw.created_at<? "
-                "AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.wallet=lower(wa.address) AND t.timestamp>=?)")) {
-            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(s, 2, cut);
-            sqlite3_bind_int64(s, 3, cut);
-            while (sqlite3_step(s) == SQLITE_ROW) bsc.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
-            sqlite3_finalize(s);
-        }
-        if (prepareOrLog(db, &s,
-                "SELECT uw.whale_id, lower(wa.address) FROM user_whales uw JOIN whale_addresses wa ON wa.id=uw.whale_id "
-                "WHERE uw.user_id=? AND uw.label='auto-hl' AND uw.created_at>0 AND uw.created_at<?")) {
-            sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(s, 2, cut);
-            while (sqlite3_step(s) == SQLITE_ROW) hlc.push_back({sqlite3_column_int64(s, 0), safeColumnText(s, 1)});
-            sqlite3_finalize(s);
-        }
-    }
-    // Hyperliquid: сделки в своей базе, время — в миллисекундах.
-    std::vector<W> hl;
-    {
-        std::lock_guard<std::mutex> l(hl::g_hlDbMutex);
-        sqlite3_stmt* s = nullptr;
-        if (hl::g_hlDb && !hlc.empty() &&
-            // wallet=? (адреса пишутся строчными), а не lower(wallet)=?: так
-            // идёт индекс (wallet, ts), а не перебор всех сделок за месяц на
-            // каждый из тысяч кошельков.
-            prepareOrLog(hl::g_hlDb, &s, "SELECT 1 FROM hl_fills WHERE wallet=? AND ts>=? LIMIT 1")) {
-            for (const auto& w : hlc) {
-                sqlite3_reset(s);
-                sqlite3_bind_text(s, 1, w.addr.c_str(), -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(s, 2, cut * 1000);
-                if (sqlite3_step(s) != SQLITE_ROW) hl.push_back(w);
-            }
-            sqlite3_finalize(s);
-        }
-    }
-    int removedBsc = 0, removedHl = 0;
-    {
-        std::lock_guard<std::mutex> l(dbMutex);
-        sqlite3_stmt* s;
-        if (prepareOrLog(db, &s, "DELETE FROM user_whales WHERE user_id=? AND label=? AND whale_id=?")) {
-            for (const auto* list : {&bsc, &hl}) {
-                const bool isBsc = list == &bsc;
-                for (const auto& w : *list) {
-                    sqlite3_reset(s);
-                    sqlite3_bind_text(s, 1, SERVICE_CHAT_ID.c_str(), -1, SQLITE_TRANSIENT);
-                    sqlite3_bind_text(s, 2, isBsc ? "auto-bsc" : "auto-hl", -1, SQLITE_STATIC);
-                    sqlite3_bind_int64(s, 3, w.id);
-                    if (sqlite3_step(s) == SQLITE_DONE) (isBsc ? removedBsc : removedHl) += sqlite3_changes(db);
-                }
-            }
-            sqlite3_finalize(s);
-        }
-    }
-    const int removed = removedBsc + removedHl;
-    // Поиск их «забывает»: вернутся к крупной торговле — добавит снова.
-    {
-        std::lock_guard<std::mutex> l(g_bscAutoMutex);
-        for (const auto& w : bsc) g_bscAutoSeen.erase(w.addr);
-    }
-    for (const auto& w : hl) hlAutoForget(w.addr);
     // Сначала бан сервисов: иначе тихий сервис ушёл бы как «удалён» и поиск
     // мог бы счесть его забытым.
     autoBanned(AutoNet::BTC, btcBanServices());
     const int btc = btcPruneAuto(cut);
-    // Счётчик для /autobase: сколько убрано за бездействие сегодня и всего.
-    autoPruned(AutoNet::BSC, removedBsc);
-    autoPruned(AutoNet::HL, removedHl);
     autoPruned(AutoNet::BTC, btc);
-    if (removed > 0 || btc > 0) {
-        std::cout << "[AUTO] убраны неактивные 30 дней (не баним): BSC " << removedBsc << ", Hyperliquid " << removedHl
-                  << ", Bitcoin " << btc << std::endl;
-        if (removed > 0) refreshWatchers();
-    }
+    if (btc > 0) std::cout << "[AUTO] Bitcoin: убраны неактивные 30 дней с остатком меньше 1 BTC: " << btc << std::endl;
 }
 
 bool processBlock(long long bn) {

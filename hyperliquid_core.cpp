@@ -1266,9 +1266,19 @@ void enrichWallet(const std::string& wallet) {
 
     std::vector<size_t> freshRows;
     size_t stored = 0;
+    bool awake = true;  // были ли сделки за 30 дней до этих — иначе кошелёк спал
     {
         const bool bulk = prepared.size() > 20;
         std::lock_guard<std::mutex> l(g_hlDbMutex);
+        if (g_hlDb && !prepared.empty()) {
+            sqlite3_stmt* q = nullptr;
+            if (prepareOrLog(g_hlDb, &q, "SELECT 1 FROM hl_fills WHERE wallet=? AND ts>=? LIMIT 1")) {
+                sqlite3_bind_text(q, 1, wallet.c_str(), -1, SQLITE_TRANSIENT);
+                sqlite3_bind_int64(q, 2, (now - 30LL * 86400LL) * 1000LL);
+                awake = sqlite3_step(q) == SQLITE_ROW;
+                sqlite3_finalize(q);
+            }
+        }
         if (g_hlDb) {
             if (bulk) sqlite3_exec(g_hlDb, "BEGIN", nullptr, nullptr, nullptr);
             for (size_t i = 0; i < prepared.size(); i++) {
@@ -1287,6 +1297,10 @@ void enrichWallet(const std::string& wallet) {
             }
         }
     }
+
+    // Спал (30 дней без сделок на Hyperliquid) и снова торгует — засчитается,
+    // если кошелёк в базе сервисного аккаунта больше 30 дней.
+    if (stored > 0 && !awake) autoWoke(AutoNet::HL, wallet);
 
     if (liveAlerts && !freshRows.empty()) {
         std::map<std::string, HlAlertData> series;
@@ -1321,7 +1335,6 @@ void enrichWallet(const std::string& wallet) {
                   << jstr(fills[0], "coin", "?")
                   << " - сверь с именами рынков из meta." << std::endl;
     } else if (stored > 0 && !wasSeeded) {
-        autoWoke(AutoNet::HL, wallet);  // засчитается, только если кошелёк давно в базе
         std::cout << "[HL] первичное наполнение " << wallet << ": " << stored
                   << " сделок записано молча" << std::endl;
     }

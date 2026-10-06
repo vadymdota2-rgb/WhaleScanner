@@ -8,6 +8,7 @@
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <sqlite3.h>
@@ -237,16 +238,18 @@ void autoPruned(AutoNet n, int count) { bump(g_pruned, n, count); }
 void autoBanned(AutoNet n, int count) { bump(g_banned, n, count); }
 
 void autoWoke(AutoNet n, const std::string& addr) {
-    // До пересборки списка (раз в час) проснувшийся ещё числится холодным, и
-    // каждая его сделка зовёт сюда — в базу идём один раз за запуск.
+    // До пересборки списка (раз в час) проснувшийся на BSC ещё числится
+    // спящим, и каждая его сделка зовёт сюда — в базу идём раз в 30 дней.
+    constexpr long long COLD_SEC = 30LL * 86400LL;  // как AUTO_IDLE_SEC в main.cpp
+    const long long now = static_cast<long long>(time(nullptr));
     static std::mutex mx;
-    static std::unordered_set<std::string> seen;
+    static std::unordered_map<std::string, long long> seen;
     {
         std::lock_guard<std::mutex> m(mx);
-        if (!seen.insert(ARG[static_cast<int>(n)] + std::string(":") + addr).second) return;
+        long long& at = seen[ARG[static_cast<int>(n)] + std::string(":") + addr];
+        if (at > now - COLD_SEC) return;
+        at = now;
     }
-    constexpr long long COLD_SEC = 30LL * 86400LL;  // как MARKET_WATCH_GRACE_SEC в main.cpp
-    const long long now = static_cast<long long>(time(nullptr));
     std::lock_guard<std::mutex> l(dbMutex);
     sqlite3_stmt* s;
     bool cold = false;
@@ -267,7 +270,7 @@ void autoWoke(AutoNet n, const std::string& addr) {
         sqlite3_bind_int64(s, 3, now);
         sqlite3_bind_int64(s, 4, COLD_SEC);
         if (sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0)
-            std::cout << "[AUTO] холодный кошелёк проснулся (" << NAME[static_cast<int>(n)] << "): " << addr << std::endl;
+            std::cout << "[AUTO] спящий кошелёк проснулся (" << NAME[static_cast<int>(n)] << "): " << addr << std::endl;
         sqlite3_finalize(s);
     }
 }
@@ -344,13 +347,14 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
     };
     t << "\n\n<b>Найдено поиском</b>\n<pre>" << row("", "BSC", "HL", "BTC") << "\n" << row("Сегодня", "", "", "")
       << "\n" << row(" найдено", today(0), today(1), today(2))
-      << "\n" << row(" удалено", num(pr[0].first), num(pr[1].first), num(pr[2].first))
+      << "\n" << row(" удалено", "—", "—", num(pr[2].first))
       << "\n" << row(" бан", num(bn[0].first), num(bn[1].first), num(bn[2].first))
       << "\n" << row("Всего", "", "", "");
     std::string found[NETS], pruned[NETS], banned[NETS], base[NETS];
     for (int i = 0; i < NETS; i++) {
         found[i] = num(inBase[i] + pr[i].second + bn[i].second);
-        pruned[i] = num(pr[i].second);
+        // BSC и Hyperliquid за бездействие не удаляют — усыпляют.
+        pruned[i] = i == 2 ? num(pr[i].second) : "—";
         banned[i] = num(bn[i].second);
         base[i] = num(inBase[i]);
     }
@@ -369,20 +373,22 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
       << "\n" << row("Кошельков", num(sb.evm), num(sb.evm), num(sb.btc))
       << "\n" << row(" импорт", num(sb.evm - sb.evmAuto), num(sb.evm - sb.evmAuto), num(sb.btc - sb.btcAuto))
       << "\n" << row(" поиском", num(sb.evmAuto), num(sb.evmAuto), num(sb.btcAuto))
-      << "\n" << row("Холодные", num(sb.bscCold), num(sb.hlCold), "—")
+      << "\n" << row("Спят", num(sb.bscSleep), num(sb.hlSleep), "—")
       << "\n" << row("Проснулись", "", "", "")
       << "\n" << row(" сегодня", num(sb.wokeToday[0]), num(sb.wokeToday[1]), "—")
       << "\n" << row(" всего", num(sb.wokeAll[0]), num(sb.wokeAll[1]), "—") << "</pre>"
+      << "\n😴 Спят на обеих сетях: <b>" << num(sb.bothSleep) << "</b> из " << num(sb.evm)
       << "\nИтого кошельков: <b>" << num(sb.evm + sb.btc) << "</b>"
       << "\n<i>Адрес 0x один на BSC и Hyperliquid — в итог входит один раз.</i>";
 
     t << "\n\nℹ️ <b>Что значат строки</b>"
-         "\n• <b>удалено</b> — месяц без сделок. Без бана: начнут торговать — найдутся снова. "
-         "Bitcoin-кошелёк от 1 BTC не удаляется."
+         "\n• <b>спят</b> — 30 дней без сделок в этой сети. Кошелёк не удаляется и просыпается "
+         "на первой же сделке. Спит отдельно в каждой сети: торгует на BSC, но не на Hyperliquid — "
+         "спит только на Hyperliquid. Касается и импорта, и найденных поиском."
+         "\n• <b>проснулись</b> — спавшие, которые снова начали торговать."
+         "\n• <b>удалено</b> — только Bitcoin: найденный поиском кошелёк месяц без движений и меньше 1 BTC. "
+         "Без бана — снова крупно выведет с биржи, найдётся снова."
          "\n• <b>бан</b> — навсегда: боты на BSC и Hyperliquid, сервисы и биржи в Bitcoin (1000+ транзакций)."
-         "\n• <b>холодные</b> — в базе больше 30 дней и без сделок в этой сети. Бот ждёт их сделку."
-         "\n• <b>проснулись</b> — холодные, которые снова начали торговать."
-         "\n• <b>импорт</b> за бездействие не удаляется."
          "\n\n⚙️ <b>Управление</b>"
          "\n<code>/autobase bsc off</code> — остановить (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
          "\n<code>/autobase bsc on</code> — включить";
