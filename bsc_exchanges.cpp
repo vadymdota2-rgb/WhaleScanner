@@ -1,4 +1,5 @@
 #include "bsc_exchanges.h"
+#include "bsc_seeds_book.h"
 
 #include <algorithm>
 #include <array>
@@ -61,7 +62,8 @@ long long g_dropped = 0;
 // Проверены в сети BSC: обычный кошелёк (не контракт), отправлял транзакции.
 // Источник имён — метки BscScan и Etherscan (адрес кошелька один во всех
 // EVM-сетях); Bybit и Bitget — по горячим кошелькам с миллионами отправок.
-// OKX здесь нет: ни один известный адрес не подтвердился в BSC.
+// Ещё 71 адрес (OKX, Bitget, Binance, Gate, KuCoin, HTX…) — в bsc_seeds_book.h:
+// из отчётов о резервах бирж, собирает tools/bsc_seeds.py. Этот список главнее.
 struct Seed { const char* addr; const char* ex; };
 const Seed SEEDS[] = {
     {"0x8894e0a0c962cb723c1976a4421c95949be2d4e3", "Binance"},  // Binance: Hot Wallet 6
@@ -125,6 +127,10 @@ const Seed SEEDS[] = {
     {"0xa310b3eeca53b9c115af529faf92bb5ca4b41494", "MaskEX"},  // MaskEX 8
     {"0xa4e71851a8c8eaefeb20a994159f4a443e46059b", "MaskEX"},  // MaskEX 9
     {"0x8458c828d602230e92eb0aac5a6aed5580011b6a", "MaskEX"},  // MaskEX 7
+    // Метки Etherscan (адрес кошелька один во всех EVM-сетях); в BSC — горячий
+    // кошелёк: 103 тыс. и 17 тыс. отправок.
+    {"0x986a2fca9eda0e06fbf7839b89bfc006ee2a23dd", "AscendEX"},
+    {"0x09344477fdc71748216a7b8bbe7f2013b893def8", "AscendEX"},
 };
 
 // Адресов пополнения у Binance — десятки тысяч новых в сутки. Храним 30 дней
@@ -404,13 +410,17 @@ void initTables() {
     sqlite3_stmt* s;
     if (prepareOrLog(g_exDb, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'seed',?) "
                              "ON CONFLICT(address) DO UPDATE SET ex=excluded.ex, how='seed' WHERE how!='owner'")) {
-        for (const Seed& sd : SEEDS) {
+        auto put = [&](const char* addr, const char* ex) {
             sqlite3_reset(s);
-            sqlite3_bind_text(s, 1, sd.addr, -1, SQLITE_STATIC);
-            sqlite3_bind_text(s, 2, sd.ex, -1, SQLITE_STATIC);
+            sqlite3_bind_text(s, 1, addr, -1, SQLITE_STATIC);
+            sqlite3_bind_text(s, 2, ex, -1, SQLITE_STATIC);
             sqlite3_bind_int64(s, 3, now());
             sqlite3_step(s);
-        }
+        };
+        // Сначала адреса из отчётов о резервах, потом ручной список — он
+        // главнее и при совпадении правит имя.
+        for (const BscSeedBook& sd : BSC_SEEDS_BOOK) put(sd.addr, sd.ex);
+        for (const Seed& sd : SEEDS) put(sd.addr, sd.ex);
         sqlite3_finalize(s);
     }
 }
@@ -438,7 +448,7 @@ void loadLabels() {
         sqlite3_finalize(s);
     }
     std::cout << "[BSC-EX] база " << exDbFile() << ", адресов бирж: " << g_labels.size() << " (из них стартовых "
-              << std::size(SEEDS) << "), торгуемых монет: " << g_listed.size() << std::endl;
+              << std::size(SEEDS) + std::size(BSC_SEEDS_BOOK) << "), торгуемых монет: " << g_listed.size() << std::endl;
 }
 }  // namespace
 

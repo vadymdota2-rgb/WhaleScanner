@@ -598,7 +598,7 @@ public:
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         // Сначала адреса из отчётов о резервах бирж (btc_seeds_book.h, ~1300
         // адресов 59 бирж), потом ручной список — он главнее и правит их.
-        std::vector<std::pair<const char*, const char*>> all(SEEDS_BOOK.begin(), SEEDS_BOOK.end());
+        std::vector<std::pair<const char*, const char*>> all(BTC_SEEDS_BOOK.begin(), BTC_SEEDS_BOOK.end());
         all.insert(all.end(), SEEDS.begin(), SEEDS.end());
         execSql("BEGIN");
         for (const auto& [a, ex] : all) {

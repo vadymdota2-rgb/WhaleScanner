@@ -6,7 +6,7 @@
 #include <utility>
 #include <vector>
 
-inline const std::vector<std::pair<const char*, const char*>> SEEDS_BOOK = {
+inline const std::vector<std::pair<const char*, const char*>> BTC_SEEDS_BOOK = {
     {"bc1qlnkyrrupehgw5evu43erlgkhhagv0uj3yyhacvc65n3ud6qeas0sa958ps", "Arkham"},
     {"bc1qaxyju6n2x2tednv8e7hgnhnz44vrfcmuhjxpfk", "BTSE"},
     {"12F3fSv4zRmw7L1z5M1vFkdYabeETqxisp", "BYDFi"},

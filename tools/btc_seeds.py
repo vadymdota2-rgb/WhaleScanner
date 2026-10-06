@@ -160,7 +160,7 @@ def main() -> None:
         "#include <utility>",
         "#include <vector>",
         "",
-        "inline const std::vector<std::pair<const char*, const char*>> SEEDS_BOOK = {",
+        "inline const std::vector<std::pair<const char*, const char*>> BTC_SEEDS_BOOK = {",
     ]
     for a, ex in sorted(owner.items(), key=lambda x: (x[1], x[0])):
         lines.append(f'    {{"{a}", "{ex}"}},')
