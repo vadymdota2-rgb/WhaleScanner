@@ -27,6 +27,7 @@
  */
 #include "btc_chain.h"
 #include "autobase.h"
+#include "btc_seeds_book.h"
 
 #include <algorithm>
 #include <array>
@@ -589,7 +590,12 @@ public:
 
     void seed() {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
-        for (const auto& [a, ex] : SEEDS) {
+        // Сначала адреса из отчётов о резервах бирж (btc_seeds_book.h, ~1300
+        // адресов 59 бирж), потом ручной список — он главнее и правит их.
+        std::vector<std::pair<const char*, const char*>> all(SEEDS_BOOK.begin(), SEEDS_BOOK.end());
+        all.insert(all.end(), SEEDS.begin(), SEEDS.end());
+        execSql("BEGIN");
+        for (const auto& [a, ex] : all) {
             putLabel(a, ex, "seed");
             sqlite3_stmt* s = nullptr;
             // Проверенная метка главнее выученной: если адрес раньше записали
@@ -601,6 +607,7 @@ public:
                 sqlite3_finalize(s);
             }
         }
+        execSql("COMMIT");
     }
 
     // Кластеры проверенных адресов: всё, что walletexplorer сведёт в тот же
