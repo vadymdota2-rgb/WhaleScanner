@@ -13,6 +13,9 @@ Reserves), собранные DefiLlama для страницы резервов
 выбрасывается. Ручной список SEEDS в bsc_exchanges.cpp главнее — его адреса
 сюда не попадают.
 
+Третий источник — tools/data/bsc_labels_extra.tsv: метки кошельков бирж
+(stablescan.achivx.com) и адреса из отчёта Bybit о резервах; проверяются так же.
+
 Запуск:
   python3 tools/bsc_seeds.py <DefiLlama-Adapters/projects> <binance_por.json>
 """
@@ -71,6 +74,13 @@ def main() -> None:
     for r in json.load(open(por_file)).get("data") or []:
         if re.fullmatch(r"0x[0-9a-fA-F]{40}", r.get("address", "")):
             add(r["address"], "Binance")
+    extra = os.path.join(ROOT, "tools", "data", "bsc_labels_extra.tsv")
+    if os.path.exists(extra):
+        for line in open(extra):
+            if line.startswith("#") or not line.strip():
+                continue
+            a, ex = line.rstrip("\n").split("\t")[:2]
+            add(a, ex)
     for a in bad:
         cand.pop(a, None)
     hand = {a.lower() for a in re.findall(r'\{"(0x[0-9a-fA-F]{40})",',
@@ -96,7 +106,8 @@ def main() -> None:
     lines = [
         "#pragma once",
         "// Собрано tools/bsc_seeds.py — руками не правится. Адреса бирж из отчётов о",
-        "// резервах (DefiLlama, projects/<биржа>; резервы Binance), проверенные в BSC:",
+        "// резервах (DefiLlama, projects/<биржа>; резервы Binance, Bybit) и меток кошельков",
+        "// (tools/data/bsc_labels_extra.tsv), проверенные в BSC:",
         "// обычный кошелёк, сам отправил от пяти транзакций. Число — сколько отправил.",
         "// " + ", ".join(f"{ex} {n}" for ex, n in sorted(by.items(), key=lambda x: -x[1])),
         "",

@@ -760,11 +760,17 @@ std::string bscExLabelCommand(const std::string& arg) {
 }
 
 std::string bscExUnknownCommand() {
+    // Известные сборщики, которые не биржи: в поток бирж их не берём, а в
+    // списке «без подписи» они только заслоняют настоящие биржи.
+    static const std::unordered_set<std::string> NOT_EXCHANGE = {
+        "0xfa500178de024bf43cfa69b7e636a28ab68f2741",  // Stake.com 6 — казино
+        "0xb0b1177e8b32bfb9744c50f1350c6a614cc1aa77",  // Cobo — кастоди
+    };
     std::vector<std::pair<long long, std::string>> top;
     {
         std::lock_guard<std::mutex> m(g_mx);
         for (const auto& [a, n] : g_collect)
-            if (n >= 10 && !g_labels.count(a)) top.emplace_back(n, a);
+            if (n >= 10 && !g_labels.count(a) && !NOT_EXCHANGE.count(a)) top.emplace_back(n, a);
     }
     std::sort(top.rbegin(), top.rend());
     if (top.size() > 15) top.resize(15);

@@ -1,0 +1,207 @@
+# Адреса бирж из меток и отчётов о резервах: адрес<TAB>биржа<TAB>источник.
+# Читает tools/bsc_seeds.py; в BSC попадают только живые кошельки (не контракт, от 5 отправок).
+# Не биржи — не сюда: Stake.com (казино), Cobo (кастоди).
+0x983873529f95132bd1812a3b52c98fb271d2f679	AscendEX	stablescan.achivx.com (метки кошельков бирж)
+0xea396eea989d901446974f589a4db0a1f95ac485	BTSE	stablescan.achivx.com (метки кошельков бирж)
+0x3f5ce5fbfe3e9af3971dd833d26ba9b5c936f0be	Binance	stablescan.achivx.com (метки кошельков бирж)
+0xe4b5b2667e049ac8c79ae6c5a7e3300815aa32be	Binance	stablescan.achivx.com (метки кошельков бирж)
+0x065ac3d33fec104fba9f2f4d674afaa7c4ebcf43	BingX	stablescan.achivx.com (метки кошельков бирж)
+0x2b3bf74b29f59fb8dda41cf3d6a8da28cf8e7921	BingX	stablescan.achivx.com (метки кошельков бирж)
+0xc3dcd744db3f114f0edf03682b807b78a227bf74	BingX	stablescan.achivx.com (метки кошельков бирж)
+0x2982bb64bcd07ac3315c32cb2bb7e5e8a2de7d67	BitMart	stablescan.achivx.com (метки кошельков бирж)
+0xb8cda8d72da558ef8f76a0d928f9652d2b003e2e	Bitget	stablescan.achivx.com (метки кошельков бирж)
+0x56152e13828f78cdcc90a6b016df0aec0985e2f3	Bitkub	stablescan.achivx.com (метки кошельков бирж)
+0x2ddbbf0627f0709c1a2880f5b1ab09d00eaad177	BitoPro	stablescan.achivx.com (метки кошельков бирж)
+0x0529ea5885702715e83923c59746ae8734c553b7	Bitpanda	stablescan.achivx.com (метки кошельков бирж)
+0xe3257c3bfe933610ed409fac95820943e9709a5c	Bitpanda	stablescan.achivx.com (метки кошельков бирж)
+0x00bdb5699745f5b860228c8f939abf1b9ae374ed	Bitstamp	stablescan.achivx.com (метки кошельков бирж)
+0x0b0f7ebf967146566799229394171fc47f1a765a	Bitstamp	stablescan.achivx.com (метки кошельков бирж)
+0xab782bc7d4a2b306825de5a7730034f8f63ee1bc	Bitvavo	stablescan.achivx.com (метки кошельков бирж)
+0x0051ef9259c7ec0644a80e866ab748a2f30841b3	Bybit	stablescan.achivx.com (метки кошельков бирж)
+0x01e2fb8f565d5e3cb9e0e8f0b607a96169b94393	Bybit	Bybit Proof of Reserves, май 2026
+0x01eadbed08832ba3a12b571b299075dc6b503dca	Bybit	Bybit Proof of Reserves, май 2026
+0x036c43bebe5fa5dff3c299584b4a6c1923c7d932	Bybit	Bybit Proof of Reserves, май 2026
+0x076d55c8998da29531ef7fcac2a01fa21582eed2	Bybit	Bybit Proof of Reserves, май 2026
+0x07bdf2aa3fe611bde1d7d03d00bd57fda9f3b633	Bybit	Bybit Proof of Reserves, май 2026
+0x0a7e3e04fb45af4233a27bcf23f2c94f5babcf39	Bybit	Bybit Proof of Reserves, май 2026
+0x0ac92eb5716516a08e7760d314d42e1d5d3c03ae	Bybit	Bybit Proof of Reserves, май 2026
+0x0d4dc3b8becc98782309e443a6da4b9455b5ca48	Bybit	Bybit Proof of Reserves, май 2026
+0x0e928b196f0ba723de312a7798027b014a7f1055	Bybit	Bybit Proof of Reserves, май 2026
+0x118db0fecb576630cb1c977efb0de29d3692cafb	Bybit	Bybit Proof of Reserves, май 2026
+0x1347378b1d0eb69d3462e09b3dfa2fe28ebe74ec	Bybit	Bybit Proof of Reserves, май 2026
+0x13f52026493dccf09065952d44101c3e42b41dda	Bybit	Bybit Proof of Reserves, май 2026
+0x180a1b935d28494f9ff4233985562b18b3dcfa74	Bybit	Bybit Proof of Reserves, май 2026
+0x18673311fec54ac2244a602e6d91845553d24e62	Bybit	Bybit Proof of Reserves, май 2026
+0x187c9fbf5bd0f266883c03f320260c407c7b4100	Bybit	Bybit Proof of Reserves, май 2026
+0x18e296053cbdf986196903e889b7dca7a73882f6	Bybit	Bybit Proof of Reserves, май 2026
+0x1c3944173abee256456b1498299fc501ad5bbd6f	Bybit	Bybit Proof of Reserves, май 2026
+0x1d834efd7ac0f39ec63ad5a30bfd4000aba837f7	Bybit	Bybit Proof of Reserves, май 2026
+0x223fea5291d43a2fb372c5f332e9ade371ded0b5	Bybit	Bybit Proof of Reserves, май 2026
+0x22f888c140c7a99bcd33af55445bd5318876dd7b	Bybit	Bybit Proof of Reserves, май 2026
+0x25c76fa90e90f5a5a6914da07baed9a9647c3dfd	Bybit	Bybit Proof of Reserves, май 2026
+0x25c7d768a7d53e6ebe5590c621437126c766e1ea	Bybit	Bybit Proof of Reserves, май 2026
+0x260b364fe0d3d37e6fd3cda0fa50926a06c54cea	Bybit	Bybit Proof of Reserves, май 2026
+0x2adcd148c975fc5fac0b11c92ed79637d4f1016c	Bybit	Bybit Proof of Reserves, май 2026
+0x3062e4ed0282f86d1b8481d06c30d7f2382776a7	Bybit	Bybit Proof of Reserves, май 2026
+0x30ba21597f22aafa4b0e86c250c8a6eebaf0da54	Bybit	Bybit Proof of Reserves, май 2026
+0x318d2aae4c99c2e74f7b5949fa1c34df837789b8	Bybit	stablescan.achivx.com (метки кошельков бирж)
+0x324316a23cd9dc84681e730225559015798567a7	Bybit	Bybit Proof of Reserves, май 2026
+0x33ae83071432116ae892693b45466949a38ac74c	Bybit	Bybit Proof of Reserves, май 2026
+0x35696b0847ed8428a098cba726b6514582aa5fc7	Bybit	Bybit Proof of Reserves, май 2026
+0x35bf33df55472938ad314678962b7c69204f0a8a	Bybit	Bybit Proof of Reserves, май 2026
+0x36cf90ac2d130b987aff0bded378525be36d9686	Bybit	Bybit Proof of Reserves, май 2026
+0x36e008d1827d451c083f87af254fd2310eef8ac1	Bybit	Bybit Proof of Reserves, май 2026
+0x371c31f9221459e10565cfe78937cbda5db1791c	Bybit	Bybit Proof of Reserves, май 2026
+0x388e52979ac487c6bdafcc84b251976cd162790b	Bybit	Bybit Proof of Reserves, май 2026
+0x3bd0e57e2917d3d9a93f479b3a23b28c3f31a789	Bybit	Bybit Proof of Reserves, май 2026
+0x3cef1f90be0f15f1573bda7a3e045cca9cff1d15	Bybit	Bybit Proof of Reserves, май 2026
+0x3db4cb6d753d9e0ba7cc84e576d17dcd01b6b67d	Bybit	Bybit Proof of Reserves, май 2026
+0x3ddb5d1247adc837cec3ba81edc923a4a230aa8f	Bybit	stablescan.achivx.com (метки кошельков бирж)
+0x3ef28b7e18c510b8fa031d7f8a1bb24a83ccceb0	Bybit	Bybit Proof of Reserves, май 2026
+0x412dd3f282b1fa20d3232d86ae060dec644249f6	Bybit	Bybit Proof of Reserves, май 2026
+0x429b41e5eb73e2266affbc2d7a41553bd8f1ede1	Bybit	Bybit Proof of Reserves, май 2026
+0x448c642074d7be4c5fc25929bb5536f772cd9d5c	Bybit	Bybit Proof of Reserves, май 2026
+0x46958006fc6c826ea5318b42ffdd99ae3f8deaf4	Bybit	Bybit Proof of Reserves, май 2026
+0x4865d4bcf4ab92e1c9ba5011560e7d4c36f54106	Bybit	Bybit Proof of Reserves, май 2026
+0x495c70e181c45f80806dcbd733140361a0f75cc2	Bybit	Bybit Proof of Reserves, май 2026
+0x495eb9345788ee6be50c9c36ed67ffa2beb3699f	Bybit	Bybit Proof of Reserves, май 2026
+0x4a67e97e770de93952b8596f04c13ada0ab9a69c	Bybit	Bybit Proof of Reserves, май 2026
+0x4cead285873b1bbbbd7fecc3c103e539f5b2ab75	Bybit	Bybit Proof of Reserves, май 2026
+0x4e19698c366f7dcd1cfad4d7f621b4d275bb1a6c	Bybit	Bybit Proof of Reserves, май 2026
+0x4e5e17e8ef17c9a7ef9798ddf78f3a2c38367d16	Bybit	Bybit Proof of Reserves, май 2026
+0x4e7292e03703e38ad5dbee25fadbf9e61016b3fe	Bybit	Bybit Proof of Reserves, май 2026
+0x554e61af48afb53bd28670c3a2aa14ce858e63dd	Bybit	Bybit Proof of Reserves, май 2026
+0x555bf90903ad18a90fa585fbc7f4b31945964c87	Bybit	Bybit Proof of Reserves, май 2026
+0x5768d8a89da933e15c5cb2f1a8f3e0627aa2c92a	Bybit	Bybit Proof of Reserves, май 2026
+0x588846213a30fd36244e0ae0ebb2374516da836c	Bybit	Bybit Proof of Reserves, май 2026
+0x59800fc68c7039566ed7a04b0f735255093cac1d	Bybit	Bybit Proof of Reserves, май 2026
+0x5c4e79cc7d5b66effcbb19e22cae0c92bff7276d	Bybit	Bybit Proof of Reserves, май 2026
+0x5f44b6fc5a741bb0c68eb8587ee53203a644a155	Bybit	Bybit Proof of Reserves, май 2026
+0x60dd01bc037e2c1ea2aaf02187701f9f4453ba32	Bybit	Bybit Proof of Reserves, май 2026
+0x61b2aa17c1c1114e7583bb31f777ff4bdc7ab717	Bybit	Bybit Proof of Reserves, май 2026
+0x6206ae3781f9f1b6fbcf44c7240b1be14f3169ef	Bybit	Bybit Proof of Reserves, май 2026
+0x62425cd6bdcb6bfe51558ea465b063486b70dc9f	Bybit	Bybit Proof of Reserves, май 2026
+0x63783f206f22a3eec1e4d0081a49ae419d02ebe4	Bybit	Bybit Proof of Reserves, май 2026
+0x63bee4a7e4aa5d76dc6ab9b9d1852aabb9a40936	Bybit	Bybit Proof of Reserves, май 2026
+0x651641299c7ec0aa44ad7ed9b7e12702fed2022f	Bybit	Bybit Proof of Reserves, май 2026
+0x6522b7f9d481eceb96557f44753a4b893f837e90	Bybit	Bybit Proof of Reserves, май 2026
+0x678cbca3a5cc152ae00f77b85b14151d761b44be	Bybit	Bybit Proof of Reserves, май 2026
+0x695f7dea85bf8c0aaafef0a9484e74834e28ce8b	Bybit	Bybit Proof of Reserves, май 2026
+0x6b9b774502e6afaafcac84f840ac8a0844a1abe3	Bybit	Bybit Proof of Reserves, май 2026
+0x6bd869be16359f9e26f0608a50497f6ef122ee3e	Bybit	Bybit Proof of Reserves, май 2026
+0x6d37817d118f72f362cf01e64d9454bdd8e8e92f	Bybit	Bybit Proof of Reserves, май 2026
+0x6f4565c9d673dbdd379aba0b13f8088d1af3bb0c	Bybit	Bybit Proof of Reserves, май 2026
+0x70167b76543c4a12b49b2f2b70cbf04d99345786	Bybit	Bybit Proof of Reserves, май 2026
+0x70f58622158d7e609ae5839c4ad0d477f468863f	Bybit	Bybit Proof of Reserves, май 2026
+0x72187db55473b693ded367983212fe2db3768829	Bybit	Bybit Proof of Reserves, май 2026
+0x75df67943d35129dd22da5d14fda4983571f553a	Bybit	Bybit Proof of Reserves, май 2026
+0x77439637cac35bedd63fc9e769d7819ca1d24a48	Bybit	Bybit Proof of Reserves, май 2026
+0x79ae8c1b31b1e61c4b9d1040217a051f954d4433	Bybit	Bybit Proof of Reserves, май 2026
+0x7a84c1f1aa344d466b0f161f57b0321b98faf6ee	Bybit	Bybit Proof of Reserves, май 2026
+0x7b66a51bad1c2fb2b21b42e6ec98e70e891edf24	Bybit	Bybit Proof of Reserves, май 2026
+0x7c41c7d883dbbe1edfcefca9d7a7592dd30c8b51	Bybit	Bybit Proof of Reserves, май 2026
+0x7da0b9211020d3775b18116fe751c555b9a7058c	Bybit	Bybit Proof of Reserves, май 2026
+0x801bfd99636ec8961f7e2d2dd0a296d726f5f1ae	Bybit	Bybit Proof of Reserves, май 2026
+0x80a9b4aab0ad3c73cce1c9223236b722db5d6628	Bybit	Bybit Proof of Reserves, май 2026
+0x80d45515a84e762c6497a089913f26b41235bf65	Bybit	Bybit Proof of Reserves, май 2026
+0x8121cf7f01b32a5cc4dc079a5c3127849c85bd6e	Bybit	Bybit Proof of Reserves, май 2026
+0x83d8b993ff9795aee4abe8597c1925b50b30d5be	Bybit	Bybit Proof of Reserves, май 2026
+0x84b1675891d370d5de8f169031f9c3116d7add25	Bybit	Bybit Proof of Reserves, май 2026
+0x855e9a74196764ab41adb3e3b76eaf9e3d6d6d48	Bybit	Bybit Proof of Reserves, май 2026
+0x869bcee3a0bad2211a65c63ec47dbd3d85a84d68	Bybit	Bybit Proof of Reserves, май 2026
+0x86dbaa55f0e65857b58109c3cb725deff4da3851	Bybit	Bybit Proof of Reserves, май 2026
+0x88a1493366d48225fc3cefbdae9ebb23e323ade3	Bybit	Bybit Proof of Reserves, май 2026
+0x8a2458f32e5ec9935f20e7c2e06e8d4820f726e5	Bybit	Bybit Proof of Reserves, май 2026
+0x8c28e696c89200d423f9a5eea7347747e78ed25f	Bybit	Bybit Proof of Reserves, май 2026
+0x8d6d3479c94bb95e737b72186192ff5e7fedf3a2	Bybit	Bybit Proof of Reserves, май 2026
+0x8ebff0f0c7d644310bd1728b6bbf643cea905986	Bybit	Bybit Proof of Reserves, май 2026
+0x8fa129f87b8a11ee1ca35abd46674f8b66984d4a	Bybit	Bybit Proof of Reserves, май 2026
+0x922fa922da1b0b28d0af5aa274d7326eaa108c3d	Bybit	Bybit Proof of Reserves, май 2026
+0x93228d328c9c74c2bfe9f97638bbb5ef322f2bd5	Bybit	Bybit Proof of Reserves, май 2026
+0x933646d78ede6f1ef5cf4a0a03e3a819c8057922	Bybit	Bybit Proof of Reserves, май 2026
+0x9814ba501c7ad64bed5ac731d0a4f9a506e18f8a	Bybit	Bybit Proof of Reserves, май 2026
+0x98bedfe412dcfc1112aae6effd6e5e083b6b0394	Bybit	Bybit Proof of Reserves, май 2026
+0x9cdb59516b37f5c1bd166bc41c5b9f68a57225bd	Bybit	Bybit Proof of Reserves, май 2026
+0x9d271a4e9523d74572b618ec10419a0a330e1bf0	Bybit	Bybit Proof of Reserves, май 2026
+0x9db9476ece7dfe1bd37318911e8a4cfed159d247	Bybit	Bybit Proof of Reserves, май 2026
+0xa0acdf9fa38b293f0bbdd01ca6bf3e7ed8291dd4	Bybit	Bybit Proof of Reserves, май 2026
+0xa1abfa21f80ecf401bd41365adbb6fef6fefdf09	Bybit	Bybit Proof of Reserves, май 2026
+0xa31231e727ca53ff95f0d00a06c645110c4ab647	Bybit	Bybit Proof of Reserves, май 2026
+0xa4287bc8a021025974a642806cf2ab717b857380	Bybit	Bybit Proof of Reserves, май 2026
+0xa4b9569bf942c3aad23c0c2d322fe4aff8e1bf30	Bybit	Bybit Proof of Reserves, май 2026
+0xa6a9f45518881a788e29f82a032f9d400177d2b6	Bybit	Bybit Proof of Reserves, май 2026
+0xa7a93fd0a276fc1c0197a5b5623ed117786eed06	Bybit	Bybit Proof of Reserves, май 2026
+0xa85c29b94f8a22a7268facee89ef4eca051be2ce	Bybit	Bybit Proof of Reserves, май 2026
+0xa9acc15d8b74a01e5605eb0f1e815ba98e3a16af	Bybit	Bybit Proof of Reserves, май 2026
+0xa9cf4aa55c675badb68519e3cfa8f4be942e6d11	Bybit	Bybit Proof of Reserves, май 2026
+0xacf9a5610cb9e6ec9c84ca7429815e95b6607e9f	Bybit	Bybit Proof of Reserves, май 2026
+0xad85405cbb1476825b78a021fa9e543bf7937549	Bybit	Bybit Proof of Reserves, май 2026
+0xb24692d17babefd97ea2b4ca604a481a7cc2c8ea	Bybit	Bybit Proof of Reserves, май 2026
+0xb3dc298398877e65ab5125ced5014438bd5c3c4c	Bybit	Bybit Proof of Reserves, май 2026
+0xb4e38f1a3bf250144364cf29076ecd2d1f8c2329	Bybit	Bybit Proof of Reserves, май 2026
+0xb829e684df8e31b402a4d4aedf3bbc18a52e7589	Bybit	Bybit Proof of Reserves, май 2026
+0xba0553154a8e0fc37d822f042f2cf7b6823c4377	Bybit	Bybit Proof of Reserves, май 2026
+0xbaed383ede0e5d9d72430661f3285daa77e9439f	Bybit	Bybit Proof of Reserves, май 2026
+0xbce9aecd3985d4cbb9d273453159a26301fa02ef	Bybit	Bybit Proof of Reserves, май 2026
+0xbedf525201f58984182d2ad607a343ac8a2e54a2	Bybit	Bybit Proof of Reserves, май 2026
+0xbee9af008e325a3cc86c533d32c4b7c50199ca0b	Bybit	Bybit Proof of Reserves, май 2026
+0xc0e17ad342afabd36b3971f8305ff147006962ae	Bybit	Bybit Proof of Reserves, май 2026
+0xc19bb2709321bd6ad6d8396a885b7c151b8d48c5	Bybit	Bybit Proof of Reserves, май 2026
+0xc22166664e820cda6bf4cedbdbb4fa1e6a84c440	Bybit	Bybit Proof of Reserves, май 2026
+0xc273a2e3fc4c8f8610ebe51123dc32d233913da7	Bybit	Bybit Proof of Reserves, май 2026
+0xc3121c4ca7402922e025e62e9bb4d5b244303878	Bybit	Bybit Proof of Reserves, май 2026
+0xc416535d86bff7b69039d0c901635316c16c7043	Bybit	Bybit Proof of Reserves, май 2026
+0xc63fe58d36bef77a9a98df32a547537f45aac71d	Bybit	Bybit Proof of Reserves, май 2026
+0xc6c6a48ee8e9f593724161c72414d76e94cda93f	Bybit	Bybit Proof of Reserves, май 2026
+0xc6ddab48e5966115810974de57a3b367ec893cc1	Bybit	Bybit Proof of Reserves, май 2026
+0xc851a293ed8b8888a2e4140744973dd23bbcbaf2	Bybit	Bybit Proof of Reserves, май 2026
+0xc868d0ea71243f1580f934cdc59620603bf9f1f1	Bybit	Bybit Proof of Reserves, май 2026
+0xc93e48d89f2d6dbc1672908aa68ce7c24d0413b4	Bybit	Bybit Proof of Reserves, май 2026
+0xcab3f132a11e5b723fc20ddab8bb1b858d00a8e8	Bybit	Bybit Proof of Reserves, май 2026
+0xcbf446565eddf074b2c99e8f1c15582a0bfe6eba	Bybit	Bybit Proof of Reserves, май 2026
+0xd07e6ab4b75b3da5a96b5e81064a65fc04f98814	Bybit	Bybit Proof of Reserves, май 2026
+0xd1c3ee17103289acbda421cbe5382a05507ae0ac	Bybit	Bybit Proof of Reserves, май 2026
+0xd374a62aa68d01cdb420e17b9840706e86bc840b	Bybit	Bybit Proof of Reserves, май 2026
+0xd4d2e6ebca6c94dd28a0935ae468012fdda5d35a	Bybit	Bybit Proof of Reserves, май 2026
+0xd7c4d4b3f076bf9fe391190c42676b4dc269ee02	Bybit	Bybit Proof of Reserves, май 2026
+0xd8169f099ce16c87a99d2a8494023574b5eea9c5	Bybit	Bybit Proof of Reserves, май 2026
+0xd860962a96cd471bbe60a83c33e65011d40eb65f	Bybit	Bybit Proof of Reserves, май 2026
+0xdae4fdcb7fc93738ec6d5b1ea92b7c7f75e4f2f6	Bybit	Bybit Proof of Reserves, май 2026
+0xdba34cfc849738b2075fd28446902d3f1689c09d	Bybit	Bybit Proof of Reserves, май 2026
+0xe1b2fd7fc19f80e6651a7ebc131642b19ac25aeb	Bybit	Bybit Proof of Reserves, май 2026
+0xee5b5b923ffce93a870b3104b7ca09c3db80047a	Bybit	Bybit Proof of Reserves, май 2026
+0xee6281d94fed46a90379f2033b6bbdcda4ef462e	Bybit	Bybit Proof of Reserves, май 2026
+0xef3aeff9a5f61c6dda33069c58c1434006e13b20	Bybit	Bybit Proof of Reserves, май 2026
+0xefdca8d1f52cf3a85dc9eb797d7bcc5e9adffe9c	Bybit	Bybit Proof of Reserves, май 2026
+0xefef30bd1cca520619306c95091ab18473febc5c	Bybit	Bybit Proof of Reserves, май 2026
+0xf22943d05ab93f63b0a229b12f4425e72a4c1f1c	Bybit	Bybit Proof of Reserves, май 2026
+0xf2f40c3bb444288f6f64d8336dcc14dbd929fd94	Bybit	Bybit Proof of Reserves, май 2026
+0xf42aac93ab142090db9fdc0bc86aab73cb36f173	Bybit	Bybit Proof of Reserves, май 2026
+0xf440139a62b2b939699c5b3e09f88e40464ab9bc	Bybit	Bybit Proof of Reserves, май 2026
+0xf4e83ff52d497ed2e5301953188cf67af3064cca	Bybit	Bybit Proof of Reserves, май 2026
+0xf833685f98eba1b99947d418c9512d27c8193b1a	Bybit	Bybit Proof of Reserves, май 2026
+0xf89d7b9c864f589bbf53a82105107622b35eaa40	Bybit	Bybit Proof of Reserves, май 2026
+0xf8f061cfc030928a4acb8c4980911b4f5afc4002	Bybit	Bybit Proof of Reserves, май 2026
+0xa96be652a08d9905f15b7fbe2255708709becd09	ChangeNOW	stablescan.achivx.com (метки кошельков бирж)
+0x4d24eececb86041f47bca41265319e9f06ae2fcb	CoinDCX	stablescan.achivx.com (метки кошельков бирж)
+0x90da1773dbf9fee15486fbb0b8533c85ab34ecee	Coins.ph	stablescan.achivx.com (метки кошельков бирж)
+0x42ed232dc3e65b3534dbb42d07a3f67a618f66a3	Crypto.com	stablescan.achivx.com (метки кошельков бирж)
+0xb428523cdda53640a62e9f26c2d8613a9159b282	Crypto.com	stablescan.achivx.com (метки кошельков бирж)
+0xba5cfbc7c1e08156d9e6e0d91a66ad3bcff7956a	HTX	stablescan.achivx.com (метки кошельков бирж)
+0x3c02290922a3618a4646e3bbca65853ea45fe7c6	Indodax	stablescan.achivx.com (метки кошельков бирж)
+0x91dca37856240e5e1906222ec79278b16420dc92	Indodax	stablescan.achivx.com (метки кошельков бирж)
+0xaba3002ab1597433ba79abc48eead54dc10a45f2	Indodax	stablescan.achivx.com (метки кошельков бирж)
+0xf0bc8fddb1f358cef470d63f96ae65b1d7914953	Korbit	stablescan.achivx.com (метки кошельков бирж)
+0x7dafba1d69f6c01ae7567ffd7b046ca03b706f83	Kraken	stablescan.achivx.com (метки кошельков бирж)
+0xd2dd7b597fd2435b6db61ddf48544fd931e6869f	Kraken	stablescan.achivx.com (метки кошельков бирж)
+0x124d9bf2fecbc16b54ec4accdb14d44c2144f012	LBank	stablescan.achivx.com (метки кошельков бирж)
+0x22f83e4b9cb95cb99b88e8f4f15ea598c74c2788	LBank	stablescan.achivx.com (метки кошельков бирж)
+0xe0f0aa98b4a4d305ac4a04d830c96a158bda9cd8	LBank	stablescan.achivx.com (метки кошельков бирж)
+0xa9bff538a906154c80a8dbccd229f3deddfa52d6	MAX Exchange	stablescan.achivx.com (метки кошельков бирж)
+0x9bb6a22da110c6c9bab745bcaf0ee142ee83af37	MEXC	stablescan.achivx.com (метки кошельков бирж)
+0xb8ba36e591facee901ffd3d5d82df491551ad7ef	Mercado Bitcoin	stablescan.achivx.com (метки кошельков бирж)
+0xa0420c29b214d09b9ec751aa1f592c7b1fa77da3	OKX	stablescan.achivx.com (метки кошельков бирж)
+0x35d2d03607b9155b42cf673102fe58251ac4f644	Phemex	stablescan.achivx.com (метки кошельков бирж)
+0x377b8ce04761754e8ac153b47805a9cf6b190873	Upbit	stablescan.achivx.com (метки кошельков бирж)
+0x33eac50b7faf4b8842a621d0475335693f5d21fe	WhiteBIT	stablescan.achivx.com (метки кошельков бирж)
+0xdb3ded7731c781224ec292e2163d9554c094fd7c	XT.com	stablescan.achivx.com (метки кошельков бирж)
