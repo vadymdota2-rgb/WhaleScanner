@@ -1377,8 +1377,9 @@ void flushPendingAlerts(bool force) {
    • Не сервис: получатель — обычный кошелёк, не контракт, и у него меньше
      BSC_AUTO_MAX_NONCE исходящих транзакций (биржи и боты — миллионы).
    Разбор блока только складывает кандидатов; проверка (два запроса к RPC)
-   идёт отдельным потоком и сканер не задерживает. Кошельки, которые за
-   месяц не сделали ни одной сделки, убирает pruneAutoWallets. */
+   идёт отдельным потоком и сканер не задерживает.
+   Тот же крупный вывод с биржи будит спящий кошелёк базы: кит вывел деньги
+   себе — скоро будет торговать. Входящие спящих иначе не смотрим. */
 constexpr long long BSC_HOT_NONCE = 300000;
 constexpr long long BSC_AUTO_MAX_NONCE = 1000;
 constexpr size_t BSC_AUTO_QUEUE_MAX = 500;
@@ -1399,24 +1400,26 @@ static long double hexToLD(const std::string& h, size_t from = 0, size_t len = s
     return v;
 }
 
-static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
-                            const std::unordered_map<std::string, std::vector<Watcher>>* watchers) {
+// Возвращает адрес спящего кошелька базы, если транзакция — крупный вывод
+// с биржи ему (processBlock разберёт её как его входящую), иначе пусто.
+static std::string bscAutoConsider(const nlohmann::json& tx, const std::string& to,
+                                   const std::unordered_map<std::string, std::vector<Watcher>>* watchers,
+                                   const std::unordered_set<std::string>* awake) {
     static const bool onBsc = chainCtx().coingeckoPlatform == "binance-smart-chain";
-    if (!onBsc || to.empty() || !tx.contains("nonce") || !tx["nonce"].is_string()) return;
+    if (!onBsc || to.empty() || !tx.contains("nonce") || !tx["nonce"].is_string()) return "";
     // Сначала дешёвые проверки — они отсекают почти все транзакции блока.
     const std::string nonceHex = tx["nonce"].get<std::string>();
-    if (nonceHex.size() < 7) return;  // не больше четырёх знаков (< 0x10000) — точно не горячий кошелёк
-    if (hexToLD(nonceHex, 2) < BSC_HOT_NONCE) return;
-    if (!autoRoom(AutoNet::BSC)) return;  // поиск выключен или лимит дня выбран
+    if (nonceHex.size() < 7) return "";  // не больше четырёх знаков (< 0x10000) — точно не горячий кошелёк
+    if (hexToLD(nonceHex, 2) < BSC_HOT_NONCE) return "";
     const std::string input = tx.contains("input") && tx["input"].is_string() ? tx["input"].get<std::string>() : "";
     std::string rcpt;
     long double usd = 0;
     if (input == "0x" || input.empty()) {
         const std::string val = tx.contains("value") && tx["value"].is_string() ? tx["value"].get<std::string>() : "0x0";
         const long double bnb = hexToLD(val, 2) / 1e18L;
-        if (bnb <= 0) return;
+        if (bnb <= 0) return "";
         const uint64_t px = nativePriceCachedNanos();
-        if (!px) return;
+        if (!px) return "";
         usd = bnb * static_cast<long double>(px) / 1e9L;
         rcpt = to;
     } else if (input.size() >= 138 && input.compare(0, 10, "0xa9059cbb") == 0 && chainCtx().stablecoins.count(to)) {
@@ -1425,15 +1428,24 @@ static void bscAutoConsider(const nlohmann::json& tx, const std::string& to,
         rcpt = "0x" + toLower(input.substr(34, 40));
         usd = hexToLD(input, 74, 64) / 1e18L;
     } else {
-        return;
+        return "";
     }
-    if (usd < static_cast<long double>(autoMinUsd(AutoNet::BSC)) || rcpt.size() != 42) return;
-    if (watchers && watchers->count(rcpt)) return;
+    if (usd < static_cast<long double>(autoMinUsd(AutoNet::BSC)) || rcpt.size() != 42) return "";
+    if (watchers && watchers->count(rcpt)) {
+        // Уже в базе. Спит на BSC — будим (поиск при этом может быть и выключен).
+        if (awake && !awake->count(rcpt)) {
+            autoWoke(AutoNet::BSC, rcpt);
+            return rcpt;
+        }
+        return "";
+    }
+    if (!autoRoom(AutoNet::BSC)) return "";  // поиск выключен или лимит дня выбран
     std::lock_guard<std::mutex> l(g_bscAutoMutex);
-    if (g_bscAutoQueue.size() >= BSC_AUTO_QUEUE_MAX) return;
+    if (g_bscAutoQueue.size() >= BSC_AUTO_QUEUE_MAX) return "";
     if (g_bscAutoSeen.size() >= BSC_AUTO_SEEN_MAX) g_bscAutoSeen.clear();
-    if (!g_bscAutoSeen.insert(rcpt).second) return;
+    if (!g_bscAutoSeen.insert(rcpt).second) return "";
     g_bscAutoQueue.push_back(rcpt);
+    return "";
 }
 
 void bscAutoLoop() {
@@ -1638,8 +1650,9 @@ bool processBlock(long long bn) {
         g_stats.tx_processed.fetch_add(1);
         std::string from=tx.contains("from")&&tx["from"].is_string()?toLower(tx["from"].get<std::string>()):"";
         std::string to=(tx.contains("to")&&!tx["to"].is_null()&&tx["to"].is_string())?toLower(tx["to"].get<std::string>()):"";
-        // Крупный вывод с биржи — кандидат в базу (без запросов к сети).
-        bscAutoConsider(tx, to, watchers.get());
+        // Крупный вывод с биржи — кандидат в базу или побудка спящего (без
+        // запросов к сети).
+        const std::string wokeBy = bscAutoConsider(tx, to, watchers.get(), bscActive.get());
         std::string mA;
         bool cold = false;
         if (bscActive && watchers) {
@@ -1650,6 +1663,9 @@ bool processBlock(long long bn) {
             // он снова тёплый. Входящие холодным не смотрим: пыль и рассылки
             // на мёртвые адреса стоили бы запросов впустую.
             else if (watchers->count(from)) { mA=from; cold=true; }
+            // Спящему пришёл крупный вывод с биржи — он уже разбужен
+            // (autoWoke), сам перевод разбираем как его входящий.
+            else if (!wokeBy.empty()) mA=wokeBy;
         }
         if (mA.empty()) continue;
         if (isTxProcessed(hash)) continue;
