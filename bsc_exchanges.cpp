@@ -44,7 +44,7 @@ struct QBlock {
     std::vector<BscExTx> txs;
     std::function<bool(const std::string&)> watched;
 };
-constexpr size_t QUEUE_MAX = 5000;
+constexpr size_t QUEUE_MAX = 2000;
 std::mutex g_qMx;
 std::condition_variable g_qCv;
 std::deque<QBlock> g_queue;
@@ -127,7 +127,18 @@ const Seed SEEDS[] = {
     {"0x8458c828d602230e92eb0aac5a6aed5580011b6a", "MaskEX"},  // MaskEX 7
 };
 
-constexpr long long LEARNED_TTL = 90LL * 86400LL;
+// Адресов пополнения у Binance — десятки тысяч новых в сутки. Храним 30 дней
+// без встреч, а в памяти — не больше LEARNED_MAX самых свежих: забытый адрес
+// снова выучится на следующем сливе, а крупный завод на него дождётся этого в
+// очереди ожидания (PEND_SEC).
+constexpr long long LEARNED_TTL = 30LL * 86400LL;
+constexpr size_t LEARNED_MAX = 300000;
+// Адрес пополнения только сливает деньги на биржу: тысяч отправок у него не
+// бывает. Кошелёк с таким числом — живой человек или бот, его не учим.
+constexpr long long LEARN_MAX_NONCE = 10000;
+// Поток — по 10 минут: окно «1 час» тогда и правда час, а не до двух.
+constexpr long long BUCKET = 600;
+constexpr long long FLOW_KEEP = 32LL * 86400LL;  // самое длинное окно в приложении — 30 дней
 constexpr long long PEND_SEC = 6LL * 3600LL;          // ждём, пока выучится адрес пополнения
 constexpr size_t PEND_MAX = 300000;
 constexpr long long USD = 1000000000LL;               // доллар в нано
@@ -170,6 +181,13 @@ constexpr size_t UNPRICED_MAX = 5000;
 constexpr long long PRICE_RETRY_SEC = 6 * 3600;
 std::unordered_set<std::string> g_unpriced;
 std::unordered_map<std::string, long long> g_priceTried;
+
+// Монеты, которые биржи сами выводят. Спам-токены рассылают на адреса бирж
+// (заводов «на миллионы» по цене из пустого пула), но биржа выводит только то,
+// чем торгует. Поэтому завод засчитывается лишь по монете из этого списка;
+// BNB и стейблкоины — всегда.
+std::unordered_set<std::string> g_listed;
+std::unordered_set<std::string> g_listedNew;  // записать в bsc_ex_tokens
 long long g_learned = 0, g_moves = 0;
 
 long long now() { return static_cast<long long>(time(nullptr)); }
@@ -226,9 +244,32 @@ const Label* labelLocked(const std::string& a) {
     return it == g_labels.end() ? nullptr : &it->second;
 }
 
+// Под g_mx.
+bool listedLocked(const std::string& token) {
+    return token == chainCtx().nativeMarker || chainCtx().stablecoins.count(token) || g_listed.count(token);
+}
+
+// Под g_mx: в памяти не больше LEARNED_MAX выученных — самые старые уходят
+// (в базе они остаются до LEARNED_TTL).
+void capLearnedLocked() {
+    size_t learned = 0;
+    for (const auto& [a, lb] : g_labels) learned += !lb.seed;
+    if (learned <= LEARNED_MAX) return;
+    std::vector<long long> ats;
+    ats.reserve(learned);
+    for (const auto& [a, lb] : g_labels) if (!lb.seed) ats.push_back(lb.at);
+    const size_t drop = learned - LEARNED_MAX * 9 / 10;  // с запасом, чтобы не считать на каждом адресе
+    std::nth_element(ats.begin(), ats.begin() + drop, ats.end());
+    const long long cut = ats[drop];
+    for (auto it = g_labels.begin(); it != g_labels.end();) {
+        if (!it->second.seed && it->second.at < cut) it = g_labels.erase(it);
+        else ++it;
+    }
+}
+
 void addFlow(long long ts, const std::string& ex, const std::string& token, bool in, long long usd, double qty) {
     if (usd < FLOW_MIN) return;
-    Flow& f = g_flow[std::to_string(ts / 3600 * 3600) + "|" + ex + "|" + token];
+    Flow& f = g_flow[std::to_string(ts / BUCKET * BUCKET) + "|" + ex + "|" + token];
     if (in) { f.inUsd += usd; f.inN++; f.inQty += qty; }
     else    { f.outUsd += usd; f.outN++; f.outQty += qty; }
 }
@@ -258,7 +299,7 @@ void resolvePendingLocked(const std::string& addr, const std::string& ex, std::v
     auto it = g_pend.find(addr);
     if (it == g_pend.end()) return;
     for (const Pend& p : it->second) {
-        addFlow(p.ts, ex, p.token, true, p.usd, p.qty);
+        if (listedLocked(p.token)) addFlow(p.ts, ex, p.token, true, p.usd, p.qty);
         if (p.watched) movesOut.push_back(p);
     }
     g_pendN -= it->second.size();
@@ -353,6 +394,8 @@ void initTables() {
                  "  UNIQUE(tx, wallet, kind));"
                  "CREATE INDEX IF NOT EXISTS idx_bsc_ex_moves_wallet ON bsc_ex_moves(wallet, ts);"
                  "CREATE INDEX IF NOT EXISTS idx_bsc_ex_moves_ts ON bsc_ex_moves(ts);"
+                 "CREATE INDEX IF NOT EXISTS idx_bsc_ex_labels_at ON bsc_ex_labels(at);"
+                 "CREATE TABLE IF NOT EXISTS bsc_ex_tokens (token TEXT PRIMARY KEY, at INTEGER NOT NULL DEFAULT 0);"
                  "CREATE TABLE IF NOT EXISTS bsc_ex_flow (ts INTEGER NOT NULL, ex TEXT NOT NULL, token TEXT NOT NULL, "
                  "  in_usd INTEGER NOT NULL DEFAULT 0, out_usd INTEGER NOT NULL DEFAULT 0, "
                  "  in_n INTEGER NOT NULL DEFAULT 0, out_n INTEGER NOT NULL DEFAULT 0, "
@@ -376,7 +419,10 @@ void loadLabels() {
     std::lock_guard<std::mutex> l(g_exDbMx);
     sqlite3_stmt* s = nullptr;
     std::lock_guard<std::mutex> m(g_mx);
-    if (prepareOrLog(g_exDb, &s, "SELECT address, ex, how, at FROM bsc_ex_labels")) {
+    if (prepareOrLog(g_exDb, &s, "SELECT address, ex, how, at FROM bsc_ex_labels WHERE how!='learned' "
+                                 "UNION ALL SELECT * FROM (SELECT address, ex, how, at FROM bsc_ex_labels "
+                                 "WHERE how='learned' ORDER BY at DESC LIMIT ?)")) {
+        sqlite3_bind_int64(s, 1, static_cast<long long>(LEARNED_MAX));
         while (sqlite3_step(s) == SQLITE_ROW) {
             Label lb;
             lb.ex = safeColumnText(s, 1);
@@ -387,8 +433,12 @@ void loadLabels() {
         }
         sqlite3_finalize(s);
     }
+    if (prepareOrLog(g_exDb, &s, "SELECT token FROM bsc_ex_tokens")) {
+        while (sqlite3_step(s) == SQLITE_ROW) g_listed.insert(toLower(safeColumnText(s, 0)));
+        sqlite3_finalize(s);
+    }
     std::cout << "[BSC-EX] база " << exDbFile() << ", адресов бирж: " << g_labels.size() << " (из них стартовых "
-              << std::size(SEEDS) << ")" << std::endl;
+              << std::size(SEEDS) << "), торгуемых монет: " << g_listed.size() << std::endl;
 }
 }  // namespace
 
@@ -432,26 +482,35 @@ BscExHit observe(const BscExTx& tx, long long block, long long blockTs,
         // Слив на кошелёк биржи из списка с незнакомого адреса — это адрес
         // пополнения той биржи. Наблюдаемые кошельки не учим: человек мог
         // отправить прямо на горячий кошелёк, и он не станет «биржей».
-        // Монета без цены прошла через биржу — в очередь на дозаполнение.
-        if (unpriced && (lf || lt) && g_unpriced.size() < UNPRICED_MAX) {
+        // Биржа сама вывела монету (с проверенного кошелька) — монета в
+        // списке торгуемых.
+        if (lf && lf->seed && !lt && token != chainCtx().nativeMarker && g_listed.insert(token).second)
+            g_listedNew.insert(token);
+        // Торгуемая монета без цены прошла через биржу — в очередь на дозаполнение.
+        if (unpriced && (lf || lt) && listedLocked(token) && g_unpriced.size() < UNPRICED_MAX) {
             auto tr = g_priceTried.find(token);
             if (tr == g_priceTried.end() || t - tr->second > PRICE_RETRY_SEC) g_unpriced.insert(token);
         }
-        if (lt && lt->seed && !lf && !watched(from)) {
+        if (lt && lt->seed && !lf && !watched(from) && hexLD(tx.nonce, 2, 64) < LEARN_MAX_NONCE) {
             g_labels[from] = Label{exTo, false, t};
             g_dirty.insert(from);
             exFrom = exTo;
             learned = true;
             ++g_learned;
             resolvePendingLocked(from, exTo, late);
+            if (g_learned % 10000 == 0) capLearnedLocked();
         }
         if (!learned) {
             if (!exFrom.empty() && !exTo.empty()) {
                 // Внутреннее: между адресами бирж.
             } else if (!exTo.empty()) {
-                addFlow(t, exTo, token, true, usd, qty);
+                // Завод — только по торгуемой монете (спам не считаем).
+                if (listedLocked(token)) addFlow(t, exTo, token, true, usd, qty);
             } else if (!exFrom.empty()) {
-                addFlow(t, exFrom, token, false, usd, qty);
+                // Вывод — только с проверенного кошелька биржи: выученный адрес
+                // пополнения на сторону не платит, а если платит — это ошибка
+                // разметки, и выдавать её за вывод с биржи нельзя.
+                if (lf && lf->seed) addFlow(t, exFrom, token, false, usd, qty);
             } else {
                 if (hexLD(tx.nonce, 2, 64) < 50) {
                     const long long day = t / 86400;
@@ -481,6 +540,16 @@ BscExHit observe(const BscExTx& tx, long long block, long long blockTs,
     return hit;
 }
 
+void handleBlock(const QBlock& b) {
+    if (b.block <= g_lastBlock) return;
+    g_lastBlock = b.block;
+    try {
+        for (const auto& tx : b.txs) observe(tx, b.block, b.ts, b.watched);
+    } catch (const std::exception& e) {
+        std::cerr << "[BSC-EX] блок " << b.block << ": " << e.what() << std::endl;
+    }
+}
+
 void workerLoop() {
     while (!g_stop.load()) {
         QBlock b;
@@ -496,15 +565,17 @@ void workerLoop() {
             b = std::move(g_queue.front());
             g_queue.pop_front();
         }
-        if (b.block <= g_lastBlock) continue;
-        g_lastBlock = b.block;
-        try {
-            for (const auto& tx : b.txs) observe(tx, b.block, b.ts, b.watched);
-            bscExFlush();
-        } catch (const std::exception& e) {
-            std::cerr << "[BSC-EX] блок " << b.block << ": " << e.what() << std::endl;
-        }
+        handleBlock(b);
+        bscExFlush();
     }
+    // Остановка: дорабатываем то, что уже в очереди (миллисекунды на блок),
+    // иначе эти блоки потерялись бы для потока.
+    std::deque<QBlock> rest;
+    {
+        std::lock_guard<std::mutex> l(g_qMx);
+        rest.swap(g_queue);
+    }
+    for (const auto& b : rest) handleBlock(b);
 }
 
 }  // namespace
@@ -527,12 +598,15 @@ void bscExFlush(bool force) {
     const long long t = now();
     std::unordered_map<std::string, Flow> flow;
     std::vector<std::pair<std::string, Label>> dirty;
+    std::vector<std::string> listedNew;
     long long learned = 0, moves = 0;
     {
         std::lock_guard<std::mutex> m(g_mx);
         if (!force && t - g_lastFlush < 60) return;
         g_lastFlush = t;
         flow.swap(g_flow);
+        listedNew.assign(g_listedNew.begin(), g_listedNew.end());
+        g_listedNew.clear();
         for (const auto& a : g_dirty) {
             auto it = g_labels.find(a);
             if (it != g_labels.end()) dirty.emplace_back(a, it->second);
@@ -541,7 +615,7 @@ void bscExFlush(bool force) {
         learned = g_learned;
         moves = g_moves;
     }
-    if (flow.empty() && dirty.empty()) return;
+    if (flow.empty() && dirty.empty() && listedNew.empty()) return;
     std::lock_guard<std::mutex> l(g_exDbMx);
     sqlite3_exec(g_exDb, "BEGIN", nullptr, nullptr, nullptr);
     sqlite3_stmt* s;
@@ -580,6 +654,15 @@ void bscExFlush(bool force) {
         }
         sqlite3_finalize(s);
     }
+    if (!listedNew.empty() && prepareOrLog(g_exDb, &s, "INSERT OR IGNORE INTO bsc_ex_tokens(token, at) VALUES(?,?)")) {
+        for (const auto& tok : listedNew) {
+            sqlite3_reset(s);
+            sqlite3_bind_text(s, 1, tok.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s, 2, t);
+            sqlite3_step(s);
+        }
+        sqlite3_finalize(s);
+    }
     sqlite3_exec(g_exDb, "COMMIT", nullptr, nullptr, nullptr);
     static long long lastLog = 0;
     if (t - lastLog >= 3600) {
@@ -595,7 +678,7 @@ void bscExCleanup() {
         std::lock_guard<std::mutex> l(g_exDbMx);
         sqlite3_stmt* s;
         if (prepareOrLog(g_exDb, &s, "DELETE FROM bsc_ex_flow WHERE ts < ?")) {
-            sqlite3_bind_int64(s, 1, t - 400LL * 86400LL);
+            sqlite3_bind_int64(s, 1, t - FLOW_KEEP);
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
