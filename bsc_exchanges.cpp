@@ -134,7 +134,8 @@ long long now() { return static_cast<long long>(time(nullptr)); }
 
 long double hexLD(const std::string& h, size_t from, size_t len) {
     long double v = 0;
-    const size_t end = std::min(h.size(), from + len);
+    // len = npos — «до конца»: from + npos переполнился бы и дал пустой разбор.
+    const size_t end = len >= h.size() ? h.size() : std::min(h.size(), from + len);
     for (size_t i = from; i < end; i++) {
         const char c = h[i];
         const int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
@@ -162,11 +163,11 @@ bool parseTransfer(const nlohmann::json& tx, const std::string& to, std::string&
         rcpt = "0x" + toLower(input.substr(34, 40));
         const bool stable = chainCtx().stablecoins.count(token) > 0;
         const int dec = stable ? 18 : decimalsCached(token);
-        if (dec < 0 || dec > 36) {
-            units = 0;
-        } else {
-            units = hexLD(input, 74, 64) / std::pow(10.0L, dec);
-        }
+        const long double raw = hexLD(input, 74, 64);
+        if (raw <= 0) return false;
+        // Знаков токена нет в памяти — сумма неизвестна (в поток не идёт), но
+        // сам перевод нужен: по сливу на кошелёк биржи учится адрес пополнения.
+        units = dec < 0 || dec > 36 ? 0 : raw / std::pow(10.0L, dec);
         px = stable ? 1.0L : static_cast<long double>(priceCachedNanos(token, 6 * 3600)) / 1e9L;
     } else {
         return false;
@@ -175,7 +176,7 @@ bool parseTransfer(const nlohmann::json& tx, const std::string& to, std::string&
     qty = static_cast<double>(units);
     const long double u = units * px * 1e9L;
     usd = u > 0 && u < static_cast<long double>(SANE_MAX) ? static_cast<long long>(u) : 0;
-    return units > 0;
+    return token != chainCtx().nativeMarker || units > 0;
 }
 
 // Под g_mx.
