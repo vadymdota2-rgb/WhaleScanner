@@ -1498,22 +1498,11 @@ void bscAutoLoop() {
    1000+ транзакций (btcBanServices). */
 constexpr long long AUTO_IDLE_SEC = 30LL * 86400LL;
 
-namespace {
-std::string thousands(long long n) {
-    std::string d = std::to_string(n), out;
-    for (size_t i = 0; i < d.size(); i++) {
-        if (i && (d.size() - i) % 3 == 0) out += ' ';
-        out += d[i];
-    }
-    return out;
-}
-}  // namespace
-
 // Вся база сервисного аккаунта, не только найденное поиском: импорт (/import)
 // плюс поиск. Адрес BSC и Hyperliquid один (0x…), поэтому кошелёк один на обе
 // сети. Холодные — давно в базе и без сделок в сети; проснувшиеся — те из
 // них, кто снова торгует (autoWoke).
-std::string serviceBaseSummary(std::string& totals) {
+ServiceBaseStats serviceBaseStats() {
     long long evm = 0, evmAuto = 0;
     {
         std::lock_guard<std::mutex> l(dbMutex);
@@ -1582,25 +1571,18 @@ std::string serviceBaseSummary(std::string& totals) {
             sqlite3_finalize(s);
         }
     }
-    const long long btc = btcWatchCount(false), btcAuto = btcWatchCount(true);
-    std::ostringstream t;
-    t << "📦 <b>Вся база сервисного аккаунта</b>"
-      << "\nBSC и Hyperliquid (адрес один на обе сети): <b>" << thousands(evm) << "</b>"
-      << "\n   импорт: " << thousands(evm - evmAuto) << " · найдено поиском: " << thousands(evmAuto)
-      << "\n   холодные (давно без сделок): BSC " << thousands(bscCold) << " · Hyperliquid " << thousands(hlCold)
-      << "\n   проснулись и начали торговать: сегодня BSC " << thousands(wokeToday[0]) << " · Hyperliquid "
-      << thousands(wokeToday[1]) << "; всего BSC " << thousands(wokeAll[0]) << " · Hyperliquid " << thousands(wokeAll[1])
-      << "\nBitcoin: <b>" << thousands(btc) << "</b>"
-      << "\n   импорт: " << thousands(btc - btcAuto) << " · найдено поиском: " << thousands(btcAuto)
-      << "\nИмпорт за бездействие не удаляется никогда; убрать его может только бан бота.";
-    // Кошелёк 0x… — один и тот же на BSC и Hyperliquid: в каждой сети он
-    // считается, а во «всего» — один раз.
-    std::ostringstream tot;
-    tot << "📊 <b>Кошельков в базе</b>"
-        << "\nBSC: " << thousands(evm) << " · Hyperliquid: " << thousands(evm) << " · Bitcoin: " << thousands(btc)
-        << "\n<b>Всего: " << thousands(evm + btc) << "</b> (адрес BSC и Hyperliquid один — считается один раз)";
-    totals = tot.str();
-    return t.str();
+    ServiceBaseStats r;
+    r.evm = evm;
+    r.evmAuto = evmAuto;
+    r.btc = btcWatchCount(false);
+    r.btcAuto = btcWatchCount(true);
+    r.bscCold = bscCold;
+    r.hlCold = hlCold;
+    for (int k = 0; k < 2; k++) {
+        r.wokeToday[k] = wokeToday[k];
+        r.wokeAll[k] = wokeAll[k];
+    }
+    return r;
 }
 
 void pruneAutoWallets() {

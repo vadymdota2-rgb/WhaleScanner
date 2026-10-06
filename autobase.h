@@ -51,9 +51,15 @@ long long btcWatchCount(bool autoOnly);  // вся база Bitcoin или то�
 // тот же кошелёк считается, только если со времени прошлого раза прошло 30
 // дней. Не под dbMutex.
 void autoWoke(AutoNet n, const std::string& addr);
-// Вся база сервисного аккаунта (импорт и поиск) — строки для /autobase (main.cpp).
-// В totals — итог по сетям и всего, для самого низа сообщения.
-std::string serviceBaseSummary(std::string& totals);
+// Вся база сервисного аккаунта (импорт и поиск) — числа для /autobase
+// (считает main.cpp). evm — кошельки 0x: один адрес на BSC и Hyperliquid.
+// wokeToday/wokeAll: [0] BSC, [1] Hyperliquid.
+struct ServiceBaseStats {
+    long long evm = 0, evmAuto = 0, btc = 0, btcAuto = 0;
+    long long bscCold = 0, hlCold = 0;
+    long long wokeToday[2] = {0, 0}, wokeAll[2] = {0, 0};
+};
+ServiceBaseStats serviceBaseStats();
 
 // /autobase — состояние; /autobase bsc|hl|btc|all on|off — включить/выключить.
 void autobaseCommand(const std::string& owner, const std::string& arg);

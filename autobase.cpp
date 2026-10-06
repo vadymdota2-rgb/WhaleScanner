@@ -99,6 +99,34 @@ std::string money(double usd) {
     return o.str();
 }
 
+
+std::string num(long long n) {
+    std::string d = std::to_string(n < 0 ? -n : n), out = n < 0 ? "-" : "";
+    for (size_t i = 0; i < d.size(); i++) {
+        if (i && (d.size() - i) % 3 == 0) out += ' ';
+        out += d[i];
+    }
+    return out;
+}
+
+// Длина в знаках, а не байтах: кириллица в UTF-8 — два байта на букву.
+size_t chars(const std::string& s) {
+    size_t n = 0;
+    for (unsigned char c : s) n += (c & 0xC0) != 0x80;
+    return n;
+}
+
+// Строка таблицы: подпись слева (9 знаков) и три числа справа (по 8).
+std::string row(const std::string& label, const std::string& a, const std::string& b, const std::string& c) {
+    std::string out = label;
+    out.append(chars(label) < 9 ? 9 - chars(label) : 0, ' ');
+    for (const std::string* v : {&a, &b, &c}) {
+        out.append(chars(*v) < 8 ? 8 - chars(*v) : 1, ' ');
+        out += *v;
+    }
+    while (!out.empty() && out.back() == ' ') out.pop_back();
+    return out;
+}
 }  // namespace
 
 void initAutobase() {
@@ -284,12 +312,24 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
             saveFlag(i);
         }
     }
+    // Числа — таблицами в <pre>: моноширинный шрифт держит столбцы ровно.
+    // Ширина строки 33 знака — влезает в экран телефона без переноса.
+    std::pair<long long, long long> pr[NETS], bn[NETS];
+    {
+        std::lock_guard<std::mutex> m(g_mx);
+        for (int i = 0; i < NETS; i++) {
+            pr[i] = tallyOf(g_pruned, i);
+            bn[i] = tallyOf(g_banned, i);
+        }
+    }
+    const ServiceBaseStats sb = serviceBaseStats();
+
     std::ostringstream t;
-    t << "🐋 <b>Поиск новых китов</b>\n";
+    t << "🐋 <b>Автопоиск китов</b>\n";
     for (int i = 0; i < NETS; i++) {
         const AutoNet n = static_cast<AutoNet>(i);
         t << "\n" << (g_on[i] ? "🟢 " : "⚪️ ") << "<b>" << NAME[i] << "</b> — " << (g_on[i] ? "ищет" : "остановлен")
-          << " · порог ";
+          << ", от ";
         if (n == AutoNet::BTC) {
             std::ostringstream b;
             b << btcAutoMinBtc();
@@ -297,29 +337,54 @@ void autobaseCommand(const std::string& owner, const std::string& arg) {
         } else {
             t << money(minUsd()[i]);
         }
-        std::pair<long long, long long> pr, bn;
-        {
-            std::lock_guard<std::mutex> m(g_mx);
-            pr = tallyOf(g_pruned, i);
-            bn = tallyOf(g_banned, i);
-        }
-        t << "\n   Сегодня: добавлено " << autoToday(n) << "/" << limits()[i] << " · удалено " << pr.first
-          << " · забанено " << bn.first;
-        t << "\n   Всего поиском: добавлено " << inBase[i] + pr.second + bn.second << " · удалено " << pr.second
-          << " · забанено " << bn.second << " · сейчас в базе " << inBase[i];
-        // Сегодняшнее число берётся из базы при запуске: в нём и то, что
-        // добавили до лимита (версии без лимита), поэтому бывает больше.
-        if (autoToday(n) >= limits()[i]) t << "\n   лимит на сегодня выбран, новые — с 00:00 UTC";
-        if (n == AutoNet::HL && g_on[i]) t << "\n   " << hlAutoStatus();
     }
-    std::string totals;
-    t << "\n\n" << serviceBaseSummary(totals);
-    t << "\n\nВыключить: <code>/autobase bsc off</code> (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
-         "\nВключить: <code>/autobase bsc on</code>"
-         "\n\nУдалено — месяц не торговали: убраны без бана, начнут торговать — найдутся снова. "
-         "Bitcoin-кошелёк, на котором 1 BTC и больше, не удаляется, даже если лежит без движения."
-         "\nЗабанено навсегда: на BSC и Hyperliquid — боты (слишком много сделок), "
-         "в Bitcoin — сервисы и биржи (1000+ транзакций).";
-    t << "\n\n" << totals;
+
+    auto today = [&](int i) {
+        return std::to_string(autoToday(static_cast<AutoNet>(i))) + "/" + std::to_string(limits()[i]);
+    };
+    t << "\n\n<b>Найдено поиском</b>\n<pre>" << row("", "BSC", "HL", "BTC") << "\n" << row("Сегодня", "", "", "")
+      << "\n" << row(" найдено", today(0), today(1), today(2))
+      << "\n" << row(" удалено", num(pr[0].first), num(pr[1].first), num(pr[2].first))
+      << "\n" << row(" бан", num(bn[0].first), num(bn[1].first), num(bn[2].first))
+      << "\n" << row("Всего", "", "", "");
+    std::string found[NETS], pruned[NETS], banned[NETS], base[NETS];
+    for (int i = 0; i < NETS; i++) {
+        found[i] = num(inBase[i] + pr[i].second + bn[i].second);
+        pruned[i] = num(pr[i].second);
+        banned[i] = num(bn[i].second);
+        base[i] = num(inBase[i]);
+    }
+    t << "\n" << row(" найдено", found[0], found[1], found[2]) << "\n" << row(" удалено", pruned[0], pruned[1], pruned[2])
+      << "\n" << row(" бан", banned[0], banned[1], banned[2]) << "\n" << row(" в базе", base[0], base[1], base[2])
+      << "</pre>";
+    // Сегодняшнее число берётся из базы при запуске: в нём и то, что
+    // добавили до лимита (версии без лимита), поэтому бывает больше.
+    std::string full;
+    for (int i = 0; i < NETS; i++)
+        if (autoToday(static_cast<AutoNet>(i)) >= limits()[i]) full += std::string(full.empty() ? "" : ", ") + NAME[i];
+    if (!full.empty()) t << "\n⛔ Лимит на сегодня выбран: " << full << ". Новые — с 00:00 UTC.";
+    if (g_on[1]) t << "\n📈 Hyperliquid: " << hlAutoStatus() << ".";
+
+    t << "\n\n📦 <b>Вся база сервисного аккаунта</b>\n<pre>" << row("", "BSC", "HL", "BTC")
+      << "\n" << row("Кошельков", num(sb.evm), num(sb.evm), num(sb.btc))
+      << "\n" << row(" импорт", num(sb.evm - sb.evmAuto), num(sb.evm - sb.evmAuto), num(sb.btc - sb.btcAuto))
+      << "\n" << row(" поиском", num(sb.evmAuto), num(sb.evmAuto), num(sb.btcAuto))
+      << "\n" << row("Холодные", num(sb.bscCold), num(sb.hlCold), "—")
+      << "\n" << row("Проснулись", "", "", "")
+      << "\n" << row(" сегодня", num(sb.wokeToday[0]), num(sb.wokeToday[1]), "—")
+      << "\n" << row(" всего", num(sb.wokeAll[0]), num(sb.wokeAll[1]), "—") << "</pre>"
+      << "\nИтого кошельков: <b>" << num(sb.evm + sb.btc) << "</b>"
+      << "\n<i>Адрес 0x один на BSC и Hyperliquid — в итог входит один раз.</i>";
+
+    t << "\n\nℹ️ <b>Что значат строки</b>"
+         "\n• <b>удалено</b> — месяц без сделок. Без бана: начнут торговать — найдутся снова. "
+         "Bitcoin-кошелёк от 1 BTC не удаляется."
+         "\n• <b>бан</b> — навсегда: боты на BSC и Hyperliquid, сервисы и биржи в Bitcoin (1000+ транзакций)."
+         "\n• <b>холодные</b> — в базе больше 30 дней и без сделок в этой сети. Бот ждёт их сделку."
+         "\n• <b>проснулись</b> — холодные, которые снова начали торговать."
+         "\n• <b>импорт</b> за бездействие не удаляется."
+         "\n\n⚙️ <b>Управление</b>"
+         "\n<code>/autobase bsc off</code> — остановить (или <code>hl</code>, <code>btc</code>, <code>all</code>)"
+         "\n<code>/autobase bsc on</code> — включить";
     sendMsg(owner, t.str());
 }
