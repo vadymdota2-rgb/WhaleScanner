@@ -3,7 +3,7 @@
 // резервах (DefiLlama, projects/<биржа>; резервы Binance, Bybit) и меток кошельков
 // (tools/data/bsc_labels_extra.tsv), проверенные в BSC:
 // обычный кошелёк, сам отправил от пяти транзакций. Число — сколько отправил.
-// Binance 22, Bitget 20, OKX 18, Bybit 16, Gate 4, KuCoin 4, BingX 3, LBank 3, HTX 3, Indodax 3, Bitstamp 2, Bitpanda 2, Crypto.com 2, Kraken 2, CoinEx 2, BitMart 1, BitoPro 1, WhiteBIT 1, Phemex 1, Upbit 1, CoinDCX 1, Bitkub 1, Bitfinex 1, Bitrue 1, Coins.ph 1, AscendEX 1, MEXC 1, ChangeNOW 1, MAX Exchange 1, Bitvavo 1, Mercado Bitcoin 1, Gemini 1, XT.com 1, BTSE 1, Korbit 1
+// Binance 22, Bitget 20, OKX 18, Bybit 16, Gate 4, KuCoin 4, BingX 3, LBank 3, HTX 3, Indodax 3, Bitstamp 2, Bitpanda 2, Crypto.com 2, Kraken 2, CoinEx 2, BitMart 1, BitoPro 1, WhiteBIT 1, Phemex 1, Upbit 1, CoinDCX 1, Bitkub 1, Bitfinex 1, Bitrue 1, Coins.ph 1, AscendEX 1, MEXC 1, ChangeNOW 1, MAX Exchange 1, Bitvavo 1, Mercado Bitcoin 1, Gemini 1, XT.com 1, HitBTC 1, BTSE 1, Korbit 1
 
 struct BscSeedBook { const char* addr; const char* ex; };
 inline const BscSeedBook BSC_SEEDS_BOOK[] = {
@@ -39,7 +39,7 @@ inline const BscSeedBook BSC_SEEDS_BOOK[] = {
     {"0xbcf6011192399df75a96b0a4ce47c4820853e9e5", "Bitget"},  // 3277505
     {"0x864a7fa57e0f8902a2de4892e925f1272edbe3fa", "Bitget"},  // 2774372
     {"0x1084203d70950bd7a93aef75eb32a51df2422a07", "Bitget"},  // 2676794
-    {"0xed9ab5bc05a0152b9dc2f7902e8369af7bc18771", "Bitget"},  // 188688
+    {"0xed9ab5bc05a0152b9dc2f7902e8369af7bc18771", "Bitget"},  // 189117
     {"0xffa8db7b38579e6a2d14f9b347a9ace4d044cd54", "Bitget"},  // 4611
     {"0xb8cda8d72da558ef8f76a0d928f9652d2b003e2e", "Bitget"},  // 2763
     {"0x26209d9f0dc3ac0129c3fb1badabfeb9ee728c66", "Bitget"},  // 775
@@ -56,19 +56,19 @@ inline const BscSeedBook BSC_SEEDS_BOOK[] = {
     {"0x80097a87a7dcde470e34c10b5cceb85abf83b531", "Bitget"},  // 19
     {"0x14b5f559c27bc00c39f668a88471498d68d18768", "Bitget"},  // 17
     {"0x8911b8f5127eec40c14e1ad0500dc4dbd279d7a7", "Bitget"},  // 5
-    {"0x56152e13828f78cdcc90a6b016df0aec0985e2f3", "Bitkub"},  // 1325031
-    {"0x2ddbbf0627f0709c1a2880f5b1ab09d00eaad177", "BitoPro"},  // 864711
-    {"0xe3257c3bfe933610ed409fac95820943e9709a5c", "Bitpanda"},  // 268619
+    {"0x56152e13828f78cdcc90a6b016df0aec0985e2f3", "Bitkub"},  // 1325054
+    {"0x2ddbbf0627f0709c1a2880f5b1ab09d00eaad177", "BitoPro"},  // 864735
+    {"0xe3257c3bfe933610ed409fac95820943e9709a5c", "Bitpanda"},  // 268621
     {"0x0529ea5885702715e83923c59746ae8734c553b7", "Bitpanda"},  // 2148
-    {"0x868f027a5e3bd1cd29606a6681c3ddb7d3dd9b67", "Bitrue"},  // 1008256
+    {"0x868f027a5e3bd1cd29606a6681c3ddb7d3dd9b67", "Bitrue"},  // 1008264
     {"0x0b0f7ebf967146566799229394171fc47f1a765a", "Bitstamp"},  // 679
     {"0x00bdb5699745f5b860228c8f939abf1b9ae374ed", "Bitstamp"},  // 10
-    {"0xab782bc7d4a2b306825de5a7730034f8f63ee1bc", "Bitvavo"},  // 37693
-    {"0xef3aeff9a5f61c6dda33069c58c1434006e13b20", "Bybit"},  // 8822862
-    {"0x318d2aae4c99c2e74f7b5949fa1c34df837789b8", "Bybit"},  // 1985013
-    {"0xc851a293ed8b8888a2e4140744973dd23bbcbaf2", "Bybit"},  // 143379
-    {"0xc3121c4ca7402922e025e62e9bb4d5b244303878", "Bybit"},  // 124086
-    {"0x93228d328c9c74c2bfe9f97638bbb5ef322f2bd5", "Bybit"},  // 17343
+    {"0xab782bc7d4a2b306825de5a7730034f8f63ee1bc", "Bitvavo"},  // 37696
+    {"0xef3aeff9a5f61c6dda33069c58c1434006e13b20", "Bybit"},  // 8823462
+    {"0x318d2aae4c99c2e74f7b5949fa1c34df837789b8", "Bybit"},  // 1985102
+    {"0xc851a293ed8b8888a2e4140744973dd23bbcbaf2", "Bybit"},  // 143382
+    {"0xc3121c4ca7402922e025e62e9bb4d5b244303878", "Bybit"},  // 124090
+    {"0x93228d328c9c74c2bfe9f97638bbb5ef322f2bd5", "Bybit"},  // 17345
     {"0x3ddb5d1247adc837cec3ba81edc923a4a230aa8f", "Bybit"},  // 7683
     {"0xf440139a62b2b939699c5b3e09f88e40464ab9bc", "Bybit"},  // 4369
     {"0x0051ef9259c7ec0644a80e866ab748a2f30841b3", "Bybit"},  // 4323
@@ -93,11 +93,12 @@ inline const BscSeedBook BSC_SEEDS_BOOK[] = {
     {"0x1c4b70a3968436b9a0a9cf5205c787eb81bb558c", "Gate"},  // 15
     {"0xd24400ae8bfebb18ca49be86258a3c749cf46853", "Gemini"},  // 692
     {"0xdd3cb5c974601bc3974d908ea4a86020f9999e0c", "HTX"},  // 1392597
-    {"0xba5cfbc7c1e08156d9e6e0d91a66ad3bcff7956a", "HTX"},  // 28137
+    {"0xba5cfbc7c1e08156d9e6e0d91a66ad3bcff7956a", "HTX"},  // 28139
     {"0x18709e89bd403f470088abdacebe86cc60dda12e", "HTX"},  // 125
+    {"0xe647b0db71985b26a1562be585bf270ea4023b10", "HitBTC"},  // 40132
     {"0xaba3002ab1597433ba79abc48eead54dc10a45f2", "Indodax"},  // 2061837
     {"0x3c02290922a3618a4646e3bbca65853ea45fe7c6", "Indodax"},  // 1702162
-    {"0x91dca37856240e5e1906222ec79278b16420dc92", "Indodax"},  // 21618
+    {"0x91dca37856240e5e1906222ec79278b16420dc92", "Indodax"},  // 21619
     {"0xf0bc8fddb1f358cef470d63f96ae65b1d7914953", "Korbit"},  // 11223
     {"0xd2dd7b597fd2435b6db61ddf48544fd931e6869f", "Kraken"},  // 3460
     {"0x7dafba1d69f6c01ae7567ffd7b046ca03b706f83", "Kraken"},  // 833
@@ -105,13 +106,13 @@ inline const BscSeedBook BSC_SEEDS_BOOK[] = {
     {"0xbb36acf8c156f19e9550d1f66b1cdd2cb003b65d", "KuCoin"},  // 828
     {"0x2933782b5a8d72f2754103d1489614f29bfa4625", "KuCoin"},  // 740
     {"0x7b915c27a0ed48e2ce726ee40f20b2bf8a88a1b3", "KuCoin"},  // 83
-    {"0xe0f0aa98b4a4d305ac4a04d830c96a158bda9cd8", "LBank"},  // 3210711
-    {"0x124d9bf2fecbc16b54ec4accdb14d44c2144f012", "LBank"},  // 688474
+    {"0xe0f0aa98b4a4d305ac4a04d830c96a158bda9cd8", "LBank"},  // 3210786
+    {"0x124d9bf2fecbc16b54ec4accdb14d44c2144f012", "LBank"},  // 688475
     {"0x22f83e4b9cb95cb99b88e8f4f15ea598c74c2788", "LBank"},  // 933
-    {"0xa9bff538a906154c80a8dbccd229f3deddfa52d6", "MAX Exchange"},  // 785847
-    {"0x9bb6a22da110c6c9bab745bcaf0ee142ee83af37", "MEXC"},  // 10206448
+    {"0xa9bff538a906154c80a8dbccd229f3deddfa52d6", "MAX Exchange"},  // 785850
+    {"0x9bb6a22da110c6c9bab745bcaf0ee142ee83af37", "MEXC"},  // 10206682
     {"0xb8ba36e591facee901ffd3d5d82df491551ad7ef", "Mercado Bitcoin"},  // 6869
-    {"0xa0420c29b214d09b9ec751aa1f592c7b1fa77da3", "OKX"},  // 275169
+    {"0xa0420c29b214d09b9ec751aa1f592c7b1fa77da3", "OKX"},  // 275172
     {"0x42cf18596ee08e877d532df1b7cf763059a7ea57", "OKX"},  // 230907
     {"0x8c3cb9665833fd9f79eb14cba16d82bbab6f22d8", "OKX"},  // 43792
     {"0xb4ec508adeb174610b4295e233a458b3475964f7", "OKX"},  // 14944
@@ -131,6 +132,6 @@ inline const BscSeedBook BSC_SEEDS_BOOK[] = {
     {"0x7e4aa755550152a522d9578621ea22edab204308", "OKX"},  // 5
     {"0x35d2d03607b9155b42cf673102fe58251ac4f644", "Phemex"},  // 24
     {"0x377b8ce04761754e8ac153b47805a9cf6b190873", "Upbit"},  // 1205
-    {"0x33eac50b7faf4b8842a621d0475335693f5d21fe", "WhiteBIT"},  // 531365
-    {"0xdb3ded7731c781224ec292e2163d9554c094fd7c", "XT.com"},  // 1009048
+    {"0x33eac50b7faf4b8842a621d0475335693f5d21fe", "WhiteBIT"},  // 531366
+    {"0xdb3ded7731c781224ec292e2163d9554c094fd7c", "XT.com"},  // 1009057
 };
