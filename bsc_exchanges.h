@@ -16,11 +16,14 @@
  * Завод на ещё не выученный адрес пополнения ждёт до 6 часов: выучится адрес
  * (биржа сольёт с него деньги) — завод засчитается задним числом.
  *
- * Пишет: bsc_ex_labels (разметка), bsc_ex_moves (заводы и выводы кошельков,
- * за которыми следят), bsc_ex_flow (поток бирж по часам, биржам и монетам).
+ * Живёт отдельно от DEX: своя база bsc_ex.db (WHALE_BSCEX_DB_FILE), свой поток
+ * разбора, своя очередь блоков. Пишет: bsc_ex_labels (разметка), bsc_ex_moves
+ * (заводы и выводы кошельков, за которыми следят; не показываются),
+ * bsc_ex_flow (поток бирж по часам, биржам и монетам). Алертов не шлёт.
  */
 #include <functional>
 #include <string>
+#include <vector>
 
 #include "json.hpp"
 
@@ -28,17 +31,25 @@ void initBscExchanges();
 // Биржа адреса (строчными) или пусто.
 std::string bscExchangeOf(const std::string& addressLower);
 
+// Перевод из транзакции блока — то, что модулю нужно, без всего блока.
+struct BscExTx {
+    std::string hash, from, to;
+    std::string input;  // до 138 знаков: селектор transfer() и два слова
+    std::string value;  // hex, wei
+    std::string nonce;  // hex
+};
+
 struct BscExHit {
     std::string wallet;  // кошелёк из наблюдаемых, которого касается перевод
     std::string ex;      // биржа на другой стороне
     int kind = 0;        // 1 — вывел с биржи (wallet получил), 2 — завёл на биржу (wallet отправил)
 };
 
-// Каждая транзакция блока. watched — следит ли кто-то за адресом. Вернёт
-// кошелёк и биржу, если перевод — завод или вывод наблюдаемого кошелька.
-BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const std::string& to, long long block,
-                      long long blockTs, const std::string& hash,
-                      const std::function<bool(const std::string&)>& watched);
+// Сканер DEX отдаёт переводы блока и сразу идёт дальше; разбирает их свой
+// поток модуля. Блок с номером не больше уже разобранного (повтор после
+// сбоя, откат цепочки) пропускается — поток не считается дважды.
+void bscExEnqueue(long long block, long long blockTs, std::vector<BscExTx> txs,
+                  std::function<bool(const std::string&)> watched);
 
 // Записать накопленное (поток, выученные адреса). Зовётся после каждого
 // блока, пишет не чаще раза в минуту.
@@ -51,3 +62,5 @@ void bscExCleanup();
 std::string bscExLabelCommand(const std::string& arg);
 // /exunknown — неподписанные адреса, куда сегодня сливают деньги молодые кошельки.
 std::string bscExUnknownCommand();
+// Остановить потоки модуля и записать накопленное — при выходе бота.
+void bscExStop();

@@ -1645,12 +1645,10 @@ bool processBlock(long long bn) {
 
     struct Matched { const nlohmann::json* tx; std::string hash; std::string wallet; bool cold; };
     std::vector<Matched> matched;
-    // Биржевой разбор (поток, выученные адреса, заводы и выводы кошельков) —
-    // один раз на блок: при повторе того же блока после сбоя поток
-    // посчитался бы дважды. Алертов он не шлёт — только записывает.
-    static long long s_exBlock = -1;
-    const bool exFresh = bn > s_exBlock;
-    auto isWatched = [&](const std::string& a) { return watchers && watchers->count(a) > 0; };
+    // Потоки бирж BSC живут отдельно (bsc_exchanges): отсюда им уходят только
+    // простые переводы блока — BNB и transfer() токенов — в очередь, разбирает
+    // их свой поток модуля со своей базой. DEX его не ждёт.
+    std::vector<BscExTx> exTxs;
     for (auto& tx:block["transactions"]) {
         if (!running.load(std::memory_order_relaxed)) return false;
         if (!tx.is_object()||!tx.contains("hash")||!tx["hash"].is_string()) continue;
@@ -1661,7 +1659,15 @@ bool processBlock(long long bn) {
         // Крупный вывод с биржи — кандидат в базу или побудка спящего (без
         // запросов к сети).
         const std::string wokeBy = bscAutoConsider(tx, to, watchers.get(), bscActive.get());
-        if (exFresh) bscExObserve(tx, from, to, bn, blockTs, hash, isWatched);
+        if (!from.empty() && !to.empty()) {
+            const std::string input = tx.contains("input") && tx["input"].is_string() ? tx["input"].get<std::string>() : "";
+            const std::string value = tx.contains("value") && tx["value"].is_string() ? tx["value"].get<std::string>() : "0x0";
+            const bool native = (input.empty() || input == "0x") && value != "0x0";
+            const bool token = input.size() >= 138 && input.compare(0, 10, "0xa9059cbb") == 0;
+            if (native || token)
+                exTxs.push_back(BscExTx{hash, from, to, token ? input.substr(0, 138) : "", value,
+                                        tx.contains("nonce") && tx["nonce"].is_string() ? tx["nonce"].get<std::string>() : ""});
+        }
         std::string mA;
         bool cold = false;
         if (bscActive && watchers) {
@@ -1680,8 +1686,8 @@ bool processBlock(long long bn) {
         if (isTxProcessed(hash)) continue;
         matched.push_back({&tx, hash, mA, cold});
     }
-    if (exFresh) s_exBlock = bn;
-    bscExFlush();
+    bscExEnqueue(bn, blockTs, std::move(exTxs),
+                 [w = watchers](const std::string& a) { return w && w->count(a) > 0; });
 
     std::vector<nlohmann::json> receipts(matched.size());
     if (!matched.empty()) {
@@ -2645,6 +2651,7 @@ int main() {
     dm.join();
     stopHyperliquid();
     stopBtc();
+    bscExStop();
     stopWsBsc();
     walCheckpoint();
     closeRankingDB();

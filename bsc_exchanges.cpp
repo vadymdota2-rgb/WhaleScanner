@@ -2,7 +2,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstdlib>
+#include <functional>
 #include <thread>
 #include <map>
 #include <sstream>
@@ -21,10 +25,38 @@
 #include "tx_analyzer.h"
 #include "utils.h"
 
-extern sqlite3* db;
-extern std::mutex dbMutex;
-
 namespace {
+
+// Своя база (bsc_ex.db, как btc.db у биткоина): с базой DEX ни таблиц, ни
+// замка общих нет.
+sqlite3* g_exDb = nullptr;
+std::mutex g_exDbMx;
+
+std::string exDbFile() {
+    const char* p = std::getenv("WHALE_BSCEX_DB_FILE");
+    return (p && *p) ? std::string(p) : std::string("bsc_ex.db");
+}
+
+// Очередь блоков: сканер DEX кладёт сюда переводы блока и идёт дальше, а
+// разбирает их свой поток. Медленный разбор или сбой здесь DEX не задержит.
+struct QBlock {
+    long long block = 0, ts = 0;
+    std::vector<BscExTx> txs;
+    std::function<bool(const std::string&)> watched;
+};
+constexpr size_t QUEUE_MAX = 5000;
+std::mutex g_qMx;
+std::condition_variable g_qCv;
+std::deque<QBlock> g_queue;
+long long g_lastBlock = -1;  // последний разобранный: повтор и откат не считаются дважды
+// Остановка: оба потока модуля ждут на g_qCv и выходят по флагу. Без этого
+// выход бота зависал — очередь уничтожалась, пока поток на ней ждал.
+std::atomic<bool> g_stop{false};
+std::thread g_worker, g_pricer;
+std::mutex g_stopMx;
+std::condition_variable g_stopCv;  // только для потока цен: сигнал о блоке ему не нужен
+std::atomic<bool> g_pricerDone{false};
+long long g_dropped = 0;
 
 // Проверены в сети BSC: обычный кошелёк (не контракт), отправлял транзакции.
 // Источник имён — метки BscScan и Etherscan (адрес кошелька один во всех
@@ -157,14 +189,13 @@ long double hexLD(const std::string& h, size_t from, size_t len) {
 
 // Перевод из самой транзакции: BNB или transfer() токена. qty — в монетах,
 // usd — в нано (0, если цены нет в памяти).
-bool parseTransfer(const nlohmann::json& tx, const std::string& to, std::string& token, std::string& rcpt,
-                   double& qty, long long& usd) {
-    const std::string input = tx.contains("input") && tx["input"].is_string() ? tx["input"].get<std::string>() : "";
+bool parseTransfer(const BscExTx& tx, std::string& token, std::string& rcpt, double& qty, long long& usd) {
+    const std::string& input = tx.input;
+    const std::string& to = tx.to;
     long double units = 0;
     long double px = 0;  // доллары за монету
     if (input.empty() || input == "0x") {
-        const std::string v = tx.contains("value") && tx["value"].is_string() ? tx["value"].get<std::string>() : "0x0";
-        units = hexLD(v, 2, std::string::npos) / 1e18L;
+        units = hexLD(tx.value, 2, std::string::npos) / 1e18L;
         token = chainCtx().nativeMarker;
         rcpt = to;
         px = static_cast<long double>(nativePriceCachedNanos()) / 1e9L;
@@ -204,9 +235,9 @@ void addFlow(long long ts, const std::string& ex, const std::string& token, bool
 
 void recordMove(const std::string& hash, long long block, long long ts, const std::string& wallet, int kind,
                 const std::string& ex, const std::string& token, double qty, long long usd) {
-    std::lock_guard<std::mutex> l(dbMutex);
+    std::lock_guard<std::mutex> l(g_exDbMx);
     sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, "INSERT OR IGNORE INTO bsc_ex_moves(tx, block, ts, wallet, kind, ex, token, qty, usd_nanos) "
+    if (!prepareOrLog(g_exDb, &s, "INSERT OR IGNORE INTO bsc_ex_moves(tx, block, ts, wallet, kind, ex, token, qty, usd_nanos) "
                               "VALUES(?,?,?,?,?,?,?,?,?)"))
         return;
     sqlite3_bind_text(s, 1, hash.c_str(), -1, SQLITE_TRANSIENT);
@@ -218,7 +249,7 @@ void recordMove(const std::string& hash, long long block, long long ts, const st
     sqlite3_bind_text(s, 7, token.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_double(s, 8, qty);
     sqlite3_bind_int64(s, 9, usd);
-    if (sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(db) > 0) ++g_moves;
+    if (sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(g_exDb) > 0) ++g_moves;
     sqlite3_finalize(s);
 }
 
@@ -249,8 +280,12 @@ void expirePendingLocked(long long t) {
 }
 
 void pricerLoop() {
-    for (;;) {
-        std::this_thread::sleep_for(std::chrono::seconds(20));
+    while (!g_stop.load()) {
+        {
+            std::unique_lock<std::mutex> l(g_stopMx);
+            g_stopCv.wait_for(l, std::chrono::seconds(20), [] { return g_stop.load(); });
+        }
+        if (g_stop.load()) break;
         std::vector<std::string> batch;
         {
             std::lock_guard<std::mutex> m(g_mx);
@@ -263,6 +298,7 @@ void pricerLoop() {
         }
         int ok = 0;
         for (const auto& tok : batch) {
+            if (g_stop.load()) break;
             try {
                 // Кладут в память и в token_cache: следующий перевод оценится,
                 // а API покажет тикер.
@@ -275,18 +311,40 @@ void pricerLoop() {
         }
         if (ok) std::cout << "[BSC-EX] узнали цену монет, прошедших через биржи: " << ok << std::endl;
     }
+    g_pricerDone.store(true);
 }
 
 }  // namespace
 
+namespace {
+void initTables();
+void loadLabels();
+void workerLoop();
+}  // namespace
+
 void initBscExchanges() {
-    static bool pricer = false;
-    if (!pricer) {
-        pricer = true;
-        std::thread(pricerLoop).detach();
+    {
+        std::lock_guard<std::mutex> l(g_exDbMx);
+        if (g_exDb) return;
+        const std::string file = exDbFile();
+        if (sqlite3_open(file.c_str(), &g_exDb) != SQLITE_OK) {
+            std::cerr << "[BSC-EX] не открыть базу " << file << " — потоки бирж выключены" << std::endl;
+            if (g_exDb) { sqlite3_close(g_exDb); g_exDb = nullptr; }
+            return;
+        }
+        sqlite3_busy_timeout(g_exDb, 8000);
+        sqlite3_exec(g_exDb, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
     }
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_exec(db,
+    initTables();
+    loadLabels();
+    g_pricer = std::thread(pricerLoop);
+    g_worker = std::thread(workerLoop);
+}
+
+namespace {
+void initTables() {
+    std::lock_guard<std::mutex> l(g_exDbMx);
+    sqlite3_exec(g_exDb,
                  "CREATE TABLE IF NOT EXISTS bsc_ex_labels (address TEXT PRIMARY KEY, ex TEXT NOT NULL, "
                  "  how TEXT NOT NULL DEFAULT 'learned', at INTEGER NOT NULL DEFAULT 0);"
                  "CREATE TABLE IF NOT EXISTS bsc_ex_moves (id INTEGER PRIMARY KEY AUTOINCREMENT, tx TEXT NOT NULL, "
@@ -301,7 +359,7 @@ void initBscExchanges() {
                  "  in_qty REAL NOT NULL DEFAULT 0, out_qty REAL NOT NULL DEFAULT 0, PRIMARY KEY (ts, ex, token));",
                  nullptr, nullptr, nullptr);
     sqlite3_stmt* s;
-    if (prepareOrLog(db, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'seed',?) "
+    if (prepareOrLog(g_exDb, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'seed',?) "
                              "ON CONFLICT(address) DO UPDATE SET ex=excluded.ex, how='seed' WHERE how!='owner'")) {
         for (const Seed& sd : SEEDS) {
             sqlite3_reset(s);
@@ -312,8 +370,13 @@ void initBscExchanges() {
         }
         sqlite3_finalize(s);
     }
+}
+
+void loadLabels() {
+    std::lock_guard<std::mutex> l(g_exDbMx);
+    sqlite3_stmt* s = nullptr;
     std::lock_guard<std::mutex> m(g_mx);
-    if (prepareOrLog(db, &s, "SELECT address, ex, how, at FROM bsc_ex_labels")) {
+    if (prepareOrLog(g_exDb, &s, "SELECT address, ex, how, at FROM bsc_ex_labels")) {
         while (sqlite3_step(s) == SQLITE_ROW) {
             Label lb;
             lb.ex = safeColumnText(s, 1);
@@ -324,9 +387,10 @@ void initBscExchanges() {
         }
         sqlite3_finalize(s);
     }
-    std::cout << "[BSC-EX] адресов бирж: " << g_labels.size() << " (из них стартовых " << std::size(SEEDS) << ")"
-              << std::endl;
+    std::cout << "[BSC-EX] база " << exDbFile() << ", адресов бирж: " << g_labels.size() << " (из них стартовых "
+              << std::size(SEEDS) << ")" << std::endl;
 }
+}  // namespace
 
 std::string bscExchangeOf(const std::string& a) {
     std::lock_guard<std::mutex> m(g_mx);
@@ -334,15 +398,17 @@ std::string bscExchangeOf(const std::string& a) {
     return lb ? lb->ex : "";
 }
 
-BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const std::string& to, long long block,
-                      long long blockTs, const std::string& hash,
-                      const std::function<bool(const std::string&)>& watched) {
+namespace {
+BscExHit observe(const BscExTx& tx, long long block, long long blockTs,
+                 const std::function<bool(const std::string&)>& watched) {
     BscExHit hit;
-    if (from.empty() || to.empty()) return hit;
+    const std::string& from = tx.from;
+    const std::string& hash = tx.hash;
+    if (from.empty() || tx.to.empty()) return hit;
     std::string token, rcpt;
     double qty = 0;
     long long usd = 0;
-    if (!parseTransfer(tx, to, token, rcpt, qty, usd)) return hit;
+    if (!parseTransfer(tx, token, rcpt, qty, usd)) return hit;
     const long long t = blockTs > 0 ? blockTs : now();
     const bool unpriced = usd == 0 && token != chainCtx().nativeMarker;
 
@@ -387,7 +453,7 @@ BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const s
             } else if (!exFrom.empty()) {
                 addFlow(t, exFrom, token, false, usd, qty);
             } else {
-                if (tx.contains("nonce") && tx["nonce"].is_string() && hexLD(tx["nonce"].get<std::string>(), 2, 64) < 50) {
+                if (hexLD(tx.nonce, 2, 64) < 50) {
                     const long long day = t / 86400;
                     if (day != g_collectDay) { g_collect.clear(); g_collectDay = day; }
                     if (g_collect.size() < COLLECT_MAX || g_collect.count(rcpt)) ++g_collect[rcpt];
@@ -415,6 +481,48 @@ BscExHit bscExObserve(const nlohmann::json& tx, const std::string& from, const s
     return hit;
 }
 
+void workerLoop() {
+    while (!g_stop.load()) {
+        QBlock b;
+        {
+            std::unique_lock<std::mutex> l(g_qMx);
+            g_qCv.wait_for(l, std::chrono::seconds(30), [] { return !g_queue.empty() || g_stop.load(); });
+            if (g_stop.load()) break;
+            if (g_queue.empty()) {
+                l.unlock();
+                bscExFlush();
+                continue;
+            }
+            b = std::move(g_queue.front());
+            g_queue.pop_front();
+        }
+        if (b.block <= g_lastBlock) continue;
+        g_lastBlock = b.block;
+        try {
+            for (const auto& tx : b.txs) observe(tx, b.block, b.ts, b.watched);
+            bscExFlush();
+        } catch (const std::exception& e) {
+            std::cerr << "[BSC-EX] блок " << b.block << ": " << e.what() << std::endl;
+        }
+    }
+}
+
+}  // namespace
+
+void bscExEnqueue(long long block, long long blockTs, std::vector<BscExTx> txs,
+                  std::function<bool(const std::string&)> watched) {
+    {
+        std::lock_guard<std::mutex> l(g_qMx);
+        if (g_queue.size() >= QUEUE_MAX) {
+            g_queue.pop_front();
+            if (++g_dropped % 100 == 1)
+                std::cerr << "[BSC-EX] очередь полна, старые блоки пропущены: " << g_dropped << std::endl;
+        }
+        g_queue.push_back(QBlock{block, blockTs, std::move(txs), std::move(watched)});
+    }
+    g_qCv.notify_one();
+}
+
 void bscExFlush(bool force) {
     const long long t = now();
     std::unordered_map<std::string, Flow> flow;
@@ -434,11 +542,11 @@ void bscExFlush(bool force) {
         moves = g_moves;
     }
     if (flow.empty() && dirty.empty()) return;
-    std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
+    std::lock_guard<std::mutex> l(g_exDbMx);
+    sqlite3_exec(g_exDb, "BEGIN", nullptr, nullptr, nullptr);
     sqlite3_stmt* s;
     if (!flow.empty() &&
-        prepareOrLog(db, &s, "INSERT INTO bsc_ex_flow(ts, ex, token, in_usd, out_usd, in_n, out_n, in_qty, out_qty) "
+        prepareOrLog(g_exDb, &s, "INSERT INTO bsc_ex_flow(ts, ex, token, in_usd, out_usd, in_n, out_n, in_qty, out_qty) "
                              "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(ts, ex, token) DO UPDATE SET "
                              "in_usd=in_usd+excluded.in_usd, out_usd=out_usd+excluded.out_usd, "
                              "in_n=in_n+excluded.in_n, out_n=out_n+excluded.out_n, "
@@ -461,7 +569,7 @@ void bscExFlush(bool force) {
         sqlite3_finalize(s);
     }
     if (!dirty.empty() &&
-        prepareOrLog(db, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'learned',?) "
+        prepareOrLog(g_exDb, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'learned',?) "
                              "ON CONFLICT(address) DO UPDATE SET at=excluded.at WHERE how='learned'")) {
         for (const auto& [a, lb] : dirty) {
             sqlite3_reset(s);
@@ -472,7 +580,7 @@ void bscExFlush(bool force) {
         }
         sqlite3_finalize(s);
     }
-    sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
+    sqlite3_exec(g_exDb, "COMMIT", nullptr, nullptr, nullptr);
     static long long lastLog = 0;
     if (t - lastLog >= 3600) {
         lastLog = t;
@@ -484,19 +592,19 @@ void bscExFlush(bool force) {
 void bscExCleanup() {
     const long long t = now();
     {
-        std::lock_guard<std::mutex> l(dbMutex);
+        std::lock_guard<std::mutex> l(g_exDbMx);
         sqlite3_stmt* s;
-        if (prepareOrLog(db, &s, "DELETE FROM bsc_ex_flow WHERE ts < ?")) {
+        if (prepareOrLog(g_exDb, &s, "DELETE FROM bsc_ex_flow WHERE ts < ?")) {
             sqlite3_bind_int64(s, 1, t - 400LL * 86400LL);
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
-        if (prepareOrLog(db, &s, "DELETE FROM bsc_ex_moves WHERE ts < ?")) {
+        if (prepareOrLog(g_exDb, &s, "DELETE FROM bsc_ex_moves WHERE ts < ?")) {
             sqlite3_bind_int64(s, 1, t - 400LL * 86400LL);
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
-        if (prepareOrLog(db, &s, "DELETE FROM bsc_ex_labels WHERE how='learned' AND at < ?")) {
+        if (prepareOrLog(g_exDb, &s, "DELETE FROM bsc_ex_labels WHERE how='learned' AND at < ?")) {
             sqlite3_bind_int64(s, 1, t - LEARNED_TTL);
             sqlite3_step(s);
             sqlite3_finalize(s);
@@ -531,10 +639,10 @@ std::string bscExLabelCommand(const std::string& arg) {
         return o.str();
     }
     const long long t = now();
-    std::lock_guard<std::mutex> l(dbMutex);
+    std::lock_guard<std::mutex> l(g_exDbMx);
     sqlite3_stmt* s;
     if (name == "-") {
-        if (prepareOrLog(db, &s, "DELETE FROM bsc_ex_labels WHERE address=?")) {
+        if (prepareOrLog(g_exDb, &s, "DELETE FROM bsc_ex_labels WHERE address=?")) {
             sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
             sqlite3_step(s);
             sqlite3_finalize(s);
@@ -543,7 +651,7 @@ std::string bscExLabelCommand(const std::string& arg) {
         g_labels.erase(addr);
         return "Подпись снята: <code>" + addr + "</code>";
     }
-    if (prepareOrLog(db, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'owner',?) "
+    if (prepareOrLog(g_exDb, &s, "INSERT INTO bsc_ex_labels(address, ex, how, at) VALUES(?,?,'owner',?) "
                              "ON CONFLICT(address) DO UPDATE SET ex=excluded.ex, how='owner', at=excluded.at")) {
         sqlite3_bind_text(s, 1, addr.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(s, 2, name.c_str(), -1, SQLITE_TRANSIENT);
@@ -577,4 +685,24 @@ std::string bscExUnknownCommand() {
           << "</a> — " << n << " сливов · <code>" << a << "</code>";
     o << "\n\nПодписать: <code>/exlabel 0x… Binance</code>";
     return o.str();
+}
+
+void bscExStop() {
+    g_stop.store(true);
+    g_qCv.notify_all();
+    g_stopCv.notify_all();
+    if (g_worker.joinable()) g_worker.join();
+    // Поток цен может ждать ответа сети (запрос цены — до десятков секунд):
+    // остановку бота из-за этого не держим — даём пять секунд и отпускаем.
+    for (int i = 0; i < 50 && !g_pricerDone.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (g_pricer.joinable()) {
+        if (g_pricerDone.load()) g_pricer.join();
+        else g_pricer.detach();
+    }
+    bscExFlush(true);
+    std::lock_guard<std::mutex> l(g_exDbMx);
+    if (g_exDb) {
+        sqlite3_close(g_exDb);
+        g_exDb = nullptr;
+    }
 }
