@@ -45,6 +45,7 @@
 #include <map>
 #include <tuple>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1764,6 +1765,51 @@ void refreshEtfBalances() {
     }
 }
 
+// Догонка фондов: блоки, где двигались кошельки фондов, с `since` до высоты
+// `upTo` — только разметкой ETF (сканер бирж их не трогает). Нужна при первом
+// запуске (два месяца истории для графика) и после простоя дольше суток.
+// Какие это блоки — из истории кошельков на mempool.space: та же цепочка,
+// посчитанная по адресу; сами блоки — с узлов, как всегда.
+constexpr long long ETF_BACK_SEC = 60LL * 86400LL;
+
+void etfBackfill(long long since, long long upTo) {
+    std::set<long long> heights;
+    for (const auto& a : etfAddresses()) {
+        std::string after;
+        for (int page = 0; page < 40; ++page) {
+            json j = json::parse(fetch("https://mempool.space/api/address/" + a + "/txs/chain" +
+                                       (after.empty() ? "" : "/" + after), 15), nullptr, false);
+            if (!j.is_array() || j.empty()) break;
+            bool older = false;
+            for (const auto& t : j) {
+                if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) continue;
+                const long long h = jll(t["status"], "block_height");
+                if (jll(t["status"], "block_time") < since) { older = true; break; }
+                if (h > 0 && h <= upTo) heights.insert(h);
+                after = jstr(t, "txid");
+            }
+            if (older || j.size() < 25 || !isHash(after)) break;
+            if (!sleepFor(1)) return;
+        }
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    int done = 0;
+    for (long long h : heights) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        Block b;
+        b.height = h;
+        b.hash = hashAt(h);
+        if (b.hash.empty() || !loadFromRpc(b)) continue;
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        execSql("BEGIN");
+        etfBlock(g_btcDb, b);
+        execSql("COMMIT");
+        ++done;
+    }
+    std::cout << "[ETF] догонка: блоков с кошельками фондов " << done << " из " << heights.size() << std::endl;
+}
+
 void btcLoop() {
     Scanner sc;
     {
@@ -1797,6 +1843,10 @@ void btcLoop() {
             long long tip = tipHeight();
             if (tip <= 0) { if (!sleepFor(30)) break; continue; }
             g_bs.tip = tip;
+            if (sc.state("etf_back") != "1") {
+                etfBackfill(nowSec() - ETF_BACK_SEC, tip);
+                sc.setStateLocked("etf_back", "1");
+            }
             long long last = 0;
             {
                 std::string v = sc.state("height");
@@ -1804,7 +1854,11 @@ void btcLoop() {
             }
             if (last <= 0 || tip - last > MAX_BEHIND) {
                 long long from = tip - (last <= 0 ? 1 : 6);
-                if (last > 0) bump(g_bs.skipped, from - last);
+                if (last > 0) {
+                    bump(g_bs.skipped, from - last);
+                    // Потоки фондов за простой — догонкой, по блокам их кошельков.
+                    etfBackfill(nowSec() - (tip - last) * 600 - 6 * 3600, from);
+                }
                 if (last > 0)
                     std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
                               << " пропущены" << std::endl;

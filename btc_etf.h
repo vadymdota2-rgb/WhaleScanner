@@ -38,6 +38,8 @@ void etfRollback(sqlite3* db, long long height);
 void etfCleanup(sqlite3* db, long long keepFrom);
 // Кошелёк фонда — тикер, иначе пусто. Можно звать без замка базы.
 std::string etfFund(const std::string& address);
+// Все кошельки фондов — для догонки по истории адресов.
+std::vector<std::string> etfAddresses();
 // Кошельки, чей остаток пора сверить с цепочкой (новые — сразу, остальные
 // раз в сутки). Сверка: остаток из цепочки на высоте `height`.
 std::vector<std::string> etfStale(sqlite3* db, size_t limit);

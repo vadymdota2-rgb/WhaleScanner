@@ -34,8 +34,9 @@ std::mutex g_mx;
 std::unordered_map<std::string, std::string> g_fund;  // адрес → фонд
 // Типы адресов фонда (по опубликованным): выученный кошелёк — того же типа.
 std::map<std::string, std::set<int>> g_types;
-// Кошельки хранителя, которые присылают фондам пылинки на комиссию. Они общие
-// для всех клиентов хранителя — фонду не принадлежат и не учатся никогда.
+// Служебные кошельки хранителя: присылают фондам пылинки на комиссию (и
+// кошелёк, с которого приходят новые монеты фонда, тоже). Они общие для всех
+// клиентов хранителя — фонду не принадлежат и не учатся никогда.
 std::set<std::string> g_service;
 // Сверки за сутки: когда, фонд, на сколько разошлось.
 struct Check { long long at; std::string fund; long long drift; };
@@ -145,7 +146,7 @@ void markService(sqlite3* db, const std::string& addr) {
     }
     Stmt q(db, "INSERT OR IGNORE INTO btc_etf_svc(address, at) VALUES(?,?)");
     q.text(1, addr).num(2, now()).run();
-    std::cout << "[ETF] кошелёк комиссий хранителя: " << addr << std::endl;
+    std::cout << "[ETF] служебный кошелёк хранителя (шлёт фондам пыль): " << addr << std::endl;
 }
 
 void learn(sqlite3* db, const std::string& addr, const std::string& fund, long long height) {
@@ -251,6 +252,15 @@ std::string btc(long long sats) {
 }  // namespace
 
 std::string etfFund(const std::string& address) { return fundOf(address); }
+
+std::vector<std::string> etfAddresses() {
+    std::lock_guard<std::mutex> l(g_mx);
+    std::vector<std::string> r;
+    r.reserve(g_fund.size());
+    for (const auto& [a, f] : g_fund) r.push_back(a);
+    std::sort(r.begin(), r.end());
+    return r;
+}
 
 void etfOpen(sqlite3* db) {
     char* err = nullptr;
