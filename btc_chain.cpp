@@ -25,6 +25,8 @@
  *   там входы чужие друг другу.
  */
 #include "btc_chain.h"
+#include "btc_block.h"
+#include "btc_etf.h"
 #include "autobase.h"
 #include "btc_seeds_book.h"
 
@@ -463,26 +465,6 @@ long long priceAt(long long ts) {
 
 // ── блок ─────────────────────────────────────────────────────────────────
 
-struct BIn { std::string addr; long long sats = 0; };
-struct BOut { std::string addr; long long sats = 0; };
-struct BTx {
-    std::string txid;
-    bool coinbase = false;
-    std::vector<BIn> in;
-    std::vector<BOut> out;
-    long long inSum() const { long long s = 0; for (auto& i : in) s += i.sats; return s; }
-    long long outSum() const { long long s = 0; for (auto& o : out) s += o.sats; return s; }
-};
-
-struct Block {
-    long long height = 0;
-    long long ts = 0;
-    std::string hash;
-    // Хэш предыдущего блока — по нему видна перестройка цепочки.
-    std::string prev;
-    std::vector<BTx> txs;
-};
-
 long long jll(const json& j, const char* k) {
     if (!j.contains(k)) return 0;
     const auto& v = j[k];
@@ -775,6 +757,7 @@ public:
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             execSql("BEGIN");
             scan(b, price, moves, learned);
+            etfBlock(g_btcDb, b);
             execSql("COMMIT");
         }
         bump(g_bs.blocks);
@@ -838,6 +821,7 @@ public:
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
+        etfRollback(g_btcDb, b.height - 1);
         setState("height", std::to_string(b.height - 2));
         execSql("COMMIT");
         return true;
@@ -955,7 +939,7 @@ public:
                         ++moves;
                     }
                     done.insert(a);
-                    if (v >= AUTO_MIN_SATS && !watch.count(a) && autoCand_.size() < AUTO_PEND_MAX)
+                    if (v >= AUTO_MIN_SATS && !watch.count(a) && autoCand_.size() < AUTO_PEND_MAX && etfFund(a).empty())
                         autoCand_.emplace(a, nowSec());
                 }
             } else if (plain && !mixed) {
@@ -1553,6 +1537,8 @@ private:
     }
 
     void putLabel(const std::string& a, const std::string& ex, const char* how) {
+        // Кошелёк фонда биржевым не становится: его ведёт btc_etf.cpp.
+        if (!etfFund(a).empty()) return;
         sqlite3_reset(db_.putLabel);
         bindText(db_.putLabel, 1, a);
         bindText(db_.putLabel, 2, ex);
@@ -1649,6 +1635,7 @@ bool openDb() {
     // Вклад блока в потоки — для отката при перестройке цепочки. Колонка
     // добавлена позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(g_btcDb, "ALTER TABLE btc_blocks ADD COLUMN flow TEXT", nullptr, nullptr, nullptr);
+    etfOpen(g_btcDb);
     sqlite3_stmt* s = nullptr;
     if (prep(&s, "SELECT address FROM btc_watch")) {
         std::lock_guard<std::mutex> w(g_watchMutex);
@@ -1701,6 +1688,7 @@ void cleanup() {
     const long long empty = execCount(
         "DELETE FROM btc_flow WHERE in_sats <= 0 AND out_sats <= 0 AND in_n <= 0 AND out_n <= 0 AND ts < ?",
         now - 3600);
+    etfCleanup(g_btcDb, cut);
     sqlite3_wal_checkpoint_v2(g_btcDb, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     g_bs.cleanAt = now;
     g_bs.cleanFlow = flow;
@@ -1752,6 +1740,28 @@ void refreshIdleBalances() {
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     if (done) std::cout << "[BTC] остаток перепроверен у " << done << " неактивных кошельков базы" << std::endl;
+}
+
+// Остатки кошельков фондов — сверка с цепочкой: новые сразу, остальные раз в
+// сутки. Высота — у узла прямо перед запросом: остаток с mempool.space верен
+// на ней, блоки до неё в него уже не пишутся.
+void refreshEtfBalances() {
+    std::vector<std::string> stale;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        stale = etfStale(g_btcDb, 200);
+    }
+    for (const auto& a : stale) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        const long long h = tipHeight();
+        long long txs = 0, bal = 0;
+        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
+        {
+            std::lock_guard<std::mutex> l(g_btcDbMutex);
+            etfSetBalance(g_btcDb, a, bal, h);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
 }
 
 void btcLoop() {
@@ -1837,6 +1847,7 @@ void btcLoop() {
                 setLag();
             }
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
+                refreshEtfBalances();
                 refreshIdleBalances();
                 lastBal = std::chrono::steady_clock::now();
             }
@@ -2217,6 +2228,8 @@ std::string btcStatsLine() {
         long long walSize = stat((file + "-wal").c_str(), &st) == 0 ? static_cast<long long>(st.st_size) : 0;
         out += "\n💾 База: " + mb(dbSize) + " · WAL " + mb(walSize);
     }
+
+    out += etfStats(g_btcDb);
 
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
     if (prep(&s, "SELECT how, COUNT(*) FROM btc_labels GROUP BY how ORDER BY 2 DESC")) {
