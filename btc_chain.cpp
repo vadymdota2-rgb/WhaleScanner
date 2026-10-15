@@ -2,15 +2,14 @@
  * Сканер сети Bitcoin. Что и зачем — в btc_chain.h.
  *
  * Круг работы:
- *   1. Раз в полминуты узнаём высоту последнего блока (mempool.space, запасной
- *      blockstream.info).
- *   2. Каждый новый блок целиком одним запросом с blockchain.info: там у
- *      входов уже есть адрес и сумма потраченного выхода, без них не понять,
- *      откуда пришли монеты. Не ответил — тот же блок страницами с
- *      mempool.space.
- *   3. Для крупных транзакций спрашиваем разметку walletexplorer.com: чей
- *      кластер у адреса. Ответы помним — адрес биржи биржей и останется.
- *   4. Разбираем транзакции: с биржи на частный адрес — вывод (покупка),
+ *   1. Раз в полминуты узнаём высоту последнего блока у узла Bitcoin
+ *      (JSON-RPC getblockcount).
+ *   2. Каждый новый блок целиком одним запросом getblock с подробностью 3:
+ *      у входов там уже есть адрес и сумма потраченного выхода (prevout), без
+ *      них не понять, откуда пришли монеты. Узлы — свой (WHALE_BTC_RPC) и
+ *      открытые публичные; не ответил один — спрашиваем следующий. Как на
+ *      BSC: данные — сама цепочка, без чужих сервисов и чужой разметки.
+ *   3. Разбираем транзакции: с биржи на частный адрес — вывод (покупка),
  *      с частного на биржу — завод (продажа). Всё, что крупнее порога, —
  *      строкой в btc_moves; потоки любого размера — суммой по блоку и бирже
  *      в btc_flow.
@@ -33,6 +32,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cctype>
 #include <cstdio>
@@ -83,16 +83,11 @@ long long envSats(const char* key, double defBtc) {
 // Строка в btc_moves — с 0,2 биткоина: ниже начинается розница, и доска
 // крупных движений утонула бы в ней. Потоки по часам считаются с любой суммы.
 const long long MOVE_MIN_SATS = envSats("WHALE_BTC_MOVE_MIN", 0.2);
-// С какой суммы транзакции спрашиваем разметку внешнего сервиса.
-const long long LOOKUP_MIN_SATS = envSats("WHALE_BTC_LOOKUP_MIN", 5.0);
-// Сколько запросов разметки на один блок: сервис бесплатный, не наглеем.
-constexpr int LOOKUPS_PER_BLOCK = 40;
 // Насколько отставание догоняем блок за блоком: сутки. Цена каждого блока —
 // на его час (priceAt), поэтому старые блоки считаются в верных долларах.
 // Простой дольше суток — прыгаем к свежим и пишем, сколько пропущено.
 constexpr long long MAX_BEHIND = 144;
 constexpr long long KEEP_SEC = 400LL * 86400LL;
-constexpr long long WE_EMPTY_TTL = 3LL * 86400LL;
 // Выученные адреса без новых встреч забываем через три месяца: адресов
 // пополнения биржи сметают десятки тысяч в сутки, хранить их вечно — гигабайты.
 // Живой адрес освежается каждой встречей и не пропадает.
@@ -161,8 +156,14 @@ std::string btcDbFile() {
 
 // ── сеть ─────────────────────────────────────────────────────────────────
 
+// Блок с узла — 10–15 МБ JSON. Больше 64 МБ ответа не бывает: обрываем,
+// чтобы сломанный или чужой узел не съел память бота.
+constexpr size_t BODY_MAX = 64u << 20;
+
 size_t writeCb(void* p, size_t s, size_t n, void* out) {
-    static_cast<std::string*>(out)->append(static_cast<char*>(p), s * n);
+    auto* body = static_cast<std::string*>(out);
+    if (body->size() + s * n > BODY_MAX) return 0;
+    body->append(static_cast<char*>(p), s * n);
     return s * n;
 }
 
@@ -171,19 +172,55 @@ struct Curl {
     ~Curl() { if (h) curl_easy_cleanup(h); }
 };
 
-std::string fetch(const std::string& url, long timeout = 20, long* status = nullptr) {
+// Адрес без логина и пароля — для журнала: у своего узла они могут стоять
+// прямо в адресе (http://user:pass@127.0.0.1:8332).
+std::string safeUrl(const std::string& url) {
+    const auto scheme = url.find("://");
+    const size_t from = scheme == std::string::npos ? 0 : scheme + 3;
+    const auto at = url.find('@', from);
+    const auto slash = url.find('/', from);
+    std::string r = url;
+    if (at != std::string::npos && (slash == std::string::npos || at < slash)) r = url.substr(0, from) + url.substr(at + 1);
+    return r.substr(0, 90);
+}
+
+// GET, а с телом — POST JSON. Тело ответа отдаём при любом коде: узел
+// Bitcoin присылает ошибку RPC с кодом 500, и её текст нужен.
+std::string request(const std::string& url, const std::string* post, long timeout, long* status, bool& ok) {
+    ok = false;
+    if (status) *status = 0;
     thread_local Curl c;
     if (!c.h) return "";
     curl_easy_reset(c.h);
     std::string body;
+    curl_slist* hdr = nullptr;
     curl_easy_setopt(c.h, CURLOPT_URL, url.c_str());
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(c.h, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(c.h, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(c.h, CURLOPT_WRITEFUNCTION, writeCb);
     curl_easy_setopt(c.h, CURLOPT_WRITEDATA, &body);
     curl_easy_setopt(c.h, CURLOPT_TIMEOUT, timeout);
     curl_easy_setopt(c.h, CURLOPT_CONNECTTIMEOUT, 5L);
     curl_easy_setopt(c.h, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(c.h, CURLOPT_FOLLOWLOCATION, 1L);
-    // Блок с blockchain.info — семь мегабайт JSON; сжатым он втрое меньше.
+    if (post) {
+        // Узлу некуда перенаправлять: POST по чужому адресу не повторяем.
+        hdr = curl_slist_append(hdr, "Content-Type: application/json");
+        curl_easy_setopt(c.h, CURLOPT_HTTPHEADER, hdr);
+        curl_easy_setopt(c.h, CURLOPT_POSTFIELDS, post->c_str());
+        curl_easy_setopt(c.h, CURLOPT_POSTFIELDSIZE, static_cast<long>(post->size()));
+    } else {
+        curl_easy_setopt(c.h, CURLOPT_FOLLOWLOCATION, 1L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+        curl_easy_setopt(c.h, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+#else
+        curl_easy_setopt(c.h, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTPS));
+#endif
+        curl_easy_setopt(c.h, CURLOPT_MAXREDIRS, 3L);
+    }
+    // Сжатым блок втрое-вчетверо меньше: 3 МБ вместо 13.
     curl_easy_setopt(c.h, CURLOPT_ACCEPT_ENCODING, "");
     curl_easy_setopt(c.h, CURLOPT_USERAGENT, "whalescanner/1.0");
     curl_easy_setopt(c.h, CURLOPT_XFERINFOFUNCTION,
@@ -192,15 +229,24 @@ std::string fetch(const std::string& url, long timeout = 20, long* status = null
                     g_btcRunning.load(std::memory_order_relaxed)) ? 0 : 1; });
     curl_easy_setopt(c.h, CURLOPT_NOPROGRESS, 0L);
     CURLcode rc = curl_easy_perform(c.h);
+    if (hdr) curl_slist_free_all(hdr);
     long code = 0;
     curl_easy_getinfo(c.h, CURLINFO_RESPONSE_CODE, &code);
     if (status) *status = code;
-    if (rc != CURLE_OK || code != 200) {
-        if (rc != CURLE_OK)
-            std::cerr << "[BTC] " << curl_easy_strerror(rc) << " | " << url.substr(0, 90) << std::endl;
+    if (rc != CURLE_OK) {
+        std::cerr << "[BTC] " << curl_easy_strerror(rc) << " | " << safeUrl(url) << std::endl;
         return "";
     }
+    ok = true;
     return body;
+}
+
+std::string fetch(const std::string& url, long timeout = 20, long* status = nullptr) {
+    bool ok = false;
+    long code = 0;
+    std::string body = request(url, nullptr, timeout, &code, ok);
+    if (status) *status = code;
+    return ok && code == 200 ? body : "";
 }
 
 bool sleepFor(int sec) {
@@ -217,23 +263,103 @@ long long parseLL(const std::string& s) {
     return std::stoll(s);
 }
 
-long long tipHeight() {
-    for (const char* u : {"https://mempool.space/api/blocks/tip/height",
-                          "https://blockstream.info/api/blocks/tip/height"}) {
-        long long h = parseLL(fetch(u, 10));
-        if (h > 0) return h;
+bool isHash(const std::string& h) {
+    return h.size() == 64 && h.find_first_not_of("0123456789abcdef") == std::string::npos;
+}
+
+// ── узлы Bitcoin ─────────────────────────────────────────────────────────
+
+// Свой узел — первым: WHALE_BTC_RPC, адреса через запятую (логин и пароль
+// можно прямо в адресе). За ним открытые публичные узлы без ключа. Узлу
+// нужен Bitcoin Core 25+ — с ним getblock отдаёт prevout у входов.
+const std::vector<std::string>& rpcPool() {
+    static const std::vector<std::string> pool = [] {
+        std::vector<std::string> r;
+        auto add = [&r](std::string u) {
+            while (!u.empty() && std::isspace(static_cast<unsigned char>(u.back()))) u.pop_back();
+            while (!u.empty() && std::isspace(static_cast<unsigned char>(u.front()))) u.erase(0, 1);
+            if (u.rfind("https://", 0) != 0 && u.rfind("http://", 0) != 0) return;
+            if (std::find(r.begin(), r.end(), u) == r.end()) r.push_back(u);
+        };
+        if (const char* v = std::getenv("WHALE_BTC_RPC")) {
+            std::string all = v;
+            for (size_t from = 0; from <= all.size();) {
+                size_t comma = all.find(',', from);
+                if (comma == std::string::npos) comma = all.size();
+                add(all.substr(from, comma - from));
+                from = comma + 1;
+            }
+        }
+        add("https://bitcoin-rpc.publicnode.com");
+        add("https://bitcoin.drpc.org");
+        return r;
+    }();
+    return pool;
+}
+
+// Узел не ответил или ответил мусором — пять минут спрашиваем других, чтобы
+// каждый блок не ждал его таймаута. Ошибка RPC (узел ещё не видел блок) —
+// не поломка, её не штрафуем.
+constexpr long long NODE_REST_SEC = 300;
+std::mutex g_nodeMutex;
+std::vector<long long> g_nodeRest;
+
+bool nodeResting(size_t i) {
+    std::lock_guard<std::mutex> l(g_nodeMutex);
+    return i < g_nodeRest.size() && g_nodeRest[i] > nowSec();
+}
+
+void restNode(size_t i) {
+    std::lock_guard<std::mutex> l(g_nodeMutex);
+    if (g_nodeRest.size() < rpcPool().size()) g_nodeRest.resize(rpcPool().size(), 0);
+    g_nodeRest[i] = nowSec() + NODE_REST_SEC;
+}
+
+// Вызов RPC по очереди узлов. take — проверить и забрать ответ: false —
+// ответ не годится (у узла нет нужного), идём к следующему. Узлы на отдыхе —
+// последними, а не никогда: лучше медленный ответ, чем никакого.
+bool btcRpc(const std::string& method, const json& params, long timeout, const std::function<bool(json&)>& take) {
+    const auto& pool = rpcPool();
+    const std::string body = json{{"jsonrpc", "1.0"}, {"id", 1}, {"method", method}, {"params", params}}.dump();
+    std::vector<size_t> order;
+    for (size_t i = 0; i < pool.size(); ++i) if (!nodeResting(i)) order.push_back(i);
+    for (size_t i = 0; i < pool.size(); ++i) if (nodeResting(i)) order.push_back(i);
+    for (size_t i : order) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
+        bool ok = false;
+        long code = 0;
+        json j = json::parse(request(pool[i], &body, timeout, &code, ok), nullptr, false);
+        if (ok && j.is_object() && j.contains("error") && !j["error"].is_null()) continue;
+        if (!ok || !j.is_object() || !j.contains("result")) {
+            if (ok) std::cerr << "[BTC] узел " << safeUrl(pool[i]) << ": " << method << " → HTTP " << code << std::endl;
+            restNode(i);
+            continue;
+        }
+        if (take(j["result"])) return true;
+        std::cerr << "[BTC] узел " << safeUrl(pool[i]) << ": " << method << " — ответ не годится" << std::endl;
+        restNode(i);
     }
-    return 0;
+    return false;
+}
+
+long long tipHeight() {
+    long long h = 0;
+    btcRpc("getblockcount", json::array(), 10, [&h](json& r) {
+        if (!r.is_number_integer() || r.get<long long>() <= 0) return false;
+        h = r.get<long long>();
+        return true;
+    });
+    return h;
 }
 
 std::string hashAt(long long height) {
-    const std::string h = std::to_string(height);
-    for (const std::string& u : {"https://mempool.space/api/block-height/" + h,
-                                "https://blockstream.info/api/block-height/" + h}) {
-        std::string r = fetch(u, 10);
-        if (r.size() == 64 && r.find_first_not_of("0123456789abcdef") == std::string::npos) return r;
-    }
-    return "";
+    std::string h;
+    btcRpc("getblockhash", json::array({height}), 10, [&h](json& r) {
+        if (!r.is_string() || !isHash(r.get<std::string>())) return false;
+        h = r.get<std::string>();
+        return true;
+    });
+    return h;
 }
 
 // Цена биткоина в нано-долларах. Два открытых источника; держим минуту.
@@ -332,71 +458,67 @@ std::string jstr(const json& j, const char* k) {
     return j[k].get<std::string>();
 }
 
-// Формат blockchain.info: inputs[].prev_out.{addr,value}, out[].{addr,value}.
-bool loadFromBlockchainInfo(const std::string& hash, Block& b) {
-    std::string raw = fetch("https://blockchain.info/rawblock/" + hash, 90);
-    if (raw.empty()) return false;
-    json j = json::parse(raw, nullptr, false);
-    if (!j.is_object() || !j.contains("tx") || !j["tx"].is_array()) return false;
-    b.ts = jll(j, "time");
-    b.prev = jstr(j, "prev_block");
-    b.txs.reserve(j["tx"].size());
-    for (const auto& t : j["tx"]) {
-        BTx x;
-        x.txid = jstr(t, "hash");
-        if (t.contains("inputs") && t["inputs"].is_array()) {
-            for (const auto& i : t["inputs"]) {
-                if (!i.contains("prev_out") || !i["prev_out"].is_object()) { x.coinbase = true; continue; }
-                const auto& p = i["prev_out"];
-                x.in.push_back({jstr(p, "addr"), jll(p, "value")});
-            }
-        }
-        if (x.in.empty()) x.coinbase = true;
-        if (t.contains("out") && t["out"].is_array())
-            for (const auto& o : t["out"]) x.out.push_back({jstr(o, "addr"), jll(o, "value")});
-        if (!x.txid.empty()) b.txs.push_back(std::move(x));
-    }
-    return !b.txs.empty();
+// Сумма из ответа узла: биткоины числом с восемью знаками → сатоши.
+// Не число или вне 0…21 млн — -1, такой блок не берём.
+long long btcSats(const json& v) {
+    if (!v.is_number()) return -1;
+    const double d = v.get<double>();
+    if (!(d >= 0 && d <= 21e6)) return -1;
+    return std::llround(d * static_cast<double>(SAT));
 }
 
-// Запасной путь — Esplora (mempool.space): по 25 транзакций на страницу.
-bool loadFromEsplora(const std::string& hash, Block& b) {
-    json meta = json::parse(fetch("https://mempool.space/api/block/" + hash, 15), nullptr, false);
-    if (!meta.is_object()) return false;
-    long long n = jll(meta, "tx_count");
-    b.ts = jll(meta, "timestamp");
-    b.prev = jstr(meta, "previousblockhash");
-    if (n <= 0) return false;
-    b.txs.clear();
-    for (long long start = 0; start < n; start += 25) {
-        json page;
-        for (int attempt = 0; attempt < 3; ++attempt) {
-            page = json::parse(fetch("https://mempool.space/api/block/" + hash + "/txs/" + std::to_string(start), 20),
-                               nullptr, false);
-            if (page.is_array()) break;
-            if (!sleepFor(2)) return false;
+// Адрес выхода; у нестандартных и OP_RETURN его нет — пустая строка.
+std::string spkAddr(const json& o) {
+    if (!o.is_object() || !o.contains("scriptPubKey") || !o["scriptPubKey"].is_object()) return "";
+    return jstr(o["scriptPubKey"], "address");
+}
+
+// getblock <hash> 3: tx[].vin[].prevout.{value, scriptPubKey.address},
+// tx[].vout[].{value, scriptPubKey.address}. Блок проверяем целиком: тот ли
+// хэш и высота, в главной ли он цепочке, все ли транзакции на месте и у
+// каждого входа есть prevout. Узел старше Bitcoin Core 25 prevout не даёт —
+// без него не понять, откуда монеты, и такой ответ не годится.
+bool parseRpcBlock(const json& j, Block& b) {
+    if (!j.is_object() || jstr(j, "hash") != b.hash || jll(j, "height") != b.height) return false;
+    if (j.contains("confirmations") && jll(j, "confirmations") < 1) return false;
+    if (!j.contains("tx") || !j["tx"].is_array() || j["tx"].empty()) return false;
+    const auto& txs = j["tx"];
+    if (j.contains("nTx") && jll(j, "nTx") != static_cast<long long>(txs.size())) return false;
+    b.ts = jll(j, "time");
+    b.prev = jstr(j, "previousblockhash");
+    if (b.ts <= 0 || (b.height > 0 && !isHash(b.prev))) return false;
+    std::vector<BTx> out;
+    out.reserve(txs.size());
+    for (const auto& t : txs) {
+        if (!t.is_object() || !t.contains("vin") || !t["vin"].is_array() || !t.contains("vout") || !t["vout"].is_array())
+            return false;
+        BTx x;
+        x.txid = jstr(t, "txid");
+        if (!isHash(x.txid)) return false;
+        for (const auto& i : t["vin"]) {
+            if (!i.is_object()) return false;
+            if (i.contains("coinbase")) { x.coinbase = true; continue; }
+            if (!i.contains("prevout") || !i["prevout"].is_object()) return false;
+            const long long sats = btcSats(i["prevout"].value("value", json()));
+            if (sats < 0) return false;
+            x.in.push_back({spkAddr(i["prevout"]), sats});
         }
-        if (!page.is_array()) return false;
-        for (const auto& t : page) {
-            BTx x;
-            x.txid = jstr(t, "txid");
-            if (t.contains("vin") && t["vin"].is_array()) {
-                for (const auto& i : t["vin"]) {
-                    if (i.value("is_coinbase", false) || !i.contains("prevout") || !i["prevout"].is_object()) {
-                        x.coinbase = true;
-                        continue;
-                    }
-                    x.in.push_back({jstr(i["prevout"], "scriptpubkey_address"), jll(i["prevout"], "value")});
-                }
-            }
-            if (t.contains("vout") && t["vout"].is_array())
-                for (const auto& o : t["vout"]) x.out.push_back({jstr(o, "scriptpubkey_address"), jll(o, "value")});
-            if (x.in.empty()) x.coinbase = true;
-            b.txs.push_back(std::move(x));
+        if (x.in.empty()) x.coinbase = true;
+        for (const auto& o : t["vout"]) {
+            const long long sats = o.is_object() ? btcSats(o.value("value", json())) : -1;
+            if (sats < 0) return false;
+            x.out.push_back({spkAddr(o), sats});
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        out.push_back(std::move(x));
     }
-    return static_cast<long long>(b.txs.size()) == n;
+    b.txs = std::move(out);
+    return true;
+}
+
+// Блок целиком с первого узла, который отдаст его правильным. 90 секунд:
+// 3 МБ сжатого JSON на медленном узле.
+bool loadFromRpc(Block& b) {
+    return btcRpc("getblock", json::array({b.hash, 3}), 90, [&b](json& r) { return parseRpcBlock(r, b); });
 }
 
 // ── метки ────────────────────────────────────────────────────────────────
@@ -465,38 +587,6 @@ const std::vector<std::pair<const char*, const char*>> SEEDS = {
     {"bc1qs5vdqkusz4v7qac8ynx0vt9jrekwuupx2fl5udp9jql3sr03z3gsr2mf0f", "Bybit"},
 };
 
-// Кластеры бирж из раздела «Exchanges» walletexplorer.com. Остальные его
-// метки — пулы, казино, миксеры — для потока бирж не годятся.
-const std::unordered_set<std::string> WE_EXCHANGES = {
-    "Huobi.com", "Bittrex.com", "Luno.com", "Kraken.com", "Poloniex.com", "BTC-e.com", "BitZlato.com",
-    "Bitstamp.net", "LocalBitcoins.com", "MercadoBitcoin.com.br", "Cryptsy.com", "Binance.com", "Bitcoin.de",
-    "CoinSpot.com.au", "Cex.io", "BtcTrade.com", "YoBit.net", "OKCoin.com", "BTCC.com", "BX.in.th",
-    "HitBtc.com", "MaiCoin.com", "Bter.com", "Hashnest.com", "Bleutrade.com", "AnxPro.com", "BitBay.net",
-    "Bitfinex.com", "CoinMotion.com", "CoinHako.com", "Matbea.com", "Bit-x.com", "VirWoX.com", "Paxful.com",
-    "BitBargain.co.uk", "SpectroCoin.com", "Cavirtex.com", "C-Cex.com", "TheRockTrading.com", "FoxBit.com.br",
-    "Vircurex.com", "BitVC.com", "Exmo.com", "Btc38.com", "Igot.com", "BlockTrades.us", "SimpleCoin.cz",
-    "FYBSG.com", "CampBX.com", "CoinTrader.net", "Bitcurex.com", "Coinmate.io", "Korbit.co.kr", "Vaultoro.com",
-    "Exchanging.ir", "796.com", "HappyCoins.com", "BtcMarkets.net", "ChBtc.com", "CoinCafe.com", "LiteBit.eu",
-    "UrduBit.com", "BTradeAustralia.com", "MeXBT.com", "Coinomat.com", "OrderBook.net", "LakeBTC.com",
-    "BitKonan.com", "QuadrigaCX.com", "Banx.io", "CleverCoin.com", "Gatecoin.com", "Indacoin.com", "CoinArch.com",
-    "BitcoinVietnam.com.vn", "CoinChimp.com", "BitcoinP2P.com.br", "Coingi.com", "Cryptonit.net", "Bitso.com",
-    "Coinimal.com", "EmpoEX.com", "Ccedk.com", "UseCryptos.com", "Coinbroker.io",
-};
-
-// «Kraken.com-old» → кластер «Kraken.com» → на экране «Kraken».
-std::string weBase(const std::string& label) {
-    for (const char* keep : {"BTC-e.com", "Bit-x.com", "C-Cex.com"})
-        if (label.rfind(keep, 0) == 0) return keep;
-    auto dash = label.find('-');
-    return dash == std::string::npos ? label : label.substr(0, dash);
-}
-
-std::string exName(const std::string& base) {
-    if (base == "Bitcoin.de" || base == "Cex.io" || base == "796.com") return base == "Cex.io" ? "CEX.IO" : base == "796.com" ? "796" : base;
-    auto dot = base.find('.');
-    return dot == std::string::npos ? base : base.substr(0, dot);
-}
-
 // Тип адреса по виду: сдача почти всегда того же типа, что и входы.
 int addrType(const std::string& a) {
     if (a.rfind("bc1p", 0) == 0) return 4;
@@ -509,14 +599,10 @@ int addrType(const std::string& a) {
 struct Db {
     sqlite3_stmt* getLabel = nullptr;
     sqlite3_stmt* putLabel = nullptr;
-    sqlite3_stmt* getWe = nullptr;
-    sqlite3_stmt* putWe = nullptr;
-    sqlite3_stmt* getCluster = nullptr;
-    sqlite3_stmt* putCluster = nullptr;
     sqlite3_stmt* putMove = nullptr;
     sqlite3_stmt* putFlow = nullptr;
     ~Db() {
-        for (auto* s : {getLabel, putLabel, getWe, putWe, getCluster, putCluster, putMove, putFlow})
+        for (auto* s : {getLabel, putLabel, putMove, putFlow})
             if (s) sqlite3_finalize(s);
     }
 };
@@ -547,6 +633,9 @@ void execSql(const char* sql) {
 }
 
 // Число транзакций и остаток адреса — с mempool.space, запасной blockstream.
+// Это не разметка, а та же цепочка, посчитанная по адресу: у узла Bitcoin
+// индекса адресов нет (scantxoutset на публичных узлах закрыт). Со своим
+// узлом и индексатором (electrs) сюда встанет он.
 bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
     json j;
     for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
@@ -581,10 +670,6 @@ public:
                     "INSERT INTO btc_labels(address, ex, how, at) VALUES(?,?,?,?) "
                     "ON CONFLICT(address) DO UPDATE SET at=excluded.at "
                     "WHERE btc_labels.how != 'seed' AND btc_labels.ex = excluded.ex") &&
-               prep(&db_.getWe, "SELECT wid, label, at FROM btc_we WHERE address=?") &&
-               prep(&db_.putWe, "INSERT OR REPLACE INTO btc_we(address, wid, label, at) VALUES(?,?,?,?)") &&
-               prep(&db_.getCluster, "SELECT ex FROM btc_clusters WHERE wid=?") &&
-               prep(&db_.putCluster, "INSERT OR IGNORE INTO btc_clusters(wid, ex, at) VALUES(?,?,?)") &&
                prep(&db_.putMove,
                     "INSERT OR IGNORE INTO btc_moves(txid, height, ts, kind, wallet, ex, sats, usd_nanos, price_nanos) "
                     "VALUES(?,?,?,?,?,?,?,?,?)") &&
@@ -616,24 +701,6 @@ public:
         execSql("COMMIT");
     }
 
-    // Кластеры проверенных адресов: всё, что walletexplorer сведёт в тот же
-    // кластер, — та же биржа.
-    void seedClusters() {
-        for (const auto& [a, ex] : SEEDS) {
-            std::string wid, label;
-            if (!weLookup(a, wid, label)) continue;
-            if (!wid.empty()) {
-                std::lock_guard<std::mutex> l(g_btcDbMutex);
-                sqlite3_reset(db_.putCluster);
-                bindText(db_.putCluster, 1, wid);
-                bindText(db_.putCluster, 2, ex);
-                sqlite3_bind_int64(db_.putCluster, 3, nowSec());
-                sqlite3_step(db_.putCluster);
-            }
-            if (!sleepFor(1)) return;
-        }
-    }
-
     enum class Result { DONE, REORG };
 
     Result process(const Block& b) {
@@ -656,10 +723,8 @@ public:
                 return Result::DONE;
             }
         }
-        lookups_ = 0;
         touched_.clear();
         touchLabel_.clear();
-        enrich(b);
         reloadWatch();
         const long long price = priceAt(b.ts);
         int moves = 0, learned = 0;
@@ -674,7 +739,7 @@ public:
         autoWatch();
         sendAlerts();
         std::cout << "[BTC] block " << b.height << ": " << b.txs.size() << " tx, " << moves << " moves, "
-                  << learned << " new labels, " << lookups_ << " lookups" << std::endl;
+                  << learned << " new labels" << std::endl;
         return Result::DONE;
     }
 
@@ -1061,7 +1126,6 @@ public:
 
 private:
     Db db_;
-    int lookups_ = 0;
     std::vector<std::string> touched_;
     // Кандидаты автопоиска → когда найдены. Живут между блоками, пока их не
     // проверят (AUTO_PEND_TTL).
@@ -1469,77 +1533,6 @@ private:
         return best >= 5;
     }
 
-    // Ответ walletexplorer: кластер и, если есть, его имя. false — сервис не
-    // ответил, повторим в другой раз.
-    bool weLookup(const std::string& a, std::string& wid, std::string& lab) {
-        std::string r = fetch("https://www.walletexplorer.com/api/1/address?address=" + a +
-                              "&from=0&count=0&caller=whalescanner", 15);
-        json j = json::parse(r, nullptr, false);
-        if (!j.is_object()) return false;
-        wid = jstr(j, "wallet_id");
-        lab = jstr(j, "label");
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        sqlite3_reset(db_.putWe);
-        bindText(db_.putWe, 1, a);
-        bindText(db_.putWe, 2, wid);
-        bindText(db_.putWe, 3, lab);
-        sqlite3_bind_int64(db_.putWe, 4, nowSec());
-        sqlite3_step(db_.putWe);
-        return true;
-    }
-
-    // Биржа по кластеру: проверенный кластер или биржевая метка сервиса.
-    std::string exOfCluster(const std::string& wid, const std::string& lab) {
-        if (!lab.empty() && WE_EXCHANGES.count(weBase(lab))) return exName(weBase(lab));
-        if (wid.empty()) return "";
-        sqlite3_reset(db_.getCluster);
-        bindText(db_.getCluster, 1, wid);
-        return sqlite3_step(db_.getCluster) == SQLITE_ROW ? colText(db_.getCluster, 0) : "";
-    }
-
-    // Для крупных транзакций без известных меток спрашиваем разметку: главный
-    // вход и крупные выходы. До разбора блока — чтобы разбор уже знал ответы.
-    void enrich(const Block& b) {
-        std::vector<std::pair<long long, std::string>> ask;
-        std::unordered_set<std::string> seen;
-        {
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            for (const auto& tx : b.txs) {
-                if (tx.coinbase || tx.in.empty() || coinjoin(tx) || tx.outSum() < LOOKUP_MIN_SATS) continue;
-                const BIn* top = &tx.in[0];
-                for (const auto& i : tx.in) if (i.sats > top->sats) top = &i;
-                std::vector<std::pair<long long, std::string>> cand{{tx.outSum(), top->addr}};
-                for (const auto& o : tx.out) if (o.sats >= LOOKUP_MIN_SATS) cand.emplace_back(o.sats, o.addr);
-                for (const auto& [sats, a] : cand) {
-                    if (a.empty() || !seen.insert(a).second || !label(a).empty()) continue;
-                    sqlite3_reset(db_.getWe);
-                    bindText(db_.getWe, 1, a);
-                    if (sqlite3_step(db_.getWe) == SQLITE_ROW) {
-                        std::string wid = colText(db_.getWe, 0), lab = colText(db_.getWe, 1);
-                        long long at = sqlite3_column_int64(db_.getWe, 2);
-                        std::string ex = exOfCluster(wid, lab);
-                        if (!ex.empty()) { putLabel(a, ex, "we"); continue; }
-                        if (nowSec() - at < WE_EMPTY_TTL) continue;
-                    }
-                    ask.emplace_back(sats, a);
-                }
-            }
-        }
-        // Крупнее — важнее: если лимит кончится, без ответа останутся мелкие.
-        std::sort(ask.begin(), ask.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-        for (const auto& [sats, a] : ask) {
-            if (lookups_ >= LOOKUPS_PER_BLOCK) break;
-            ++lookups_;
-            std::string wid, lab;
-            if (!weLookup(a, wid, lab)) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-                continue;
-            }
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            std::string ex = exOfCluster(wid, lab);
-            if (!ex.empty()) putLabel(a, ex, "we");
-        }
-    }
 };
 
 bool openDb() {
@@ -1556,15 +1549,15 @@ bool openDb() {
         "PRAGMA synchronous=NORMAL;"
         // Чей адрес. how: seed — проверен вручную, cospend — потрачен вместе
         // с биржевым, sweep — сметён в горячий кошелёк, move — перекладка
-        // без сдачи, we — разметка walletexplorer.
+        // без сдачи, bounce — круг через свой адрес.
         "CREATE TABLE IF NOT EXISTS btc_labels ("
         "  address TEXT PRIMARY KEY, ex TEXT NOT NULL, how TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0);"
         "CREATE INDEX IF NOT EXISTS idx_btc_labels_at ON btc_labels(at);"
-        "CREATE TABLE IF NOT EXISTS btc_we ("
-        "  address TEXT PRIMARY KEY, wid TEXT NOT NULL DEFAULT '', label TEXT NOT NULL DEFAULT '',"
-        "  at INTEGER NOT NULL DEFAULT 0);"
-        "CREATE TABLE IF NOT EXISTS btc_clusters ("
-        "  wid TEXT PRIMARY KEY, ex TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0);"
+        // Чужую разметку (walletexplorer) больше не берём: её метки, ответы
+        // и кластеры со старых баз стираем.
+        "DELETE FROM btc_labels WHERE how = 'we';"
+        "DROP TABLE IF EXISTS btc_we;"
+        "DROP TABLE IF EXISTS btc_clusters;"
         // kind 1 — вывод с биржи (покупка), 2 — завод на биржу (продажа).
         "CREATE TABLE IF NOT EXISTS btc_moves ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -1612,12 +1605,10 @@ void cleanup() {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     const long long cut = nowSec() - KEEP_SEC;
     const std::string c = std::to_string(cut);
-    const std::string w = std::to_string(nowSec() - WE_EMPTY_TTL);
     execSql(("DELETE FROM btc_moves WHERE ts < " + c + ";"
              "DELETE FROM btc_flow WHERE ts < " + c + ";"
              "DELETE FROM btc_labels WHERE how != 'seed' AND at < " + std::to_string(nowSec() - LEARNED_TTL) + ";"
-             "DELETE FROM btc_blocks WHERE ts < " + std::to_string(nowSec() - 30LL * 86400LL) + ";"
-             "DELETE FROM btc_we WHERE wid = '' AND label = '' AND at < " + w + ";").c_str());
+             "DELETE FROM btc_blocks WHERE ts < " + std::to_string(nowSec() - 30LL * 86400LL) + ";").c_str());
 }
 
 // Тот же срок, что AUTO_IDLE_SEC в main.cpp: столько без движений —
@@ -1686,12 +1677,6 @@ void btcLoop() {
         sc.cancelBounces();
         sc.setStateLocked("bounce", "1");
     }
-    // Номер — версия списка SEEDS: список вырос — кластеры новых адресов
-    // надо спросить заново.
-    if (sc.state("clusters") != "3") {
-        sc.seedClusters();
-        sc.setStateLocked("clusters", "3");
-    }
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
 
@@ -1718,10 +1703,9 @@ void btcLoop() {
                 b.height = last + 1;
                 b.hash = hashAt(b.height);
                 if (b.hash.empty()) break;
-                if (!loadFromBlockchainInfo(b.hash, b)) {
-                    std::cerr << "[BTC] blockchain.info не отдал блок " << b.height << ", беру с mempool.space" << std::endl;
-                    b.txs.clear();
-                    if (!loadFromEsplora(b.hash, b)) break;
+                if (!loadFromRpc(b)) {
+                    std::cerr << "[BTC] ни один узел не отдал блок " << b.height << ", повторю через полминуты" << std::endl;
+                    break;
                 }
                 if (sc.process(b) == Scanner::Result::REORG) {
                     last = b.height - 2;
@@ -2029,7 +2013,7 @@ std::string btcStatsLine() {
             out += " " + colText(s, 0) + " " + std::to_string(sqlite3_column_int64(s, 1)) + ";";
         sqlite3_finalize(s);
     }
-    out += "\nОтветов walletexplorer в памяти: " + std::to_string(one("SELECT COUNT(*) FROM btc_we"));
+    out += "\nУзлы Bitcoin: " + std::to_string(rpcPool().size());
 
     out += "\n\n<b>База сервисного аккаунта</b>: " + std::to_string(btcWatchCount()) +
            (WATCH_MAX > 0 ? " / " + std::to_string(WATCH_MAX) : std::string(" (без потолка)")) +
