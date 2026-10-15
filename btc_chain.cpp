@@ -52,6 +52,7 @@
 #include <curl/curl.h>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <sqlite3.h>
 
@@ -69,6 +70,24 @@ sqlite3* g_btcDb = nullptr;
 std::mutex g_btcDbMutex;
 std::atomic<bool> g_btcRunning{false};
 std::thread g_btcThread;
+
+// Счётчики для /statsbtc — как у BSC в /stats: с запуска бота.
+struct BtcStats {
+    std::atomic<long long> startedAt{0};
+    std::atomic<long long> tip{0}, lag{0}, maxLag{0};
+    std::atomic<long long> blocks{0}, txs{0}, ins{0}, outs{0}, moves{0}, alerts{0};
+    std::atomic<long long> reorgs{0}, skipped{0}, loadFails{0};
+    std::atomic<long long> loadMs{0}, loadMsSum{0};
+    std::atomic<long long> bytes{0};
+    std::atomic<long long> addrAsked{0}, addrFailed{0};
+    // Разбор транзакций: куда отнесена каждая.
+    std::atomic<long long> fromEx{0}, toEx{0}, sweep{0}, move{0}, bounce{0}, mixed{0}, coinjoin{0},
+        coinbase{0}, plain{0};
+    // Последняя самоочистка: когда и сколько снято.
+    std::atomic<long long> cleanAt{0}, cleanFlow{0}, cleanAddr{0}, cleanEmpty{0}, cleanOld{0};
+} g_bs;
+
+void bump(std::atomic<long long>& c, long long n = 1) { c.fetch_add(n, std::memory_order_relaxed); }
 
 long long envSats(const char* key, double defBtc) {
     const char* v = std::getenv(key);
@@ -233,6 +252,8 @@ std::string request(const std::string& url, const std::string* post, long timeou
     long code = 0;
     curl_easy_getinfo(c.h, CURLINFO_RESPONSE_CODE, &code);
     if (status) *status = code;
+    curl_off_t got = 0;
+    if (curl_easy_getinfo(c.h, CURLINFO_SIZE_DOWNLOAD_T, &got) == CURLE_OK && got > 0) bump(g_bs.bytes, got);
     if (rc != CURLE_OK) {
         std::cerr << "[BTC] " << curl_easy_strerror(rc) << " | " << safeUrl(url) << std::endl;
         return "";
@@ -301,18 +322,32 @@ const std::vector<std::string>& rpcPool() {
 // каждый блок не ждал его таймаута. Ошибка RPC (узел ещё не видел блок) —
 // не поломка, её не штрафуем.
 constexpr long long NODE_REST_SEC = 300;
+struct NodeStat { long long rest = 0, ok = 0, fail = 0, ms = 0, lastOk = 0; };
 std::mutex g_nodeMutex;
-std::vector<long long> g_nodeRest;
+std::vector<NodeStat> g_nodes;
+
+NodeStat& nodeAt(size_t i) {
+    if (g_nodes.size() < rpcPool().size()) g_nodes.resize(rpcPool().size());
+    return g_nodes[i];
+}
 
 bool nodeResting(size_t i) {
     std::lock_guard<std::mutex> l(g_nodeMutex);
-    return i < g_nodeRest.size() && g_nodeRest[i] > nowSec();
+    return nodeAt(i).rest > nowSec();
 }
 
 void restNode(size_t i) {
     std::lock_guard<std::mutex> l(g_nodeMutex);
-    if (g_nodeRest.size() < rpcPool().size()) g_nodeRest.resize(rpcPool().size(), 0);
-    g_nodeRest[i] = nowSec() + NODE_REST_SEC;
+    nodeAt(i).rest = nowSec() + NODE_REST_SEC;
+    ++nodeAt(i).fail;
+}
+
+void nodeOk(size_t i, long long ms) {
+    std::lock_guard<std::mutex> l(g_nodeMutex);
+    NodeStat& n = nodeAt(i);
+    ++n.ok;
+    n.ms += ms;
+    n.lastOk = nowSec();
 }
 
 // Вызов RPC по очереди узлов. take — проверить и забрать ответ: false —
@@ -328,14 +363,17 @@ bool btcRpc(const std::string& method, const json& params, long timeout, const s
         if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
         bool ok = false;
         long code = 0;
+        const auto t0 = std::chrono::steady_clock::now();
         json j = json::parse(request(pool[i], &body, timeout, &code, ok), nullptr, false);
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
         if (ok && j.is_object() && j.contains("error") && !j["error"].is_null()) continue;
         if (!ok || !j.is_object() || !j.contains("result")) {
             if (ok) std::cerr << "[BTC] узел " << safeUrl(pool[i]) << ": " << method << " → HTTP " << code << std::endl;
             restNode(i);
             continue;
         }
-        if (take(j["result"])) return true;
+        if (take(j["result"])) { nodeOk(i, ms); return true; }
         std::cerr << "[BTC] узел " << safeUrl(pool[i]) << ": " << method << " — ответ не годится" << std::endl;
         restNode(i);
     }
@@ -637,12 +675,16 @@ void execSql(const char* sql) {
 // индекса адресов нет (scantxoutset на публичных узлах закрыт). Со своим
 // узлом и индексатором (electrs) сюда встанет он.
 bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
+    bump(g_bs.addrAsked);
     json j;
     for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
         j = json::parse(fetch(host + a, 10), nullptr, false);
         if (j.is_object() && j.contains("chain_stats")) break;
     }
-    if (!j.is_object() || !j.contains("chain_stats") || !j["chain_stats"].is_object()) return false;
+    if (!j.is_object() || !j.contains("chain_stats") || !j["chain_stats"].is_object()) {
+        bump(g_bs.addrFailed);
+        return false;
+    }
     const auto& c = j["chain_stats"];
     txs = jll(c, "tx_count");
     bal = jll(c, "funded_txo_sum") - jll(c, "spent_txo_sum");
@@ -735,6 +777,13 @@ public:
             scan(b, price, moves, learned);
             execSql("COMMIT");
         }
+        bump(g_bs.blocks);
+        bump(g_bs.txs, static_cast<long long>(b.txs.size()));
+        for (const auto& tx : b.txs) {
+            bump(g_bs.ins, static_cast<long long>(tx.in.size()));
+            bump(g_bs.outs, static_cast<long long>(tx.out.size()));
+        }
+        bump(g_bs.moves, moves);
         addrStats();
         autoWatch();
         sendAlerts();
@@ -853,6 +902,9 @@ public:
             // клиентам с пятью одинаковыми суммами (по 0,01 BTC) выглядит так
             // же, а биржи в CoinJoin не участвуют. Раньше такие выводы терялись.
             const bool plain = basic && (!exIn.empty() || !coinjoin(tx));
+            if (!basic) bump(g_bs.coinbase);
+            else if (!plain) bump(g_bs.coinjoin);
+            else if (mixed) bump(g_bs.mixed);
 
             if (plain && !mixed && !exIn.empty()) {
                 // Со своих адресов биржи. Свой кошелёк, потраченный вместе с
@@ -879,8 +931,10 @@ public:
                     // кошельками: клиенту биржа так не платит.
                     putLabel(rest.begin()->first, exIn, "move");
                     ++learned;
+                    bump(g_bs.move);
                     continue;
                 }
+                bump(g_bs.fromEx);
                 if (!back && rest.size() >= 2) {
                     // Сдача ушла на новый адрес биржи — угадываем её: тот же
                     // тип, что у входов, и самая крупная. Свой кошелёк сдачей
@@ -938,6 +992,9 @@ public:
                     toEx[e] += o.sats;
                     toExN[e] += 1;
                 }
+                // Каждая транзакция — ровно в одну графу разбора; круг
+                // ниже переносит её из заводов в круги.
+                bump(sweep ? g_bs.sweep : toEx.empty() ? g_bs.plain : g_bs.toEx);
                 if (!toEx.empty() && !sender->addr.empty() && !(sweep && !mine(sender->addr))) {
                     // Строка одна на транзакцию: вся сумма на биржи, биржа —
                     // та, куда ушло больше.
@@ -945,6 +1002,7 @@ public:
                     std::string ex;
                     for (const auto& [e, v] : toEx) { total += v; if (v > best) { best = v; ex = e; } }
                     const bool round = toEx.size() == 1 && unBounce(sender->addr, ex, total, b, flow);
+                    if (round && !sweep) { bump(g_bs.toEx, -1); bump(g_bs.bounce); }
                     if (round) {
                         // Круг: ни вывода, ни завода не было — потоки назад.
                         auto& f = flow[ex];
@@ -1383,7 +1441,7 @@ private:
         alerts_.clear();
         for (auto& [k, a] : merged) {
             enrichAlert(a);
-            if (sink) sink(a);
+            if (sink) { sink(a); bump(g_bs.alerts); }
         }
     }
 
@@ -1601,14 +1659,57 @@ bool openDb() {
     return true;
 }
 
+// Сколько строк снял запрос — для /statsbtc.
+long long execCount(const std::string& sql, long long arg) {
+    sqlite3_stmt* s = nullptr;
+    if (!prep(&s, sql.c_str())) return 0;
+    sqlite3_bind_int64(s, 1, arg);
+    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    sqlite3_finalize(s);
+    return ok ? sqlite3_changes(g_btcDb) : 0;
+}
+
+// Самоочистка раз в час — как у BSC (processed_tx и сжатие WAL):
+//   • вклад блока в потоки нужен только для отката при перестройке; блок
+//     глубже FINAL_DEPTH уже не перестроится — снимаем, это самая толстая
+//     часть строки блока;
+//   • сами блоки — 30 дней, движения и потоки — 400 дней, выученные адреса
+//     без встреч — 90 дней;
+//   • снимок адреса (число транзакций, остаток) старше недели всё равно
+//     спросят заново; держим только тех, кто на досках (btc_moves) или в
+//     базе (btc_watch) — их читает API;
+//   • строки потоков, обнулённые кругами и откатами;
+//   • журнал WAL — обратно в ноль, как у BSC.
+constexpr long long FINAL_DEPTH = 12;
+
 void cleanup() {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
-    const long long cut = nowSec() - KEEP_SEC;
-    const std::string c = std::to_string(cut);
-    execSql(("DELETE FROM btc_moves WHERE ts < " + c + ";"
-             "DELETE FROM btc_flow WHERE ts < " + c + ";"
-             "DELETE FROM btc_labels WHERE how != 'seed' AND at < " + std::to_string(nowSec() - LEARNED_TTL) + ";"
-             "DELETE FROM btc_blocks WHERE ts < " + std::to_string(nowSec() - 30LL * 86400LL) + ";").c_str());
+    const long long now = nowSec();
+    const long long cut = now - KEEP_SEC;
+    long long old = 0;
+    old += execCount("DELETE FROM btc_moves WHERE ts < ?", cut);
+    old += execCount("DELETE FROM btc_flow WHERE ts < ?", cut);
+    old += execCount("DELETE FROM btc_labels WHERE how != 'seed' AND at < ?", now - LEARNED_TTL);
+    old += execCount("DELETE FROM btc_blocks WHERE ts < ?", now - 30LL * 86400LL);
+    const long long flow = execCount(
+        "UPDATE btc_blocks SET flow = NULL WHERE flow IS NOT NULL "
+        "AND height < (SELECT MAX(height) FROM btc_blocks) - ?", FINAL_DEPTH);
+    const long long addr = execCount(
+        "DELETE FROM btc_addr WHERE at < ? "
+        "AND NOT EXISTS (SELECT 1 FROM btc_watch w WHERE w.address = btc_addr.address) "
+        "AND NOT EXISTS (SELECT 1 FROM btc_moves m WHERE m.wallet = btc_addr.address)", now - ADDR_TTL);
+    const long long empty = execCount(
+        "DELETE FROM btc_flow WHERE in_sats <= 0 AND out_sats <= 0 AND in_n <= 0 AND out_n <= 0 AND ts < ?",
+        now - 3600);
+    sqlite3_wal_checkpoint_v2(g_btcDb, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
+    g_bs.cleanAt = now;
+    g_bs.cleanFlow = flow;
+    g_bs.cleanAddr = addr;
+    g_bs.cleanEmpty = empty;
+    g_bs.cleanOld = old;
+    if (flow + addr + empty + old > 0)
+        std::cout << "[BTC] очистка: откатов блоков " << flow << ", снимков адресов " << addr
+                  << ", пустых потоков " << empty << ", старых строк " << old << std::endl;
 }
 
 // Тот же срок, что AUTO_IDLE_SEC в main.cpp: столько без движений —
@@ -1677,6 +1778,7 @@ void btcLoop() {
         sc.cancelBounces();
         sc.setStateLocked("bounce", "1");
     }
+    g_bs.startedAt = nowSec();
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
 
@@ -1684,6 +1786,7 @@ void btcLoop() {
         try {
             long long tip = tipHeight();
             if (tip <= 0) { if (!sleepFor(30)) break; continue; }
+            g_bs.tip = tip;
             long long last = 0;
             {
                 std::string v = sc.state("height");
@@ -1691,6 +1794,7 @@ void btcLoop() {
             }
             if (last <= 0 || tip - last > MAX_BEHIND) {
                 long long from = tip - (last <= 0 ? 1 : 6);
+                if (last > 0) bump(g_bs.skipped, from - last);
                 if (last > 0)
                     std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
                               << " пропущены" << std::endl;
@@ -1698,20 +1802,39 @@ void btcLoop() {
                 last = from;
                 sc.setStateLocked("height", std::to_string(last));
             }
+            // Отставание — как Lag у BSC: сколько блоков сети ещё не разобрано.
+            auto setLag = [&last, tip] {
+                const long long lag = std::max(0LL, tip - last);
+                g_bs.lag = lag;
+                if (lag > g_bs.maxLag.load()) g_bs.maxLag = lag;
+            };
+            setLag();
             while (last < tip && running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
                 Block b;
                 b.height = last + 1;
                 b.hash = hashAt(b.height);
                 if (b.hash.empty()) break;
-                if (!loadFromRpc(b)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool loaded = loadFromRpc(b);
+                if (loaded) {
+                    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    g_bs.loadMs = ms;
+                    bump(g_bs.loadMsSum, ms);
+                }
+                if (!loaded) {
+                    bump(g_bs.loadFails);
                     std::cerr << "[BTC] ни один узел не отдал блок " << b.height << ", повторю через полминуты" << std::endl;
                     break;
                 }
                 if (sc.process(b) == Scanner::Result::REORG) {
+                    bump(g_bs.reorgs);
                     last = b.height - 2;
+                    setLag();
                     continue;
                 }
                 last = b.height;
+                setLag();
             }
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshIdleBalances();
@@ -1996,10 +2119,104 @@ std::string btcStatsLine() {
         }
         sqlite3_finalize(s);
     }
-    std::string out = "₿ <b>Bitcoin</b>\n\n<b>Сканер</b>\nПоследний блок: " + std::to_string(height);
-    if (ts) out += " (" + std::to_string((nowSec() - ts) / 60) + " мин назад)";
-    out += "\nБлоков за сутки: " + std::to_string(one("SELECT COUNT(*) FROM btc_blocks WHERE ts >= ?", day));
-    if (price) out += "\nЦена: $" + std::to_string(price / 1000000000LL);
+    // Числа — с пробелами по разрядам, время — коротко, как в /stats BSC.
+    auto num = [](long long v) {
+        std::string d = std::to_string(v < 0 ? -v : v), r;
+        for (size_t i = 0; i < d.size(); ++i) {
+            if (i && (d.size() - i) % 3 == 0) r += ' ';
+            r += d[i];
+        }
+        return (v < 0 ? "-" : "") + r;
+    };
+    auto ago = [](long long sec) {
+        if (sec < 0) sec = 0;
+        if (sec < 120) return std::to_string(sec) + " с";
+        if (sec < 7200) return std::to_string(sec / 60) + " мин";
+        if (sec < 2 * 86400) return std::to_string(sec / 3600) + " ч " + std::to_string(sec % 3600 / 60) + " мин";
+        return std::to_string(sec / 86400) + " д " + std::to_string(sec % 86400 / 3600) + " ч";
+    };
+    auto secs = [](long long ms) {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "%.1f с", static_cast<double>(ms) / 1000.0);
+        std::string r = buf;
+        for (auto& ch : r) if (ch == '.') ch = ',';
+        return r;
+    };
+    auto mb = [](long long bytes) {
+        char buf[32];
+        if (bytes >= (10LL << 30)) std::snprintf(buf, sizeof buf, "%.1f ГБ", static_cast<double>(bytes) / (1LL << 30));
+        else std::snprintf(buf, sizeof buf, "%.0f МБ", static_cast<double>(bytes) / (1LL << 20));
+        std::string r = buf;
+        for (auto& ch : r) if (ch == '.') ch = ',';
+        return r;
+    };
+    const long long now = nowSec();
+    const long long started = g_bs.startedAt.load();
+    const long long blocks = g_bs.blocks.load();
+
+    std::string out = "₿ <b>Bitcoin</b>\n\n<b>Сканер</b>";
+    out += "\n⏳ Lag: " + num(g_bs.lag.load()) + " blocks (max: " + num(g_bs.maxLag.load()) + ")";
+    out += "\n⛓ Сеть: блок " + num(g_bs.tip.load()) + " · разобран " + num(height);
+    if (ts) out += " (" + ago(now - ts) + " назад)";
+    if (started) out += "\n⏱ Работает: " + ago(now - started);
+    out += "\n📦 Блоков: " + num(blocks) + " с запуска · " +
+           num(one("SELECT COUNT(*) FROM btc_blocks WHERE ts >= ?", day)) + " за сутки";
+    out += "\n🔄 Перестроек: " + num(g_bs.reorgs.load()) + " · пропущено при простое: " + num(g_bs.skipped.load()) +
+           " · не загрузилось: " + num(g_bs.loadFails.load());
+    out += "\n🔍 TX: " + num(g_bs.txs.load()) + " с запуска · " +
+           num(one("SELECT COALESCE(SUM(txs), 0) FROM btc_blocks WHERE ts >= ?", day)) + " за сутки";
+    out += "\n↔️ Входов " + num(g_bs.ins.load()) + " · выходов " + num(g_bs.outs.load());
+    out += "\n📝 Движений записано: " + num(g_bs.moves.load()) + " · 📨 алертов: " + num(g_bs.alerts.load());
+    if (blocks > 0)
+        out += "\n⚡ Блок грузится: " + secs(g_bs.loadMs.load()) + " (среднее " + secs(g_bs.loadMsSum.load() / blocks) + ")";
+    out += "\n📶 Трафик: " + mb(g_bs.bytes.load()) + " с запуска";
+    if (price) out += "\n💰 Цена: $" + num(price / 1000000000LL);
+
+    {
+        std::lock_guard<std::mutex> n(g_nodeMutex);
+        const auto& pool = rpcPool();
+        out += "\n\n🌐 <b>Узлы Bitcoin</b> (" + std::to_string(pool.size()) + ")";
+        for (size_t i = 0; i < pool.size(); ++i) {
+            const NodeStat& st = nodeAt(i);
+            std::string host = safeUrl(pool[i]);
+            const auto sch = host.find("://");
+            if (sch != std::string::npos) host = host.substr(sch + 3);
+            const auto slash = host.find('/');
+            if (slash != std::string::npos) host = host.substr(0, slash);
+            out += "\n· " + host + " — " + (st.rest > now ? "💤 отдыхает" : st.ok ? "✅" : "⏸ запасной") +
+                   " ок " + num(st.ok) + " · сбоев " + num(st.fail);
+            if (st.ok) out += " · " + secs(st.ms / st.ok);
+        }
+    }
+    out += "\n📇 Адреса (mempool.space): запросов " + num(g_bs.addrAsked.load()) + " · сбоев " +
+           num(g_bs.addrFailed.load());
+
+    out += "\n\n📈 <b>Разбор транзакций</b> (с запуска)"
+           "\n🟢 С биржи (выводы): " + num(g_bs.fromEx.load()) +
+           "\n🚨 На биржу (заводы): " + num(g_bs.toEx.load()) +
+           "\n🧺 Сбор депозитов: " + num(g_bs.sweep.load()) +
+           "\n🔁 Перекладки биржи: " + num(g_bs.move.load()) +
+           "\n♻️ Круги через свой адрес: " + num(g_bs.bounce.load()) +
+           "\n🔀 Несколько бирж во входах: " + num(g_bs.mixed.load()) +
+           "\n🌀 CoinJoin: " + num(g_bs.coinjoin.load()) +
+           "\n⛏ Coinbase: " + num(g_bs.coinbase.load()) +
+           "\n📤 Без бирж: " + num(g_bs.plain.load());
+
+    {
+        const long long at = g_bs.cleanAt.load();
+        out += "\n\n🧹 <b>Самоочистка</b> (раз в час)";
+        if (at)
+            out += "\nПоследняя: " + ago(now - at) + " назад · откатов блоков " + num(g_bs.cleanFlow.load()) +
+                   " · снимков адресов " + num(g_bs.cleanAddr.load()) + " · пустых потоков " +
+                   num(g_bs.cleanEmpty.load()) + " · старых строк " + num(g_bs.cleanOld.load());
+        else
+            out += "\nЕщё не было";
+        struct stat st{};
+        const std::string file = btcDbFile();
+        long long dbSize = stat(file.c_str(), &st) == 0 ? static_cast<long long>(st.st_size) : 0;
+        long long walSize = stat((file + "-wal").c_str(), &st) == 0 ? static_cast<long long>(st.st_size) : 0;
+        out += "\n💾 База: " + mb(dbSize) + " · WAL " + mb(walSize);
+    }
 
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
     if (prep(&s, "SELECT how, COUNT(*) FROM btc_labels GROUP BY how ORDER BY 2 DESC")) {
@@ -2013,7 +2230,6 @@ std::string btcStatsLine() {
             out += " " + colText(s, 0) + " " + std::to_string(sqlite3_column_int64(s, 1)) + ";";
         sqlite3_finalize(s);
     }
-    out += "\nУзлы Bitcoin: " + std::to_string(rpcPool().size());
 
     out += "\n\n<b>База сервисного аккаунта</b>: " + std::to_string(btcWatchCount()) +
            (WATCH_MAX > 0 ? " / " + std::to_string(WATCH_MAX) : std::string(" (без потолка)")) +
