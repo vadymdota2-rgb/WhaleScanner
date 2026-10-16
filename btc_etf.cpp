@@ -1,6 +1,7 @@
 // Биржевые фонды в сети Bitcoin. Что и почему — в btc_etf.h.
 #include "btc_etf.h"
 #include "btc_etf_book.h"
+#include "btc_etf_list.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <mutex>
 #include <set>
 #include <unordered_map>
+#include <utility>
 
 namespace {
 
@@ -22,7 +24,8 @@ constexpr long long CHECK_SEC = 86400;
 
 // Плата за управление, базисные пункты в год (проспект фонда). Нужна, чтобы
 // отличить её от оттока инвесторов.
-const std::map<std::string, int> FEE_BPS = {{"BITB", 20}};
+// Плата за управление, базисные пункты в год (проспекты фондов).
+const std::map<std::string, int> FEE_BPS = {{"BITB", 20}, {"HODL", 20}, {"BTCW", 25}, {"EZBC", 19}, {"IBIT", 25}};
 
 enum Kind { IN = 1, OUT = 2, FEE = 3, INTERNAL = 4 };
 
@@ -151,6 +154,33 @@ void unOut(sqlite3* db, const std::string& fund, const std::string& addr) {
     }
     if (!rows.empty())
         std::cout << "[ETF] " << fund << ": " << addr << " — свой кошелёк, снято оттоков: " << rows.size() << std::endl;
+}
+
+// Платил ли фонд на этот адрес раньше (отток) — тогда это участник фонда.
+bool paidBefore(sqlite3* db, const std::string& fund, const std::string& addr) {
+    Stmt q(db, "SELECT 1 FROM btc_etf_moves WHERE fund=? AND peer=? AND kind=2 LIMIT 1");
+    q.text(1, fund).text(2, addr);
+    return q.row();
+}
+
+// Новый ли адрес в цепочке (первая его трата — эта): спрашивает btc_chain.
+EtfFreshCheck g_fresh;
+std::map<std::string, int> g_freshMemo;  // только твёрдые ответы: 1 — новый, 0 — жил раньше
+
+bool freshAddr(const std::string& addr, const std::string& txid, long long height) {
+    if (auto it = g_freshMemo.find(addr); it != g_freshMemo.end()) return it->second == 1;
+    const int r = g_fresh ? g_fresh(addr, txid, height) : -1;
+    if (r >= 0) g_freshMemo[addr] = r;
+    return r == 1;
+}
+
+// Переезд учим только у фондов без опубликованного списка: у BITB список
+// кошельков фонд ведёт сам, и чужой адрес в его запас не попадёт.
+bool learnableMove(const std::string& addr, const std::string& fund) {
+    for (const auto& [a, f] : BTC_ETF_BOOK)
+        if (fund == f) return false;
+    std::lock_guard<std::mutex> l(g_mx);
+    return !addr.empty() && !g_service.count(addr);
 }
 
 bool learnable(const std::string& addr, const std::string& fund) {
@@ -327,6 +357,25 @@ void scanTx(sqlite3* db, const Block& b, const BTx& tx) {
             if (f == fund) continue;
             dest[o.addr] += o.sats;
         }
+        // Переезд: фонд отдал почти всё, что тратил (от 90 %), и не меньше
+        // половины всего запаса, на адрес, которого до этой траты в цепочке не
+        // было и которому фонд раньше не платил, — это его новый кошелёк, а не
+        // отток. Так хранитель перекладывает запас: старый адрес пустеет, новый
+        // держит всё. Старый чужой кошелёк (39wVd42… жил с 2023 года и принял
+        // от HODL 8 975 BTC) переездом не считается: это отток.
+        const long long spent = inF.begin()->second;
+        const long long held = holdings(db, fund);
+        for (auto it = dest.begin(); it != dest.end();) {
+            if (it->second * 10 >= spent * 9 && it->second * 2 >= held && fundOf(it->first).empty() &&
+                !paidBefore(db, fund, it->first) && learnableMove(it->first, fund) &&
+                freshAddr(it->first, tx.txid, b.height)) {
+                learn(db, it->first, fund, b.height);
+                std::cout << "[ETF] " << fund << ": запас переехал на " << it->first << std::endl;
+                it = dest.erase(it);
+            } else {
+                ++it;
+            }
+        }
         for (const auto& [a, v] : dest) {
             const std::string other = fundOf(a);
             putMove(db, b, tx, fund, !other.empty() || !isFee(db, fund, v, b.ts) ? OUT : FEE, v, a);
@@ -387,6 +436,8 @@ void etfVaultRead(sqlite3* db, const std::string& address) {
     Stmt q(db, "UPDATE btc_cust_vault SET read=1 WHERE address=?");
     q.text(1, address).run();
 }
+
+void etfSetFreshCheck(EtfFreshCheck f) { g_fresh = std::move(f); }
 
 std::vector<std::string> etfAddresses() {
     std::lock_guard<std::mutex> l(g_mx);
@@ -460,12 +511,20 @@ void etfOpen(sqlite3* db) {
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='seed'");
         q.text(1, a).text(2, fund).num(3, now()).run();
     }
+    // Кошельки из чужих списков, проверенные по цепочке (btc_etf_list.h):
+    // опубликованного фондом не трогают, выученное — уточняют.
+    for (const auto& [a, fund] : BTC_ETF_LIST) {
+        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'list',?) "
+                   "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list' WHERE btc_etf_addr.how != 'seed'");
+        q.text(1, a).text(2, fund).num(3, now()).run();
+    }
     sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
     std::lock_guard<std::mutex> l(g_mx);
     g_fund.clear();
     g_types.clear();
     g_service.clear();
     for (const auto& [a, fund] : BTC_ETF_BOOK) g_types[fund].insert(addrType(a));
+    for (const auto& [a, fund] : BTC_ETF_LIST) g_types[fund].insert(addrType(a));
     Stmt q(db, "SELECT address, fund FROM btc_etf_addr");
     while (q.row()) g_fund[q.str(0)] = q.str(1);
     Stmt v(db, "SELECT address, fee FROM btc_etf_svc");

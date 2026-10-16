@@ -677,6 +677,33 @@ bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
     return true;
 }
 
+// Был ли адрес в цепочке до траты `txid` на высоте `height` — по его истории
+// с mempool.space (запасной blockstream), страницами по 25 от новых к старым.
+// Нашлась транзакция ниже этой высоты — адрес жил раньше. Дольше 20 страниц
+// или источники молчат — «не узнать».
+int addrFresh(const std::string& a, const std::string& txid, long long height) {
+    std::string last;
+    bool self = false;
+    for (int page = 0; page < 20; ++page) {
+        json j;
+        for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
+            j = json::parse(fetch(host + a + "/txs/chain" + (last.empty() ? "" : "/" + last), 15), nullptr, false);
+            if (j.is_array()) break;
+        }
+        if (!j.is_array()) return -1;
+        for (const auto& t : j) {
+            if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) return -1;
+            const long long h = jll(t["status"], "block_height");
+            if (h > 0 && h < height) return 0;
+            if (jstr(t, "txid") == txid) self = true;
+        }
+        if (j.size() < 25) return self ? 1 : -1;
+        last = jstr(j.back(), "txid");
+        if (!isHash(last)) return -1;
+    }
+    return -1;
+}
+
 void saveAddrStats(const std::string& a, long long txs, long long bal) {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     sqlite3_stmt* s = nullptr;
@@ -1706,6 +1733,7 @@ bool openDb() {
     // добавлена позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(g_btcDb, "ALTER TABLE btc_blocks ADD COLUMN flow TEXT", nullptr, nullptr, nullptr);
     etfOpen(g_btcDb);
+    etfSetFreshCheck(addrFresh);
     govOpen(g_btcDb);
     sqlite3_stmt* s = nullptr;
     if (prep(&s, "SELECT address FROM btc_watch")) {
@@ -2078,13 +2106,15 @@ void btcLoop() {
             g_bs.tip = tip;
             // Версия 2: первая версия помечала догонку сделанной и после
             // отказа сервиса истории — на таких установках она пройдёт заново.
-            if (sc.state("etf_back") != "2" &&
+            // Версия 3: добавились кошельки фондов из списков (btc_etf_list.h) —
+            // их два месяца тоже догоняются (уже записанное не задвоится).
+            if (sc.state("etf_back") != "3" &&
                 std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
                 lastBack = std::chrono::steady_clock::now();
                 // Сначала остатки кошельков: плату фонду за управление сканер
                 // узнаёт по доле от запаса, а без запаса записал бы её оттоком.
                 refreshEtfBalances();
-                if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "2");
+                if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "3");
             }
             long long last = 0;
             {

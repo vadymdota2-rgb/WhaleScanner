@@ -26,6 +26,7 @@
 
 #include <sqlite3.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -51,5 +52,9 @@ void etfVaultTx(sqlite3* db, long long height, long long ts, const BTx& tx);
 void etfVaultRead(sqlite3* db, const std::string& address);
 // Не прочиталась (оба источника молчат) — в конец очереди, на следующий круг.
 void etfVaultRetry(const std::string& address);
+// Новый ли адрес: 1 — до траты `txid` (высота `height`) в цепочке его не было,
+// 0 — был, -1 — не узнать (тогда не переезд, а отток). Ставит btc_chain.
+using EtfFreshCheck = std::function<int(const std::string& address, const std::string& txid, long long height)>;
+void etfSetFreshCheck(EtfFreshCheck f);
 // Раздел для /statsbtc.
 std::string etfStats(sqlite3* db);
