@@ -1922,6 +1922,9 @@ void btcLoop() {
             if (sc.state("etf_back") != "2" &&
                 std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
                 lastBack = std::chrono::steady_clock::now();
+                // Сначала остатки кошельков: плату фонду за управление сканер
+                // узнаёт по доле от запаса, а без запаса записал бы её оттоком.
+                refreshEtfBalances();
                 if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "2");
             }
             long long last = 0;
