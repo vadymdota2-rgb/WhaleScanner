@@ -1810,6 +1810,45 @@ void etfBackfill(long long since, long long upTo) {
     std::cout << "[ETF] догонка: блоков с кошельками фондов " << done << " из " << heights.size() << std::endl;
 }
 
+// История новых хранилищ хранителя: первая страница их транзакций с
+// mempool.space (та же цепочка, посчитанная по адресу) — в переводы для
+// разбора по корзинам. Не больше 30 хранилищ за круг.
+void readNewVaults() {
+    for (const auto& a : etfVaultsToRead(30)) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        json j = json::parse(fetch("https://mempool.space/api/address/" + a + "/txs/chain", 15), nullptr, false);
+        if (!j.is_array())
+            j = json::parse(fetch("https://blockstream.info/api/address/" + a + "/txs/chain", 15), nullptr, false);
+        if (!j.is_array()) {
+            etfVaultRetry(a);
+            continue;
+        }
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        execSql("BEGIN");
+        for (const auto& t : j) {
+            if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) continue;
+            const long long h = jll(t["status"], "block_height"), ts = jll(t["status"], "block_time");
+            if (h <= 0 || ts <= 0 || !t.contains("vin") || !t["vin"].is_array() || !t.contains("vout") ||
+                !t["vout"].is_array())
+                continue;
+            BTx x;
+            x.txid = jstr(t, "txid");
+            if (!isHash(x.txid)) continue;
+            bool ok = true;
+            for (const auto& i : t["vin"]) {
+                if (i.value("is_coinbase", false)) { x.coinbase = true; continue; }
+                if (!i.contains("prevout") || !i["prevout"].is_object()) { ok = false; break; }
+                x.in.push_back({jstr(i["prevout"], "scriptpubkey_address"), jll(i["prevout"], "value")});
+            }
+            for (const auto& o : t["vout"]) x.out.push_back({jstr(o, "scriptpubkey_address"), jll(o, "value")});
+            if (ok) etfVaultTx(g_btcDb, h, ts, x);
+        }
+        etfVaultRead(g_btcDb, a);
+        execSql("COMMIT");
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
 void btcLoop() {
     Scanner sc;
     {
@@ -1900,6 +1939,7 @@ void btcLoop() {
                 last = b.height;
                 setLag();
             }
+            readNewVaults();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshEtfBalances();
                 refreshIdleBalances();

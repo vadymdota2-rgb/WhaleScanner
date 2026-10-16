@@ -44,5 +44,12 @@ std::vector<std::string> etfAddresses();
 // раз в сутки). Сверка: остаток из цепочки на высоте `height`.
 std::vector<std::string> etfStale(sqlite3* db, size_t limit);
 void etfSetBalance(sqlite3* db, const std::string& address, long long sats, long long height);
+// Хранилища хранителя, чью историю пора дочитать (с mempool.space): приток в
+// хранилище бывает раньше, чем хранитель пришлёт ему первую пылинку.
+std::vector<std::string> etfVaultsToRead(size_t limit);
+void etfVaultTx(sqlite3* db, long long height, long long ts, const BTx& tx);
+void etfVaultRead(sqlite3* db, const std::string& address);
+// Не прочиталась (оба источника молчат) — в конец очереди, на следующий круг.
+void etfVaultRetry(const std::string& address);
 // Раздел для /statsbtc.
 std::string etfStats(sqlite3* db);

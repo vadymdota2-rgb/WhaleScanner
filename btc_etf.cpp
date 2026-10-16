@@ -38,6 +38,27 @@ std::map<std::string, std::set<int>> g_types;
 // кошелёк, с которого приходят новые монеты фонда, тоже). Они общие для всех
 // клиентов хранителя — фонду не принадлежат и не учатся никогда.
 std::set<std::string> g_service;
+// Хранилища хранителя: на них кошелёк комиссий хранителя присылает пылинку
+// перед каждой тратой. Хранилище — всегда одного клиента (за 17 дней и 2 545
+// трат ни одно не потратилось вместе с чужим), но чьё — по самой цепочке не
+// видно: это решает разбор переводов по «корзинам» фондов в API.
+std::set<std::string> g_vault;
+// Кошельки комиссий хранителя: подтверждены, когда прислали пылинку трём
+// разным известным хранилищам (кошелькам фондов).
+std::set<std::string> g_feeWallet;
+std::map<std::string, std::set<std::string>> g_feeSeen;
+// Новые хранилища, чью историю ещё надо дочитать: приток в хранилище бывает
+// раньше, чем хранитель впервые пришлёт ему пылинку.
+std::vector<std::string> g_vaultQueue;
+// Перевод хранилища пишется с этой суммы: корзины фондов — от полубиткоина,
+// мельче — пыль и сдача.
+constexpr long long XFER_MIN = SAT / 20;
+constexpr size_t FEE_CONFIRM = 3;
+// Кошельки комиссий, найденные по цепочке заранее: 3J7c… прислал пылинки
+// кошелькам BITB 206 раз за два года (перед каждой их тратой). Без затравки
+// сканер дошёл бы до него сам за неделю-две — и потерял бы эти недели.
+const std::vector<const char*> FEE_SEEDS = {"3J7cUjBZxvGRCwFBz3q23zAsnhFfZrDSSU"};
+
 // Сверки за сутки: когда, фонд, на сколько разошлось.
 struct Check { long long at; std::string fund; long long drift; };
 std::vector<Check> g_checks;
@@ -179,7 +200,96 @@ bool isFee(sqlite3* db, const std::string& fund, long long sats, long long ts) {
     return month > 0 && sats >= month * 0.5L && sats <= month * 1.5L;
 }
 
+bool isVault(const std::string& a) {
+    if (a.empty()) return false;
+    std::lock_guard<std::mutex> l(g_mx);
+    return g_vault.count(a) > 0;
+}
+
+void addVault(sqlite3* db, const std::string& a, const std::string& fee, long long height, bool retro) {
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        if (!g_vault.insert(a).second) return;
+        if (retro && g_vaultQueue.size() < 5000) g_vaultQueue.push_back(a);
+    }
+    Stmt q(db, "INSERT OR IGNORE INTO btc_cust_vault(address, fee_wallet, at, height, read) VALUES(?,?,?,?,?)");
+    q.text(1, a).text(2, fee).num(3, now()).num(4, height).num(5, retro ? 0 : 1).run();
+}
+
+// Подпитка комиссией: все входы — один адрес F, выходов два — пылинка на V и
+// сдача обратно на F. Так хранитель готовит хранилище к трате.
+bool feeTopUp(sqlite3* db, const Block& b, const BTx& tx) {
+    if (tx.in.empty() || tx.out.size() != 2) return false;
+    const std::string& f = tx.in[0].addr;
+    if (f.empty()) return false;
+    for (const auto& i : tx.in) if (i.addr != f) return false;
+    const BOut* dust = nullptr;
+    const BOut* back = nullptr;
+    for (const auto& o : tx.out) {
+        if (o.addr == f) back = &o;
+        else if (!o.addr.empty() && o.sats < DUST) dust = &o;
+    }
+    if (!dust || !back) return false;
+    bool confirmed;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        confirmed = g_feeWallet.count(f) > 0;
+    }
+    if (confirmed) {
+        addVault(db, dust->addr, f, b.height, true);
+        return true;
+    }
+    // Ещё не подтверждён: считаем, скольким известным хранилищам он платит.
+    bool known = !fundOf(dust->addr).empty() || isVault(dust->addr);
+    if (!known) return false;
+    size_t n;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        auto& seen = g_feeSeen[f];
+        if (seen.size() < 64) seen.insert(dust->addr);
+        n = seen.size();
+        if (n >= FEE_CONFIRM) g_feeWallet.insert(f);
+    }
+    if (n >= FEE_CONFIRM) {
+        Stmt q(db, "INSERT INTO btc_etf_svc(address, at, fee) VALUES(?,?,1) ON CONFLICT(address) DO UPDATE SET fee=1");
+        q.text(1, f).num(2, now()).run();
+        std::cout << "[ETF] кошелёк комиссий хранителя подтверждён: " << f << std::endl;
+    }
+    return false;
+}
+
+// Перевод, где хотя бы одна сторона — хранилище: сырой факт цепочки для
+// разбора по корзинам. Сдача (выход на адрес входа) и пыль не пишутся.
+void custTx(sqlite3* db, const Block& b, const BTx& tx) {
+    if (tx.coinbase || tx.in.empty()) return;
+    if (feeTopUp(db, b, tx)) return;
+    std::set<std::string> ins;
+    const BIn* top = nullptr;
+    bool fromVault = false;
+    for (const auto& i : tx.in) {
+        ins.insert(i.addr);
+        if (isVault(i.addr)) fromVault = true;
+        if (!top || i.sats > top->sats) top = &i;
+    }
+    for (size_t n = 0; n < tx.out.size(); ++n) {
+        const auto& o = tx.out[n];
+        if (o.addr.empty() || o.sats < XFER_MIN || ins.count(o.addr)) continue;
+        const bool toVault = isVault(o.addr);
+        if (!fromVault && !toVault) continue;
+        {
+            std::lock_guard<std::mutex> l(g_mx);
+            if (g_feeWallet.count(o.addr)) continue;
+        }
+        Stmt q(db, "INSERT OR IGNORE INTO btc_cust_xfer(txid, n, height, ts, src, dst, sats, sv, dv) "
+                   "VALUES(?,?,?,?,?,?,?,?,?)");
+        q.text(1, tx.txid).num(2, static_cast<long long>(n)).num(3, b.height).num(4, b.ts)
+            .text(5, top ? top->addr : "").text(6, o.addr).num(7, o.sats).num(8, fromVault ? 1 : 0)
+            .num(9, toVault ? 1 : 0).run();
+    }
+}
+
 void scanTx(sqlite3* db, const Block& b, const BTx& tx) {
+    custTx(db, b, tx);
     if (tx.coinbase) return;
     std::map<std::string, long long> inF;
     const BIn* top = nullptr;
@@ -253,6 +363,31 @@ std::string btc(long long sats) {
 
 std::string etfFund(const std::string& address) { return fundOf(address); }
 
+std::vector<std::string> etfVaultsToRead(size_t limit) {
+    std::lock_guard<std::mutex> l(g_mx);
+    const size_t n = std::min(limit, g_vaultQueue.size());
+    std::vector<std::string> r(g_vaultQueue.begin(), g_vaultQueue.begin() + static_cast<long>(n));
+    g_vaultQueue.erase(g_vaultQueue.begin(), g_vaultQueue.begin() + static_cast<long>(n));
+    return r;
+}
+
+void etfVaultTx(sqlite3* db, long long height, long long ts, const BTx& tx) {
+    Block b;
+    b.height = height;
+    b.ts = ts;
+    custTx(db, b, tx);
+}
+
+void etfVaultRetry(const std::string& address) {
+    std::lock_guard<std::mutex> l(g_mx);
+    if (g_vaultQueue.size() < 5000) g_vaultQueue.push_back(address);
+}
+
+void etfVaultRead(sqlite3* db, const std::string& address) {
+    Stmt q(db, "UPDATE btc_cust_vault SET read=1 WHERE address=?");
+    q.text(1, address).run();
+}
+
 std::vector<std::string> etfAddresses() {
     std::lock_guard<std::mutex> l(g_mx);
     std::vector<std::string> r;
@@ -290,6 +425,17 @@ void etfOpen(sqlite3* db) {
         "  out_n INTEGER NOT NULL DEFAULT 0, fee_n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, fund));"
         // Запас фонда на конец суток — по сверке с цепочкой.
         "CREATE TABLE IF NOT EXISTS btc_etf_svc (address TEXT PRIMARY KEY, at INTEGER NOT NULL DEFAULT 0);"
+        // Хранилища хранителя и переводы с ними — сырьё для разбора по
+        // корзинам фондов (API). read — история хранилища дочитана.
+        "CREATE TABLE IF NOT EXISTS btc_cust_vault ("
+        "  address TEXT PRIMARY KEY, fee_wallet TEXT NOT NULL DEFAULT '', at INTEGER NOT NULL DEFAULT 0,"
+        "  height INTEGER NOT NULL DEFAULT 0, read INTEGER NOT NULL DEFAULT 0);"
+        // src — главный вход перевода, dst — получатель; sv/dv — хранилище ли.
+        "CREATE TABLE IF NOT EXISTS btc_cust_xfer ("
+        "  txid TEXT NOT NULL, n INTEGER NOT NULL, height INTEGER NOT NULL, ts INTEGER NOT NULL,"
+        "  src TEXT NOT NULL, dst TEXT NOT NULL, sats INTEGER NOT NULL, sv INTEGER NOT NULL, dv INTEGER NOT NULL,"
+        "  PRIMARY KEY (txid, n));"
+        "CREATE INDEX IF NOT EXISTS idx_btc_cust_xfer_ts ON btc_cust_xfer(ts);"
         "CREATE TABLE IF NOT EXISTS btc_etf_hold ("
         "  day INTEGER NOT NULL, fund TEXT NOT NULL, sats INTEGER NOT NULL, n INTEGER NOT NULL,"
         "  PRIMARY KEY (day, fund));";
@@ -297,7 +443,18 @@ void etfOpen(sqlite3* db) {
         std::cerr << "[ETF] схема: " << (err ? err : "?") << std::endl;
         sqlite3_free(err);
     }
+    // Колонка появилась позже: на старой базе её нет, ошибку «уже есть» глотаем.
+    sqlite3_exec(db, "ALTER TABLE btc_etf_svc ADD COLUMN fee INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
+    for (const char* f : FEE_SEEDS) {
+        Stmt q(db, "INSERT INTO btc_etf_svc(address, at, fee) VALUES(?,?,1) ON CONFLICT(address) DO UPDATE SET fee=1");
+        q.text(1, f).num(2, now()).run();
+    }
+    // Кошельки фондов — тоже хранилища хранителя.
+    for (const auto& [a, fund] : BTC_ETF_BOOK) {
+        Stmt q(db, "INSERT OR IGNORE INTO btc_cust_vault(address, fee_wallet, at, read) VALUES(?, '', ?, 1)");
+        q.text(1, a).num(2, now()).run();
+    }
     for (const auto& [a, fund] : BTC_ETF_BOOK) {
         Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'seed',?) "
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='seed'");
@@ -311,9 +468,20 @@ void etfOpen(sqlite3* db) {
     for (const auto& [a, fund] : BTC_ETF_BOOK) g_types[fund].insert(addrType(a));
     Stmt q(db, "SELECT address, fund FROM btc_etf_addr");
     while (q.row()) g_fund[q.str(0)] = q.str(1);
-    Stmt v(db, "SELECT address FROM btc_etf_svc");
-    while (v.row()) g_service.insert(v.str(0));
-    std::cout << "[ETF] кошельков фондов: " << g_fund.size() << std::endl;
+    Stmt v(db, "SELECT address, fee FROM btc_etf_svc");
+    while (v.row()) {
+        g_service.insert(v.str(0));
+        if (v.col(1)) g_feeWallet.insert(v.str(0));
+    }
+    g_vault.clear();
+    g_vaultQueue.clear();
+    Stmt w(db, "SELECT address, read FROM btc_cust_vault");
+    while (w.row()) {
+        g_vault.insert(w.str(0));
+        if (!w.col(1)) g_vaultQueue.push_back(w.str(0));
+    }
+    std::cout << "[ETF] кошельков фондов: " << g_fund.size() << ", хранилищ хранителя: " << g_vault.size()
+              << ", кошельков комиссий: " << g_feeWallet.size() << std::endl;
 }
 
 void etfBlock(sqlite3* db, const Block& b) {
@@ -343,6 +511,8 @@ void etfCleanup(sqlite3* db, long long keepFrom) {
     f.num(1, keepFrom).run();
     Stmt h(db, "DELETE FROM btc_etf_hold WHERE day < ?");
     h.num(1, keepFrom).run();
+    Stmt x(db, "DELETE FROM btc_cust_xfer WHERE ts < ?");
+    x.num(1, keepFrom).run();
     std::lock_guard<std::mutex> l(g_mx);
     const long long cut = now() - 86400;
     g_checks.erase(std::remove_if(g_checks.begin(), g_checks.end(), [cut](const Check& c) { return c.at < cut; }),
@@ -424,5 +594,23 @@ std::string etfStats(sqlite3* db) {
                btc(drift) + " BTC";
     }
     if (g_mixed) out += "\n⚠️ Траты со смешанными фондами: " + std::to_string(g_mixed);
+    {
+        long long vaults = 0, unread = 0, xday = 0, xall = 0;
+        Stmt q(db, "SELECT COUNT(*), SUM(read = 0) FROM btc_cust_vault");
+        if (q.row()) { vaults = q.col(0); unread = q.col(1); }
+        Stmt x(db, "SELECT COUNT(*), SUM(ts >= ?) FROM btc_cust_xfer");
+        x.num(1, now() - 86400);
+        if (x.row()) { xall = x.col(0); xday = x.col(1); }
+        size_t fees;
+        {
+            std::lock_guard<std::mutex> l(g_mx);
+            fees = g_feeWallet.size();
+        }
+        out += "\n🗄 Хранилища хранителя: " + std::to_string(vaults) +
+               (unread ? " (история дочитывается: " + std::to_string(unread) + ")" : std::string()) +
+               " · кошельков комиссий: " + std::to_string(fees) +
+               "\n  переводов с хранилищами: " + std::to_string(xday) + " за сутки, " + std::to_string(xall) +
+               " всего — разбор по фондам в API";
+    }
     return out;
 }
