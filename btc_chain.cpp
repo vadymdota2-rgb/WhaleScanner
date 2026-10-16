@@ -27,6 +27,7 @@
 #include "btc_chain.h"
 #include "btc_block.h"
 #include "btc_etf.h"
+#include "btc_gov.h"
 #include "autobase.h"
 #include "btc_seeds_book.h"
 
@@ -795,6 +796,7 @@ public:
             scan(b, price, moves, learned);
             exBalances(b);
             etfBlock(g_btcDb, b);
+            govBlock(g_btcDb, b);
             execSql("COMMIT");
         }
         bump(g_bs.blocks);
@@ -859,6 +861,14 @@ public:
             sqlite3_finalize(s);
         }
         etfRollback(g_btcDb, b.height - 1);
+        // Остатки, которые вели блоки, — на сверку: откатанный блок в них уже
+        // записан. Резервы бирж — крупные адреса (мелочь сверится за неделю).
+        govRollback(g_btcDb);
+        if (prep(&s, "UPDATE btc_ex_bal SET checked_at = 0 WHERE checked_at != 0 AND bal_sats >= ?")) {
+            sqlite3_bind_int64(s, 1, 10LL * SAT);
+            sqlite3_step(s);
+            sqlite3_finalize(s);
+        }
         setState("height", std::to_string(b.height - 2));
         execSql("COMMIT");
         return true;
@@ -1696,6 +1706,7 @@ bool openDb() {
     // добавлена позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(g_btcDb, "ALTER TABLE btc_blocks ADD COLUMN flow TEXT", nullptr, nullptr, nullptr);
     etfOpen(g_btcDb);
+    govOpen(g_btcDb);
     sqlite3_stmt* s = nullptr;
     if (prep(&s, "SELECT address FROM btc_watch")) {
         std::lock_guard<std::mutex> w(g_watchMutex);
@@ -1749,6 +1760,7 @@ void cleanup() {
         "DELETE FROM btc_flow WHERE in_sats <= 0 AND out_sats <= 0 AND in_n <= 0 AND out_n <= 0 AND ts < ?",
         now - 3600);
     etfCleanup(g_btcDb, cut);
+    govSnapshot(g_btcDb, now, cut);
     // Резервы бирж: адрес, забытый разметкой, из резервов уходит; снимок
     // суток — сверенные адреса и сметённые (их ведут блоки).
     if (sqlite3_exec(g_btcDb, "DELETE FROM btc_ex_bal WHERE NOT EXISTS "
@@ -1841,6 +1853,40 @@ void refreshEtfBalances() {
 // с mempool.space верен на ней, блоки до неё в него уже не пишутся.
 constexpr int EX_BAL_PER_PASS = 20;
 constexpr long long EX_BAL_BIG = 10LL * SAT;
+
+// Государства: остатки их адресов — сверкой с цепочкой (btc_gov.h), список
+// Сальвадора — с его же Национального биткоин-офиса, дважды в сутки.
+void refreshGovBalances() {
+    std::vector<std::string> stale;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        stale = govStale(g_btcDb, 40);
+    }
+    for (const auto& a : stale) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        const long long h = tipHeight();
+        long long txs = 0, bal = 0;
+        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
+        {
+            std::lock_guard<std::mutex> l(g_btcDbMutex);
+            govSetBalance(g_btcDb, a, bal, h);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+void readGovOfficial() {
+    json j = json::parse(fetch("https://bitcoin.gob.sv/api/v1/wallet/ONBTC", 30), nullptr, false);
+    if (!j.is_object()) {
+        std::cerr << "[GOV] список Сальвадора (bitcoin.gob.sv) не прочитался — повторю позже" << std::endl;
+        return;
+    }
+    std::vector<std::string> addrs;
+    for (auto& [a, v] : j.items())
+        if (govAddrOk(a)) addrs.push_back(a);
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    govOfficial(g_btcDb, "SV", addrs);
+}
 
 void refreshExBalances() {
     std::vector<std::string> ask;
@@ -2023,6 +2069,7 @@ void btcLoop() {
     auto lastBack = std::chrono::steady_clock::now() - std::chrono::hours(2);
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
+    auto lastGov = std::chrono::steady_clock::now() - std::chrono::hours(12);
 
     while (running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
         try {
@@ -2096,6 +2143,11 @@ void btcLoop() {
             }
             readNewVaults();
             refreshExBalances();
+            if (std::chrono::steady_clock::now() - lastGov > std::chrono::hours(12)) {
+                lastGov = std::chrono::steady_clock::now();
+                readGovOfficial();
+            }
+            refreshGovBalances();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshEtfBalances();
                 refreshIdleBalances();
@@ -2488,6 +2540,7 @@ std::string btcStatsLine() {
     }
 
     out += etfStats(g_btcDb);
+    out += govStats(g_btcDb);
     out += "\n⏮ Догонка истории фондов: " + g_backStatus;
 
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
