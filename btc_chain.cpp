@@ -622,8 +622,10 @@ struct Db {
     sqlite3_stmt* putLabel = nullptr;
     sqlite3_stmt* putMove = nullptr;
     sqlite3_stmt* putFlow = nullptr;
+    sqlite3_stmt* addExBal = nullptr;
+    sqlite3_stmt* moveExBal = nullptr;
     ~Db() {
-        for (auto* s : {getLabel, putLabel, putMove, putFlow})
+        for (auto* s : {getLabel, putLabel, putMove, putFlow, addExBal, moveExBal})
             if (s) sqlite3_finalize(s);
     }
 };
@@ -701,7 +703,14 @@ public:
                prep(&db_.putFlow,
                     "INSERT INTO btc_flow(ts, ex, in_sats, out_sats, in_n, out_n) VALUES(?,?,?,?,?,?) "
                     "ON CONFLICT(ts, ex) DO UPDATE SET in_sats=in_sats+excluded.in_sats, "
-                    "out_sats=out_sats+excluded.out_sats, in_n=in_n+excluded.in_n, out_n=out_n+excluded.out_n");
+                    "out_sats=out_sats+excluded.out_sats, in_n=in_n+excluded.in_n, out_n=out_n+excluded.out_n") &&
+               // Остаток адреса биржи: checked_at 0 — ещё не сверен с цепочкой,
+               // -1 — адрес пополнения, сметённый в этом же блоке (остаток ~0,
+               // дальше его ведут блоки).
+               prep(&db_.addExBal,
+                    "INSERT OR IGNORE INTO btc_ex_bal(address, bal_sats, bal_height, checked_at) VALUES(?, 0, ?, ?)") &&
+               prep(&db_.moveExBal,
+                    "UPDATE btc_ex_bal SET bal_sats = bal_sats + ? WHERE address = ? AND bal_height < ? AND checked_at != 0");
     }
 
     void seed() {
@@ -713,6 +722,11 @@ public:
         execSql("BEGIN");
         for (const auto& [a, ex] : all) {
             putLabel(a, ex, "seed");
+            sqlite3_reset(db_.addExBal);
+            bindText(db_.addExBal, 1, a);
+            sqlite3_bind_int64(db_.addExBal, 2, 0);
+            sqlite3_bind_int64(db_.addExBal, 3, 0);
+            sqlite3_step(db_.addExBal);
             sqlite3_stmt* s = nullptr;
             // Проверенная метка главнее выученной: если адрес раньше записали
             // другой бирже, правим.
@@ -728,7 +742,28 @@ public:
 
     enum class Result { DONE, REORG };
 
+    // Остатки адресов бирж — по каждому блоку: вход с адреса биржи — минус,
+    // выход на него — плюс. Блоки до сверки адреса с цепочкой (bal_height) в
+    // остаток не идут — сверка их уже учла.
+    void exBalances(const Block& b) {
+        for (const auto& tx : b.txs) {
+            for (const auto& i : tx.in)
+                if (!i.addr.empty() && !label(i.addr).empty()) exDelta(i.addr, -i.sats, b.height);
+            for (const auto& o : tx.out)
+                if (!o.addr.empty() && !label(o.addr).empty()) exDelta(o.addr, o.sats, b.height);
+        }
+    }
+
+    void exDelta(const std::string& a, long long d, long long height) {
+        sqlite3_reset(db_.moveExBal);
+        sqlite3_bind_int64(db_.moveExBal, 1, d);
+        bindText(db_.moveExBal, 2, a);
+        sqlite3_bind_int64(db_.moveExBal, 3, height);
+        sqlite3_step(db_.moveExBal);
+    }
+
     Result process(const Block& b) {
+        height_ = b.height;
         if (rolledBack(b)) return Result::REORG;
         {
             // Блок уже посчитан (перезапуск, повтор после сбоя сети) — второй
@@ -758,6 +793,7 @@ public:
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             execSql("BEGIN");
             scan(b, price, moves, learned);
+            exBalances(b);
             etfBlock(g_btcDb, b);
             execSql("COMMIT");
         }
@@ -1169,6 +1205,7 @@ public:
 
 private:
     Db db_;
+    long long height_ = 0;
     std::vector<std::string> touched_;
     // Кандидаты автопоиска → когда найдены. Живут между блоками, пока их не
     // проверят (AUTO_PEND_TTL).
@@ -1540,6 +1577,16 @@ private:
     void putLabel(const std::string& a, const std::string& ex, const char* how) {
         // Кошелёк фонда биржевым не становится: его ведёт btc_etf.cpp.
         if (!etfFund(a).empty()) return;
+        if (std::strcmp(how, "seed") != 0) {
+            // Резервы биржи: новый адрес сверим с цепочкой; сметённый адрес
+            // пополнения пуст — его ведут блоки с этого.
+            const bool swept = std::strcmp(how, "sweep") == 0;
+            sqlite3_reset(db_.addExBal);
+            bindText(db_.addExBal, 1, a);
+            sqlite3_bind_int64(db_.addExBal, 2, swept ? height_ : 0);
+            sqlite3_bind_int64(db_.addExBal, 3, swept ? -1 : 0);
+            sqlite3_step(db_.addExBal);
+        }
         sqlite3_reset(db_.putLabel);
         bindText(db_.putLabel, 1, a);
         bindText(db_.putLabel, 2, ex);
@@ -1632,7 +1679,19 @@ bool openDb() {
         "  height INTEGER PRIMARY KEY, hash TEXT NOT NULL, ts INTEGER NOT NULL,"
         "  txs INTEGER NOT NULL DEFAULT 0, moves INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0,"
         "  price_nanos INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL DEFAULT 0);"
-        "CREATE TABLE IF NOT EXISTS btc_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);");
+        "CREATE TABLE IF NOT EXISTS btc_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);"
+        // Резервы бирж: остаток каждого адреса биржи (биржа — по btc_labels).
+        // Сверка с цепочкой один раз (и раз в неделю у крупных), дальше —
+        // по блокам. checked_at: 0 — ещё не сверен, -1 — сметённый адрес
+        // пополнения (пуст, ведут блоки).
+        "CREATE TABLE IF NOT EXISTS btc_ex_bal ("
+        "  address TEXT PRIMARY KEY, bal_sats INTEGER NOT NULL DEFAULT 0, bal_height INTEGER NOT NULL DEFAULT 0,"
+        "  checked_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE INDEX IF NOT EXISTS idx_btc_ex_bal_checked ON btc_ex_bal(checked_at);"
+        // Резервы на конец суток — для «изменение за 7 дней».
+        "CREATE TABLE IF NOT EXISTS btc_ex_day ("
+        "  day INTEGER NOT NULL, ex TEXT NOT NULL, sats INTEGER NOT NULL, n INTEGER NOT NULL,"
+        "  PRIMARY KEY (day, ex));");
     // Вклад блока в потоки — для отката при перестройке цепочки. Колонка
     // добавлена позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(g_btcDb, "ALTER TABLE btc_blocks ADD COLUMN flow TEXT", nullptr, nullptr, nullptr);
@@ -1690,6 +1749,17 @@ void cleanup() {
         "DELETE FROM btc_flow WHERE in_sats <= 0 AND out_sats <= 0 AND in_n <= 0 AND out_n <= 0 AND ts < ?",
         now - 3600);
     etfCleanup(g_btcDb, cut);
+    // Резервы бирж: адрес, забытый разметкой, из резервов уходит; снимок
+    // суток — сверенные адреса и сметённые (их ведут блоки).
+    if (sqlite3_exec(g_btcDb, "DELETE FROM btc_ex_bal WHERE NOT EXISTS "
+                     "(SELECT 1 FROM btc_labels b WHERE b.address = btc_ex_bal.address)",
+                     nullptr, nullptr, nullptr) == SQLITE_OK)
+        old += sqlite3_changes(g_btcDb);
+    old += execCount("DELETE FROM btc_ex_day WHERE day < ?", cut);
+    execCount("INSERT OR REPLACE INTO btc_ex_day(day, ex, sats, n) "
+              "SELECT ?, b.ex, SUM(MAX(e.bal_sats, 0)), COUNT(*) FROM btc_ex_bal e "
+              "JOIN btc_labels b ON b.address = e.address WHERE e.checked_at != 0 GROUP BY b.ex",
+              now - now % 86400);
     sqlite3_wal_checkpoint_v2(g_btcDb, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     g_bs.cleanAt = now;
     g_bs.cleanFlow = flow;
@@ -1760,6 +1830,48 @@ void refreshEtfBalances() {
         {
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             etfSetBalance(g_btcDb, a, bal, h);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+}
+
+// Резервы бирж: остатки адресов из разметки сверяем с цепочкой — новые
+// сразу, крупные (от 10 BTC) раз в неделю; между сверками остаток ведут
+// блоки (Scanner::exBalances). Высота — у узла прямо перед запросом: остаток
+// с mempool.space верен на ней, блоки до неё в него уже не пишутся.
+constexpr int EX_BAL_PER_PASS = 20;
+constexpr long long EX_BAL_BIG = 10LL * SAT;
+
+void refreshExBalances() {
+    std::vector<std::string> ask;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        sqlite3_stmt* s = nullptr;
+        if (!prep(&s, "SELECT address FROM btc_ex_bal WHERE checked_at = 0 OR (checked_at < ? AND bal_sats >= ?) "
+                      "ORDER BY checked_at LIMIT ?"))
+            return;
+        sqlite3_bind_int64(s, 1, nowSec() - ADDR_TTL);
+        sqlite3_bind_int64(s, 2, EX_BAL_BIG);
+        sqlite3_bind_int(s, 3, EX_BAL_PER_PASS);
+        while (sqlite3_step(s) == SQLITE_ROW) ask.push_back(colText(s, 0));
+        sqlite3_finalize(s);
+    }
+    for (const auto& a : ask) {
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        const long long h = tipHeight();
+        long long txs = 0, bal = 0;
+        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
+        {
+            std::lock_guard<std::mutex> l(g_btcDbMutex);
+            sqlite3_stmt* s = nullptr;
+            if (prep(&s, "UPDATE btc_ex_bal SET bal_sats = ?, bal_height = ?, checked_at = ? WHERE address = ?")) {
+                sqlite3_bind_int64(s, 1, bal);
+                sqlite3_bind_int64(s, 2, h);
+                sqlite3_bind_int64(s, 3, nowSec());
+                bindText(s, 4, a);
+                sqlite3_step(s);
+                sqlite3_finalize(s);
+            }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
@@ -1983,6 +2095,7 @@ void btcLoop() {
                 setLag();
             }
             readNewVaults();
+            refreshExBalances();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshEtfBalances();
                 refreshIdleBalances();
@@ -2338,6 +2451,14 @@ std::string btcStatsLine() {
     }
     out += "\n📇 Адреса (mempool.space): запросов " + num(g_bs.addrAsked.load()) + " · сбоев " +
            num(g_bs.addrFailed.load());
+
+    {
+        // Резервы бирж — свой счёт: остатки адресов из разметки.
+        const long long total = one("SELECT COALESCE(SUM(MAX(bal_sats, 0)), 0) FROM btc_ex_bal WHERE checked_at != 0");
+        const long long done = one("SELECT COUNT(*) FROM btc_ex_bal WHERE checked_at != 0");
+        const long long all = one("SELECT COUNT(*) FROM btc_ex_bal");
+        out += "\n🏦 Резервы бирж: " + btc(total) + " BTC · адресов сверено " + num(done) + " из " + num(all);
+    }
 
     out += "\n\n📈 <b>Разбор транзакций</b> (с запуска)"
            "\n🟢 С биржи (выводы): " + num(g_bs.fromEx.load()) +
