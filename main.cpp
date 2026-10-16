@@ -2183,7 +2183,8 @@ void partnerCommand(const std::string& owner, const std::string& arg) {
 // ── /import: разметка адресов владельцем ────────────────────────────────
 // Адреса Bitcoin из /import (текстом или файлом CSV с подписью /import) бот
 // не проверяет — размечает, как скажет владелец: кнопкой фонда (IBIT, FBTC…)
-// или «Другое» — в базу китов сервисного аккаунта, как раньше. Строка, где
+// или «Другое» — кто угодно (хоть сам владелец): в базу китов сервисного
+// аккаунта, без всякой метки. Метки — только у фондов ETF. Строка, где
 // рядом с адресом стоит тикер фонда (выгрузка CSV), размечается сама.
 // Адреса 0x (BSC, Hyperliquid) — сразу в базу китов.
 const std::vector<std::string> IMPORT_FUNDS = {"IBIT", "FBTC", "GBTC", "BTC", "ARKB", "BITB",
@@ -2275,10 +2276,8 @@ std::string importWhalesReport(const std::vector<std::string>& x0, const std::ve
     }
     if (!btc.empty()) {
         BtcImportResult br = btcImport(btc);
-        rep << "\n₿ Bitcoin: <b>" << btc.size() << "</b>, добавлено <b>" << br.added << "</b>";
-        if (br.marked) rep << ", были без пометки — помечены ★ <b>" << br.marked << "</b>";
-        rep << ", уже были <b>" << br.dup << "</b>\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount()
-            << "</b>";
+        rep << "\n₿ Bitcoin: <b>" << btc.size() << "</b>, добавлено <b>" << br.added << "</b>, уже были <b>"
+            << br.dup + br.marked << "</b>\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
     }
     return rep.str();
 }
@@ -2305,7 +2304,7 @@ std::string importKeyboard(long long id) {
     }
     if (!row.empty()) rows.push_back(row);
     rows.push_back(json::array({
-        {{"text", "Другое (в базу китов)"}, {"callback_data", "imp:" + std::to_string(id) + ":other"}},
+        {{"text", "Другое — без метки"}, {"callback_data", "imp:" + std::to_string(id) + ":other"}},
         {{"text", "Отмена"}, {"callback_data", "imp:" + std::to_string(id) + ":no"}}}));
     json kb;
     kb["inline_keyboard"] = rows;
@@ -2317,7 +2316,8 @@ void importCommand(const std::string& cid, const std::string& txt) {
     if (p.x0.empty() && p.byFund.empty() && p.rest.empty()) {
         sendMsg(cid, "Использование: /import и адреса (через пробел, запятую или с новой строки) — или файл CSV с "
                      "подписью /import. Для адресов Bitcoin бот спросит, чьи они: фонд (IBIT, FBTC…) или «Другое» "
-                     "(база китов). Строка, где рядом с адресом стоит тикер фонда, размечается сама.");
+                     "(кто угодно — в базу китов без метки). Строка, где рядом с адресом стоит тикер фонда, "
+                     "размечается сама.");
         return;
     }
     std::string out;

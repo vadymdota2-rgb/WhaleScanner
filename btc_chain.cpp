@@ -2432,8 +2432,8 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
     sqlite3_stmt* s = nullptr;
     sqlite3_stmt* m = nullptr;
     if (!prep(&s, "INSERT OR IGNORE INTO btc_watch(address, src, at) VALUES(?, 'import', ?)")) return r;
-    // Уже в базе, но не помечен (добавил поиск) — помечаем импортированным:
-    // звёздочка в приложении, и чистка неактивных его больше не уберёт.
+    // Уже в базе, но добавлен поиском — теперь как импортированный: чистка
+    // неактивных его больше не уберёт. Метки на экране это не даёт.
     if (!prep(&m, "UPDATE btc_watch SET src = 'import' WHERE address = ? AND src = 'auto'")) {
         sqlite3_finalize(s);
         return r;
