@@ -13,3 +13,6 @@ coins/
 whale_api.py
 fetch_logos.py
 coins_manifest.json
+
+# Кеш ответов API на диске (whale_api: CACHE_DIR) — данные сервера, не код
+api_cache/
