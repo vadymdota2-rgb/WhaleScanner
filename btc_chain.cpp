@@ -1772,14 +1772,43 @@ void refreshEtfBalances() {
 // посчитанная по адресу; сами блоки — с узлов, как всегда.
 constexpr long long ETF_BACK_SEC = 60LL * 86400LL;
 
-void etfBackfill(long long since, long long upTo) {
+// Страница истории адреса: mempool.space, не ответил — blockstream.info; три
+// круга с паузой: общий сервис ограничивает частоту запросов и на десятках
+// адресов подряд начинает отказывать.
+json addrPage(const std::string& path, bool& ok) {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
+            json j = json::parse(fetch(host + path, 15), nullptr, false);
+            if (j.is_array()) {
+                ok = true;
+                return j;
+            }
+        }
+        if (!sleepFor(5 * (attempt + 1))) break;
+    }
+    ok = false;
+    return json();
+}
+
+// Как прошла последняя догонка — для /statsbtc.
+std::string g_backStatus = "ещё не было";
+
+// true — история всех кошельков прочитана и все блоки разобраны. Иначе
+// догонка повторится через час: пометить её сделанной после отказа сервиса
+// значило бы остаться без двух месяцев потоков (так и было: «0 BTC»).
+bool etfBackfill(long long since, long long upTo) {
     std::set<long long> heights;
+    int failed = 0;
     for (const auto& a : etfAddresses()) {
         std::string after;
         for (int page = 0; page < 40; ++page) {
-            json j = json::parse(fetch("https://mempool.space/api/address/" + a + "/txs/chain" +
-                                       (after.empty() ? "" : "/" + after), 15), nullptr, false);
-            if (!j.is_array() || j.empty()) break;
+            bool ok = false;
+            json j = addrPage(a + "/txs/chain" + (after.empty() ? "" : "/" + after), ok);
+            if (!ok) {
+                ++failed;
+                break;
+            }
+            if (j.empty()) break;
             bool older = false;
             for (const auto& t : j) {
                 if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) continue;
@@ -1789,14 +1818,14 @@ void etfBackfill(long long since, long long upTo) {
                 after = jstr(t, "txid");
             }
             if (older || j.size() < 25 || !isHash(after)) break;
-            if (!sleepFor(1)) return;
+            if (!sleepFor(1)) return false;
         }
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
     int done = 0;
     for (long long h : heights) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
+        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
         Block b;
         b.height = h;
         b.hash = hashAt(h);
@@ -1807,7 +1836,12 @@ void etfBackfill(long long since, long long upTo) {
         execSql("COMMIT");
         ++done;
     }
-    std::cout << "[ETF] догонка: блоков с кошельками фондов " << done << " из " << heights.size() << std::endl;
+    const bool ok = failed == 0 && done == static_cast<int>(heights.size());
+    g_backStatus = std::string(ok ? "готово" : "не вся, повтор через час") + " — блоков " + std::to_string(done) +
+                   " из " + std::to_string(heights.size()) +
+                   (failed ? ", кошельков без истории " + std::to_string(failed) : std::string());
+    std::cout << "[ETF] догонка: " << g_backStatus << std::endl;
+    return ok;
 }
 
 // История новых хранилищ хранителя: первая страница их транзакций с
@@ -1874,6 +1908,7 @@ void btcLoop() {
         sc.setStateLocked("bounce", "1");
     }
     g_bs.startedAt = nowSec();
+    auto lastBack = std::chrono::steady_clock::now() - std::chrono::hours(2);
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
 
@@ -1882,9 +1917,12 @@ void btcLoop() {
             long long tip = tipHeight();
             if (tip <= 0) { if (!sleepFor(30)) break; continue; }
             g_bs.tip = tip;
-            if (sc.state("etf_back") != "1") {
-                etfBackfill(nowSec() - ETF_BACK_SEC, tip);
-                sc.setStateLocked("etf_back", "1");
+            // Версия 2: первая версия помечала догонку сделанной и после
+            // отказа сервиса истории — на таких установках она пройдёт заново.
+            if (sc.state("etf_back") != "2" &&
+                std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
+                lastBack = std::chrono::steady_clock::now();
+                if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "2");
             }
             long long last = 0;
             {
@@ -1896,7 +1934,9 @@ void btcLoop() {
                 if (last > 0) {
                     bump(g_bs.skipped, from - last);
                     // Потоки фондов за простой — догонкой, по блокам их кошельков.
-                    etfBackfill(nowSec() - (tip - last) * 600 - 6 * 3600, from);
+                    // Не вышло — полная догонка двух месяцев на следующем круге.
+                    if (!etfBackfill(nowSec() - (tip - last) * 600 - 6 * 3600, from))
+                        sc.setStateLocked("etf_back", "0");
                 }
                 if (last > 0)
                     std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
@@ -2324,6 +2364,7 @@ std::string btcStatsLine() {
     }
 
     out += etfStats(g_btcDb);
+    out += "\n⏮ Догонка истории фондов: " + g_backStatus;
 
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
     if (prep(&s, "SELECT how, COUNT(*) FROM btc_labels GROUP BY how ORDER BY 2 DESC")) {
