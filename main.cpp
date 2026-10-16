@@ -2180,6 +2180,234 @@ void partnerCommand(const std::string& owner, const std::string& arg) {
     sendMsg(owner, "Команды: <code>/partner</code> · <code>/partner add @канал 2</code> · <code>/partner off @канал</code>");
 }
 
+// ── /import: разметка адресов владельцем ────────────────────────────────
+// Адреса Bitcoin из /import (текстом или файлом CSV с подписью /import) бот
+// не проверяет — размечает, как скажет владелец: кнопкой фонда (IBIT, FBTC…)
+// или «Другое» — в базу китов сервисного аккаунта, как раньше. Строка, где
+// рядом с адресом стоит тикер фонда (выгрузка CSV), размечается сама.
+// Адреса 0x (BSC, Hyperliquid) — сразу в базу китов.
+const std::vector<std::string> IMPORT_FUNDS = {"IBIT", "FBTC", "GBTC", "BTC", "ARKB", "BITB",
+                                               "HODL", "BRRR", "EZBC", "BTCO", "BTCW"};
+// В строке выгрузки «BTC» — чаще монета или колонка суммы, а не мини-фонд
+// Grayscale: его тикер сам не узнаём, только кнопкой.
+bool importAutoTicker(const std::string& t) { return t != "BTC"; }
+
+struct ImportPending { std::vector<std::string> btc; long long at = 0; };
+std::mutex g_impMx;
+std::map<long long, ImportPending> g_imp;
+long long g_impNext = 1;
+constexpr long long IMPORT_PENDING_SEC = 86400;
+constexpr size_t IMPORT_FILE_MAX = 8u << 20;
+
+struct ImportParse {
+    std::vector<std::string> x0;                              // адреса 0x
+    std::map<std::string, std::vector<std::string>> byFund;  // строки с тикером фонда
+    std::vector<std::string> rest;                            // Bitcoin без метки
+};
+
+ImportParse parseImport(const std::string& txt) {
+    ImportParse r;
+    {
+        std::string s = toLower(txt);
+        std::set<std::string> seen;
+        size_t p = 0;
+        while ((p = s.find("0x", p)) != std::string::npos) {
+            if (p + 42 <= s.size()) {
+                std::string cand = s.substr(p, 42);
+                if (isValidAddress(cand)) {
+                    if (seen.insert(cand).second) r.x0.push_back(cand);
+                    p += 42;
+                    continue;
+                }
+            }
+            p += 2;
+        }
+    }
+    // Адреса Bitcoin — по строкам: регистр base58 значим, разбираем исходный текст.
+    std::set<std::string> seen;
+    std::istringstream in(txt);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::vector<std::string> addrs;
+        std::set<std::string> funds;
+        std::string tok;
+        auto flush = [&] {
+            if (tok.empty()) return;
+            if (isBtcAddress(tok)) addrs.push_back(normBtcAddress(tok));
+            else if (importAutoTicker(tok) &&
+                     std::find(IMPORT_FUNDS.begin(), IMPORT_FUNDS.end(), tok) != IMPORT_FUNDS.end())
+                funds.insert(tok);
+            tok.clear();
+        };
+        for (char ch : line) {
+            if (std::isalnum(static_cast<unsigned char>(ch))) tok += ch;
+            else flush();
+        }
+        flush();
+        for (const auto& a : addrs) {
+            if (!seen.insert(a).second) continue;
+            if (funds.size() == 1) r.byFund[*funds.begin()].push_back(a);
+            else r.rest.push_back(a);
+        }
+    }
+    return r;
+}
+
+std::string importWhalesReport(const std::vector<std::string>& x0, const std::vector<std::string>& btc) {
+    std::stringstream rep;
+    rep << "\U0001F4E5 <b>В базу китов</b>\n";
+    if (!x0.empty()) {
+        int added = 0, dup = 0, banned = 0, failed = 0;
+        for (const auto& a : x0) {
+            switch (addUserWhale(SERVICE_CHAT_ID, a, a)) {
+                case AddWhaleResult::OK:                  ++added;  break;
+                case AddWhaleResult::ALREADY_EXISTS:      ++dup;    break;
+                case AddWhaleResult::PERMANENTLY_BANNED:  ++banned; break;
+                default:                                  ++failed; break;
+            }
+        }
+        refreshWatchers();
+        rep << "\nАдресов 0x: <b>" << x0.size() << "</b>, добавлено <b>" << added << "</b>, уже были <b>" << dup
+            << "</b>";
+        if (banned > 0) rep << ", помечены как боты <b>" << banned << "</b>";
+        if (failed > 0) rep << ", не вышло <b>" << failed << "</b>";
+        rep << "\nВсего на сервисном аккаунте: <b>" << countUserWhales(SERVICE_CHAT_ID) << "</b>";
+    }
+    if (!btc.empty()) {
+        BtcImportResult br = btcImport(btc);
+        rep << "\n₿ Bitcoin: <b>" << btc.size() << "</b>, добавлено <b>" << br.added << "</b>, уже были <b>"
+            << br.dup << "</b>\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+    }
+    return rep.str();
+}
+
+std::string importFundReport(const std::string& fund, size_t n, const EtfImportResult& r) {
+    std::stringstream rep;
+    rep << "\U0001F3F7 <b>Разметка: " << escapeHtml(fund) << "</b>\nАдресов: <b>" << n << "</b>"
+        << "\n✅ В разметку: <b>" << r.queued << "</b>";
+    if (r.moved) rep << " (из них были у другого фонда: " << r.moved << ")";
+    if (r.dup) rep << "\n↩️ Уже " << escapeHtml(fund) << ": <b>" << r.dup << "</b>";
+    if (r.seed) rep << "\n\U0001F512 Опубликованы фондом, не тронуты: <b>" << r.seed << "</b>";
+    if (r.queued) rep << "\nСканер перенесёт их с ближайшим блоком, историю за два месяца дочитает сам.";
+    return rep.str();
+}
+
+std::string importKeyboard(long long id) {
+    json rows = json::array();
+    json row = json::array();
+    for (const auto& f : IMPORT_FUNDS) {
+        row.push_back({{"text", f}, {"callback_data", "imp:" + std::to_string(id) + ":" + f}});
+        if (row.size() == 4) { rows.push_back(row); row = json::array(); }
+    }
+    if (!row.empty()) rows.push_back(row);
+    rows.push_back(json::array({
+        {{"text", "Другое (в базу китов)"}, {"callback_data", "imp:" + std::to_string(id) + ":other"}},
+        {{"text", "Отмена"}, {"callback_data", "imp:" + std::to_string(id) + ":no"}}}));
+    json kb;
+    kb["inline_keyboard"] = rows;
+    return kb.dump();
+}
+
+void importCommand(const std::string& cid, const std::string& txt) {
+    ImportParse p = parseImport(txt);
+    if (p.x0.empty() && p.byFund.empty() && p.rest.empty()) {
+        sendMsg(cid, "Использование: /import и адреса (через пробел, запятую или с новой строки) — или файл CSV с "
+                     "подписью /import. Для адресов Bitcoin бот спросит, чьи они: фонд (IBIT, FBTC…) или «Другое» "
+                     "(база китов). Строка, где рядом с адресом стоит тикер фонда, размечается сама.");
+        return;
+    }
+    std::string out;
+    for (const auto& [fund, addrs] : p.byFund) {
+        if (!out.empty()) out += "\n\n";
+        out += importFundReport(fund, addrs.size(), btcEtfImport(addrs, fund));
+    }
+    if (!p.x0.empty()) {
+        if (!out.empty()) out += "\n\n";
+        out += importWhalesReport(p.x0, {});
+    }
+    if (!out.empty()) sendMsg(cid, out);
+    if (p.rest.empty()) return;
+    long long id = 0;
+    {
+        std::lock_guard<std::mutex> l(g_impMx);
+        const long long t = static_cast<long long>(time(nullptr));
+        for (auto it = g_imp.begin(); it != g_imp.end();)
+            it = t - it->second.at > IMPORT_PENDING_SEC ? g_imp.erase(it) : std::next(it);
+        id = g_impNext++;
+        g_imp[id] = {p.rest, t};
+    }
+    std::string head = "₿ Адресов Bitcoin без метки: <b>" + std::to_string(p.rest.size()) + "</b>\n<code>" +
+                       escapeHtml(p.rest.front()) + "</code>" + (p.rest.size() > 1 ? " …" : "") +
+                       "\n\nЧьи это адреса?";
+    sendMsg(cid, head, importKeyboard(id));
+}
+
+/* Кнопка под вопросом «чьи адреса». true — нажатие разобрано. */
+bool handleImportCallback(const json& cq) {
+    const std::string data = cq.contains("data") && cq["data"].is_string() ? cq["data"].get<std::string>() : "";
+    if (data.rfind("imp:", 0) != 0) return false;
+    const std::string qid = cq.contains("id") && cq["id"].is_string() ? cq["id"].get<std::string>() : "";
+    const std::string from = cq.contains("from") && cq["from"].is_object() && cq["from"].contains("id") &&
+                             cq["from"]["id"].is_number_integer()
+                             ? std::to_string(cq["from"]["id"].get<long long>()) : "";
+    if (from != OWNER_CHAT_ID) {
+        if (!qid.empty()) answerCallbackQuery(qid);
+        return true;
+    }
+    const size_t colon = data.find(':', 4);
+    long long id = 0;
+    try { id = std::stoll(data.substr(4, colon == std::string::npos ? std::string::npos : colon - 4)); } catch (...) { id = 0; }
+    const std::string label = colon == std::string::npos ? "" : data.substr(colon + 1);
+    ImportPending pend;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> l(g_impMx);
+        auto it = g_imp.find(id);
+        if (it != g_imp.end()) {
+            pend = std::move(it->second);
+            g_imp.erase(it);
+            found = true;
+        }
+    }
+    std::string text;
+    if (!found) text = "Этот список уже разобран или устарел — пришлите /import ещё раз.";
+    else if (label == "no") text = "Импорт отменён.";
+    else if (label == "other") text = importWhalesReport({}, pend.btc);
+    else if (std::find(IMPORT_FUNDS.begin(), IMPORT_FUNDS.end(), label) != IMPORT_FUNDS.end())
+        text = importFundReport(label, pend.btc.size(), btcEtfImport(pend.btc, label));
+    else text = "Не понял кнопку — пришлите /import ещё раз.";
+    if (!qid.empty()) answerCallbackQuery(qid, found ? "Готово" : "");
+    if (cq.contains("message") && cq["message"].is_object() && cq["message"].contains("message_id") &&
+        cq["message"].contains("chat") && cq["message"]["chat"].is_object() &&
+        cq["message"]["chat"].contains("id")) {
+        json j;
+        j["chat_id"] = cq["message"]["chat"]["id"];
+        j["message_id"] = cq["message"]["message_id"];
+        j["text"] = text;
+        j["parse_mode"] = "HTML";
+        j["disable_web_page_preview"] = true;
+        http(tgApi("editMessageText"), j.dump());
+    }
+    return true;
+}
+
+// Файл со списком (CSV, TXT) от владельца — текстом. Больше 8 МБ не берём.
+std::string tgFileText(const json& doc) {
+    if (!doc.is_object() || !doc.contains("file_id") || !doc["file_id"].is_string()) return "";
+    if (doc.contains("file_size") && doc["file_size"].is_number_integer() &&
+        doc["file_size"].get<long long>() > static_cast<long long>(IMPORT_FILE_MAX))
+        return "";
+    try {
+        auto r = json::parse(http(tgApi("getFile") + "?file_id=" + doc["file_id"].get<std::string>(), "", 20));
+        if (!r.value("ok", false) || !r.contains("result") || !r["result"].contains("file_path")) return "";
+        std::string body = http(TG_API_BASE + "/file/bot" + TG_TOKEN + "/" + r["result"]["file_path"].get<std::string>(), "", 60);
+        if (body.size() > IMPORT_FILE_MAX) body.resize(IMPORT_FILE_MAX);
+        return body;
+    } catch (...) {
+        return "";
+    }
+}
+
 bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     if (cid != OWNER_CHAT_ID || txt.empty() || txt[0] != '/') return false;
     if (txt=="/health") {
@@ -2325,73 +2553,7 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
         sendMsg(cid,ss2.str());
     }
     else if (txt.rfind("/import", 0) == 0) {
-        std::vector<std::string> found;
-        {
-            std::string s = toLower(txt);
-            size_t p = 0;
-            while ((p = s.find("0x", p)) != std::string::npos) {
-                if (p + 42 <= s.size()) {
-                    std::string cand = s.substr(p, 42);
-                    if (isValidAddress(cand)) { found.push_back(cand); p += 42; continue; }
-                }
-                p += 2;
-            }
-        }
-        // Адреса биткоина — в свою базу того же сервисного
-        // аккаунта (btc.db). Регистр base58 значим, поэтому
-        // разбираем исходный текст, а не строчную копию.
-        std::vector<std::string> btcFound;
-        {
-            std::string tok;
-            auto flush = [&] {
-                if (!tok.empty() && isBtcAddress(tok)) btcFound.push_back(normBtcAddress(tok));
-                tok.clear();
-            };
-            for (char ch : txt) {
-                if (std::isalnum(static_cast<unsigned char>(ch))) tok += ch;
-                else flush();
-            }
-            flush();
-        }
-        if (found.empty() && btcFound.empty()) {
-            sendMsg(cid, "Использование: /import 0x... bc1... (адреса BSC, Hyperliquid и Bitcoin через пробел, запятую или с новой строки)");
-        } else if (found.empty()) {
-            BtcImportResult br = btcImport(btcFound);
-            std::stringstream rep;
-            rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
-                << "₿ Адресов Bitcoin: <b>" << btcFound.size() << "</b>\n"
-                << "✅ Добавлено: <b>" << br.added << "</b>\n"
-                << "↩️ Уже в базе: <b>" << br.dup << "</b>\n"
-                << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
-            sendMsg(cid, rep.str());
-        } else {
-            int added = 0, dup = 0, banned = 0, failed = 0;
-            for (const auto& a : found) {
-                switch (addUserWhale(SERVICE_CHAT_ID, a, a)) {
-                    case AddWhaleResult::OK:                  ++added;  break;
-                    case AddWhaleResult::ALREADY_EXISTS:      ++dup;    break;
-                    case AddWhaleResult::PERMANENTLY_BANNED:  ++banned; break;
-                    default:                                  ++failed; break;
-                }
-            }
-            refreshWatchers();
-            std::stringstream rep;
-            rep << "\U0001F4E5 <b>Импорт завершён</b>\n\n"
-                << "Найдено адресов: <b>" << found.size() << "</b>\n"
-                << "✅ Добавлено: <b>" << added << "</b>\n"
-                << "↩️ Уже отслеживались: <b>" << dup << "</b>\n";
-            if (banned > 0) rep << "🤖 Помечены как боты (пропущены): <b>" << banned << "</b>\n";
-            if (failed > 0) rep << "⚠️ Не удалось добавить: <b>" << failed << "</b>\n";
-            rep << "\nВсего на сервисном аккаунте: <b>"
-                << countUserWhales(SERVICE_CHAT_ID) << "</b>";
-            if (!btcFound.empty()) {
-                BtcImportResult br = btcImport(btcFound);
-                rep << "\n\n₿ Bitcoin: найдено <b>" << btcFound.size() << "</b>, добавлено <b>"
-                    << br.added << "</b>, уже в базе <b>" << br.dup << "</b>"
-                    << "\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
-            }
-            sendMsg(cid, rep.str());
-        }
+        importCommand(cid, txt);
     }
     else if (txt.rfind("/unban", 0) == 0) {
         std::string arg = trim(txt.substr(6));
@@ -2450,6 +2612,7 @@ void telegramLoop() {
                 if (u.contains("callback_query")&&u["callback_query"].is_object()) {
                     const json& cq = u["callback_query"];
                     if (handleExchCallback(cq)) continue;
+                    if (handleImportCallback(cq)) continue;
                     if (cq.contains("id") && cq["id"].is_string())
                         answerCallbackQuery(cq["id"].get<std::string>());
                     if (cq.contains("message") && cq["message"].is_object() &&
@@ -2477,7 +2640,17 @@ void telegramLoop() {
                 }
                 if (!g_rateLimiter.allow(cid)) continue;
 
-                const std::string txt = m.contains("text") && m["text"].is_string() ? m["text"].get<std::string>() : "";
+                std::string txt = m.contains("text") && m["text"].is_string() ? m["text"].get<std::string>() : "";
+                // Список файлом от владельца: подпись /import, сам список — в файле.
+                if (txt.empty() && cid == OWNER_CHAT_ID && m.contains("document") && m.contains("caption") &&
+                    m["caption"].is_string() && m["caption"].get<std::string>().rfind("/import", 0) == 0) {
+                    const std::string body = tgFileText(m["document"]);
+                    if (body.empty()) {
+                        sendMsg(cid, "Файл не прочитался (до 8 МБ, текст или CSV).");
+                        continue;
+                    }
+                    txt = m["caption"].get<std::string>() + "\n" + body;
+                }
                 if (handleOwnerCommand(cid, txt)) continue;
 
                 std::string tgLang;

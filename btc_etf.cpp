@@ -487,6 +487,10 @@ void etfOpen(sqlite3* db) {
         "  src TEXT NOT NULL, dst TEXT NOT NULL, sats INTEGER NOT NULL, sv INTEGER NOT NULL, dv INTEGER NOT NULL,"
         "  PRIMARY KEY (txid, n));"
         "CREATE INDEX IF NOT EXISTS idx_btc_cust_xfer_ts ON btc_cust_xfer(ts);"
+        // Разметка владельца (/import): адрес → фонд. Пишет любой процесс бота,
+        // в разметку переносит тот, что читает блоки (etfDrainLabels).
+        "CREATE TABLE IF NOT EXISTS btc_etf_import ("
+        "  address TEXT PRIMARY KEY, fund TEXT NOT NULL, at INTEGER NOT NULL DEFAULT 0);"
         "CREATE TABLE IF NOT EXISTS btc_etf_hold ("
         "  day INTEGER NOT NULL, fund TEXT NOT NULL, sats INTEGER NOT NULL, n INTEGER NOT NULL,"
         "  PRIMARY KEY (day, fund));";
@@ -496,6 +500,9 @@ void etfOpen(sqlite3* db) {
     }
     // Колонка появилась позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(db, "ALTER TABLE btc_etf_svc ADD COLUMN fee INTEGER NOT NULL DEFAULT 0", nullptr, nullptr, nullptr);
+    // hist = 0 — история кошелька за два месяца ещё не прочитана (размечен
+    // через /import): её дочитывает etfHistQueue понемногу.
+    sqlite3_exec(db, "ALTER TABLE btc_etf_addr ADD COLUMN hist INTEGER NOT NULL DEFAULT 1", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr);
     for (const char* f : FEE_SEEDS) {
         Stmt q(db, "INSERT INTO btc_etf_svc(address, at, fee) VALUES(?,?,1) ON CONFLICT(address) DO UPDATE SET fee=1");
@@ -512,10 +519,12 @@ void etfOpen(sqlite3* db) {
         q.text(1, a).text(2, fund).num(3, now()).run();
     }
     // Кошельки из чужих списков, проверенные по цепочке (btc_etf_list.h):
-    // опубликованного фондом не трогают, выученное — уточняют.
+    // опубликованного фондом и размеченного владельцем (/import) не трогают,
+    // выученное — уточняют.
     for (const auto& [a, fund] : BTC_ETF_LIST) {
         Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'list',?) "
-                   "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list' WHERE btc_etf_addr.how != 'seed'");
+                   "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list' "
+                   "WHERE btc_etf_addr.how NOT IN ('seed', 'list')");
         q.text(1, a).text(2, fund).num(3, now()).run();
     }
     sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
@@ -524,9 +533,12 @@ void etfOpen(sqlite3* db) {
     g_types.clear();
     g_service.clear();
     for (const auto& [a, fund] : BTC_ETF_BOOK) g_types[fund].insert(addrType(a));
-    for (const auto& [a, fund] : BTC_ETF_LIST) g_types[fund].insert(addrType(a));
-    Stmt q(db, "SELECT address, fund FROM btc_etf_addr");
-    while (q.row()) g_fund[q.str(0)] = q.str(1);
+    Stmt q(db, "SELECT address, fund, how FROM btc_etf_addr");
+    while (q.row()) {
+        g_fund[q.str(0)] = q.str(1);
+        // Типы адресов фонда — по его спискам (свой и размеченный владельцем).
+        if (q.str(2) == "list") g_types[q.str(1)].insert(addrType(q.str(0)));
+    }
     Stmt v(db, "SELECT address, fee FROM btc_etf_svc");
     while (v.row()) {
         g_service.insert(v.str(0));
@@ -545,6 +557,66 @@ void etfOpen(sqlite3* db) {
 
 void etfBlock(sqlite3* db, const Block& b) {
     for (const auto& tx : b.txs) scanTx(db, b, tx);
+}
+
+EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund) {
+    EtfImportResult r;
+    Stmt was(db, "SELECT fund, how FROM btc_etf_addr WHERE address=?");
+    for (const auto& a : addrs) {
+        sqlite3_reset(was.s);
+        was.text(1, a);
+        if (was.row()) {
+            if (was.str(1) == "seed") { ++r.seed; continue; }
+            if (was.str(0) == fund) { ++r.dup; continue; }
+            ++r.moved;
+        }
+        Stmt q(db, "INSERT INTO btc_etf_import(address, fund, at) VALUES(?,?,?) "
+                   "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, at=excluded.at");
+        q.text(1, a).text(2, fund).num(3, now()).run();
+        ++r.queued;
+    }
+    return r;
+}
+
+int etfDrainLabels(sqlite3* db) {
+    std::vector<std::pair<std::string, std::string>> rows;
+    {
+        Stmt q(db, "SELECT address, fund FROM btc_etf_import");
+        while (q.row()) rows.emplace_back(q.str(0), q.str(1));
+    }
+    if (rows.empty()) return 0;
+    int n = 0;
+    for (const auto& [a, fund] : rows) {
+        // Опубликованное фондом не трогаем; остальное — как сказал владелец.
+        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at, hist) VALUES(?,?,'list',?,0) "
+                   "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list', at=excluded.at, "
+                   "bal_at=0, hist=0 WHERE btc_etf_addr.how != 'seed'");
+        q.text(1, a).text(2, fund).num(3, now()).run();
+        if (sqlite3_changes(db) == 0) continue;
+        ++n;
+        std::lock_guard<std::mutex> l(g_mx);
+        g_fund[a] = fund;
+        g_types[fund].insert(addrType(a));
+    }
+    sqlite3_exec(db, "DELETE FROM btc_etf_import", nullptr, nullptr, nullptr);
+    std::cout << "[ETF] разметка владельца: " << n << " кошельков" << std::endl;
+    return n;
+}
+
+std::vector<std::string> etfHistQueue(sqlite3* db, size_t limit) {
+    std::vector<std::string> r;
+    Stmt q(db, "SELECT address FROM btc_etf_addr WHERE hist = 0 ORDER BY at LIMIT ?");
+    q.num(1, static_cast<long long>(limit));
+    while (q.row()) r.push_back(q.str(0));
+    return r;
+}
+
+void etfHistDone(sqlite3* db, const std::vector<std::string>& addrs) {
+    Stmt q(db, "UPDATE btc_etf_addr SET hist = 1 WHERE address = ?");
+    for (const auto& a : addrs) {
+        sqlite3_reset(q.s);
+        q.text(1, a).run();
+    }
 }
 
 void etfRollback(sqlite3* db, long long height) {

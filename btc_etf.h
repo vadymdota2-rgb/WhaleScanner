@@ -56,5 +56,19 @@ void etfVaultRetry(const std::string& address);
 // 0 — был, -1 — не узнать (тогда не переезд, а отток). Ставит btc_chain.
 using EtfFreshCheck = std::function<int(const std::string& address, const std::string& txid, long long height)>;
 void etfSetFreshCheck(EtfFreshCheck f);
+// Разметка владельца (/import): адреса → фонд. В очередь (её переносит в
+// разметку процесс, читающий блоки, — etfDrainLabels с каждым блоком).
+// Опубликованные фондом (BITB) не переписываются.
+struct EtfImportResult {
+    int queued = 0;  // в очереди на разметку
+    int dup = 0;     // уже этого фонда
+    int moved = 0;   // были чужого фонда — переразмечены (входят в queued)
+    int seed = 0;    // опубликованы фондом — не тронуты
+};
+EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund);
+int etfDrainLabels(sqlite3* db);
+// Размеченные, чья история за два месяца ещё не прочитана, — догонке.
+std::vector<std::string> etfHistQueue(sqlite3* db, size_t limit);
+void etfHistDone(sqlite3* db, const std::vector<std::string>& addrs);
 // Раздел для /statsbtc.
 std::string etfStats(sqlite3* db);

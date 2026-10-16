@@ -822,6 +822,8 @@ public:
             execSql("BEGIN");
             scan(b, price, moves, learned);
             exBalances(b);
+            // Разметка владельца (/import из любого процесса бота) — до блока.
+            etfDrainLabels(g_btcDb);
             etfBlock(g_btcDb, b);
             govBlock(g_btcDb, b);
             execSql("COMMIT");
@@ -1982,10 +1984,10 @@ std::string g_backStatus = "ещё не было";
 // true — история всех кошельков прочитана и все блоки разобраны. Иначе
 // догонка повторится через час: пометить её сделанной после отказа сервиса
 // значило бы остаться без двух месяцев потоков (так и было: «0 BTC»).
-bool etfBackfill(long long since, long long upTo) {
+bool etfBackfillFor(const std::vector<std::string>& addrs, long long since, long long upTo) {
     std::set<long long> heights;
     int failed = 0;
-    for (const auto& a : etfAddresses()) {
+    for (const auto& a : addrs) {
         std::string after;
         for (int page = 0; page < 40; ++page) {
             bool ok = false;
@@ -2028,6 +2030,24 @@ bool etfBackfill(long long since, long long upTo) {
                    (failed ? ", кошельков без истории " + std::to_string(failed) : std::string());
     std::cout << "[ETF] догонка: " << g_backStatus << std::endl;
     return ok;
+}
+
+bool etfBackfill(long long since, long long upTo) { return etfBackfillFor(etfAddresses(), since, upTo); }
+
+// Кошельки, размеченные через /import: их два месяца — понемногу, по 100 за
+// круг (список бывает в тысячи адресов). Не прочиталось — повтор на
+// следующем круге.
+constexpr size_t ETF_HIST_PER_PASS = 100;
+
+void backfillImported(long long tip) {
+    std::vector<std::string> addrs;
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        addrs = etfHistQueue(g_btcDb, ETF_HIST_PER_PASS);
+    }
+    if (addrs.empty() || !etfBackfillFor(addrs, nowSec() - ETF_BACK_SEC, tip)) return;
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    etfHistDone(g_btcDb, addrs);
 }
 
 // История новых хранилищ хранителя: первая страница их транзакций с
@@ -2180,6 +2200,7 @@ void btcLoop() {
             refreshGovBalances();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshEtfBalances();
+                backfillImported(tip);
                 refreshIdleBalances();
                 lastBal = std::chrono::steady_clock::now();
             }
@@ -2391,6 +2412,17 @@ bool isBtcKey(const std::string& a) {
     if ((a[0] != '1' && a[0] != '3') || a.size() < 26 || a.size() > 35) return false;
     for (char ch : a) if (!std::isalnum(static_cast<unsigned char>(ch))) return false;
     return true;
+}
+
+EtfImportResult btcEtfImport(const std::vector<std::string>& addrs, const std::string& fund) {
+    std::vector<std::string> norm;
+    for (const auto& a : addrs) norm.push_back(normBtcAddress(a));
+    std::lock_guard<std::mutex> l(g_btcDbMutex);
+    if (!g_btcDb) return {};
+    execSql("BEGIN");
+    EtfImportResult r = etfImport(g_btcDb, norm, fund);
+    execSql("COMMIT");
+    return r;
 }
 
 BtcImportResult btcImport(const std::vector<std::string>& addrs) {
