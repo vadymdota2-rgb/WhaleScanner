@@ -562,13 +562,22 @@ void etfBlock(sqlite3* db, const Block& b) {
 EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund) {
     EtfImportResult r;
     Stmt was(db, "SELECT fund, how FROM btc_etf_addr WHERE address=?");
+    // База китов (btc_watch) живёт в той же btc.db; в тестах её может не быть.
+    sqlite3_stmt* probe = nullptr;
+    const bool hasWatch = sqlite3_prepare_v2(db, "SELECT 1 FROM btc_watch LIMIT 0", -1, &probe, nullptr) == SQLITE_OK;
+    sqlite3_finalize(probe);
     for (const auto& a : addrs) {
         sqlite3_reset(was.s);
         was.text(1, a);
         if (was.row()) {
             if (was.str(1) == "seed") { ++r.seed; continue; }
             if (was.str(0) == fund) { ++r.dup; continue; }
-            ++r.moved;
+            if (!was.str(0).empty() && was.str(0)[0] == '#') ++r.named;
+            else ++r.moved;
+        } else if (hasWatch) {
+            Stmt w(db, "SELECT 1 FROM btc_watch WHERE address=?");
+            w.text(1, a);
+            if (w.row()) ++r.inBase;
         }
         Stmt q(db, "INSERT INTO btc_etf_import(address, fund, at) VALUES(?,?,?) "
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, at=excluded.at");

@@ -2430,7 +2430,14 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     if (!g_btcDb) return r;
     sqlite3_stmt* s = nullptr;
+    sqlite3_stmt* m = nullptr;
     if (!prep(&s, "INSERT OR IGNORE INTO btc_watch(address, src, at) VALUES(?, 'import', ?)")) return r;
+    // Уже в базе, но не помечен (добавил поиск) — помечаем импортированным:
+    // звёздочка в приложении, и чистка неактивных его больше не уберёт.
+    if (!prep(&m, "UPDATE btc_watch SET src = 'import' WHERE address = ? AND src = 'auto'")) {
+        sqlite3_finalize(s);
+        return r;
+    }
     execSql("BEGIN");
     for (const auto& raw : addrs) {
         const std::string a = normBtcAddress(raw);
@@ -2441,12 +2448,16 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
             ++r.added;
             std::lock_guard<std::mutex> w(g_watchMutex);
             g_watch.insert(a);
-        } else {
-            ++r.dup;
+            continue;
         }
+        sqlite3_reset(m);
+        bindText(m, 1, a);
+        if (sqlite3_step(m) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) ++r.marked;
+        else ++r.dup;
     }
     execSql("COMMIT");
     sqlite3_finalize(s);
+    sqlite3_finalize(m);
     return r;
 }
 

@@ -44,6 +44,7 @@ void stopBtc();
 struct BtcImportResult {
     int added = 0;
     int dup = 0;
+    int marked = 0;  // были в базе без пометки (нашёл поиск) — теперь импортированные (★)
 };
 
 // Похоже ли на адрес биткоина: bech32/bech32m с проверкой контрольной

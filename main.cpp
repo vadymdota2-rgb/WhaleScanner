@@ -2275,8 +2275,10 @@ std::string importWhalesReport(const std::vector<std::string>& x0, const std::ve
     }
     if (!btc.empty()) {
         BtcImportResult br = btcImport(btc);
-        rep << "\n₿ Bitcoin: <b>" << btc.size() << "</b>, добавлено <b>" << br.added << "</b>, уже были <b>"
-            << br.dup << "</b>\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount() << "</b>";
+        rep << "\n₿ Bitcoin: <b>" << btc.size() << "</b>, добавлено <b>" << br.added << "</b>";
+        if (br.marked) rep << ", были без пометки — помечены ★ <b>" << br.marked << "</b>";
+        rep << ", уже были <b>" << br.dup << "</b>\nКошельков Bitcoin на сервисном аккаунте: <b>" << btcWatchCount()
+            << "</b>";
     }
     return rep.str();
 }
@@ -2285,7 +2287,9 @@ std::string importFundReport(const std::string& fund, size_t n, const EtfImportR
     std::stringstream rep;
     rep << "\U0001F3F7 <b>Разметка: " << escapeHtml(fund) << "</b>\nАдресов: <b>" << n << "</b>"
         << "\n✅ В разметку: <b>" << r.queued << "</b>";
-    if (r.moved) rep << " (из них были у другого фонда: " << r.moved << ")";
+    if (r.inBase) rep << "\n⭐ Были в базе китов без метки — помечены: <b>" << r.inBase << "</b>";
+    if (r.named) rep << "\n\U0001F50E Были в группе без имени — помечены: <b>" << r.named << "</b>";
+    if (r.moved) rep << "\n\U0001F504 Были у другого фонда — переразмечены: <b>" << r.moved << "</b>";
     if (r.dup) rep << "\n↩️ Уже " << escapeHtml(fund) << ": <b>" << r.dup << "</b>";
     if (r.seed) rep << "\n\U0001F512 Опубликованы фондом, не тронуты: <b>" << r.seed << "</b>";
     if (r.queued) rep << "\nСканер перенесёт их с ближайшим блоком, историю за два месяца дочитает сам.";

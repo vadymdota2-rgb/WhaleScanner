@@ -62,7 +62,9 @@ void etfSetFreshCheck(EtfFreshCheck f);
 struct EtfImportResult {
     int queued = 0;  // в очереди на разметку
     int dup = 0;     // уже этого фонда
-    int moved = 0;   // были чужого фонда — переразмечены (входят в queued)
+    int moved = 0;   // были другого фонда — переразмечены (входят в queued)
+    int named = 0;   // были без имени (группа «#…») — помечены (входят в queued)
+    int inBase = 0;  // лежали в базе китов без метки фонда — помечены (входят в queued)
     int seed = 0;    // опубликованы фондом — не тронуты
 };
 EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund);
