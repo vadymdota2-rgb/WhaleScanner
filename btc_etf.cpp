@@ -101,6 +101,8 @@ struct Stmt {
     bool row() { return s && sqlite3_step(s) == SQLITE_ROW; }
     bool run() { return s && sqlite3_step(s) == SQLITE_DONE; }
     long long col(int i) { return sqlite3_column_int64(s, i); }
+    double dbl(int i) { return sqlite3_column_double(s, i); }
+    bool null(int i) { return sqlite3_column_type(s, i) == SQLITE_NULL; }
     std::string str(int i) {
         const unsigned char* t = sqlite3_column_text(s, i);
         return t ? reinterpret_cast<const char*>(t) : "";
@@ -473,6 +475,13 @@ void etfOpen(sqlite3* db) {
         "CREATE INDEX IF NOT EXISTS idx_btc_etf_moves_height ON btc_etf_moves(height);"
         "CREATE INDEX IF NOT EXISTS idx_btc_etf_moves_peer ON btc_etf_moves(fund, peer);"
         "CREATE INDEX IF NOT EXISTS idx_btc_etf_moves_ts ON btc_etf_moves(ts);"
+        // Сверка разметки фонда с «Институциональными потоками» — пишет API
+        // (_btc_check), бот показывает в /statsbtc. Только проверка: v — ok
+        // (сходится), part (верно, но размечено не всё), bad (не сходится),
+        // few (мало дней); share — какую долю потока фонда видит разметка.
+        "CREATE TABLE IF NOT EXISTS btc_etf_check ("
+        "  fund TEXT PRIMARY KEY, v TEXT NOT NULL, days INTEGER NOT NULL, err REAL, share REAL,"
+        "  at INTEGER NOT NULL);"
         // Поток по суткам UTC: его читает API.
         "CREATE TABLE IF NOT EXISTS btc_etf_flow ("
         "  day INTEGER NOT NULL, fund TEXT NOT NULL,"
@@ -697,6 +706,23 @@ void etfSetBalance(sqlite3* db, const std::string& address, long long sats, long
     h.num(1, dayOf(now())).text(2, fund).run();
 }
 
+// Строка сверки разметки фонда с «Институциональными потоками» (btc_etf_check).
+std::string checkLine(sqlite3* db, const std::string& fund) {
+    Stmt q(db, "SELECT v, days, err, share, at FROM btc_etf_check WHERE fund=?");
+    q.text(1, fund);
+    if (!q.row()) return "\n  сверка с инст. потоками: ещё не было";
+    const std::string v = q.str(0);
+    const long long days = q.col(1);
+    const int err = q.null(2) ? -1 : static_cast<int>(q.dbl(2) * 100 + 0.5);
+    const int share = q.null(3) ? -1 : static_cast<int>(q.dbl(3) * 100 + 0.5);
+    std::string out = "\n  сверка с инст. потоками (" + std::to_string(days) + " дн.): ";
+    if (v == "ok") out += "✅ сходится, расхождение " + std::to_string(err) + "%";
+    else if (v == "part") out += "🟡 верно, но размечено не всё: видим ~" + std::to_string(share) + "% потока фонда";
+    else if (v == "bad") out += "❌ не сходится (расхождение " + std::to_string(err) + "%) — проверьте разметку";
+    else out += "⏳ мало дней с движением";
+    return out;
+}
+
 std::string etfStats(sqlite3* db) {
     std::string out = "\n\n🏦 <b>ETF по цепочке</b> (свои метки)";
     std::vector<std::string> funds;
@@ -738,7 +764,7 @@ std::string etfStats(sqlite3* db) {
                "\n  сегодня +" + btc(in) + " / −" + btc(outS) + (fee ? " · плата фонду " + btc(fee) : std::string()) +
                " · за 7 дней " + (week >= 0 ? "+" : "−") + btc(week >= 0 ? week : -week) + " BTC" +
                "\n  сверка с цепочкой за сутки: " + std::to_string(checks) + " кошельков, расхождение " +
-               btc(drift) + " BTC";
+               btc(drift) + " BTC" + checkLine(db, f);
     }
     if (g_mixed) out += "\n⚠️ Траты со смешанными фондами: " + std::to_string(g_mixed);
     {
