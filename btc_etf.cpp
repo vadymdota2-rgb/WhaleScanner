@@ -21,6 +21,9 @@ constexpr long long SAT = 100000000LL;
 constexpr long long DUST = SAT / 100;
 // Сверка остатка кошелька с цепочкой — раз в сутки.
 constexpr long long CHECK_SEC = 86400;
+// Высота «остаток ещё не сверен»: выше любого блока, поэтому движения блоков
+// к нему не прибавляются; сверка (etfSetBalance) ставит настоящую.
+constexpr long long UNKNOWN_HEIGHT = 1LL << 62;
 
 // Плата за управление, базисные пункты в год (проспект фонда). Нужна, чтобы
 // отличить её от оттока инвесторов.
@@ -205,10 +208,12 @@ void learn(sqlite3* db, const std::string& addr, const std::string& fund, long l
         std::lock_guard<std::mutex> l(g_mx);
         if (!g_fund.emplace(addr, fund).second) return;
     }
-    // Остаток нового кошелька неизвестен: этот блок в него не пишем, сверка
-    // с цепочкой (bal_at = 0 — первым в очереди) даст настоящий.
+    // Остаток нового кошелька неизвестен: блоки в него не пишем, пока сверка
+    // с цепочкой (bal_at = 0 — первым в очереди) не даст настоящий и свою
+    // высоту. Иначе к нулю копились бы движения и остаток уходил в минус.
+    (void)height;
     Stmt q(db, "INSERT OR IGNORE INTO btc_etf_addr(address, fund, how, at, bal_height) VALUES(?,?,'cospend',?,?)");
-    q.text(1, addr).text(2, fund).num(3, now()).num(4, height).run();
+    q.text(1, addr).text(2, fund).num(3, now()).num(4, UNKNOWN_HEIGHT).run();
     unOut(db, fund, addr);
 }
 
@@ -514,18 +519,18 @@ void etfOpen(sqlite3* db) {
         q.text(1, a).num(2, now()).run();
     }
     for (const auto& [a, fund] : BTC_ETF_BOOK) {
-        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'seed',?) "
+        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at, bal_height) VALUES(?,?,'seed',?,?) "
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='seed'");
-        q.text(1, a).text(2, fund).num(3, now()).run();
+        q.text(1, a).text(2, fund).num(3, now()).num(4, UNKNOWN_HEIGHT).run();
     }
     // Кошельки из чужих списков, проверенные по цепочке (btc_etf_list.h):
     // опубликованного фондом и размеченного владельцем (/import) не трогают,
     // выученное — уточняют.
     for (const auto& [a, fund] : BTC_ETF_LIST) {
-        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'list',?) "
+        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at, bal_height) VALUES(?,?,'list',?,?) "
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list' "
                    "WHERE btc_etf_addr.how NOT IN ('seed', 'list')");
-        q.text(1, a).text(2, fund).num(3, now()).run();
+        q.text(1, a).text(2, fund).num(3, now()).num(4, UNKNOWN_HEIGHT).run();
     }
     sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr);
     std::lock_guard<std::mutex> l(g_mx);
@@ -597,10 +602,12 @@ int etfDrainLabels(sqlite3* db) {
     int n = 0;
     for (const auto& [a, fund] : rows) {
         // Опубликованное фондом не трогаем; остальное — как сказал владелец.
-        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at, hist) VALUES(?,?,'list',?,0) "
+        // Новый кошелёк — остаток до сверки не ведём (UNKNOWN_HEIGHT); уже
+        // известный (переразметка) — его остаток верен, высоту не трогаем.
+        Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at, hist, bal_height) VALUES(?,?,'list',?,0,?) "
                    "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='list', at=excluded.at, "
                    "bal_at=0, hist=0 WHERE btc_etf_addr.how != 'seed'");
-        q.text(1, a).text(2, fund).num(3, now()).run();
+        q.text(1, a).text(2, fund).num(3, now()).num(4, UNKNOWN_HEIGHT).run();
         if (sqlite3_changes(db) == 0) continue;
         ++n;
         std::lock_guard<std::mutex> l(g_mx);

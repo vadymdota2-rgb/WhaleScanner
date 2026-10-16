@@ -679,12 +679,14 @@ bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
 
 // Был ли адрес в цепочке до траты `txid` на высоте `height` — по его истории
 // с mempool.space (запасной blockstream), страницами по 25 от новых к старым.
-// Нашлась транзакция ниже этой высоты — адрес жил раньше. Дольше 20 страниц
-// или источники молчат — «не узнать».
+// Нашлась транзакция ниже этой высоты — адрес жил раньше. Дольше 8 страниц
+// (200 транзакций после переезда — это не новый кошелёк фонда, а узел) или
+// источники молчат — «не узнать». Зовётся под замком базы, редко: страниц
+// мало, чтобы замок не держался минутами.
 int addrFresh(const std::string& a, const std::string& txid, long long height) {
     std::string last;
     bool self = false;
-    for (int page = 0; page < 20; ++page) {
+    for (int page = 0; page < 8; ++page) {
         json j;
         for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
             j = json::parse(fetch(host + a + "/txs/chain" + (last.empty() ? "" : "/" + last), 15), nullptr, false);
