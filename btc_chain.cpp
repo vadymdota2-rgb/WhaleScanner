@@ -1980,8 +1980,14 @@ json addrPage(const std::string& path, bool& ok) {
     return json();
 }
 
-// Как прошла последняя догонка — для /statsbtc.
+// Как прошла последняя догонка — для /statsbtc (читает другой поток).
+std::mutex g_backMx;
 std::string g_backStatus = "ещё не было";
+
+std::string backStatus() {
+    std::lock_guard<std::mutex> l(g_backMx);
+    return g_backStatus;
+}
 
 // true — история всех кошельков прочитана и все блоки разобраны. Иначе
 // догонка повторится через час: пометить её сделанной после отказа сервиса
@@ -2027,10 +2033,14 @@ bool etfBackfillFor(const std::vector<std::string>& addrs, long long since, long
         ++done;
     }
     const bool ok = failed == 0 && done == static_cast<int>(heights.size());
-    g_backStatus = std::string(ok ? "готово" : "не вся, повтор через час") + " — блоков " + std::to_string(done) +
-                   " из " + std::to_string(heights.size()) +
-                   (failed ? ", кошельков без истории " + std::to_string(failed) : std::string());
-    std::cout << "[ETF] догонка: " << g_backStatus << std::endl;
+    const std::string status = std::string(ok ? "готово" : "не вся, повтор через час") + " — блоков " +
+                               std::to_string(done) + " из " + std::to_string(heights.size()) +
+                               (failed ? ", кошельков без истории " + std::to_string(failed) : std::string());
+    {
+        std::lock_guard<std::mutex> l(g_backMx);
+        g_backStatus = status;
+    }
+    std::cout << "[ETF] догонка: " << status << std::endl;
     return ok;
 }
 
@@ -2091,6 +2101,60 @@ void readNewVaults() {
     }
 }
 
+// Работа по фондам ETF — в своём потоке, а не в цикле блоков. Догонка двух
+// месяцев читает историю сотен адресов с mempool.space (с паузами — сервис
+// ограничивает частоту) и заново разбирает тысячи старых блоков: это часы.
+// В цикле блоков она стояла перед разбором новых, а при отказе сервиса —
+// повторялась каждый час: новые блоки ждали, отставание переваливало за
+// сутки, блоки пропускались целиком — крупные сделки и рейтинг вставали с
+// 16 октября. Здесь же сверка остатков фондов, история кошельков из /import
+// и хранилища хранителя — тоже сеть. Разбор блока из обоих потоков безопасен:
+// под одним замком базы, а движения фонда пишутся по уникальному ключу (тот
+// же блок второй раз ничего не удвоит).
+void etfLoop(Scanner& sc) {
+    auto lastBack = std::chrono::steady_clock::now() - std::chrono::hours(2);
+    auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
+    while (running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
+        try {
+            const long long tip = g_bs.tip.load();
+            if (tip > 0) {
+                // Простой бота дольше суток: цикл блоков записал, какие блоки
+                // пропущены («от:до»), — потоки фондов за них догоняются здесь.
+                const std::string gap = sc.state("etf_gap");
+                const size_t colon = gap.find(':');
+                if (colon != std::string::npos) {
+                    const long long since = parseLL(gap.substr(0, colon)), upTo = parseLL(gap.substr(colon + 1));
+                    if (since <= 0 || upTo <= 0 || !etfBackfill(since, upTo)) sc.setStateLocked("etf_back", "0");
+                    sc.setStateLocked("etf_gap", "");
+                }
+                // Версия 2: первая версия помечала догонку сделанной и после
+                // отказа сервиса истории — на таких установках она пройдёт
+                // заново. Версия 3: добавились кошельки фондов из списков
+                // (btc_etf_list.h) — их два месяца тоже догоняются (уже
+                // записанное не задвоится).
+                if (sc.state("etf_back") != "3" &&
+                    std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
+                    lastBack = std::chrono::steady_clock::now();
+                    // Сначала остатки кошельков: плату фонду за управление
+                    // сканер узнаёт по доле от запаса, а без запаса записал бы
+                    // её оттоком.
+                    refreshEtfBalances();
+                    if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "3");
+                }
+                readNewVaults();
+                if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
+                    refreshEtfBalances();
+                    backfillImported(tip);
+                    lastBal = std::chrono::steady_clock::now();
+                }
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[ETF] " << e.what() << std::endl;
+        }
+        if (!sleepFor(30)) break;
+    }
+}
+
 void btcLoop() {
     Scanner sc;
     {
@@ -2116,7 +2180,7 @@ void btcLoop() {
         sc.setStateLocked("bounce", "1");
     }
     g_bs.startedAt = nowSec();
-    auto lastBack = std::chrono::steady_clock::now() - std::chrono::hours(2);
+    std::thread etf(etfLoop, std::ref(sc));
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
     auto lastGov = std::chrono::steady_clock::now() - std::chrono::hours(12);
@@ -2126,18 +2190,6 @@ void btcLoop() {
             long long tip = tipHeight();
             if (tip <= 0) { if (!sleepFor(30)) break; continue; }
             g_bs.tip = tip;
-            // Версия 2: первая версия помечала догонку сделанной и после
-            // отказа сервиса истории — на таких установках она пройдёт заново.
-            // Версия 3: добавились кошельки фондов из списков (btc_etf_list.h) —
-            // их два месяца тоже догоняются (уже записанное не задвоится).
-            if (sc.state("etf_back") != "3" &&
-                std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
-                lastBack = std::chrono::steady_clock::now();
-                // Сначала остатки кошельков: плату фонду за управление сканер
-                // узнаёт по доле от запаса, а без запаса записал бы её оттоком.
-                refreshEtfBalances();
-                if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "3");
-            }
             long long last = 0;
             {
                 std::string v = sc.state("height");
@@ -2147,10 +2199,11 @@ void btcLoop() {
                 long long from = tip - (last <= 0 ? 1 : 6);
                 if (last > 0) {
                     bump(g_bs.skipped, from - last);
-                    // Потоки фондов за простой — догонкой, по блокам их кошельков.
-                    // Не вышло — полная догонка двух месяцев на следующем круге.
-                    if (!etfBackfill(nowSec() - (tip - last) * 600 - 6 * 3600, from))
-                        sc.setStateLocked("etf_back", "0");
+                    // Потоки фондов за простой — догонкой в потоке фондов
+                    // (etfLoop), по блокам их кошельков; не выйдет — там же
+                    // полная догонка двух месяцев. Новые блоки её не ждут.
+                    sc.setStateLocked("etf_gap", std::to_string(nowSec() - (tip - last) * 600 - 6 * 3600) + ":" +
+                                                     std::to_string(from));
                 }
                 if (last > 0)
                     std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
@@ -2193,7 +2246,6 @@ void btcLoop() {
                 last = b.height;
                 setLag();
             }
-            readNewVaults();
             refreshExBalances();
             if (std::chrono::steady_clock::now() - lastGov > std::chrono::hours(12)) {
                 lastGov = std::chrono::steady_clock::now();
@@ -2201,8 +2253,6 @@ void btcLoop() {
             }
             refreshGovBalances();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
-                refreshEtfBalances();
-                backfillImported(tip);
                 refreshIdleBalances();
                 lastBal = std::chrono::steady_clock::now();
             }
@@ -2215,6 +2265,9 @@ void btcLoop() {
         }
         if (!sleepFor(30)) break;
     }
+    // sc живёт здесь: поток фондов закончится раньше него (он тоже следит за
+    // running и g_btcRunning).
+    etf.join();
 }
 
 }  // namespace
@@ -2616,7 +2669,7 @@ std::string btcStatsLine() {
 
     out += etfStats(g_btcDb);
     out += govStats(g_btcDb);
-    out += "\n⏮ Догонка истории фондов: " + g_backStatus;
+    out += "\n⏮ Догонка истории фондов: " + backStatus();
 
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
     if (prep(&s, "SELECT how, COUNT(*) FROM btc_labels GROUP BY how ORDER BY 2 DESC")) {
