@@ -11,9 +11,7 @@ void setPriceStatHandler(std::function<void(int)> h);
 enum class PriceSource : int {
     None = 0,
     Cache = 1,
-    Pool = 2,        // V2/V3 on-chain, цена из резервов
     DexScreener = 3,
-    CoinGecko = 4  // unused, kept for stats enum stability
 };
 
 int         getDecimals(const std::string& token);
@@ -27,15 +25,12 @@ int         decimalsCached(const std::string& token);
 uint64_t    priceCachedNanos(const std::string& token, long long maxAgeSec);
 /** То же + явный источник. source может быть nullptr. */
 uint64_t    getPriceNanosEx(const std::string& token, PriceSource* source);
-double      getPoolLiquidityUsd(const std::string& token);
 void        ensureNativePrice();
 
 void loadTokenCache();
-void loadPairCache();
 void saveTokenMetadata(const std::string& addr, const std::string& symbol, int decimals);
 void saveTokenPrice(const std::string& addr, uint64_t priceNanos);
 void savePriceHistory(const std::string& addr, uint64_t priceNanos);
 void cleanupPriceHistory();
-void cleanupPairCache();
 /** Единая точка: разные кэши чистятся с разным периодом. Звать из maintenance ~раз в минуту. */
 void cleanupTokenPricesPeriodic();

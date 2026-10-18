@@ -18,5 +18,3 @@ bool wsHeadsOk();
 int64_t wsHeadsLatest();
 std::string wsHeadsActiveLabel();
 
-/** Смен/простоев/отказов подписки/отказов связи — через слэш. */
-std::string wsHeadsStats();

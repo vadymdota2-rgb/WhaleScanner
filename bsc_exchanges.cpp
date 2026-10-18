@@ -453,12 +453,6 @@ void loadLabels() {
 }
 }  // namespace
 
-std::string bscExchangeOf(const std::string& a) {
-    std::lock_guard<std::mutex> m(g_mx);
-    const Label* lb = labelLocked(a);
-    return lb ? lb->ex : "";
-}
-
 namespace {
 BscExHit observe(const BscExTx& tx, long long block, long long blockTs,
                  const std::function<bool(const std::string&)>& watched) {

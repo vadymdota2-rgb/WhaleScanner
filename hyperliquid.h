@@ -17,14 +17,10 @@ size_t hlAlertRecipientCount();
 
 bool initHyperliquid();
 
-void invalidateRankCache();
 void startHyperliquidLoop();
 
 void stopHyperliquid();
 
-// Автокошелёк убран из базы за бездействие — поиск должен снова его
-// заметить, когда он вернётся к торговле.
-void hlAutoForget(const std::string& addressLower);
 // Состояние рейтинга трейдеров для /autobase: когда загружен, сколько
 // прошли отбор, когда следующая попытка.
 std::string hlAutoStatus();

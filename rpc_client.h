@@ -29,7 +29,6 @@ json rpcSpread(size_t seed, const std::string& method, json params);
 void initEndpointHealth();
 bool endpointUsable(size_t idx);
 void reportEndpoint(size_t idx, bool ok);
-size_t usableEndpointFrom(size_t idx);
 
 void setRpcFailureHandler(std::function<void()> handler);
 void setRpcGiveUpHandler(std::function<void()> handler);

@@ -31,8 +31,6 @@
 #include "json.hpp"
 
 void initBscExchanges();
-// Биржа адреса (строчными) или пусто.
-std::string bscExchangeOf(const std::string& addressLower);
 
 // Перевод из транзакции блока — то, что модулю нужно, без всего блока.
 struct BscExTx {

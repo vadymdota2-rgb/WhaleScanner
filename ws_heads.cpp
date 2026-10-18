@@ -30,11 +30,6 @@ std::mutex g_urlMutex;
 std::vector<std::string> g_wsUrls;
 constexpr time_t WS_STALE_SEC = 15;
 constexpr time_t WS_SUBSCRIBE_WAIT_SEC = 5;
-std::atomic<uint64_t> g_wsSwitches{0};
-std::atomic<uint64_t> g_wsStales{0};
-std::atomic<uint64_t> g_wsRejects{0};
-std::atomic<uint64_t> g_wsConnFails{0};
-std::atomic<bool> g_wsEverConnected{false};
 std::atomic<bool> g_subConfirmed{false};
 std::atomic<bool> g_subRejected{false};
 std::atomic<int> g_activeIdx{0};
@@ -87,7 +82,6 @@ void handleWsPayload(const std::string& payload) {
                 msg = j["error"]["message"].get<std::string>();
             std::cerr << "[WS] subscribe rejected: " << (msg.empty() ? "unknown" : msg) << std::endl;
             g_subRejected.store(true, std::memory_order_relaxed);
-            g_wsRejects.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         if (j.contains("method") && j["method"].is_string() &&
@@ -120,15 +114,12 @@ bool wsSession(const std::string& url, int idx) {
 
     CURLcode rc = curl_easy_perform(curl);
     if (rc != CURLE_OK) {
-        g_wsConnFails.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[WS] connect failed (" << shortLabel(idx, url) << "): "
                   << curl_easy_strerror(rc) << " | " << url << std::endl;
         curl_easy_cleanup(curl);
         return false;
     }
-    const int prevIdx = g_activeIdx.exchange(idx, std::memory_order_relaxed);
-    if (g_wsEverConnected.exchange(true, std::memory_order_relaxed) && prevIdx != idx)
-        g_wsSwitches.fetch_add(1, std::memory_order_relaxed);
+    g_activeIdx.store(idx, std::memory_order_relaxed);
     std::cout << "[WS] connected (" << shortLabel(idx, url) << "): " << url << std::endl;
 
     const char* sub =
@@ -136,7 +127,6 @@ bool wsSession(const std::string& url, int idx) {
     size_t sent = 0;
     rc = curl_ws_send(curl, sub, std::strlen(sub), &sent, 0, CURLWS_TEXT);
     if (rc != CURLE_OK) {
-        g_wsConnFails.fetch_add(1, std::memory_order_relaxed);
         std::cerr << "[WS] subscribe send failed: " << curl_easy_strerror(rc) << std::endl;
         curl_easy_cleanup(curl);
         return false;
@@ -186,7 +176,6 @@ bool wsSession(const std::string& url, int idx) {
         const time_t staleLimit = g_subConfirmed.load(std::memory_order_relaxed)
                                 ? WS_STALE_SEC : WS_SUBSCRIBE_WAIT_SEC;
         if (last > 0 && time(nullptr) - last > staleLimit) {
-            g_wsStales.fetch_add(1, std::memory_order_relaxed);
             std::cerr << "[WS] stale >" << staleLimit << "s on " << shortLabel(idx, url)
                       << " — switching" << std::endl;
             g_wsOk.store(false, std::memory_order_relaxed);
@@ -303,13 +292,6 @@ bool wsHeadsOk() {
 
 int64_t wsHeadsLatest() {
     return g_wsHead.load(std::memory_order_relaxed);
-}
-
-std::string wsHeadsStats() {
-    return std::to_string(g_wsSwitches.load(std::memory_order_relaxed)) + "/" +
-           std::to_string(g_wsStales.load(std::memory_order_relaxed)) + "/" +
-           std::to_string(g_wsRejects.load(std::memory_order_relaxed)) + "/" +
-           std::to_string(g_wsConnFails.load(std::memory_order_relaxed));
 }
 
 std::string wsHeadsActiveLabel() {

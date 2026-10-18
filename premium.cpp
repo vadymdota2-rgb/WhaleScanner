@@ -76,11 +76,6 @@ bool introBinding(const std::string& payload, std::string& chat, long long& unti
     return !chat.empty() && until > 0;
 }
 
-// Цена подписки в USD₮ и срок жизни счёта. Оплата монетой TON убрана: цена
-// в долларах равна цене в USD₮, и курс, который мог не прийти, больше не
-// нужен ни для счёта, ни для проверки прихода.
-constexpr double PREMIUM_PRICE_USD = 3.99;
-constexpr long long TON_INVOICE_TTL_SEC = 3600;
 // Переводы жетонов отдаёт только третья версия обозревателя: во второй
 // пришлось бы разбирать тело сообщения вручную.
 const char* const TON_API_V3 = "https://toncenter.com/api/v3/";

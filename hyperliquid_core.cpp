@@ -1974,11 +1974,6 @@ std::string hlAutoStatus() {
     return out;
 }
 
-void hlAutoForget(const std::string& addressLower) {
-    std::lock_guard<std::mutex> l(g_autoMutex);
-    g_autoSeen.erase(addressLower);
-}
-
 bool initHyperliquid() {
     std::lock_guard<std::mutex> l(g_hlDbMutex);
     if (g_hlDb) return true;

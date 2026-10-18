@@ -99,16 +99,6 @@ void reportEndpoint(size_t idx, bool ok) {
     }
 }
 
-size_t usableEndpointFrom(size_t idx) {
-    const size_t n = RPC_ENDPOINTS.size();
-    if (n == 0) return 0;
-    for (size_t k = 0; k < n; ++k) {
-        size_t cand = (idx + k) % n;
-        if (endpointUsable(cand)) return cand;
-    }
-    return idx % n;
-}
-
 enum class RpcRole { Logs = 0, Fill = 1, Price = 2, WsHttp = 3 };
 constexpr int kRoleCount = 4;
 

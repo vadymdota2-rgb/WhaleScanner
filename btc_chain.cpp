@@ -470,8 +470,6 @@ struct BTx {
     bool coinbase = false;
     std::vector<BIn> in;
     std::vector<BOut> out;
-    long long inSum() const { long long s = 0; for (auto& i : in) s += i.sats; return s; }
-    long long outSum() const { long long s = 0; for (auto& o : out) s += o.sats; return s; }
 };
 
 struct Block {

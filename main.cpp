@@ -54,11 +54,8 @@ struct Stats {
     std::atomic<uint64_t> rpc_giveups{0};
     std::atomic<uint64_t> price_fallbacks{0};
     std::atomic<uint64_t> price_thin_pool{0};
-    std::atomic<uint64_t> price_from_pool{0};
     std::atomic<uint64_t> price_from_dex{0};
-    std::atomic<uint64_t> price_from_cg{0};
     std::atomic<uint64_t> price_cache_hit{0};
-    std::atomic<uint64_t> price_divergence{0};
     std::atomic<uint64_t> price_spike_reject{0};
     std::atomic<uint64_t> reorg_verifications{0};
     std::atomic<uint64_t> tx_processed{0};
@@ -272,7 +269,6 @@ std::string tgApi(const std::string& method) {
     return TG_API_BASE + "/bot" + TG_TOKEN + "/" + method;
 }
 
-constexpr long long WALLET_TOKEN_TTL_SEC = 60LL * 86400LL;
 const std::string OWNER_CHAT_ID = "546348566";
 const std::string SERVICE_CHAT_ID = "7479880531";
 const std::string DB_FILE = "whale_bot.db";
@@ -367,10 +363,6 @@ void initDB() {
             FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE);
         CREATE INDEX IF NOT EXISTS idx_deliveries_queue ON deliveries(status, next_retry_at, id) WHERE status IN (0,3);
         CREATE INDEX IF NOT EXISTS idx_deliveries_terminal ON deliveries(status, alert_id) WHERE status IN (1,2,4);
-        CREATE TABLE IF NOT EXISTS pair_cache (
-            token TEXT PRIMARY KEY,
-            val TEXT NOT NULL
-        );
         INSERT OR IGNORE INTO state(key,value) VALUES ('tg_offset','0');
     )";
     // Сначала таблицы, потом добавление колонок: на новой базе ALTER до
@@ -444,19 +436,20 @@ void initDB() {
         }
     }
 
-    // Cortex (сигналы и обучаемая модель) убран из проекта. Его таблицы
-    // больше никто не пишет и не чистит — удаляем их, чтобы журнал сигналов
-    // и свечи не лежали в базе без срока. На чистой базе это пустая операция.
+    // Таблицы убранного: Cortex (сигналы и обучаемая модель) и кэш пар DEX
+    // (цена по резервам пулов — её брал только неиспользуемый путь). Их
+    // никто не пишет и не читает — удаляем, чтобы не лежали в базе без
+    // срока. На чистой базе это пустая операция.
     {
         const char* dropSql =
             "DROP TABLE IF EXISTS ai_signals; DROP TABLE IF EXISTS ai_signal_log;"
             "DROP TABLE IF EXISTS ai_events; DROP TABLE IF EXISTS ai_weights;"
             "DROP TABLE IF EXISTS ai_access; DROP TABLE IF EXISTS ai_models;"
             "DROP TABLE IF EXISTS ai_model_try; DROP TABLE IF EXISTS ai_coin_seen;"
-            "DROP TABLE IF EXISTS hl_candles;";
+            "DROP TABLE IF EXISTS hl_candles; DROP TABLE IF EXISTS pair_cache;";
         char* derr = nullptr;
         if (sqlite3_exec(db, dropSql, nullptr, nullptr, &derr) != SQLITE_OK) {
-            std::cerr << "[STARTUP] Cortex tables cleanup failed: " << (derr ? derr : "") << std::endl;
+            std::cerr << "[STARTUP] old tables cleanup failed: " << (derr ? derr : "") << std::endl;
             sqlite3_free(derr);
         }
     }
@@ -2492,12 +2485,9 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
             << "⚙️ RPC: " << g_stats.rpc_failures.load() << " попыток · "
             << g_stats.rpc_giveups.load() << " отказов"
             << "\n💰 Цена: кэш " << g_stats.price_cache_hit.load()
-            << " · пул " << g_stats.price_from_pool.load()
             << " · DexScreener " << g_stats.price_from_dex.load()
-            << " · CoinGecko " << g_stats.price_from_cg.load()
             << "\n💰 Защита: тонкий пул " << g_stats.price_thin_pool.load()
             << " · устаревший кэш " << g_stats.price_fallbacks.load()
-            << " · расхождение " << g_stats.price_divergence.load()
             << " · скачок " << g_stats.price_spike_reject.load()
             << "\n🔄 REORG: " << g_stats.reorg_verifications.load()
             << "\n📨 Sent: " << g_stats.alerts_sent.load()
@@ -2695,14 +2685,11 @@ int main() {
     });
     setPriceStatHandler([](int kind){
         switch (kind) {
-            case 0: g_stats.price_from_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 1: g_stats.price_thin_pool.fetch_add(1, std::memory_order_relaxed); break;
             case 2: g_stats.price_fallbacks.fetch_add(1, std::memory_order_relaxed); break;
             case 3: g_stats.rpc_failures.fetch_add(1, std::memory_order_relaxed); break; // meta rpc
-            case 4: g_stats.price_divergence.fetch_add(1, std::memory_order_relaxed); break;
             case 5: g_stats.price_spike_reject.fetch_add(1, std::memory_order_relaxed); break;
             case 6: g_stats.price_from_dex.fetch_add(1, std::memory_order_relaxed); break;
-            case 7: g_stats.price_from_cg.fetch_add(1, std::memory_order_relaxed); break;
             case 8: g_stats.price_cache_hit.fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
@@ -2718,7 +2705,6 @@ int main() {
     initAutobase();
     initBscExchanges();
     loadTokenCache();
-    loadPairCache();
     ensureNativePrice();
     ensureUser(OWNER_CHAT_ID);
     refreshWatchers();

@@ -404,7 +404,3 @@ void invalidateRankCache() {
 }
 
 }
-
-void invalidateRankCache() {
-    hl::invalidateRankCache();
-}
