@@ -2287,11 +2287,10 @@ std::string importFundReport(const std::string& fund, size_t n, const EtfImportR
     rep << "\U0001F3F7 <b>Разметка: " << escapeHtml(fund) << "</b>\nАдресов: <b>" << n << "</b>"
         << "\n✅ В разметку: <b>" << r.queued << "</b>";
     if (r.inBase) rep << "\n⭐ Были в базе китов без метки — помечены: <b>" << r.inBase << "</b>";
-    if (r.named) rep << "\n\U0001F50E Были в группе без имени — помечены: <b>" << r.named << "</b>";
     if (r.moved) rep << "\n\U0001F504 Были у другого фонда — переразмечены: <b>" << r.moved << "</b>";
     if (r.dup) rep << "\n↩️ Уже " << escapeHtml(fund) << ": <b>" << r.dup << "</b>";
     if (r.seed) rep << "\n\U0001F512 Опубликованы фондом, не тронуты: <b>" << r.seed << "</b>";
-    if (r.queued) rep << "\nСканер перенесёт их с ближайшим блоком, историю за два месяца дочитает сам.";
+    if (r.queued) rep << "\nМетки встанут с ближайшим блоком.";
     return rep.str();
 }
 

@@ -25,9 +25,6 @@
  *   там входы чужие друг другу.
  */
 #include "btc_chain.h"
-#include "btc_block.h"
-#include "btc_etf.h"
-#include "btc_gov.h"
 #include "autobase.h"
 #include "btc_seeds_book.h"
 
@@ -46,7 +43,6 @@
 #include <map>
 #include <tuple>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -467,6 +463,26 @@ long long priceAt(long long ts) {
 
 // ── блок ─────────────────────────────────────────────────────────────────
 
+struct BIn { std::string addr; long long sats = 0; };
+struct BOut { std::string addr; long long sats = 0; };
+struct BTx {
+    std::string txid;
+    bool coinbase = false;
+    std::vector<BIn> in;
+    std::vector<BOut> out;
+    long long inSum() const { long long s = 0; for (auto& i : in) s += i.sats; return s; }
+    long long outSum() const { long long s = 0; for (auto& o : out) s += o.sats; return s; }
+};
+
+struct Block {
+    long long height = 0;
+    long long ts = 0;
+    std::string hash;
+    // Хэш предыдущего блока — по нему видна перестройка цепочки.
+    std::string prev;
+    std::vector<BTx> txs;
+};
+
 long long jll(const json& j, const char* k) {
     if (!j.contains(k)) return 0;
     const auto& v = j[k];
@@ -623,10 +639,8 @@ struct Db {
     sqlite3_stmt* putLabel = nullptr;
     sqlite3_stmt* putMove = nullptr;
     sqlite3_stmt* putFlow = nullptr;
-    sqlite3_stmt* addExBal = nullptr;
-    sqlite3_stmt* moveExBal = nullptr;
     ~Db() {
-        for (auto* s : {getLabel, putLabel, putMove, putFlow, addExBal, moveExBal})
+        for (auto* s : {getLabel, putLabel, putMove, putFlow})
             if (s) sqlite3_finalize(s);
     }
 };
@@ -677,35 +691,6 @@ bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
     return true;
 }
 
-// Был ли адрес в цепочке до траты `txid` на высоте `height` — по его истории
-// с mempool.space (запасной blockstream), страницами по 25 от новых к старым.
-// Нашлась транзакция ниже этой высоты — адрес жил раньше. Дольше 8 страниц
-// (200 транзакций после переезда — это не новый кошелёк фонда, а узел) или
-// источники молчат — «не узнать». Зовётся под замком базы, редко: страниц
-// мало, чтобы замок не держался минутами.
-int addrFresh(const std::string& a, const std::string& txid, long long height) {
-    std::string last;
-    bool self = false;
-    for (int page = 0; page < 8; ++page) {
-        json j;
-        for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
-            j = json::parse(fetch(host + a + "/txs/chain" + (last.empty() ? "" : "/" + last), 15), nullptr, false);
-            if (j.is_array()) break;
-        }
-        if (!j.is_array()) return -1;
-        for (const auto& t : j) {
-            if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) return -1;
-            const long long h = jll(t["status"], "block_height");
-            if (h > 0 && h < height) return 0;
-            if (jstr(t, "txid") == txid) self = true;
-        }
-        if (j.size() < 25) return self ? 1 : -1;
-        last = jstr(j.back(), "txid");
-        if (!isHash(last)) return -1;
-    }
-    return -1;
-}
-
 void saveAddrStats(const std::string& a, long long txs, long long bal) {
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     sqlite3_stmt* s = nullptr;
@@ -733,14 +718,7 @@ public:
                prep(&db_.putFlow,
                     "INSERT INTO btc_flow(ts, ex, in_sats, out_sats, in_n, out_n) VALUES(?,?,?,?,?,?) "
                     "ON CONFLICT(ts, ex) DO UPDATE SET in_sats=in_sats+excluded.in_sats, "
-                    "out_sats=out_sats+excluded.out_sats, in_n=in_n+excluded.in_n, out_n=out_n+excluded.out_n") &&
-               // Остаток адреса биржи: checked_at 0 — ещё не сверен с цепочкой,
-               // -1 — адрес пополнения, сметённый в этом же блоке (остаток ~0,
-               // дальше его ведут блоки).
-               prep(&db_.addExBal,
-                    "INSERT OR IGNORE INTO btc_ex_bal(address, bal_sats, bal_height, checked_at) VALUES(?, 0, ?, ?)") &&
-               prep(&db_.moveExBal,
-                    "UPDATE btc_ex_bal SET bal_sats = bal_sats + ? WHERE address = ? AND bal_height < ? AND checked_at != 0");
+                    "out_sats=out_sats+excluded.out_sats, in_n=in_n+excluded.in_n, out_n=out_n+excluded.out_n");
     }
 
     void seed() {
@@ -752,11 +730,6 @@ public:
         execSql("BEGIN");
         for (const auto& [a, ex] : all) {
             putLabel(a, ex, "seed");
-            sqlite3_reset(db_.addExBal);
-            bindText(db_.addExBal, 1, a);
-            sqlite3_bind_int64(db_.addExBal, 2, 0);
-            sqlite3_bind_int64(db_.addExBal, 3, 0);
-            sqlite3_step(db_.addExBal);
             sqlite3_stmt* s = nullptr;
             // Проверенная метка главнее выученной: если адрес раньше записали
             // другой бирже, правим.
@@ -772,28 +745,7 @@ public:
 
     enum class Result { DONE, REORG };
 
-    // Остатки адресов бирж — по каждому блоку: вход с адреса биржи — минус,
-    // выход на него — плюс. Блоки до сверки адреса с цепочкой (bal_height) в
-    // остаток не идут — сверка их уже учла.
-    void exBalances(const Block& b) {
-        for (const auto& tx : b.txs) {
-            for (const auto& i : tx.in)
-                if (!i.addr.empty() && !label(i.addr).empty()) exDelta(i.addr, -i.sats, b.height);
-            for (const auto& o : tx.out)
-                if (!o.addr.empty() && !label(o.addr).empty()) exDelta(o.addr, o.sats, b.height);
-        }
-    }
-
-    void exDelta(const std::string& a, long long d, long long height) {
-        sqlite3_reset(db_.moveExBal);
-        sqlite3_bind_int64(db_.moveExBal, 1, d);
-        bindText(db_.moveExBal, 2, a);
-        sqlite3_bind_int64(db_.moveExBal, 3, height);
-        sqlite3_step(db_.moveExBal);
-    }
-
     Result process(const Block& b) {
-        height_ = b.height;
         if (rolledBack(b)) return Result::REORG;
         {
             // Блок уже посчитан (перезапуск, повтор после сбоя сети) — второй
@@ -823,11 +775,8 @@ public:
             std::lock_guard<std::mutex> l(g_btcDbMutex);
             execSql("BEGIN");
             scan(b, price, moves, learned);
-            exBalances(b);
-            // Разметка владельца (/import из любого процесса бота) — до блока.
+            // Разметка владельца (/import из любого процесса бота) — с блоком.
             etfDrainLabels(g_btcDb);
-            etfBlock(g_btcDb, b);
-            govBlock(g_btcDb, b);
             execSql("COMMIT");
         }
         bump(g_bs.blocks);
@@ -888,15 +837,6 @@ public:
         }
         if (prep(&s, "DELETE FROM btc_blocks WHERE height=?")) {
             sqlite3_bind_int64(s, 1, b.height - 1);
-            sqlite3_step(s);
-            sqlite3_finalize(s);
-        }
-        etfRollback(g_btcDb, b.height - 1);
-        // Остатки, которые вели блоки, — на сверку: откатанный блок в них уже
-        // записан. Резервы бирж — крупные адреса (мелочь сверится за неделю).
-        govRollback(g_btcDb);
-        if (prep(&s, "UPDATE btc_ex_bal SET checked_at = 0 WHERE checked_at != 0 AND bal_sats >= ?")) {
-            sqlite3_bind_int64(s, 1, 10LL * SAT);
             sqlite3_step(s);
             sqlite3_finalize(s);
         }
@@ -1246,7 +1186,6 @@ public:
 
 private:
     Db db_;
-    long long height_ = 0;
     std::vector<std::string> touched_;
     // Кандидаты автопоиска → когда найдены. Живут между блоками, пока их не
     // проверят (AUTO_PEND_TTL).
@@ -1616,18 +1555,8 @@ private:
     }
 
     void putLabel(const std::string& a, const std::string& ex, const char* how) {
-        // Кошелёк фонда биржевым не становится: его ведёт btc_etf.cpp.
+        // Кошелёк фонда (разметка /import, список BITB) биржевым не становится.
         if (!etfFund(a).empty()) return;
-        if (std::strcmp(how, "seed") != 0) {
-            // Резервы биржи: новый адрес сверим с цепочкой; сметённый адрес
-            // пополнения пуст — его ведут блоки с этого.
-            const bool swept = std::strcmp(how, "sweep") == 0;
-            sqlite3_reset(db_.addExBal);
-            bindText(db_.addExBal, 1, a);
-            sqlite3_bind_int64(db_.addExBal, 2, swept ? height_ : 0);
-            sqlite3_bind_int64(db_.addExBal, 3, swept ? -1 : 0);
-            sqlite3_step(db_.addExBal);
-        }
         sqlite3_reset(db_.putLabel);
         bindText(db_.putLabel, 1, a);
         bindText(db_.putLabel, 2, ex);
@@ -1720,25 +1649,16 @@ bool openDb() {
         "  height INTEGER PRIMARY KEY, hash TEXT NOT NULL, ts INTEGER NOT NULL,"
         "  txs INTEGER NOT NULL DEFAULT 0, moves INTEGER NOT NULL DEFAULT 0, learned INTEGER NOT NULL DEFAULT 0,"
         "  price_nanos INTEGER NOT NULL DEFAULT 0, at INTEGER NOT NULL DEFAULT 0);"
-        "CREATE TABLE IF NOT EXISTS btc_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);"
-        // Резервы бирж: остаток каждого адреса биржи (биржа — по btc_labels).
-        // Сверка с цепочкой один раз (и раз в неделю у крупных), дальше —
-        // по блокам. checked_at: 0 — ещё не сверен, -1 — сметённый адрес
-        // пополнения (пуст, ведут блоки).
-        "CREATE TABLE IF NOT EXISTS btc_ex_bal ("
-        "  address TEXT PRIMARY KEY, bal_sats INTEGER NOT NULL DEFAULT 0, bal_height INTEGER NOT NULL DEFAULT 0,"
-        "  checked_at INTEGER NOT NULL DEFAULT 0);"
-        "CREATE INDEX IF NOT EXISTS idx_btc_ex_bal_checked ON btc_ex_bal(checked_at);"
-        // Резервы на конец суток — для «изменение за 7 дней».
-        "CREATE TABLE IF NOT EXISTS btc_ex_day ("
-        "  day INTEGER NOT NULL, ex TEXT NOT NULL, sats INTEGER NOT NULL, n INTEGER NOT NULL,"
-        "  PRIMARY KEY (day, ex));");
+        "CREATE TABLE IF NOT EXISTS btc_state (k TEXT PRIMARY KEY, v TEXT NOT NULL);");
     // Вклад блока в потоки — для отката при перестройке цепочки. Колонка
     // добавлена позже: на старой базе её нет, ошибку «уже есть» глотаем.
     sqlite3_exec(g_btcDb, "ALTER TABLE btc_blocks ADD COLUMN flow TEXT", nullptr, nullptr, nullptr);
+    // Резервы бирж и биткоины государств по цепочке (16–18 октября) сняты:
+    // приложение их не читало, а сверка их адресов шла в цикле блоков.
+    execSql("DROP TABLE IF EXISTS btc_ex_bal; DROP TABLE IF EXISTS btc_ex_day;"
+            "DROP TABLE IF EXISTS btc_gov_addr; DROP TABLE IF EXISTS btc_gov_day;"
+            "DELETE FROM btc_state WHERE k IN ('etf_back', 'etf_gap');");
     etfOpen(g_btcDb);
-    etfSetFreshCheck(addrFresh);
-    govOpen(g_btcDb);
     sqlite3_stmt* s = nullptr;
     if (prep(&s, "SELECT address FROM btc_watch")) {
         std::lock_guard<std::mutex> w(g_watchMutex);
@@ -1791,19 +1711,6 @@ void cleanup() {
     const long long empty = execCount(
         "DELETE FROM btc_flow WHERE in_sats <= 0 AND out_sats <= 0 AND in_n <= 0 AND out_n <= 0 AND ts < ?",
         now - 3600);
-    etfCleanup(g_btcDb, cut);
-    govSnapshot(g_btcDb, now, cut);
-    // Резервы бирж: адрес, забытый разметкой, из резервов уходит; снимок
-    // суток — сверенные адреса и сметённые (их ведут блоки).
-    if (sqlite3_exec(g_btcDb, "DELETE FROM btc_ex_bal WHERE NOT EXISTS "
-                     "(SELECT 1 FROM btc_labels b WHERE b.address = btc_ex_bal.address)",
-                     nullptr, nullptr, nullptr) == SQLITE_OK)
-        old += sqlite3_changes(g_btcDb);
-    old += execCount("DELETE FROM btc_ex_day WHERE day < ?", cut);
-    execCount("INSERT OR REPLACE INTO btc_ex_day(day, ex, sats, n) "
-              "SELECT ?, b.ex, SUM(MAX(e.bal_sats, 0)), COUNT(*) FROM btc_ex_bal e "
-              "JOIN btc_labels b ON b.address = e.address WHERE e.checked_at != 0 GROUP BY b.ex",
-              now - now % 86400);
     sqlite3_wal_checkpoint_v2(g_btcDb, nullptr, SQLITE_CHECKPOINT_TRUNCATE, nullptr, nullptr);
     g_bs.cleanAt = now;
     g_bs.cleanFlow = flow;
@@ -1857,304 +1764,6 @@ void refreshIdleBalances() {
     if (done) std::cout << "[BTC] остаток перепроверен у " << done << " неактивных кошельков базы" << std::endl;
 }
 
-// Остатки кошельков фондов — сверка с цепочкой: новые сразу, остальные раз в
-// сутки. Высота — у узла прямо перед запросом: остаток с mempool.space верен
-// на ней, блоки до неё в него уже не пишутся.
-void refreshEtfBalances() {
-    std::vector<std::string> stale;
-    {
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        stale = etfStale(g_btcDb, 200);
-    }
-    for (const auto& a : stale) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
-        const long long h = tipHeight();
-        long long txs = 0, bal = 0;
-        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
-        {
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            etfSetBalance(g_btcDb, a, bal, h);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-}
-
-// Резервы бирж: остатки адресов из разметки сверяем с цепочкой — новые
-// сразу, крупные (от 10 BTC) раз в неделю; между сверками остаток ведут
-// блоки (Scanner::exBalances). Высота — у узла прямо перед запросом: остаток
-// с mempool.space верен на ней, блоки до неё в него уже не пишутся.
-constexpr int EX_BAL_PER_PASS = 20;
-constexpr long long EX_BAL_BIG = 10LL * SAT;
-
-// Государства: остатки их адресов — сверкой с цепочкой (btc_gov.h), список
-// Сальвадора — с его же Национального биткоин-офиса, дважды в сутки.
-void refreshGovBalances() {
-    std::vector<std::string> stale;
-    {
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        stale = govStale(g_btcDb, 40);
-    }
-    for (const auto& a : stale) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
-        const long long h = tipHeight();
-        long long txs = 0, bal = 0;
-        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
-        {
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            govSetBalance(g_btcDb, a, bal, h);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-}
-
-void readGovOfficial() {
-    json j = json::parse(fetch("https://bitcoin.gob.sv/api/v1/wallet/ONBTC", 30), nullptr, false);
-    if (!j.is_object()) {
-        std::cerr << "[GOV] список Сальвадора (bitcoin.gob.sv) не прочитался — повторю позже" << std::endl;
-        return;
-    }
-    std::vector<std::string> addrs;
-    for (auto& [a, v] : j.items())
-        if (govAddrOk(a)) addrs.push_back(a);
-    std::lock_guard<std::mutex> l(g_btcDbMutex);
-    govOfficial(g_btcDb, "SV", addrs);
-}
-
-void refreshExBalances() {
-    std::vector<std::string> ask;
-    {
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        sqlite3_stmt* s = nullptr;
-        if (!prep(&s, "SELECT address FROM btc_ex_bal WHERE checked_at = 0 OR (checked_at < ? AND bal_sats >= ?) "
-                      "ORDER BY checked_at LIMIT ?"))
-            return;
-        sqlite3_bind_int64(s, 1, nowSec() - ADDR_TTL);
-        sqlite3_bind_int64(s, 2, EX_BAL_BIG);
-        sqlite3_bind_int(s, 3, EX_BAL_PER_PASS);
-        while (sqlite3_step(s) == SQLITE_ROW) ask.push_back(colText(s, 0));
-        sqlite3_finalize(s);
-    }
-    for (const auto& a : ask) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
-        const long long h = tipHeight();
-        long long txs = 0, bal = 0;
-        if (h <= 0 || !fetchAddrStats(a, txs, bal)) continue;
-        {
-            std::lock_guard<std::mutex> l(g_btcDbMutex);
-            sqlite3_stmt* s = nullptr;
-            if (prep(&s, "UPDATE btc_ex_bal SET bal_sats = ?, bal_height = ?, checked_at = ? WHERE address = ?")) {
-                sqlite3_bind_int64(s, 1, bal);
-                sqlite3_bind_int64(s, 2, h);
-                sqlite3_bind_int64(s, 3, nowSec());
-                bindText(s, 4, a);
-                sqlite3_step(s);
-                sqlite3_finalize(s);
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-}
-
-// Догонка фондов: блоки, где двигались кошельки фондов, с `since` до высоты
-// `upTo` — только разметкой ETF (сканер бирж их не трогает). Нужна при первом
-// запуске (два месяца истории для графика) и после простоя дольше суток.
-// Какие это блоки — из истории кошельков на mempool.space: та же цепочка,
-// посчитанная по адресу; сами блоки — с узлов, как всегда.
-constexpr long long ETF_BACK_SEC = 60LL * 86400LL;
-
-// Страница истории адреса: mempool.space, не ответил — blockstream.info; три
-// круга с паузой: общий сервис ограничивает частоту запросов и на десятках
-// адресов подряд начинает отказывать.
-json addrPage(const std::string& path, bool& ok) {
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
-            json j = json::parse(fetch(host + path, 15), nullptr, false);
-            if (j.is_array()) {
-                ok = true;
-                return j;
-            }
-        }
-        if (!sleepFor(5 * (attempt + 1))) break;
-    }
-    ok = false;
-    return json();
-}
-
-// Как прошла последняя догонка — для /statsbtc (читает другой поток).
-std::mutex g_backMx;
-std::string g_backStatus = "ещё не было";
-
-std::string backStatus() {
-    std::lock_guard<std::mutex> l(g_backMx);
-    return g_backStatus;
-}
-
-// true — история всех кошельков прочитана и все блоки разобраны. Иначе
-// догонка повторится через час: пометить её сделанной после отказа сервиса
-// значило бы остаться без двух месяцев потоков (так и было: «0 BTC»).
-bool etfBackfillFor(const std::vector<std::string>& addrs, long long since, long long upTo) {
-    std::set<long long> heights;
-    int failed = 0;
-    for (const auto& a : addrs) {
-        std::string after;
-        for (int page = 0; page < 40; ++page) {
-            bool ok = false;
-            json j = addrPage(a + "/txs/chain" + (after.empty() ? "" : "/" + after), ok);
-            if (!ok) {
-                ++failed;
-                break;
-            }
-            if (j.empty()) break;
-            bool older = false;
-            for (const auto& t : j) {
-                if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) continue;
-                const long long h = jll(t["status"], "block_height");
-                if (jll(t["status"], "block_time") < since) { older = true; break; }
-                if (h > 0 && h <= upTo) heights.insert(h);
-                after = jstr(t, "txid");
-            }
-            if (older || j.size() < 25 || !isHash(after)) break;
-            if (!sleepFor(1)) return false;
-        }
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    }
-    int done = 0;
-    for (long long h : heights) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return false;
-        Block b;
-        b.height = h;
-        b.hash = hashAt(h);
-        if (b.hash.empty() || !loadFromRpc(b)) continue;
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        execSql("BEGIN");
-        etfBlock(g_btcDb, b);
-        execSql("COMMIT");
-        ++done;
-    }
-    const bool ok = failed == 0 && done == static_cast<int>(heights.size());
-    const std::string status = std::string(ok ? "готово" : "не вся, повтор через час") + " — блоков " +
-                               std::to_string(done) + " из " + std::to_string(heights.size()) +
-                               (failed ? ", кошельков без истории " + std::to_string(failed) : std::string());
-    {
-        std::lock_guard<std::mutex> l(g_backMx);
-        g_backStatus = status;
-    }
-    std::cout << "[ETF] догонка: " << status << std::endl;
-    return ok;
-}
-
-bool etfBackfill(long long since, long long upTo) { return etfBackfillFor(etfAddresses(), since, upTo); }
-
-// Кошельки, размеченные через /import: их два месяца — понемногу, по 100 за
-// круг (список бывает в тысячи адресов). Не прочиталось — повтор на
-// следующем круге.
-constexpr size_t ETF_HIST_PER_PASS = 100;
-
-void backfillImported(long long tip) {
-    std::vector<std::string> addrs;
-    {
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        addrs = etfHistQueue(g_btcDb, ETF_HIST_PER_PASS);
-    }
-    if (addrs.empty() || !etfBackfillFor(addrs, nowSec() - ETF_BACK_SEC, tip)) return;
-    std::lock_guard<std::mutex> l(g_btcDbMutex);
-    etfHistDone(g_btcDb, addrs);
-}
-
-// История новых хранилищ хранителя: первая страница их транзакций с
-// mempool.space (та же цепочка, посчитанная по адресу) — в переводы для
-// разбора по корзинам. Не больше 30 хранилищ за круг.
-void readNewVaults() {
-    for (const auto& a : etfVaultsToRead(30)) {
-        if (!running.load(std::memory_order_relaxed) || !g_btcRunning.load()) return;
-        json j = json::parse(fetch("https://mempool.space/api/address/" + a + "/txs/chain", 15), nullptr, false);
-        if (!j.is_array())
-            j = json::parse(fetch("https://blockstream.info/api/address/" + a + "/txs/chain", 15), nullptr, false);
-        if (!j.is_array()) {
-            etfVaultRetry(a);
-            continue;
-        }
-        std::lock_guard<std::mutex> l(g_btcDbMutex);
-        execSql("BEGIN");
-        for (const auto& t : j) {
-            if (!t.is_object() || !t.contains("status") || !t["status"].is_object()) continue;
-            const long long h = jll(t["status"], "block_height"), ts = jll(t["status"], "block_time");
-            if (h <= 0 || ts <= 0 || !t.contains("vin") || !t["vin"].is_array() || !t.contains("vout") ||
-                !t["vout"].is_array())
-                continue;
-            BTx x;
-            x.txid = jstr(t, "txid");
-            if (!isHash(x.txid)) continue;
-            bool ok = true;
-            for (const auto& i : t["vin"]) {
-                if (i.value("is_coinbase", false)) { x.coinbase = true; continue; }
-                if (!i.contains("prevout") || !i["prevout"].is_object()) { ok = false; break; }
-                x.in.push_back({jstr(i["prevout"], "scriptpubkey_address"), jll(i["prevout"], "value")});
-            }
-            for (const auto& o : t["vout"]) x.out.push_back({jstr(o, "scriptpubkey_address"), jll(o, "value")});
-            if (ok) etfVaultTx(g_btcDb, h, ts, x);
-        }
-        etfVaultRead(g_btcDb, a);
-        execSql("COMMIT");
-        std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    }
-}
-
-// Работа по фондам ETF — в своём потоке, а не в цикле блоков. Догонка двух
-// месяцев читает историю сотен адресов с mempool.space (с паузами — сервис
-// ограничивает частоту) и заново разбирает тысячи старых блоков: это часы.
-// В цикле блоков она стояла перед разбором новых, а при отказе сервиса —
-// повторялась каждый час: новые блоки ждали, отставание переваливало за
-// сутки, блоки пропускались целиком — крупные сделки и рейтинг вставали с
-// 16 октября. Здесь же сверка остатков фондов, история кошельков из /import
-// и хранилища хранителя — тоже сеть. Разбор блока из обоих потоков безопасен:
-// под одним замком базы, а движения фонда пишутся по уникальному ключу (тот
-// же блок второй раз ничего не удвоит).
-void etfLoop(Scanner& sc) {
-    auto lastBack = std::chrono::steady_clock::now() - std::chrono::hours(2);
-    auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
-    while (running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
-        try {
-            const long long tip = g_bs.tip.load();
-            if (tip > 0) {
-                // Простой бота дольше суток: цикл блоков записал, какие блоки
-                // пропущены («от:до»), — потоки фондов за них догоняются здесь.
-                const std::string gap = sc.state("etf_gap");
-                const size_t colon = gap.find(':');
-                if (colon != std::string::npos) {
-                    const long long since = parseLL(gap.substr(0, colon)), upTo = parseLL(gap.substr(colon + 1));
-                    if (since <= 0 || upTo <= 0 || !etfBackfill(since, upTo)) sc.setStateLocked("etf_back", "0");
-                    sc.setStateLocked("etf_gap", "");
-                }
-                // Версия 2: первая версия помечала догонку сделанной и после
-                // отказа сервиса истории — на таких установках она пройдёт
-                // заново. Версия 3: добавились кошельки фондов из списков
-                // (btc_etf_list.h) — их два месяца тоже догоняются (уже
-                // записанное не задвоится).
-                if (sc.state("etf_back") != "3" &&
-                    std::chrono::steady_clock::now() - lastBack > std::chrono::hours(1)) {
-                    lastBack = std::chrono::steady_clock::now();
-                    // Сначала остатки кошельков: плату фонду за управление
-                    // сканер узнаёт по доле от запаса, а без запаса записал бы
-                    // её оттоком.
-                    refreshEtfBalances();
-                    if (etfBackfill(nowSec() - ETF_BACK_SEC, tip)) sc.setStateLocked("etf_back", "3");
-                }
-                readNewVaults();
-                if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
-                    refreshEtfBalances();
-                    backfillImported(tip);
-                    lastBal = std::chrono::steady_clock::now();
-                }
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "[ETF] " << e.what() << std::endl;
-        }
-        if (!sleepFor(30)) break;
-    }
-}
-
 void btcLoop() {
     Scanner sc;
     {
@@ -2180,10 +1789,8 @@ void btcLoop() {
         sc.setStateLocked("bounce", "1");
     }
     g_bs.startedAt = nowSec();
-    std::thread etf(etfLoop, std::ref(sc));
     auto lastClean = std::chrono::steady_clock::now() - std::chrono::hours(1);
     auto lastBal = std::chrono::steady_clock::now() - std::chrono::minutes(30);
-    auto lastGov = std::chrono::steady_clock::now() - std::chrono::hours(12);
 
     while (running.load(std::memory_order_relaxed) && g_btcRunning.load()) {
         try {
@@ -2197,14 +1804,7 @@ void btcLoop() {
             }
             if (last <= 0 || tip - last > MAX_BEHIND) {
                 long long from = tip - (last <= 0 ? 1 : 6);
-                if (last > 0) {
-                    bump(g_bs.skipped, from - last);
-                    // Потоки фондов за простой — догонкой в потоке фондов
-                    // (etfLoop), по блокам их кошельков; не выйдет — там же
-                    // полная догонка двух месяцев. Новые блоки её не ждут.
-                    sc.setStateLocked("etf_gap", std::to_string(nowSec() - (tip - last) * 600 - 6 * 3600) + ":" +
-                                                     std::to_string(from));
-                }
+                if (last > 0) bump(g_bs.skipped, from - last);
                 if (last > 0)
                     std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
                               << " пропущены" << std::endl;
@@ -2246,12 +1846,6 @@ void btcLoop() {
                 last = b.height;
                 setLag();
             }
-            refreshExBalances();
-            if (std::chrono::steady_clock::now() - lastGov > std::chrono::hours(12)) {
-                lastGov = std::chrono::steady_clock::now();
-                readGovOfficial();
-            }
-            refreshGovBalances();
             if (std::chrono::steady_clock::now() - lastBal > std::chrono::minutes(30)) {
                 refreshIdleBalances();
                 lastBal = std::chrono::steady_clock::now();
@@ -2265,9 +1859,6 @@ void btcLoop() {
         }
         if (!sleepFor(30)) break;
     }
-    // sc живёт здесь: поток фондов закончится раньше него (он тоже следит за
-    // running и g_btcRunning).
-    etf.join();
 }
 
 }  // namespace
@@ -2632,14 +2223,6 @@ std::string btcStatsLine() {
     out += "\n📇 Адреса (mempool.space): запросов " + num(g_bs.addrAsked.load()) + " · сбоев " +
            num(g_bs.addrFailed.load());
 
-    {
-        // Резервы бирж — свой счёт: остатки адресов из разметки.
-        const long long total = one("SELECT COALESCE(SUM(MAX(bal_sats, 0)), 0) FROM btc_ex_bal WHERE checked_at != 0");
-        const long long done = one("SELECT COUNT(*) FROM btc_ex_bal WHERE checked_at != 0");
-        const long long all = one("SELECT COUNT(*) FROM btc_ex_bal");
-        out += "\n🏦 Резервы бирж: " + btc(total) + " BTC · адресов сверено " + num(done) + " из " + num(all);
-    }
-
     out += "\n\n📈 <b>Разбор транзакций</b> (с запуска)"
            "\n🟢 С биржи (выводы): " + num(g_bs.fromEx.load()) +
            "\n🚨 На биржу (заводы): " + num(g_bs.toEx.load()) +
@@ -2667,10 +2250,6 @@ std::string btcStatsLine() {
         out += "\n💾 База: " + mb(dbSize) + " · WAL " + mb(walSize);
     }
 
-    out += etfStats(g_btcDb);
-    out += govStats(g_btcDb);
-    out += "\n⏮ Догонка истории фондов: " + backStatus();
-
     out += "\n\n<b>Адреса бирж</b>: " + std::to_string(one("SELECT COUNT(*) FROM btc_labels"));
     if (prep(&s, "SELECT how, COUNT(*) FROM btc_labels GROUP BY how ORDER BY 2 DESC")) {
         while (sqlite3_step(s) == SQLITE_ROW)
@@ -2696,5 +2275,6 @@ std::string btcStatsLine() {
                "SELECT COUNT(*) FROM btc_moves m WHERE ts >= ? AND EXISTS (SELECT 1 FROM btc_watch w WHERE w.address = m.wallet)", day)) +
            "\nПриток на биржи: " + btc(one("SELECT COALESCE(SUM(in_sats), 0) FROM btc_flow WHERE ts >= ?", day)) + " BTC" +
            "\nОтток с бирж: " + btc(one("SELECT COALESCE(SUM(out_sats), 0) FROM btc_flow WHERE ts >= ?", day)) + " BTC";
+    out += etfStats(g_btcDb);
     return out;
 }

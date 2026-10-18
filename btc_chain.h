@@ -57,8 +57,8 @@ std::string normBtcAddress(const std::string& a);
 // форма: длина, первая цифра, буквы и цифры.
 bool isBtcKey(const std::string& lowerAddr);
 BtcImportResult btcImport(const std::vector<std::string>& addrs);
-// Разметка владельца: адреса Bitcoin — кошельки фонда (тикер). Сканер
-// перенесёт их в разметку с ближайшим блоком, историю дочитает сам.
+// Разметка владельца: адреса Bitcoin — кошельки фонда (тикер). Метки
+// встают с ближайшим блоком.
 EtfImportResult btcEtfImport(const std::vector<std::string>& addrs, const std::string& fund);
 size_t btcWatchCount();
 // Ответ на /statsbtc владельца.
