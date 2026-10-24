@@ -80,6 +80,8 @@ struct BtcStats {
     std::atomic<long long> loadMs{0}, loadMsSum{0};
     std::atomic<long long> bytes{0};
     std::atomic<long long> addrAsked{0}, addrFailed{0};
+    // Алерты старых блоков (догонка простоя), которые не ушли.
+    std::atomic<long long> alertsOld{0};
     // Разбор транзакций: куда отнесена каждая.
     std::atomic<long long> fromEx{0}, toEx{0}, sweep{0}, move{0}, bounce{0}, mixed{0}, coinjoin{0},
         coinbase{0}, plain{0};
@@ -129,6 +131,10 @@ constexpr int AUTO_ADDR_PER_BLOCK = 80;
 constexpr int ADDR_BUDGET_SEC = 60;
 constexpr int ADDR_BUDGET_BEHIND_SEC = 10;
 constexpr long long AUTO_PEND_TTL = 6LL * 3600LL;
+// Алерт — только о свежем блоке. Догоняя простой (24 октября — полтора дня),
+// сканер разбирает старые блоки, и подписчик получил бы «покупку» суточной
+// давности как только что случившуюся. Час — с запасом на медленный блок.
+constexpr long long ALERT_MAX_AGE_SEC = 3600;
 // Круг: кошелёк получил с биржи и за сутки вернул ей ту же сумму (минус
 // комиссия сети, допуск — 1% или 0,0002 BTC). Это не покупка и продажа, а
 // перекладка биржи через свой адрес: у Kraken так ходило 9 «выводов» из 10.
@@ -514,7 +520,12 @@ long long jll(const json& j, const char* k) {
     if (!j.contains(k)) return 0;
     const auto& v = j[k];
     if (v.is_number_integer()) return v.get<long long>();
-    if (v.is_number()) return static_cast<long long>(v.get<double>());
+    // Дробное за пределами long long (1e300 от сломанного узла) при
+    // приведении — неопределённое поведение: такое число — 0.
+    if (v.is_number()) {
+        const double d = v.get<double>();
+        return d > -9e18 && d < 9e18 ? static_cast<long long>(d) : 0;
+    }
     return 0;
 }
 
@@ -551,7 +562,9 @@ bool parseRpcBlock(const json& j, Block& b) {
     if (j.contains("nTx") && jll(j, "nTx") != static_cast<long long>(txs.size())) return false;
     b.ts = jll(j, "time");
     b.prev = jstr(j, "previousblockhash");
-    if (b.ts <= 0 || (b.height > 0 && !isHash(b.prev))) return false;
+    // Время блока сеть принимает не дальше двух часов вперёд; дальше —
+    // сломанный узел, а такой блок встал бы во все окна потоков «сейчас».
+    if (b.ts <= 0 || b.ts > nowSec() + 7200 || (b.height > 0 && !isHash(b.prev))) return false;
     std::vector<BTx> out;
     out.reserve(txs.size());
     for (const auto& t : txs) {
@@ -1580,6 +1593,12 @@ private:
 
     void sendAlerts() {
         if (alerts_.empty()) return;
+        // Блок старый — догоняем простой: движения в базе, алертов нет.
+        if (nowSec() - alerts_.front().ts > ALERT_MAX_AGE_SEC) {
+            bump(g_bs.alertsOld, static_cast<long long>(alerts_.size()));
+            alerts_.clear();
+            return;
+        }
         std::function<void(const BtcAlert&)> sink;
         {
             std::lock_guard<std::mutex> w(g_watchMutex);
@@ -2370,6 +2389,8 @@ std::string btcStatsLine() {
            num(one("SELECT COALESCE(SUM(txs), 0) FROM btc_blocks WHERE ts >= ?", day)) + " за сутки";
     out += "\n↔️ Входов " + num(g_bs.ins.load()) + " · выходов " + num(g_bs.outs.load());
     out += "\n📝 Движений записано: " + num(g_bs.moves.load()) + " · 📨 алертов: " + num(g_bs.alerts.load());
+    if (g_bs.alertsOld.load())
+        out += " · не отправлено (старые блоки): " + num(g_bs.alertsOld.load());
     if (blocks > 0)
         out += "\n⚡ Блок грузится: " + secs(g_bs.loadMs.load()) + " (среднее " + secs(g_bs.loadMsSum.load() / blocks) + ")";
     out += "\n📶 Трафик: " + mb(g_bs.bytes.load()) + " с запуска";
