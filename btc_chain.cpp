@@ -76,7 +76,7 @@ struct BtcStats {
     std::atomic<long long> startedAt{0};
     std::atomic<long long> tip{0}, lag{0}, maxLag{0};
     std::atomic<long long> blocks{0}, txs{0}, ins{0}, outs{0}, moves{0}, alerts{0};
-    std::atomic<long long> reorgs{0}, skipped{0}, loadFails{0};
+    std::atomic<long long> reorgs{0}, skipped{0}, loadFails{0}, saveFails{0};
     std::atomic<long long> loadMs{0}, loadMsSum{0};
     std::atomic<long long> bytes{0};
     std::atomic<long long> addrAsked{0}, addrFailed{0};
@@ -102,10 +102,12 @@ long long envSats(const char* key, double defBtc) {
 // Строка в btc_moves — с 0,2 биткоина: ниже начинается розница, и доска
 // крупных движений утонула бы в ней. Потоки по часам считаются с любой суммы.
 const long long MOVE_MIN_SATS = envSats("WHALE_BTC_MOVE_MIN", 0.2);
-// Насколько отставание догоняем блок за блоком: сутки. Цена каждого блока —
-// на его час (priceAt), поэтому старые блоки считаются в верных долларах.
-// Простой дольше суток — прыгаем к свежим и пишем, сколько пропущено.
-constexpr long long MAX_BEHIND = 144;
+// Насколько отставание догоняем блок за блоком: неделя (блок грузится
+// секунды — неделя догоняется за пару часов). Цена каждого блока — на его
+// час (priceAt), поэтому старые блоки считаются в верных долларах. Простой
+// дольше недели — прыгаем к свежим и пишем, сколько пропущено. Суток было
+// мало: полуторасуточный сбой записи 23–24 октября пропал бы целиком.
+constexpr long long MAX_BEHIND = 1008;
 constexpr long long KEEP_SEC = 400LL * 86400LL;
 // Выученные адреса без новых встреч забываем через три месяца: адресов
 // пополнения биржи сметают десятки тысяч в сутки, хранить их вечно — гигабайты.
@@ -668,6 +670,73 @@ void execSql(const char* sql) {
     }
 }
 
+// Запись в базу — транзакцией, которая обязана закрыться. 23 октября COMMIT
+// блока не прошёл («cannot commit transaction - SQL statements in
+// progress»), транзакция осталась открытой, каждый следующий BEGIN падал
+// («within a transaction»), и полтора дня ни один блок не попал в базу, а
+// сканер считал их разобранными. Теперь: незавершённые запросы перед
+// COMMIT сбрасываются (пишущие — с их текстом в журнале: это ошибка в коде,
+// её надо видеть), COMMIT проверяется, не прошёл — откат, и вызвавший знает,
+// что записи нет.
+void resetBusy(const char* where) {
+    for (sqlite3_stmt* s = sqlite3_next_stmt(g_btcDb, nullptr); s; s = sqlite3_next_stmt(g_btcDb, s)) {
+        if (!sqlite3_stmt_busy(s)) continue;
+        if (!sqlite3_stmt_readonly(s)) {
+            const char* sql = sqlite3_sql(s);
+            std::cerr << "[BTC] " << where << ": незавершённый пишущий запрос сброшен: "
+                      << std::string(sql ? sql : "?").substr(0, 160) << std::endl;
+        }
+        sqlite3_reset(s);
+    }
+}
+
+void txRollback(const char* why) {
+    if (sqlite3_get_autocommit(g_btcDb)) return;
+    std::cerr << "[BTC] откат записи: " << why << std::endl;
+    resetBusy("откат");
+    char* err = nullptr;
+    if (sqlite3_exec(g_btcDb, "ROLLBACK", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[BTC] sql: ROLLBACK: " << (err ? err : "?") << std::endl;
+        sqlite3_free(err);
+    }
+}
+
+// IMMEDIATE — блокировка записи сразу (ждём busy_timeout), а не на
+// середине блока. Прошлая транзакция осталась открытой — сначала откат.
+bool txBegin() {
+    txRollback("транзакция осталась открытой");
+    char* err = nullptr;
+    if (sqlite3_exec(g_btcDb, "BEGIN IMMEDIATE", nullptr, nullptr, &err) != SQLITE_OK) {
+        std::cerr << "[BTC] sql: BEGIN: " << (err ? err : "?") << std::endl;
+        sqlite3_free(err);
+        return false;
+    }
+    return true;
+}
+
+bool txCommit() {
+    resetBusy("COMMIT");
+    char* err = nullptr;
+    if (sqlite3_exec(g_btcDb, "COMMIT", nullptr, nullptr, &err) == SQLITE_OK) return true;
+    std::cerr << "[BTC] sql: COMMIT: " << (err ? err : "?") << std::endl;
+    sqlite3_free(err);
+    txRollback("COMMIT не прошёл");
+    return false;
+}
+
+// Транзакция вокруг f: исключение или сбой записи — откат, false.
+template <class F>
+bool inTx(F&& f) {
+    if (!txBegin()) return false;
+    try {
+        f();
+    } catch (...) {
+        txRollback("исключение посреди записи");
+        throw;
+    }
+    return txCommit();
+}
+
 // Число транзакций и остаток адреса — с mempool.space, запасной blockstream.
 // Это не разметка, а та же цепочка, посчитанная по адресу: у узла Bitcoin
 // индекса адресов нет (scantxoutset на публичных узлах закрыт). Со своим
@@ -725,7 +794,7 @@ public:
         // адресов 59 бирж), потом ручной список — он главнее и правит их.
         std::vector<std::pair<const char*, const char*>> all(BTC_SEEDS_BOOK.begin(), BTC_SEEDS_BOOK.end());
         all.insert(all.end(), SEEDS.begin(), SEEDS.end());
-        execSql("BEGIN");
+        inTx([&] {
         for (const auto& [a, ex] : all) {
             putLabel(a, ex, "seed");
             sqlite3_stmt* s = nullptr;
@@ -738,13 +807,19 @@ public:
                 sqlite3_finalize(s);
             }
         }
-        execSql("COMMIT");
+        });
     }
 
-    enum class Result { DONE, REORG };
+    // FAILED — блок не записался (база занята, сбой записи): он не разобран,
+    // его надо прочитать ещё раз, а не идти дальше.
+    enum class Result { DONE, REORG, FAILED };
 
     Result process(const Block& b) {
-        if (rolledBack(b)) return Result::REORG;
+        switch (rolledBack(b)) {
+            case Back::DONE: return Result::REORG;
+            case Back::FAILED: bump(g_bs.saveFails); return Result::FAILED;
+            case Back::NONE: break;
+        }
         {
             // Блок уже посчитан (перезапуск, повтор после сбоя сети) — второй
             // раз его потоки не складываем: иначе суммы по биржам удваиваются.
@@ -771,11 +846,17 @@ public:
         alerts_.clear();
         {
             std::lock_guard<std::mutex> l(g_btcDbMutex);
-            execSql("BEGIN");
-            scan(b, price, moves, learned);
-            // Разметка владельца (/import из любого процесса бота) — с блоком.
-            etfDrainLabels(g_btcDb);
-            execSql("COMMIT");
+            const bool saved = inTx([&] {
+                scan(b, price, moves, learned);
+                // Разметка владельца (/import из любого процесса бота) — с блоком.
+                etfDrainLabels(g_btcDb);
+            });
+            if (!saved) {
+                // Алерты этого блока не уходят: его нет в базе, его прочитают снова.
+                alerts_.clear();
+                bump(g_bs.saveFails);
+                return Result::FAILED;
+            }
         }
         bump(g_bs.blocks);
         bump(g_bs.txs, static_cast<long long>(b.txs.size()));
@@ -796,8 +877,9 @@ public:
     // нас. Тогда посчитанный блок откатываем целиком — его вклад в потоки,
     // его движения — и читаем эту высоту заново. Без этого транзакции
     // осиротевшего блока, попав в новый, считались бы дважды.
-    bool rolledBack(const Block& b) {
-        if (b.prev.empty()) return false;
+    enum class Back { NONE, DONE, FAILED };
+    Back rolledBack(const Block& b) {
+        if (b.prev.empty()) return Back::NONE;
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         sqlite3_stmt* s = nullptr;
         std::string have, flowJson;
@@ -811,9 +893,9 @@ public:
             }
             sqlite3_finalize(s);
         }
-        if (have.empty() || have == b.prev) return false;
+        if (have.empty() || have == b.prev) return Back::NONE;
         std::cerr << "[BTC] перестройка цепочки на блоке " << b.height - 1 << " — откатываю его" << std::endl;
-        execSql("BEGIN");
+        const bool ok = inTx([&] {
         json f = json::parse(flowJson, nullptr, false);
         if (f.is_object()) {
             for (auto& [ex, v] : f.items()) {
@@ -839,8 +921,8 @@ public:
             sqlite3_finalize(s);
         }
         setState("height", std::to_string(b.height - 2));
-        execSql("COMMIT");
-        return true;
+        });
+        return ok ? Back::DONE : Back::FAILED;
     }
 
     // База могла пополниться из другого процесса бота (/import там, где
@@ -1133,7 +1215,7 @@ public:
         };
         int pairs = 0, labeled = 0, purged = 0;
         std::vector<std::pair<std::string, std::string>> mark;
-        execSql("BEGIN");
+        inTx([&] {
         for (auto& [key, mv] : by) {
             const auto& [wallet, ex] = key;
             std::vector<bool> used(mv.size(), false);
@@ -1164,7 +1246,7 @@ public:
             purged += purgeWallet(wallet, 0, nullptr);
             ++labeled;
         }
-        execSql("COMMIT");
+        });
         if (pairs)
             std::cout << "[BTC] сняты круги «с биржи и обратно»: " << pairs << " пар, адресов бирж +" << labeled
                       << ", их прочих строк снято " << purged << std::endl;
@@ -1804,7 +1886,7 @@ void btcLoop() {
                 long long from = tip - (last <= 0 ? 1 : 6);
                 if (last > 0) bump(g_bs.skipped, from - last);
                 if (last > 0)
-                    std::cerr << "[BTC] простой дольше суток: блоки " << last + 1 << "–" << from
+                    std::cerr << "[BTC] простой дольше недели: блоки " << last + 1 << "–" << from
                               << " пропущены" << std::endl;
                 std::cout << "[BTC] start from block " << from + 1 << " (tip " << tip << ")" << std::endl;
                 last = from;
@@ -1835,7 +1917,12 @@ void btcLoop() {
                     std::cerr << "[BTC] ни один узел не отдал блок " << b.height << ", повторю через полминуты" << std::endl;
                     break;
                 }
-                if (sc.process(b) == Scanner::Result::REORG) {
+                const auto res = sc.process(b);
+                if (res == Scanner::Result::FAILED) {
+                    std::cerr << "[BTC] блок " << b.height << " не записался в базу, повторю через полминуты" << std::endl;
+                    break;
+                }
+                if (res == Scanner::Result::REORG) {
                     bump(g_bs.reorgs);
                     last = b.height - 2;
                     setLag();
@@ -2063,9 +2150,8 @@ EtfImportResult btcEtfImport(const std::vector<std::string>& addrs, const std::s
     for (const auto& a : addrs) norm.push_back(normBtcAddress(a));
     std::lock_guard<std::mutex> l(g_btcDbMutex);
     if (!g_btcDb) return {};
-    execSql("BEGIN");
-    EtfImportResult r = etfImport(g_btcDb, norm, fund);
-    execSql("COMMIT");
+    EtfImportResult r;
+    if (!inTx([&] { r = etfImport(g_btcDb, norm, fund); })) return {};
     return r;
 }
 
@@ -2082,7 +2168,7 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
         sqlite3_finalize(s);
         return r;
     }
-    execSql("BEGIN");
+    const bool ok = inTx([&] {
     for (const auto& raw : addrs) {
         const std::string a = normBtcAddress(raw);
         sqlite3_reset(s);
@@ -2099,10 +2185,10 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
         if (sqlite3_step(m) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) ++r.marked;
         else ++r.dup;
     }
-    execSql("COMMIT");
+    });
     sqlite3_finalize(s);
     sqlite3_finalize(m);
-    return r;
+    return ok ? r : BtcImportResult{};
 }
 
 void btcSetFollowed(std::unordered_set<std::string> lowerAddrs) {
@@ -2192,7 +2278,8 @@ std::string btcStatsLine() {
     out += "\n📦 Блоков: " + num(blocks) + " с запуска · " +
            num(one("SELECT COUNT(*) FROM btc_blocks WHERE ts >= ?", day)) + " за сутки";
     out += "\n🔄 Перестроек: " + num(g_bs.reorgs.load()) + " · пропущено при простое: " + num(g_bs.skipped.load()) +
-           " · не загрузилось: " + num(g_bs.loadFails.load());
+           " · не загрузилось: " + num(g_bs.loadFails.load()) +
+           " · не записалось: " + num(g_bs.saveFails.load());
     out += "\n🔍 TX: " + num(g_bs.txs.load()) + " с запуска · " +
            num(one("SELECT COALESCE(SUM(txs), 0) FROM btc_blocks WHERE ts >= ?", day)) + " за сутки";
     out += "\n↔️ Входов " + num(g_bs.ins.load()) + " · выходов " + num(g_bs.outs.load());
