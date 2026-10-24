@@ -123,6 +123,10 @@ constexpr int ADDR_PER_BLOCK = 60;
 // а без проверки «не сервис ли» в базу никого не берём. Непроверенные ждут
 // следующих блоков до 6 часов, очередь — не длиннее 5000.
 constexpr int AUTO_ADDR_PER_BLOCK = 80;
+// Сколько секунд блок тратит на адреса; кто не успел — со следующими блоками.
+// Пока догоняем сеть — меньше: сначала блоки, потом адреса.
+constexpr int ADDR_BUDGET_SEC = 60;
+constexpr int ADDR_BUDGET_BEHIND_SEC = 10;
 constexpr long long AUTO_PEND_TTL = 6LL * 3600LL;
 // Круг: кошелёк получил с биржи и за сутки вернул ей ту же сумму (минус
 // комиссия сети, допуск — 1% или 0,0002 BTC). Это не покупка и продажа, а
@@ -741,14 +745,40 @@ bool inTx(F&& f) {
 // Это не разметка, а та же цепочка, посчитанная по адресу: у узла Bitcoin
 // индекса адресов нет (scantxoutset на публичных узлах закрыт). Со своим
 // узлом и индексатором (electrs) сюда встанет он.
+//
+// Сервис не ответил (таймаут, 429, мусор) — десять минут его не спрашиваем.
+// Иначе каждый адрес ждёт его таймаута, а у блока их до 140: 24.10
+// mempool.space не отвечал, блок разбирался дольше 10 минут, и сканер
+// отставал от сети навсегда — потоки бирж в приложении стояли на нуле.
+constexpr long long ADDR_HOST_REST_SEC = 600;
+const char* const ADDR_HOSTS[] = {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"};
+std::atomic<long long> g_addrRest[2] = {0, 0};
+
+// Есть кого спросить: хоть один сервис не отдыхает.
+bool addrUp() {
+    const long long now = nowSec();
+    for (const auto& r : g_addrRest)
+        if (r.load() <= now) return true;
+    return false;
+}
+
 bool fetchAddrStats(const std::string& a, long long& txs, long long& bal) {
+    if (!addrUp()) return false;
     bump(g_bs.addrAsked);
     json j;
-    for (const char* host : {"https://mempool.space/api/address/", "https://blockstream.info/api/address/"}) {
-        j = json::parse(fetch(host + a, 10), nullptr, false);
-        if (j.is_object() && j.contains("chain_stats")) break;
+    bool got = false;
+    for (size_t i = 0; i < 2 && !got; ++i) {
+        if (g_addrRest[i].load() > nowSec()) continue;
+        long code = 0;
+        j = json::parse(fetch(ADDR_HOSTS[i] + a, 10, &code), nullptr, false);
+        got = j.is_object() && j.contains("chain_stats") && j["chain_stats"].is_object();
+        // 400 — сервис жив, не понравился адрес: у другого будет так же.
+        if (got || code == 400) break;
+        g_addrRest[i] = nowSec() + ADDR_HOST_REST_SEC;
+        std::cerr << "[BTC] " << ADDR_HOSTS[i] << " не ответил (код " << code << ") — "
+                  << ADDR_HOST_REST_SEC / 60 << " мин без него" << std::endl;
     }
-    if (!j.is_object() || !j.contains("chain_stats") || !j["chain_stats"].is_object()) {
+    if (!got) {
         bump(g_bs.addrFailed);
         return false;
     }
@@ -1608,8 +1638,10 @@ private:
         }
         if (static_cast<int>(ask.size()) > ADDR_PER_BLOCK) ask.resize(ADDR_PER_BLOCK);
         ask.insert(ask.begin(), askAuto.begin(), askAuto.end());
+        const auto until = std::chrono::steady_clock::now() +
+            std::chrono::seconds(g_bs.lag.load() > 1 ? ADDR_BUDGET_BEHIND_SEC : ADDR_BUDGET_SEC);
         for (const auto& a : ask) {
-            if (!running) break;
+            if (!running || !addrUp() || std::chrono::steady_clock::now() >= until) break;
             long long txs = 0, bal = 0;
             if (!fetchAddrStats(a, txs, bal)) continue;
             saveAddrStats(a, txs, bal);
@@ -1832,8 +1864,9 @@ void refreshIdleBalances() {
         sqlite3_finalize(s);
     }
     int done = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(ADDR_BUDGET_SEC);
     for (const auto& a : ask) {
-        if (!g_btcRunning.load()) break;
+        if (!g_btcRunning.load() || !addrUp() || std::chrono::steady_clock::now() >= until) break;
         long long txs = 0, bal = 0;
         if (fetchAddrStats(a, txs, bal)) {
             saveAddrStats(a, txs, bal);
