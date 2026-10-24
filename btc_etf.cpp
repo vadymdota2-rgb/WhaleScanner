@@ -45,12 +45,14 @@ struct Stmt {
     }
 };
 
-void exec(sqlite3* db, const char* sql) {
+bool exec(sqlite3* db, const char* sql) {
     char* err = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
         std::cerr << "[ETF] " << (err ? err : "?") << std::endl;
         sqlite3_free(err);
+        return false;
     }
+    return true;
 }
 
 }  // namespace
@@ -98,7 +100,9 @@ void etfOpen(sqlite3* db) {
             q.text(1, a).text(2, fund).num(3, now()).run();
         }
     }
-    exec(db, "COMMIT");
+    // COMMIT не прошёл — откат: открытая транзакция остановила бы запись
+    // блоков (как 23 октября).
+    if (!exec(db, "COMMIT") && !sqlite3_get_autocommit(db)) exec(db, "ROLLBACK");
     std::unordered_map<std::string, std::string> all;
     {
         Stmt q(db, "SELECT address, fund FROM btc_etf_addr");
@@ -148,22 +152,30 @@ int etfDrainLabels(sqlite3* db) {
         while (q.row()) rows.emplace_back(q.str(0), q.str(1));
     }
     if (rows.empty()) return 0;
-    int n = 0;
+    // Карта в памяти меняется только после записи всей очереди: не
+    // записалось — блок откатят, очередь останется и придёт со следующим.
+    std::vector<std::pair<std::string, std::string>> done;
     Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'import',?) "
                "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='import', at=excluded.at "
                "WHERE btc_etf_addr.how != 'seed'");
+    if (!q.s) return -1;
     for (const auto& [a, fund] : rows) {
         // Опубликованное фондом не трогаем; остальное — как сказал владелец.
         q.reset();
-        q.text(1, a).text(2, fund).num(3, now()).run();
-        if (sqlite3_changes(db) == 0) continue;
-        ++n;
-        std::lock_guard<std::mutex> l(g_mx);
-        g_fund[a] = fund;
+        if (!q.text(1, a).text(2, fund).num(3, now()).run()) {
+            std::cerr << "[ETF] разметка " << a << ": " << sqlite3_errmsg(db) << std::endl;
+            q.reset();
+            return -1;
+        }
+        if (sqlite3_changes(db) > 0) done.emplace_back(a, fund);
     }
-    exec(db, "DELETE FROM btc_etf_import");
-    std::cout << "[ETF] разметка владельца: " << n << " кошельков" << std::endl;
-    return n;
+    if (!exec(db, "DELETE FROM btc_etf_import")) return -1;
+    {
+        std::lock_guard<std::mutex> l(g_mx);
+        for (const auto& [a, fund] : done) g_fund[a] = fund;
+    }
+    std::cout << "[ETF] разметка владельца: " << done.size() << " кошельков" << std::endl;
+    return static_cast<int>(done.size());
 }
 
 std::string etfStats(sqlite3* db) {

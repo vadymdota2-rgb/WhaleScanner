@@ -95,7 +95,8 @@ long long envSats(const char* key, double defBtc) {
     if (v && *v) {
         try { btc = std::stod(v); } catch (...) {}
     }
-    if (btc <= 0) btc = defBtc;
+    // «nan», «inf» и больше всех биткоинов — опечатка в настройке, не порог.
+    if (!(btc > 0 && btc <= 21e6)) btc = defBtc;
     return static_cast<long long>(btc * SAT);
 }
 
@@ -459,10 +460,32 @@ long long priceAt(long long ts) {
                                iso(hour) + "&end=" + iso(hour + 3600), 10), nullptr, false);
     if (j.is_array())
         for (const auto& c : j)
-            if (c.is_array() && c.size() >= 5 && c[0].is_number() && c[0].get<long long>() == hour && c[4].is_number())
+            if (c.is_array() && c.size() >= 5 && c[0].is_number() && c[0].get<long long>() == hour && c[4].is_number() &&
+                c[4].get<double>() > 1000 && c[4].get<double>() < 10000000)
                 p = static_cast<long long>(c[4].get<double>() * 1e9);
-    if (p <= 0) return btcPriceNanos();
-    if (g_hourPrice.size() > 500) g_hourPrice.clear();
+    if (g_hourPrice.size() > 2000) g_hourPrice.clear();
+    if (p <= 0) {
+        // Coinbase не ответил — часовые свечи Kraken: один ответ — до 720
+        // часов, его хватает на всю догонку (неделя — 168 часов). Без этого
+        // старый блок получал сегодняшнюю цену: после полутора суток простоя
+        // доллары выводов расходились с ценой их часа на проценты.
+        j = json::parse(fetch("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60&since=" +
+                              std::to_string(hour - 3600), 10), nullptr, false);
+        if (j.is_object() && j.contains("result") && j["result"].is_object())
+            for (const auto& [k, rows] : j["result"].items()) {
+                if (!rows.is_array()) continue;
+                for (const auto& c : rows) {
+                    if (!c.is_array() || c.size() < 5 || !c[0].is_number_integer() || !c[4].is_string()) continue;
+                    double close = 0;
+                    try { close = std::stod(c[4].get<std::string>()); } catch (...) { continue; }
+                    if (!(close > 1000 && close < 10000000)) continue;
+                    g_hourPrice[c[0].get<long long>()] = static_cast<long long>(close * 1e9);
+                }
+            }
+        auto k = g_hourPrice.find(hour);
+        if (k != g_hourPrice.end()) return k->second;
+        return btcPriceNanos();
+    }
     g_hourPrice[hour] = p;
     return p;
 }
@@ -666,6 +689,23 @@ std::string colText(sqlite3_stmt* s, int i) {
     return t ? reinterpret_cast<const char*>(t) : "";
 }
 
+// Шаг пишущего запроса. Не прошёл — в журнал с текстом запроса, запрос
+// сбрасывается (недошедший запрос держал бы COMMIT: «SQL statements in
+// progress» — так 23 октября и встала запись), счётчик ошибок транзакции +1.
+// Счётчик — под замком базы, как и всё, что пишет в неё.
+int g_txErrs = 0;
+
+int stepW(sqlite3_stmt* s) {
+    const int rc = sqlite3_step(s);
+    if (rc == SQLITE_DONE || rc == SQLITE_ROW) return rc;
+    ++g_txErrs;
+    const char* sql = sqlite3_sql(s);
+    std::cerr << "[BTC] запись не прошла: " << sqlite3_errmsg(g_btcDb) << " | "
+              << std::string(sql ? sql : "?").substr(0, 120) << std::endl;
+    sqlite3_reset(s);
+    return rc;
+}
+
 void execSql(const char* sql) {
     char* err = nullptr;
     if (sqlite3_exec(g_btcDb, sql, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -729,14 +769,22 @@ bool txCommit() {
 }
 
 // Транзакция вокруг f: исключение или сбой записи — откат, false.
+// Сбой любой записи внутри (stepW) — тоже откат: раньше ошибки шагов не
+// проверялись, и блок мог лечь в базу наполовину — потоки без движений или
+// движения без блока.
 template <class F>
 bool inTx(F&& f) {
     if (!txBegin()) return false;
+    g_txErrs = 0;
     try {
         f();
     } catch (...) {
         txRollback("исключение посреди записи");
         throw;
+    }
+    if (g_txErrs) {
+        txRollback("запись не прошла");
+        return false;
     }
     return txCommit();
 }
@@ -796,7 +844,7 @@ void saveAddrStats(const std::string& a, long long txs, long long bal) {
         sqlite3_bind_int64(s, 2, txs);
         sqlite3_bind_int64(s, 3, bal);
         sqlite3_bind_int64(s, 4, nowSec());
-        sqlite3_step(s);
+        stepW(s);
         sqlite3_finalize(s);
     }
 }
@@ -833,7 +881,7 @@ public:
             if (prep(&s, "UPDATE btc_labels SET ex=?, how='seed' WHERE address=?")) {
                 bindText(s, 1, ex);
                 bindText(s, 2, a);
-                sqlite3_step(s);
+                stepW(s);
                 sqlite3_finalize(s);
             }
         }
@@ -879,7 +927,8 @@ public:
             const bool saved = inTx([&] {
                 scan(b, price, moves, learned);
                 // Разметка владельца (/import из любого процесса бота) — с блоком.
-                etfDrainLabels(g_btcDb);
+                // Не записалась — блок тоже нет: очередь разметки не потеряется.
+                if (etfDrainLabels(g_btcDb) < 0) ++g_txErrs;
             });
             if (!saved) {
                 // Алерты этого блока не уходят: его нет в базе, его прочитают снова.
@@ -929,25 +978,29 @@ public:
         json f = json::parse(flowJson, nullptr, false);
         if (f.is_object()) {
             for (auto& [ex, v] : f.items()) {
+                // Не четыре целых — строку не трогаем: get<> бросил бы
+                // исключение, и откат повторялся бы каждые полминуты вечно.
                 if (!v.is_array() || v.size() < 4) continue;
+                if (!std::all_of(v.begin(), v.begin() + 4, [](const json& x) { return x.is_number_integer(); }))
+                    continue;
                 if (prep(&s, "UPDATE btc_flow SET in_sats=in_sats-?, out_sats=out_sats-?, in_n=in_n-?, out_n=out_n-? "
                              "WHERE ts=? AND ex=?")) {
                     for (int k = 0; k < 4; ++k) sqlite3_bind_int64(s, 1 + k, v[k].get<long long>());
                     sqlite3_bind_int64(s, 5, ts);
                     bindText(s, 6, ex);
-                    sqlite3_step(s);
+                    stepW(s);
                     sqlite3_finalize(s);
                 }
             }
         }
         if (prep(&s, "DELETE FROM btc_moves WHERE height=?")) {
             sqlite3_bind_int64(s, 1, b.height - 1);
-            sqlite3_step(s);
+            stepW(s);
             sqlite3_finalize(s);
         }
         if (prep(&s, "DELETE FROM btc_blocks WHERE height=?")) {
             sqlite3_bind_int64(s, 1, b.height - 1);
-            sqlite3_step(s);
+            stepW(s);
             sqlite3_finalize(s);
         }
         setState("height", std::to_string(b.height - 2));
@@ -1150,7 +1203,7 @@ public:
             sqlite3_bind_int64(db_.putFlow, 1, b.ts);
             bindText(db_.putFlow, 2, ex);
             for (int k = 0; k < 4; ++k) sqlite3_bind_int64(db_.putFlow, 3 + k, f[k]);
-            sqlite3_step(db_.putFlow);
+            stepW(db_.putFlow);
             blockFlow[ex] = json::array({f[0], f[1], f[2], f[3]});
         }
         // Живые адреса бирж освежаются каждой встречей: иначе выученный
@@ -1164,7 +1217,7 @@ public:
                 sqlite3_reset(s);
                 sqlite3_bind_int64(s, 1, t);
                 bindText(s, 2, a);
-                sqlite3_step(s);
+                stepW(s);
             }
             sqlite3_finalize(s);
         }
@@ -1179,7 +1232,7 @@ public:
             sqlite3_bind_int64(s, 7, price);
             sqlite3_bind_int64(s, 8, nowSec());
             bindText(s, 9, blockFlow.dump());
-            sqlite3_step(s);
+            stepW(s);
             sqlite3_finalize(s);
         }
         setState("height", std::to_string(b.height));
@@ -1236,12 +1289,12 @@ public:
         auto drop = [&](sqlite3_stmt* f, const Mv& m, const std::string& ex) {
             sqlite3_reset(del);
             sqlite3_bind_int64(del, 1, m.id);
-            sqlite3_step(del);
+            stepW(del);
             sqlite3_reset(f);
             sqlite3_bind_int64(f, 1, m.sats);
             sqlite3_bind_int64(f, 2, m.ts);
             bindText(f, 3, ex);
-            sqlite3_step(f);
+            stepW(f);
         };
         int pairs = 0, labeled = 0, purged = 0;
         std::vector<std::pair<std::string, std::string>> mark;
@@ -1332,7 +1385,7 @@ private:
         if (!id) return false;
         if (prep(&q, "DELETE FROM btc_moves WHERE id=?")) {
             sqlite3_bind_int64(q, 1, id);
-            sqlite3_step(q);
+            stepW(q);
             sqlite3_finalize(q);
         }
         if (ts == b.ts) {
@@ -1344,7 +1397,7 @@ private:
             sqlite3_bind_int64(q, 1, out);
             sqlite3_bind_int64(q, 2, ts);
             bindText(q, 3, ex);
-            sqlite3_step(q);
+            stepW(q);
             sqlite3_finalize(q);
         }
         return true;
@@ -1377,7 +1430,7 @@ private:
         for (const auto& r : rows) {
             sqlite3_reset(del);
             sqlite3_bind_int64(del, 1, r.id);
-            sqlite3_step(del);
+            stepW(del);
             if (r.ex.empty()) continue;  // перевод кошелька базы — в потоки бирж не входил
             if (flow && r.ts == blockTs) {
                 auto& f = (*flow)[r.ex];
@@ -1391,7 +1444,7 @@ private:
             sqlite3_bind_int64(f, 1, r.sats);
             sqlite3_bind_int64(f, 2, r.ts);
             bindText(f, 3, r.ex);
-            sqlite3_step(f);
+            stepW(f);
         }
         for (auto* x : {del, fo, fi}) sqlite3_finalize(x);
         return static_cast<int>(rows.size());
@@ -1404,7 +1457,7 @@ private:
         sqlite3_stmt* q = nullptr;
         if (prep(&q, "DELETE FROM btc_watch WHERE address=? AND src='auto'")) {
             bindText(q, 1, a);
-            sqlite3_step(q);
+            stepW(q);
             const bool gone = sqlite3_changes(g_btcDb) > 0;
             sqlite3_finalize(q);
             if (gone) {
@@ -1478,7 +1531,7 @@ private:
         if (!prep(&s, "INSERT OR IGNORE INTO btc_case(lower, addr) VALUES(?,?)")) return;
         bindText(s, 1, lower(a));
         bindText(s, 2, a);
-        sqlite3_step(s);
+        stepW(s);
         sqlite3_finalize(s);
     }
 
@@ -1592,7 +1645,7 @@ private:
             sqlite3_reset(ins);
             bindText(ins, 1, a);
             sqlite3_bind_int64(ins, 2, nowSec());
-            if (sqlite3_step(ins) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) {
+            if (stepW(ins) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) {
                 std::lock_guard<std::mutex> w(g_watchMutex);
                 g_watch.insert(a);
                 ++added;
@@ -1654,7 +1707,7 @@ private:
         if (prep(&s, "INSERT OR REPLACE INTO btc_state(k, v) VALUES(?,?)")) {
             bindText(s, 1, k);
             bindText(s, 2, v);
-            sqlite3_step(s);
+            stepW(s);
             sqlite3_finalize(s);
         }
     }
@@ -1674,7 +1727,7 @@ private:
         bindText(db_.putLabel, 2, ex);
         sqlite3_bind_text(db_.putLabel, 3, how, -1, SQLITE_STATIC);
         sqlite3_bind_int64(db_.putLabel, 4, nowSec());
-        sqlite3_step(db_.putLabel);
+        stepW(db_.putLabel);
     }
 
     // true — строка новая (повтор той же транзакции отбрасывает UNIQUE).
@@ -1692,7 +1745,7 @@ private:
         long long usd = static_cast<long long>(static_cast<long double>(sats) * price / SAT);
         sqlite3_bind_int64(db_.putMove, 8, usd);
         sqlite3_bind_int64(db_.putMove, 9, price);
-        const bool fresh = sqlite3_step(db_.putMove) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0;
+        const bool fresh = stepW(db_.putMove) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0;
         touched_.push_back(wallet);
         return fresh;
     }
@@ -1786,7 +1839,7 @@ long long execCount(const std::string& sql, long long arg) {
     sqlite3_stmt* s = nullptr;
     if (!prep(&s, sql.c_str())) return 0;
     sqlite3_bind_int64(s, 1, arg);
-    const bool ok = sqlite3_step(s) == SQLITE_DONE;
+    const bool ok = stepW(s) == SQLITE_DONE;
     sqlite3_finalize(s);
     return ok ? sqlite3_changes(g_btcDb) : 0;
 }
@@ -2061,7 +2114,7 @@ int btcPruneAuto(long long cut) {
             for (const auto& a : gone) {
                 sqlite3_reset(s);
                 bindText(s, 1, a);
-                sqlite3_step(s);
+                stepW(s);
             }
             sqlite3_finalize(s);
         }
@@ -2094,7 +2147,7 @@ int btcBanServices() {
             for (const auto& b : bad) {
                 sqlite3_reset(s);
                 bindText(s, 1, b.first);
-                sqlite3_step(s);
+                stepW(s);
             }
             sqlite3_finalize(s);
         }
@@ -2207,7 +2260,7 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
         sqlite3_reset(s);
         bindText(s, 1, a);
         sqlite3_bind_int64(s, 2, nowSec());
-        if (sqlite3_step(s) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) {
+        if (stepW(s) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) {
             ++r.added;
             std::lock_guard<std::mutex> w(g_watchMutex);
             g_watch.insert(a);
@@ -2215,7 +2268,7 @@ BtcImportResult btcImport(const std::vector<std::string>& addrs) {
         }
         sqlite3_reset(m);
         bindText(m, 1, a);
-        if (sqlite3_step(m) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) ++r.marked;
+        if (stepW(m) == SQLITE_DONE && sqlite3_changes(g_btcDb) > 0) ++r.marked;
         else ++r.dup;
     }
     });
@@ -2338,8 +2391,15 @@ std::string btcStatsLine() {
             if (st.ok) out += " · " + secs(st.ms / st.ok);
         }
     }
-    out += "\n📇 Адреса (mempool.space): запросов " + num(g_bs.addrAsked.load()) + " · сбоев " +
-           num(g_bs.addrFailed.load());
+    out += "\n📇 Адреса: запросов " + num(g_bs.addrAsked.load()) + " · сбоев " + num(g_bs.addrFailed.load());
+    // Кто из сервисов адресов сейчас отдыхает (не ответил — 10 минут без него).
+    for (size_t i = 0; i < 2; ++i) {
+        std::string host = ADDR_HOSTS[i];
+        host = host.substr(host.find("://") + 3);
+        host = host.substr(0, host.find('/'));
+        const long long rest = g_addrRest[i].load() - now;
+        out += "\n· " + host + " — " + (rest > 0 ? "💤 отдыхает ещё " + ago(rest) : std::string("✅"));
+    }
 
     out += "\n\n📈 <b>Разбор транзакций</b> (с запуска)"
            "\n🟢 С биржи (выводы): " + num(g_bs.fromEx.load()) +

@@ -34,6 +34,7 @@ struct EtfImportResult {
     int seed = 0;    // опубликованы фондом — не тронуты
 };
 EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund);
+// Сколько адресов размечено; -1 — запись не прошла (транзакцию откатить).
 int etfDrainLabels(sqlite3* db);
 // Раздел для /statsbtc.
 std::string etfStats(sqlite3* db);
