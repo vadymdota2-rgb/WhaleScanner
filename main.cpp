@@ -2277,6 +2277,9 @@ std::string importWhalesReport(const std::vector<std::string>& x0, const std::ve
 
 std::string importFundReport(const std::string& fund, size_t n, const EtfImportResult& r) {
     std::stringstream rep;
+    if (r.failed)
+        return "\U0001F3F7 <b>Разметка: " + escapeHtml(fund) + "</b>\n❌ Не записалось в базу — ничего не изменено. "
+               "Пришлите /import ещё раз.";
     rep << "\U0001F3F7 <b>Разметка: " << escapeHtml(fund) << "</b>\nАдресов: <b>" << n << "</b>"
         << "\n✅ В разметку: <b>" << r.queued << "</b>";
     if (r.inBase) rep << "\n⭐ Были в базе китов без метки — помечены: <b>" << r.inBase << "</b>";

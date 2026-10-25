@@ -2253,10 +2253,18 @@ bool isBtcKey(const std::string& a) {
 EtfImportResult btcEtfImport(const std::vector<std::string>& addrs, const std::string& fund) {
     std::vector<std::string> norm;
     for (const auto& a : addrs) norm.push_back(normBtcAddress(a));
+    EtfImportResult failed;
+    failed.failed = true;
     std::lock_guard<std::mutex> l(g_btcDbMutex);
-    if (!g_btcDb) return {};
+    if (!g_btcDb) return failed;
     EtfImportResult r;
-    if (!inTx([&] { r = etfImport(g_btcDb, norm, fund); })) return {};
+    // Не записалось хоть что-то — откат всего списка, а в отчёте — сбой, а не
+    // «в разметку: 0».
+    if (!inTx([&] {
+            r = etfImport(g_btcDb, norm, fund);
+            if (r.failed) ++g_txErrs;
+        }))
+        return failed;
     return r;
 }
 

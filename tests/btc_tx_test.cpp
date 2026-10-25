@@ -2,6 +2,7 @@
 // чужой писатель посреди транзакции (так 23 октября встала запись блоков),
 // кривой вклад блока при откате цепочки. Запуск: tests/run.sh
 #include "../btc_chain.cpp"
+#include "../btc_etf_book.h"
 std::atomic<bool> running{true};
 void autoSeed(AutoNet, int) {}
 bool autoRoom(AutoNet) { return false; }
@@ -76,6 +77,94 @@ int main() {
         try { (void)sc.process(b); } catch (...) { threw = true; }
         CHECK(!threw);
         CHECK(count("SELECT COUNT(*) FROM btc_blocks WHERE height=99") == 0);
+    }
+    // ── Метки фондов ETF (btc_etf.cpp) ──
+    auto exec1 = [](const char* sql) {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        CHECK(sqlite3_exec(g_btcDb, sql, nullptr, nullptr, nullptr) == SQLITE_OK);
+    };
+    const std::string book0 = BTC_ETF_BOOK[0].first, book1 = BTC_ETF_BOOK[1].first;
+    // 5. Список фонда — метки при запуске.
+    CHECK(etfFund(book0) == "BITB");
+    // 6. Адрес, которого больше нет в списке фонда, снимается; выученная
+    //    метка биржи с кошелька фонда — тоже; проверенная вручную — нет.
+    exec1("INSERT INTO btc_etf_addr(address, fund, how) VALUES('bc1qstale', 'BITB', 'seed')");
+    {
+        const std::string sql = "INSERT INTO btc_labels(address, ex, how) VALUES('" + book0 + "', 'Coinbase', 'cospend'),"
+                                "('" + book1 + "', 'Coinbase', 'seed')";
+        exec1(sql.c_str());
+    }
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        etfOpen(g_btcDb);
+        CHECK(sqlite3_get_autocommit(g_btcDb));
+    }
+    CHECK(etfFund("bc1qstale").empty());
+    CHECK(count("SELECT COUNT(*) FROM btc_etf_addr WHERE address='bc1qstale'") == 0);
+    CHECK(count(("SELECT COUNT(*) FROM btc_labels WHERE address='" + book0 + "'").c_str()) == 0);
+    CHECK(count(("SELECT COUNT(*) FROM btc_labels WHERE address='" + book1 + "'").c_str()) == 1);
+    CHECK(count("SELECT COUNT(*) FROM btc_etf_addr WHERE how='seed'") == static_cast<long long>(BTC_ETF_BOOK.size()));
+    // 7. /import: повтор адреса — одна разметка; опубликованное фондом — не
+    //    тронуто; кошелёк из базы китов — помечен.
+    exec1("INSERT INTO btc_watch(address, src) VALUES('bc1qwhale', 'import')");
+    {
+        EtfImportResult r = btcEtfImport({"bc1qnew", "bc1qnew", book0, "bc1qwhale"}, "IBIT");
+        CHECK(!r.failed);
+        CHECK(r.queued == 2 && r.seed == 1 && r.inBase == 1 && r.dup == 0);
+        CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 2);
+    }
+    // 8. Не тикер фонда — сбой, очередь не тронута.
+    {
+        EtfImportResult r = btcEtfImport({"bc1qother"}, "<b>x");
+        CHECK(r.failed);
+        CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 2);
+    }
+    // 9. Сбой записи посреди списка — откат всего списка, в отчёте сбой.
+    exec1("CREATE TRIGGER boom BEFORE INSERT ON btc_etf_import WHEN NEW.address = 'bc1qboom' "
+          "BEGIN SELECT RAISE(ABORT, 'boom'); END");
+    {
+        EtfImportResult r = btcEtfImport({"bc1qfirst", "bc1qboom"}, "FBTC");
+        CHECK(r.failed);
+        CHECK(count("SELECT COUNT(*) FROM btc_etf_import WHERE address='bc1qfirst'") == 0);
+        CHECK(sqlite3_get_autocommit(g_btcDb));
+    }
+    exec1("DROP TRIGGER boom");
+    // 10. Разметка с блоком: метки встают, выученная метка биржи снимается,
+    //     опубликованное фондом не переписывается, очередь — пустая.
+    exec1("INSERT INTO btc_labels(address, ex, how) VALUES('bc1qnew', 'Kraken', 'sweep')");
+    exec1(("INSERT INTO btc_etf_import(address, fund) VALUES('" + book1 + "', 'IBIT')").c_str());
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        int n = -2;
+        CHECK(inTx([&] { n = etfDrainLabels(g_btcDb); }));
+        CHECK(n == 2);
+    }
+    CHECK(etfFund("bc1qnew") == "IBIT" && etfFund("bc1qwhale") == "IBIT");
+    CHECK(etfFund(book1) == "BITB");
+    CHECK(count("SELECT COUNT(*) FROM btc_labels WHERE address='bc1qnew'") == 0);
+    CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 0);
+    // 11. Сбой записи разметки — -1, карта в памяти не меняется.
+    exec1("INSERT INTO btc_etf_import(address, fund) VALUES('bc1qlate', 'ARKB')");
+    exec1("CREATE TRIGGER boom2 BEFORE INSERT ON btc_etf_addr BEGIN SELECT RAISE(ABORT, 'boom'); END");
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        int n = 0;
+        CHECK(!inTx([&] {
+            n = etfDrainLabels(g_btcDb);
+            if (n < 0) ++g_txErrs;
+        }));
+        CHECK(n == -1);
+    }
+    CHECK(etfFund("bc1qlate").empty());
+    CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 1);
+    exec1("DROP TRIGGER boom2");
+    // 12. /statsbtc: имя фонда — экранировано.
+    exec1("INSERT INTO btc_etf_addr(address, fund, how) VALUES('bc1qodd', '<i>', 'import')");
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        const std::string st = etfStats(g_btcDb);
+        CHECK(st.find("&lt;i&gt;") != std::string::npos && st.find("<i>") == std::string::npos);
+        CHECK(st.find("В очереди на разметку: 1") != std::string::npos);
     }
     stopBtc();
     for (const char* suf : {"", "-wal", "-shm"}) std::remove((db + suf).c_str());
