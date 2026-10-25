@@ -937,11 +937,12 @@ public:
         alerts_.clear();
         {
             std::lock_guard<std::mutex> l(g_btcDbMutex);
+            EtfLabels etfNew;
             const bool saved = inTx([&] {
                 scan(b, price, moves, learned);
                 // Разметка владельца (/import из любого процесса бота) — с блоком.
                 // Не записалась — блок тоже нет: очередь разметки не потеряется.
-                if (etfDrainLabels(g_btcDb) < 0) ++g_txErrs;
+                if (etfDrainLabels(g_btcDb, etfNew) < 0) ++g_txErrs;
             });
             if (!saved) {
                 // Алерты этого блока не уходят: его нет в базе, его прочитают снова.
@@ -949,6 +950,9 @@ public:
                 bump(g_bs.saveFails);
                 return Result::FAILED;
             }
+            // Метки фондов — в память только записанные: блок откатили бы —
+            // карта не разошлась бы с базой.
+            etfRemember(etfNew);
         }
         bump(g_bs.blocks);
         bump(g_bs.txs, static_cast<long long>(b.txs.size()));

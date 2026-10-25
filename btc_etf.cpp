@@ -196,10 +196,12 @@ EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, co
         return r;
     }
     Stmt was(db, "SELECT fund, how FROM btc_etf_addr WHERE address=?");
+    // Уже ждёт в очереди с тем же фондом — тоже «уже этого фонда».
+    Stmt pend(db, "SELECT fund FROM btc_etf_import WHERE address=?");
     Stmt base(db, "SELECT 1 FROM btc_watch WHERE address=?");
     Stmt q(db, "INSERT INTO btc_etf_import(address, fund, at) VALUES(?,?,?) "
                "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, at=excluded.at");
-    if (!was.s || !base.s || !q.s) {
+    if (!was.s || !pend.s || !base.s || !q.s) {
         r.failed = true;
         return r;
     }
@@ -207,6 +209,9 @@ EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, co
     std::unordered_set<std::string> seen;
     for (const auto& a : addrs) {
         if (a.empty() || !seen.insert(a).second) continue;
+        pend.reset();
+        pend.text(1, a);
+        if (pend.row() && pend.str(0) == fund) { ++r.dup; continue; }
         was.reset();
         was.text(1, a);
         if (was.row()) {
@@ -232,16 +237,18 @@ EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, co
     return r;
 }
 
-int etfDrainLabels(sqlite3* db) {
+int etfDrainLabels(sqlite3* db, EtfLabels& applied) {
+    applied.clear();
     std::vector<std::pair<std::string, std::string>> rows;
     {
         Stmt q(db, "SELECT address, fund FROM btc_etf_import");
         while (q.row()) rows.emplace_back(q.str(0), q.str(1));
     }
     if (rows.empty()) return 0;
-    // Карта в памяти меняется только после записи всей очереди: не
-    // записалось — блок откатят, очередь останется и придёт со следующим.
-    std::vector<std::pair<std::string, std::string>> done;
+    // Карта в памяти здесь не меняется: её меняет etfRemember после COMMIT
+    // блока. Не записалось — блок откатят, очередь останется и придёт со
+    // следующим.
+    EtfLabels done;
     Stmt q(db, "INSERT INTO btc_etf_addr(address, fund, how, at) VALUES(?,?,'import',?) "
                "ON CONFLICT(address) DO UPDATE SET fund=excluded.fund, how='import', at=excluded.at "
                "WHERE btc_etf_addr.how != 'seed'");
@@ -273,12 +280,15 @@ int etfDrainLabels(sqlite3* db) {
             return -1;
         }
     }
-    {
-        std::lock_guard<std::mutex> l(g_mx);
-        for (const auto& [a, fund] : done) g_fund[a] = fund;
-    }
     std::cout << "[ETF] разметка владельца: " << done.size() << " кошельков" << std::endl;
-    return static_cast<int>(done.size());
+    applied = std::move(done);
+    return static_cast<int>(applied.size());
+}
+
+void etfRemember(const EtfLabels& applied) {
+    if (applied.empty()) return;
+    std::lock_guard<std::mutex> l(g_mx);
+    for (const auto& [a, fund] : applied) g_fund[a] = fund;
 }
 
 std::string etfStats(sqlite3* db) {

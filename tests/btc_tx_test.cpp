@@ -112,6 +112,9 @@ int main() {
         CHECK(!r.failed);
         CHECK(r.queued == 2 && r.seed == 1 && r.inBase == 1 && r.dup == 0);
         CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 2);
+        // Тот же список ещё раз, пока очередь не разобрана, — «уже этого фонда».
+        EtfImportResult again = btcEtfImport({"bc1qnew"}, "IBIT");
+        CHECK(again.dup == 1 && again.queued == 0);
     }
     // 8. Не тикер фонда — сбой, очередь не тронута.
     {
@@ -136,23 +139,43 @@ int main() {
     {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         int n = -2;
-        CHECK(inTx([&] { n = etfDrainLabels(g_btcDb); }));
-        CHECK(n == 2);
+        EtfLabels got;
+        CHECK(inTx([&] { n = etfDrainLabels(g_btcDb, got); }));
+        CHECK(n == 2 && got.size() == 2);
+        // До etfRemember (после COMMIT блока) карта в памяти — прежняя.
+        CHECK(etfFund("bc1qnew").empty());
+        etfRemember(got);
     }
     CHECK(etfFund("bc1qnew") == "IBIT" && etfFund("bc1qwhale") == "IBIT");
     CHECK(etfFund(book1) == "BITB");
     CHECK(count("SELECT COUNT(*) FROM btc_labels WHERE address='bc1qnew'") == 0);
     CHECK(count("SELECT COUNT(*) FROM btc_etf_import") == 0);
-    // 11. Сбой записи разметки — -1, карта в памяти не меняется.
+    // 11. Разметка легла, а блок откатили (сбой другой записи) — карта в
+    //     памяти не меняется, очередь остаётся.
+    exec1("INSERT INTO btc_etf_import(address, fund) VALUES('bc1qrb', 'HODL')");
+    {
+        std::lock_guard<std::mutex> l(g_btcDbMutex);
+        EtfLabels got;
+        CHECK(!inTx([&] {
+            CHECK(etfDrainLabels(g_btcDb, got) == 1);
+            ++g_txErrs;
+        }));
+    }
+    CHECK(etfFund("bc1qrb").empty());
+    CHECK(count("SELECT COUNT(*) FROM btc_etf_import WHERE address='bc1qrb'") == 1);
+    exec1("DELETE FROM btc_etf_import");
+    // 11б. Сбой записи разметки — -1, карта в памяти не меняется.
     exec1("INSERT INTO btc_etf_import(address, fund) VALUES('bc1qlate', 'ARKB')");
     exec1("CREATE TRIGGER boom2 BEFORE INSERT ON btc_etf_addr BEGIN SELECT RAISE(ABORT, 'boom'); END");
     {
         std::lock_guard<std::mutex> l(g_btcDbMutex);
         int n = 0;
+        EtfLabels got;
         CHECK(!inTx([&] {
-            n = etfDrainLabels(g_btcDb);
+            n = etfDrainLabels(g_btcDb, got);
             if (n < 0) ++g_txErrs;
         }));
+        CHECK(got.empty());
         CHECK(n == -1);
     }
     CHECK(etfFund("bc1qlate").empty());

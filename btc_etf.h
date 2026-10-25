@@ -17,6 +17,7 @@
 #include <sqlite3.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 // Все функции, кроме etfFund, — под замком базы биткоина, на её соединении.
@@ -35,7 +36,12 @@ struct EtfImportResult {
     bool failed = false;  // не тикер фонда или запись не прошла — импорт откатить
 };
 EtfImportResult etfImport(sqlite3* db, const std::vector<std::string>& addrs, const std::string& fund);
-// Сколько адресов размечено; -1 — запись не прошла (транзакцию откатить).
-int etfDrainLabels(sqlite3* db);
+// Очередь разметки владельца — в метки, внутри транзакции блока. applied —
+// что легло (адрес, фонд); сколько — возвращается; -1 — запись не прошла
+// (транзакцию откатить). Карту в памяти меняет etfRemember(applied) — после
+// COMMIT: откатят блок, и карта не разойдётся с базой.
+using EtfLabels = std::vector<std::pair<std::string, std::string>>;
+int etfDrainLabels(sqlite3* db, EtfLabels& applied);
+void etfRemember(const EtfLabels& applied);
 // Раздел для /statsbtc.
 std::string etfStats(sqlite3* db);
