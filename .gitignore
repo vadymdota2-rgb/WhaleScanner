@@ -4,6 +4,9 @@
 *.db-wal
 # сборка и кэши
 whale_bot
+# автовыкат на сервере: новая сборка и прежняя версия для отката
+whale_bot.new
+whale_bot.prev
 __pycache__/
 # логотипы: их место в репозитории Wallet-Tracker
 coins/
