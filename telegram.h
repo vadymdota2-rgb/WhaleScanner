@@ -23,6 +23,15 @@ constexpr uint64_t DEFAULT_THRESHOLD_NANOS = 100ULL * 1000000000ULL;
 std::string tgApi(const std::string& method);
 
 struct SendResult { bool ok; bool deadUser; int retryAfterSec; };
+
+// Кнопка web_app («Открыть приложение») разрешена только в личном чате с
+// ботом: в группе и канале (их номер начинается с «-») Telegram отклоняет
+// всё сообщение с ошибкой BUTTON_TYPE_INVALID — и человек не получает ничего.
+// Туда сообщение уходит без такой клавиатуры; остальные кнопки — как есть.
+inline std::string markupForChat(const std::string& chatId, const std::string& markup) {
+    if (!chatId.empty() && chatId[0] == '-' && markup.find("\"web_app\"") != std::string::npos) return "";
+    return markup;
+}
 SendResult sendMsg(const std::string& chatId, const std::string& text,
                    const std::string& reply_markup = "");
 

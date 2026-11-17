@@ -924,14 +924,26 @@ SendResult sendMsg(const std::string& c, const std::string& t, const std::string
     j["text"] = t;
     j["parse_mode"] = "HTML";
     j["disable_web_page_preview"] = true;
-    if (!reply_markup.empty()) {
-        try { j["reply_markup"] = json::parse(reply_markup); } catch (...) {}
+    const std::string markup = markupForChat(c, reply_markup);
+    if (!markup.empty()) {
+        try { j["reply_markup"] = json::parse(markup); } catch (...) {}
     }
     auto r = http(tgApi("sendMessage"), j.dump());
     try {
         auto p = json::parse(r);
         if (p.value("ok", false)) return {true, false, 0};
         int code = p.value("error_code", 0);
+        // Кнопка не подходит этому чату (BUTTON_TYPE_INVALID) — то же
+        // сообщение ещё раз, без клавиатуры: текст важнее кнопки.
+        if (code == 400 && j.contains("reply_markup") &&
+            toLower(p.value("description", "")).find("button_type_invalid") != std::string::npos) {
+            std::cerr << "[TG] кнопка не подходит чату — повторяю без неё" << std::endl;
+            j.erase("reply_markup");
+            r = http(tgApi("sendMessage"), j.dump());
+            p = json::parse(r);
+            if (p.value("ok", false)) return {true, false, 0};
+            code = p.value("error_code", 0);
+        }
         if (code == 429) {
             int ra = p.contains("parameters") && p["parameters"].contains("retry_after")
                      ? p["parameters"]["retry_after"].get<int>() : 30;
