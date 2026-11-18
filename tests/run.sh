@@ -5,7 +5,7 @@
 #
 #   bash tests/run.sh                  # быстрые проверки
 #   SANITIZE=1 bash tests/run.sh       # под ASan + UBSan (так в CI)
-#   FULL=1 bash tests/run.sh           # ещё clang-tidy, фаззинг, покрытие 100 %
+#   FULL=1 bash tests/run.sh           # ещё clang-tidy, фаззинг, покрытие 100 %, миллион человек
 #   FUZZ_SECONDS=60 FULL=1 …           # фаззинг дольше (по умолчанию 20 с)
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -75,3 +75,9 @@ fi
 grep -E "^Done [0-9]+ runs" "$out/fuzz.log" | sed 's/^/premium: фаззинг — /'
 
 bash tools/coverage.sh | tail -n 1
+
+# Миллион человек — сборка как на сервере (-O2, без санитайзеров): время
+# каждого действия модуля в пределах (tests/premium_test.cpp, million).
+"$CXX" -std=c++20 -O2 -pthread -I. tests/premium_test.cpp premium.cpp utils.cpp ru.cpp translations.cpp -lsqlite3 \
+    -o "$out/premium_million"
+PREMIUM_MILLION=1 run premium_million

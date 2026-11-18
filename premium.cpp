@@ -23,6 +23,8 @@
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
+#include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -54,6 +56,10 @@ std::atomic<bool> g_schemaOk{false};
 long long systemNow() { return static_cast<long long>(std::time(nullptr)); }
 std::atomic<premium::Clock> g_clock{&systemNow};
 long long nowSec() { return g_clock.load()(); }
+
+void systemPause(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+std::atomic<premium::Pause> g_pause{&systemPause};
+void pause(int ms) { g_pause.load()(ms); }
 
 bool isService(const std::string& chatId) { return !g_serviceChatId.empty() && chatId == g_serviceChatId; }
 
@@ -214,6 +220,7 @@ bool tgAnswerOk(const std::string& resp, std::string& why) {
 }  // namespace
 
 void premium::setClock(premium::Clock clock) { g_clock = clock != nullptr ? clock : &systemNow; }
+void premium::setPause(premium::Pause p) { g_pause = p != nullptr ? p : &systemPause; }
 
 // ── схема ────────────────────────────────────────────────────────────────────
 
@@ -275,6 +282,20 @@ bool initPremium(const std::string& serviceChatId, const std::string& ownerChatI
                             "ALTER TABLE ton_invoices ADD COLUMN days INTEGER NOT NULL DEFAULT 30"})
         ok = ok && addColumnLocked(sql);
 
+    // Индексы под каждый запрос модуля — на миллионе людей и миллионах
+    // счетов ни один запрос не читает таблицу целиком (проверяет
+    // tests/premium_policy.py, ScaleTest). Частичные — только нужные строки:
+    // подписчики, живые счета USD₮, оплатившие хеши, подписки звёздами.
+    const char* indexSql = R"(
+        CREATE INDEX IF NOT EXISTS idx_users_premium ON users(premium_expire) WHERE is_premium=1;
+        CREATE INDEX IF NOT EXISTS idx_ton_hash ON ton_invoices(tx_hash) WHERE tx_hash!='';
+        CREATE INDEX IF NOT EXISTS idx_premium_sub ON premium_payments(sub_until) WHERE sub_until>0;
+    )";
+    if (ok && sqlite3_exec(db, indexSql, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM][FATAL] payment indexes failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;
+        ok = false;
+    }
+
     // Сервисному аккаунту Премиума не бывает: старую отметку в базе снимаем,
     // чтобы он не считался подписчиком ни в /stats, ни в API.
     if (ok && !g_serviceChatId.empty()) {
@@ -304,8 +325,10 @@ std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds) {
     // 999), и алерт большому кругу людей иначе ушёл бы всем как бесплатным.
     constexpr size_t CHUNK = 500;
 
-    const std::lock_guard<std::mutex> l(dbMutex);
     for (size_t from = 0; from < chatIds.size(); from += CHUNK) {
+        // Замок — на кусок, а не на весь список: рассылка на миллион человек
+        // не держит базу бота секунду, остальные потоки идут между кусками.
+        const std::lock_guard<std::mutex> l(dbMutex);
         const size_t n = std::min(CHUNK, chatIds.size() - from);
         std::string sql = "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire>? AND chat_id IN (";
         for (size_t i = 0; i < n; i++) sql += i != 0 ? ",?" : "?";
@@ -338,30 +361,51 @@ size_t premiumMaxWallets(const std::string& chatId) {
 }
 
 void cleanupExpiredPremium() {
-    const long long now = nowSec();
-    std::vector<std::string> expired;
-    {
-        // Кто истёк и снятие отметки — одной транзакцией: иначе API, в ту же
-        // секунду продливший кому-то срок, оставил бы его в списке истёкших,
-        // и человек с действующим Премиумом получил бы письмо «Премиум
-        // закончился».
-        const std::lock_guard<std::mutex> l(dbMutex);
-        Tx tx("cleanup");
-        if (!tx.ok()) return;
-        Stmt sel("SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire<=?");
-        sel.bind(1, now);
-        while (sel.row()) expired.push_back(sel.text(0));
-        if (expired.empty()) return;
-        Stmt upd("UPDATE users SET is_premium=0 WHERE is_premium=1 AND premium_expire<=?");
-        upd.bind(1, now);
-        if (!upd.run() || !tx.commit()) return;
+    // Проход может длиться долго (письма — с паузами); второй, пока идёт
+    // первый, ничего не делает — двух писем одному человеку не будет.
+    // Отметка «идёт» снимается при любом выходе (и при исключении из
+    // письма): иначе снятие истёкших остановилось бы навсегда.
+    static std::atomic<bool> busy{false};
+    if (busy.exchange(true)) return;
+    const auto release = [](std::atomic<bool>* flag) { *flag = false; };
+    const std::unique_ptr<std::atomic<bool>, decltype(release)> done(&busy, release);
+
+    // Пачками: транзакция записи короткая (API пишет в ту же базу и ждёт
+    // её), память — на пачку, а не на всех истёкших сразу.
+    constexpr int BATCH = 1000;
+    // Письмо — не чаще 4 в секунду: лимит Telegram (~30 в секунду) — на
+    // весь бот, львиная доля — алертам. 1000 писем — около 4 минут.
+    constexpr int MAIL_GAP_MS = 250;
+    for (;;) {
+        const long long now = nowSec();
+        std::vector<std::string> expired;
+        {
+            // Снятие отметки и список снятых — один запрос (RETURNING) в
+            // транзакции: продление от API в ту же секунду не даст письма
+            // «Премиум закончился» тому, у кого он есть. Ошибку SQLite
+            // (триггер, ограничение) step возвращает до первой строки.
+            const std::lock_guard<std::mutex> l(dbMutex);
+            Tx tx("cleanup");
+            if (!tx.ok()) return;
+            Stmt upd(
+                "UPDATE users SET is_premium=0 WHERE chat_id IN (SELECT chat_id FROM users "
+                "WHERE is_premium=1 AND premium_expire<=? LIMIT ?) RETURNING chat_id");
+            upd.bind(1, now).bind(2, BATCH);
+            int rc = upd.step();
+            for (; rc == SQLITE_ROW; rc = upd.step()) expired.push_back(upd.text(0));
+            if (rc != SQLITE_DONE || expired.empty() || !tx.commit()) return;
+        }
+        std::cout << "[PREMIUM] Expired -> Free: " << expired.size() << " user(s)" << std::endl;
+        refreshWatchers();
+        // Письмо об окончании: после пробной недели — с итогом и вводной
+        // ценой, после оплаченного срока — что остаётся бесплатно.
+        for (const std::string& cid : expired) {
+            if (cid.empty() || isService(cid)) continue;
+            sendPremiumEnded(cid);
+            pause(MAIL_GAP_MS);
+        }
+        if (expired.size() < static_cast<size_t>(BATCH)) return;
     }
-    std::cout << "[PREMIUM] Expired -> Free: " << expired.size() << " user(s)" << std::endl;
-    refreshWatchers();
-    // Письмо об окончании: после пробной недели — с итогом и вводной ценой,
-    // после оплаченного срока — что остаётся бесплатно.
-    for (const std::string& cid : expired)
-        if (!cid.empty() && !isService(cid)) sendPremiumEnded(cid);
 }
 
 // ── выдача дней ──────────────────────────────────────────────────────────────
@@ -448,17 +492,6 @@ struct Invoice {
     long long created = 0;
 };
 
-// Живой счёт в USD₮ с этой памяткой; нет — nullopt.
-std::optional<Invoice> activeInvoice(const std::string& memo) {
-    const std::lock_guard<std::mutex> l(dbMutex);
-    Stmt s(
-        "SELECT chat_id, nano_amount, days, created_at FROM ton_invoices "
-        "WHERE memo=? AND status='active' AND kind='usdt'");
-    s.bind(1, memo);
-    if (!s.row()) return std::nullopt;
-    return Invoice{s.text(0), s.int64(1), s.int64(2) == 365 ? 365 : 30, s.int64(3)};
-}
-
 }  // namespace
 
 void pollUsdtPayments() {
@@ -468,6 +501,7 @@ void pollUsdtPayments() {
     // главного цикла бота, всегда из одного потока.
     if (!g_schemaOk) return;
     static premium::Once said;
+    static long long lastPoll = 0;  // когда спрашивали обозреватель
     const std::string wallet = tonWallet();
     const std::string walletRaw = premium::tonRawAddress(wallet);
     if (walletRaw.empty()) {
@@ -476,20 +510,32 @@ void pollUsdtPayments() {
         return;
     }
 
+    // Живой счёт — активный и моложе суток. Счёт старше гасим, но живость
+    // проверяем и сами: не погасился (сбой базы) — всё равно не засчитываем.
     const long long now = nowSec();
-    std::optional<long long> newest;  // самый молодой живой счёт
+    const long long cutoff = now - USDT_INVOICE_LIVE_SEC;
+    long long newest = 0;  // самый молодой активный счёт
     {
+        // Сначала только чтение: в WAL оно не ждёт пишущего. Блокировку
+        // записи (а с ней — ожидание, пока API допишет своё, под общим
+        // замком бота) берём, только когда есть что гасить.
         const std::lock_guard<std::mutex> l(dbMutex);
-        Stmt expire("UPDATE ton_invoices SET status='expired' WHERE status='active' AND kind='usdt' AND created_at <= ?");
-        expire.bind(1, now - USDT_INVOICE_LIVE_SEC);
-        if (!expire.run()) std::cerr << "[USDT] истечение счетов: " << logSafe(sqlite3_errmsg(db)) << std::endl;
-        Stmt any("SELECT MAX(created_at) FROM ton_invoices WHERE status='active' AND kind='usdt'");
-        if (any.row() && !any.null(0)) newest = any.int64(0);
+        long long oldest = 0;
+        {
+            Stmt live("SELECT MIN(created_at), MAX(created_at) FROM ton_invoices WHERE status='active' AND kind='usdt'");
+            if (!live.row() || live.null(0)) return;
+            oldest = live.int64(0);
+            newest = live.int64(1);
+        }
+        if (oldest <= cutoff) {
+            Stmt expire("UPDATE ton_invoices SET status='expired' WHERE status='active' AND kind='usdt' AND created_at <= ?");
+            expire.bind(1, cutoff);
+            if (!expire.run()) std::cerr << "[USDT] истечение счетов: " << logSafe(sqlite3_errmsg(db)) << std::endl;
+        }
     }
     // Живых счетов нет — обозреватель не спрашиваем вовсе; есть только
     // старые — реже (premium::pollDue).
-    static long long lastPoll = 0;
-    if (!newest || !premium::pollDue(now, *newest, lastPoll)) return;
+    if (newest <= cutoff || !premium::pollDue(now, newest, lastPoll)) return;
     lastPoll = now;
 
     // Только переводы USD₮ (jetton_master): рассылки чужих жетонов на кошелёк
@@ -504,29 +550,52 @@ void pollUsdtPayments() {
     const auto list = j.is_object() ? j.find("jetton_transfers") : j.end();
     if (!j.is_object() || list == j.end() || !list->is_array()) return;
 
+    // Переводы, похожие на оплату, и живые счета с их памятками — одним
+    // запросом на весь список, а не запросом на каждый перевод.
+    std::vector<premium::UsdtTransfer> pays;
+    json memos = json::array();
     for (const auto& item : *list) {
-        const auto pay = premium::usdtTransfer(item, walletRaw);
-        if (!pay) continue;
-        const std::string& memo = pay->memo;
+        if (auto pay = premium::usdtTransfer(item, walletRaw)) {
+            memos.push_back(pay->memo);
+            pays.push_back(std::move(*pay));
+        }
+    }
+    // Поиск — по памятке (первичный ключ): «+» перед status и created_at
+    // не даёт SQLite взять вместо него индекс по статусу — тот прошёл бы
+    // все живые счета, а не полсотни нужных.
+    std::map<std::string, Invoice> invoices;
+    {
+        const std::lock_guard<std::mutex> l(dbMutex);
+        Stmt s(
+            "SELECT memo, chat_id, nano_amount, days, created_at FROM ton_invoices "
+            "WHERE +status='active' AND kind='usdt' AND +created_at > ? AND memo IN (SELECT value FROM json_each(?))");
+        s.bind(1, cutoff).bind(2, memos.dump(-1, ' ', false, json::error_handler_t::replace));
+        while (s.row()) invoices[s.text(0)] = Invoice{s.text(1), s.int64(2), s.int64(3) == 365 ? 365 : 30, s.int64(4)};
+    }
+
+    for (const auto& pay : pays) {
+        const std::string& memo = pay.memo;
 
         // Нет живого счёта с такой памяткой (чужой перевод, уже оплаченный
         // или истёкший счёт) или сумма счёта ниже доллара — не наш случай.
-        const auto inv = activeInvoice(memo);
-        if (!inv || inv->chatId.empty() || inv->need < premium::USDT_MIN_UNITS) continue;
+        const auto found = invoices.find(memo);
+        if (found == invoices.end()) continue;
+        const Invoice inv = found->second;
+        if (inv.chatId.empty() || inv.need < premium::USDT_MIN_UNITS) continue;
 
-        if (!premium::transferFitsInvoice(pay->at, inv->created)) {
-            if (said.first("old:" + pay->hash))
-                std::cerr << "[USDT] перевод " << logSafe(pay->hash, 64) << " сделан раньше счёта " << logSafe(memo)
+        if (!premium::transferFitsInvoice(pay.at, inv.created)) {
+            if (said.first("old:" + pay.hash))
+                std::cerr << "[USDT] перевод " << logSafe(pay.hash, 64) << " сделан раньше счёта " << logSafe(memo)
                           << " — не засчитываю" << std::endl;
             continue;
         }
-        if (!premium::paidEnough(pay->units, inv->need)) {
-            if (said.first("under:" + pay->hash))
-                std::cerr << "[USDT] недоплата по " << logSafe(memo) << ": пришло " << pay->units << ", ждали "
-                          << inv->need << std::endl;
+        if (!premium::paidEnough(pay.units, inv.need)) {
+            if (said.first("under:" + pay.hash))
+                std::cerr << "[USDT] недоплата по " << logSafe(memo) << ": пришло " << pay.units << ", ждали "
+                          << inv.need << std::endl;
             continue;
         }
-        if (isService(inv->chatId)) {
+        if (isService(inv.chatId)) {
             if (said.first("service:" + memo))
                 std::cerr << "[USDT] счёт " << logSafe(memo) << " выставлен сервисному аккаунту — Премиум ему не выдаётся"
                           << std::endl;
@@ -536,48 +605,50 @@ void pollUsdtPayments() {
         // Занять счёт и продлить срок — одной транзакцией: либо счёт оплачен
         // и подписка выдана, либо не изменилось ничего и следующий опрос
         // попробует снова. Счёта «оплачен, а подписки нет» не бывает.
-        ensureUser(inv->chatId);
+        ensureUser(inv.chatId);
         bool taken = false;  // счёт успели занять раньше нас — не ошибка
         bool reused = false;  // этот перевод уже оплатил другой счёт
         bool granted = false;
         {
             const std::lock_guard<std::mutex> l(dbMutex);
             Tx tx("usdt");
-            Stmt used("SELECT 1 FROM ton_invoices WHERE tx_hash=? AND status='paid' LIMIT 1");
-            used.bind(1, pay->hash);
+            Stmt used("SELECT 1 FROM ton_invoices WHERE tx_hash=? AND tx_hash!='' AND status='paid' LIMIT 1");
+            used.bind(1, pay.hash);
             reused = used.row();
             Stmt claim(
                 "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
                 "WHERE memo=? AND status='active' AND kind='usdt'");
-            claim.bind(1, now).bind(2, pay->hash).bind(3, memo);
+            claim.bind(1, now).bind(2, pay.hash).bind(3, memo);
             if (tx.ok() && !reused && claim.run()) {
                 taken = sqlite3_changes(db) != 1;
-                granted = !taken && extendPremiumLocked(inv->chatId, now, inv->days) && tx.commit();
+                granted = !taken && extendPremiumLocked(inv.chatId, now, inv.days) && tx.commit();
             }
         }
+        // Счёт закрыт — второй перевод с той же памяткой его уже не ищет.
+        if (taken || granted) invoices.erase(found);
         if (taken) continue;
         if (reused) {
-            if (said.first("reused:" + pay->hash))
-                std::cerr << "[USDT] перевод " << logSafe(pay->hash, 64) << " уже оплатил другой счёт — " << logSafe(memo)
+            if (said.first("reused:" + pay.hash))
+                std::cerr << "[USDT] перевод " << logSafe(pay.hash, 64) << " уже оплатил другой счёт — " << logSafe(memo)
                           << " не засчитываю" << std::endl;
             continue;
         }
         if (!granted) {
             if (said.first("fail:" + memo)) {
-                std::cerr << "[USDT] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << logSafe(inv->chatId)
+                std::cerr << "[USDT] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << logSafe(inv.chatId)
                           << " memo=" << logSafe(memo) << " — счёт остался активным, повторяю" << std::endl;
-                alertOwner("пришло " + premium::usdText(pay->units) + " USD₮ по счёту " + forOwner(memo, 64) + " (chat " +
-                           forOwner(inv->chatId, 32) +
+                alertOwner("пришло " + premium::usdText(pay.units) + " USD₮ по счёту " + forOwner(memo, 64) + " (chat " +
+                           forOwner(inv.chatId, 32) +
                            "), а Премиум выдать не вышло. Бот повторяет каждые 20 с; если не пройдёт — выдать вручную.");
             }
             continue;
         }
         refreshWatchers();
-        trackFunnel(inv->chatId, "paid", "usdt");
-        std::cout << "[USDT] premium " << inv->days << "d выдан: chat=" << logSafe(inv->chatId)
-                  << " memo=" << logSafe(memo) << " " << premium::usdText(pay->units) << " USDT" << std::endl;
-        const Lang lang = langFromCode(getUserLanguage(inv->chatId));
-        sendMsg(inv->chatId, withDays(tr(lang, "ton_paid_ok"), inv->days), openAppKeyboard(lang));
+        trackFunnel(inv.chatId, "paid", "usdt");
+        std::cout << "[USDT] premium " << inv.days << "d выдан: chat=" << logSafe(inv.chatId)
+                  << " memo=" << logSafe(memo) << " " << premium::usdText(pay.units) << " USDT" << std::endl;
+        const Lang lang = langFromCode(getUserLanguage(inv.chatId));
+        sendMsg(inv.chatId, withDays(tr(lang, "ton_paid_ok"), inv.days), openAppKeyboard(lang));
     }
 }
 
@@ -761,7 +832,7 @@ int cancelStarSubscriptions(const std::string& reportTo, bool sayNone) {
         const std::lock_guard<std::mutex> l(dbMutex);
         Stmt s(
             "SELECT p.chat_id, p.telegram_payment_charge_id FROM premium_payments p "
-            "WHERE p.sub_until > ? AND p.paid_at = (SELECT MAX(q.paid_at) FROM premium_payments q "
+            "WHERE p.sub_until > ? AND p.sub_until>0 AND p.paid_at = (SELECT MAX(q.paid_at) FROM premium_payments q "
             "WHERE q.chat_id = p.chat_id AND q.sub_until > 0)");
         s.bind(1, nowSec());
         while (s.row()) subs.push_back({s.text(0), s.text(1)});
@@ -795,7 +866,7 @@ int cancelStarSubscriptions(const std::string& reportTo, bool sayNone) {
         }
         const Lang lang = langFromCode(getUserLanguage(sub.chat));
         sendMsg(sub.chat, tr(lang, "autorenew_off"), openAppKeyboard(lang, "premium-renew", "btn_extend"));
-        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        pause(60);
     }
     std::cout << "[PREMIUM] автопродления отменены: " << ok << ", не вышло: " << failed << std::endl;
     if (!reportTo.empty())

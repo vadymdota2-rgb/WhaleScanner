@@ -22,7 +22,7 @@ sudo systemctl restart whalescanner.service
 bash tests/run.sh                  # без сети: несколько минут
 SANITIZE=1 bash tests/run.sh       # под ASan и UBSan (так в CI)
 CXX=clang++ SANITIZE=1 bash tests/run.sh
-FULL=1 bash tests/run.sh           # ещё clang-tidy, фаззинг, покрытие 100 %
+FULL=1 bash tests/run.sh           # ещё clang-tidy, фаззинг, покрытие 100 %, миллион человек
 python3 tools/mutate.py            # мутационная проверка оплаты (~30 минут)
 ```
 

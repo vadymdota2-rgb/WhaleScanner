@@ -23,7 +23,7 @@ HEADER = os.path.join(ROOT, "premium.h")
 # Что можно подключать. У правил (premium_logic.h) — ни базы, ни сети, ни
 # часов, ни потоков, ни ввода-вывода: только вычисления.
 CPP_INCLUDES = {"premium.h", "premium_logic.h", "lifecycle.h", "safe_http.h", "ru.h", "telegram.h", "utils.h",
-                "sqlite3.h", "algorithm", "array", "atomic", "chrono", "cstdint", "cstdlib", "ctime", "iostream",
+                "sqlite3.h", "algorithm", "array", "atomic", "chrono", "cstdint", "cstdlib", "ctime", "iostream", "map", "memory",
                 "mutex", "optional", "set", "string", "thread", "vector"}
 LOGIC_INCLUDES = {"algorithm", "array", "utility", "climits", "cstddef", "cstdint", "optional", "string", "string_view", "unordered_set",
                   "json.hpp"}
@@ -113,7 +113,7 @@ class PolicyTest(unittest.TestCase):
             self.assertTrue(re.fullmatch(r'\s*(""|i\s*!=\s*0\s*\?\s*""\s*:\s*"")\s*', m.group(1)),
                             f"в SQL склеивается не литерал: {m.group(0)!r}")
         for m in re.finditer(r"\bsqlite3_exec\s*\(\s*db\s*,\s*([^,]+),", code):
-            self.assertIn(m.group(1).strip(), {'""', "sql", "tablesSql"}, f"sqlite3_exec не из литерала: {m.group(1)!r}")
+            self.assertIn(m.group(1).strip(), {'""', "sql", "tablesSql", "indexSql"}, f"sqlite3_exec не из литерала: {m.group(1)!r}")
         # sql в addColumnLocked — только из списка литералов в цикле.
         for m in re.finditer(r"\baddColumnLocked\s*\(\s*([^)]*)\)", code):
             self.assertIn(m.group(1).strip(), {"sql", "const char* sql"}, f"addColumnLocked не из литерала: {m.group(1)!r}")
@@ -259,6 +259,10 @@ class PolicyCatchesTest(unittest.TestCase):
         ("#include <vector>", "#include <vector>\n#include <fstream>"),
         ('std::getenv("TON_WALLET_ADDRESS")', 'std::getenv("HOME")'),
         ("const json j = json::parse(", "try { } catch (...) { }\n    const json j = json::parse("),
+        # Большая база: запрос без своего индекса читает таблицу целиком.
+        ("CREATE INDEX IF NOT EXISTS idx_ton_hash ON ton_invoices(tx_hash) WHERE tx_hash!='';", ""),
+        ("CREATE INDEX IF NOT EXISTS idx_users_premium ON users(premium_expire) WHERE is_premium=1;", ""),
+        ("p.sub_until > ? AND p.sub_until>0 AND", "p.sub_until > ? AND"),
     )
 
     def test_each_injected_violation_is_caught(self):
@@ -274,13 +278,69 @@ class PolicyCatchesTest(unittest.TestCase):
                 CPP = f.name
                 try:
                     with open(os.devnull, "w", encoding="utf-8") as sink:
+                        load = unittest.defaultTestLoader.loadTestsFromTestCase
                         r = unittest.TextTestRunner(stream=sink, verbosity=0).run(
-                            unittest.defaultTestLoader.loadTestsFromTestCase(PolicyTest))
+                            unittest.TestSuite([load(PolicyTest), load(ScaleTest)]))
                     self.assertFalse(r.wasSuccessful(), f"подлог не пойман: {new!r}")
                 finally:
                     os.unlink(f.name)
         finally:
             CPP = orig
+
+
+def cpp_literal(chunk: str) -> str:
+    """Текст подряд идущих строковых литералов C++ ("…" "…" или R"(…)")."""
+    raw = re.match(r'\s*R"\((.*?)\)"', chunk, re.DOTALL)
+    if raw:
+        return raw.group(1)
+    out, i = [], 0
+    while True:
+        m = re.match(r'\s*"((?:[^"\\]|\\.)*)"', chunk[i:])
+        if not m:
+            return "".join(out)
+        out.append(m.group(1))
+        i += m.end()
+
+
+class ScaleTest(unittest.TestCase):
+    """Миллион человек и миллионы счетов: ни один запрос модуля не читает
+    таблицу целиком — каждый идёт по индексу (план запроса SQLite, EXPLAIN
+    QUERY PLAN, на той же схеме, что строит initPremium). Новый запрос без
+    индекса — проверка падает, а не бот на большой базе."""
+
+    def test_every_query_uses_an_index(self):
+        import sqlite3
+
+        src = read(CPP)
+        con = sqlite3.connect(":memory:")
+        # users и funnel_events заводит бот (main.cpp, initDB) — как там.
+        con.execute("CREATE TABLE users(chat_id TEXT PRIMARY KEY, language TEXT NOT NULL DEFAULT 'en', "
+                    "threshold_nanos INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)")
+        con.execute("CREATE TABLE funnel_events(chat_id TEXT NOT NULL, ev TEXT NOT NULL, src TEXT NOT NULL DEFAULT '', "
+                    "day TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (chat_id, ev, src, day))")
+        alters = re.findall(r'"(ALTER TABLE [^"]+)"', src)
+        self.assertEqual(len(alters), 6)
+        for sql in alters[:3]:
+            con.execute(sql)
+        for name in ("tablesSql", "indexSql"):
+            m = re.search(r"const char\* " + name + r"\s*=\s*(R\"\(.*?\)\")", src, re.DOTALL)
+            self.assertIsNotNone(m, name)
+            con.executescript(cpp_literal(m.group(1)))
+        queries = [cpp_literal(m.group(1)) for m in re.finditer(r"\bStmt\s+\w+\s*\(\s*((?:R?\"[^;]*?\"\s*)+)\)\s*;", src)]
+        subset = re.search(r'std::string sql\s*=\s*("[^;]*?")\s*;', src)
+        self.assertIsNotNone(subset)
+        queries.append(cpp_literal(subset.group(1)) + "?,?)")
+        # Каждый запрос модуля — в проверке (собранный — premiumSubsetOf — тоже).
+        self.assertEqual(len(queries), len(re.findall(r"\bStmt\s+\w+\s*\(", strip(src))))
+        for sql in queries:
+            plan = con.execute("EXPLAIN QUERY PLAN " + sql, [None] * sql.count("?")).fetchall()
+            scans = [row[3] for row in plan if row[3].startswith("SCAN") and "json_each" not in row[3]]
+            self.assertFalse(scans, f"чтение всей таблицы: {sql!r} → {plan}")
+            # Индекс только по статусу — тоже почти вся таблица: оплаченных и
+            # истёкших счетов миллионы. Допустим лишь для живых (active):
+            # их мало — гасятся через сутки.
+            broad = [row[3] for row in plan if re.search(r"\(status=\?(\)| AND created_at)", row[3])]
+            self.assertFalse(broad and "status='active'" not in sql, f"поиск по одному статусу: {sql!r} → {plan}")
 
 
 if __name__ == "__main__":

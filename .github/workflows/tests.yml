@@ -49,7 +49,7 @@ jobs:
         run: >
           sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
           clang clang-tidy libclang-rt-18-dev llvm
-      - name: clang-tidy, фаззинг минуту, покрытие 100 % (строки, ветвления, функции, области)
+      - name: clang-tidy, фаззинг минуту, покрытие 100 % (строки, ветвления, функции, области), миллион человек
         run: FULL=1 FUZZ_SECONDS=60 bash tests/run.sh
 
   premium-mutation:

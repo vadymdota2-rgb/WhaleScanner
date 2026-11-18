@@ -47,7 +47,7 @@ EQUIV: dict = {
         'второй рубеж: extendTerm отклоняет те же дни',
     ('premium.cpp', 'wasActive = term && term->wasActive;', ' && → || @16'):
         'Activated и Extended различаются только словом в журнале',
-    ('premium.cpp', 'static long long lastPoll = 0;', '0→1@28'):
+    ('premium.cpp', 'static long long lastPoll = 0;  // когда спрашивали обозреватель', '0→1@28'):
         'время прошлого опроса — любое давнее: первый проход всё равно спросит',
     ('premium.cpp', 'if (!open_) std::cerr << "[PREMIUM] " << what_ << ": BEGIN failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
@@ -99,11 +99,9 @@ EQUIV: dict = {
         'только журнал',
     ('premium.cpp', 'const json j = json::parse(httpsCapped(url, "", 15, TONCENTER_MAX_BYTES, &err), nullptr, false);', '15→16@48'):
         'тайм-аут сети',
-    ('premium.cpp', 'if (!inv || inv->chatId.empty() || inv->need < premium::USDT_MIN_UNITS) continue;', ' || → && @8'):
-        'пустой optional дальше не разыменуется в исходном коде; в мутанте — UB, его ловит UBSan',
-    ('premium.cpp', 'if (said.first("old:" + pay->hash))', 'if (→if (!@0'):
+    ('premium.cpp', 'if (said.first("old:" + pay.hash))', 'if (→if (!@0'):
         'только журнал',
-    ('premium.cpp', 'if (said.first("under:" + pay->hash))', 'if (→if (!@0'):
+    ('premium.cpp', 'if (said.first("under:" + pay.hash))', 'if (→if (!@0'):
         'только журнал',
     ('premium.cpp', 'if (said.first("service:" + memo))', 'if (→if (!@0'):
         'только журнал',
@@ -113,11 +111,11 @@ EQUIV: dict = {
         'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'bool granted = false;', 'false→true@15'):
         'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'if (said.first("reused:" + pay->hash))', 'if (→if (!@0'):
+    ('premium.cpp', 'if (said.first("reused:" + pay.hash))', 'if (→if (!@0'):
         'только журнал',
-    ('premium.cpp', 'alertOwner("пришло " + premium::usdText(pay->units) + " USD₮ по счёту " + forOwner(memo, 64) + " (chat " +', '64→65@89'):
+    ('premium.cpp', 'alertOwner("пришло " + premium::usdText(pay.units) + " USD₮ по счёту " + forOwner(memo, 64) + " (chat " +', '64→65@88'):
         'длина строки в сообщении владельцу',
-    ('premium.cpp', 'forOwner(inv->chatId, 32) +', '32→33@22'):
+    ('premium.cpp', 'forOwner(inv.chatId, 32) +', '32→33@21'):
         'длина строки в сообщении владельцу',
     ('premium.cpp', 'if (!sp.is_object()) return {Applied::Rejected, 0};', '0→1@48'):
         'срок у отказа не читается',
@@ -149,8 +147,6 @@ EQUIV: dict = {
         'тайм-аут сети',
     ('premium.cpp', 'if (!s.run()) std::cerr << "[PREMIUM] cancel: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
-    ('premium.cpp', 'std::this_thread::sleep_for(std::chrono::milliseconds(60));', '60→61@54'):
-        'пауза между вызовами Telegram',
     ('premium_logic.h', 'if (a == std::string_view::npos) return false;', 'if (→if (!@0'):
         '«!a == npos» всегда ложно; без двоеточия строка не пройдёт strictInt',
     ('premium_logic.h', "const size_t b = payload.find(':', a + 1);", '1→2@39'):

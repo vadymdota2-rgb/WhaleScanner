@@ -7,6 +7,7 @@
 //
 // Каждое правило отвечает на вопрос «выдать ли подписку»: ошибка в одну
 // сторону — человек заплатил и ничего не получил, в другую — получил даром.
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <climits>
@@ -82,7 +83,13 @@ void ensureUser(const std::string& chatId, const std::string&) {
     sqlite3_finalize(s);
 }
 void refreshWatchers() { ++g_refreshed; }
-void sendPremiumEnded(const std::string& chatId) { g_ended.push_back(chatId); }
+static bool g_reenter = false;                  // письмо зовёт снятие истёкших ещё раз
+void sendPremiumEnded(const std::string& chatId) {
+    g_ended.push_back(chatId);
+    if (g_reenter) cleanupExpiredPremium();
+}
+static std::vector<int> g_pauses;               // паузы между сообщениями, мс
+static void fakePause(int ms) { g_pauses.push_back(ms); }
 
 // ── помощники ────────────────────────────────────────────────────────────────
 static const std::string WALLET = "UQDAiNYvy2KUIwjEcgD1ZxPVw-CPwdk4WbBQwpVsQQ5jsO6o";
@@ -485,6 +492,11 @@ static void schema() {
     exec("CREATE TABLE idx_ton_chat(x)");
     CHECK(!initPremium("777"));
     disabled();
+    // То же с индексом под большую базу (имя занято таблицей).
+    openBare();
+    exec("CREATE TABLE idx_premium_sub(x)");
+    CHECK(!initPremium("777"));
+    disabled();
     // Старая таблица платежей без столбца sub_until, а база только на чтение:
     // столбцы людей уже есть, таблицы тоже — не добавился один столбец, и
     // оплата всё равно выключена.
@@ -808,7 +820,9 @@ static void autorenew() {
     CHECK(g_sent.size() == 1 && g_sent[0].first == "owner" && g_sent[0].second.find("Не вышло: 3") != std::string::npos);
     g_tgAnswer = R"({"ok":true,"result":true})";
     g_tgPosts.clear();
+    g_pauses.clear();
     CHECK(cancelStarSubscriptions("", false) == 2);
+    CHECK((g_pauses == std::vector<int>{60, 60}));  // между сообщениями — пауза
     // Номер «-100» — не человек: в Telegram не уходит, считается неудачей.
     CHECK(g_tgPosts.size() == 2 && g_tgPosts[0]["is_canceled"] == true);
     CHECK(g_tgPosts[0]["telegram_payment_charge_id"] == "a" && g_tgPosts[1]["telegram_payment_charge_id"] == "b");
@@ -824,6 +838,48 @@ static void autorenew() {
     g_sent.clear();
     CHECK(cancelStarSubscriptions("owner", false) == 0);
     CHECK(g_sent.size() == 1 && g_sent[0].second.find("Не вышло: 1") != std::string::npos);
+    // Настоящая пауза (setPause(nullptr)) — действительно ждёт.
+    exec("DELETE FROM premium_payments WHERE chat_id='-5'");
+    exec("INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, payload, amount, currency, paid_at, sub_until) "
+         "VALUES('6','f','premium_30_days',250,'XTR',1," + std::to_string(t + 99) + ")");
+    premium::setPause(nullptr);
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK(cancelStarSubscriptions("", false) == 1);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(60));
+    premium::setPause(&fakePause);
+}
+
+// Массовое окончание (тысячи пробных недель в один день): снятие — пачками
+// по 1000, после каждого письма — пауза 250 мс, письма — по порядку, без
+// повторов. Письмо, позвавшее снятие ещё раз (второй поток), — ничего не
+// делает, пока идёт первый проход.
+static void endedInBatches() {
+    for (const int n : {2500, 2000, 1000, 999}) {
+        freshDb();
+        exec("BEGIN");
+        for (int i = 0; i < n; ++i) {
+            char id[16];
+            std::snprintf(id, sizeof id, "e%05d", i);
+            exec(std::string("INSERT INTO users(chat_id, created_at, is_premium, premium_expire) VALUES('") + id +
+                 "', 1, 1, 5)");
+        }
+        exec("COMMIT");
+        g_ended.clear();
+        g_pauses.clear();
+        g_reenter = true;
+        cleanupExpiredPremium();
+        g_reenter = false;
+        CHECK(static_cast<int>(g_ended.size()) == n && std::is_sorted(g_ended.begin(), g_ended.end()));
+        CHECK(std::adjacent_find(g_ended.begin(), g_ended.end()) == g_ended.end());
+        CHECK(g_pauses == std::vector<int>(static_cast<size_t>(n), 250));
+        CHECK(g_refreshed == (n + 999) / 1000);
+        CHECK(num("SELECT COUNT(*) FROM users WHERE is_premium=1") == 0);
+    }
+    // Проход закончился — следующий снова работает.
+    exec("UPDATE users SET is_premium=1 WHERE chat_id='e00007'");
+    g_ended.clear();
+    cleanupExpiredPremium();
+    CHECK(g_ended == std::vector<std::string>{"e00007"});
 }
 
 // Образцы ответов — договор с toncenter и Telegram: форма полей как в
@@ -1275,6 +1331,20 @@ static void faults() {
     g_tgAnswer = R"({"ok":"true"})";
     handlePreCheckoutQuery(preCheckout("premium_30_days", 250, 1));
     g_tgAnswer = R"({"ok":true,"result":true})";
+
+    // Счёт старше суток погасить не дали — в базе он «active», но живым не
+    // считается: один такой — обозреватель не спрашиваем; рядом свежий —
+    // спрашиваем, а по старому перевод всё равно не засчитываем.
+    freshDb();
+    invoice("WT-XSTAL", "x1", 4990000, now() - DAY_SEC - 5);
+    exec("CREATE TRIGGER x_boom BEFORE UPDATE ON ton_invoices WHEN OLD.memo='WT-XSTAL' BEGIN SELECT RAISE(ABORT,'x'); END");
+    g_explorer = json{{"jetton_transfers", {transfer("WT-XSTAL", 4990000, "x1")}}}.dump();
+    pollUsdtPayments();
+    CHECK(g_urls.empty() && text("SELECT status FROM ton_invoices WHERE memo='WT-XSTAL'") == "active");
+    invoice("WT-XFRSH", "x2", 4990000, now());
+    g_explorer = json{{"jetton_transfers", {transfer("WT-XSTAL", 4990000, "x1"), transfer("WT-XFRSH", 4990000, "x2")}}}.dump();
+    pollUsdtPayments();
+    CHECK(g_urls.size() == 1 && expireOf("x1") == LLONG_MIN && expireOf("x2") > now());
 }
 
 // Остальные развилки разбора — по одной на ветку.
@@ -1502,8 +1572,97 @@ static void texts() {
     }
 }
 
+// Миллион человек (PREMIUM_MILLION=1, сборка -O2, в CI — premium-quality):
+// 1 000 000 людей (100 000 подписчиков, у 20 000 срок вышел), миллион
+// оплаченных счетов, 200 000 платежей звёздами. Каждое действие модуля — в
+// пределах времени: запросы идут по индексам (а что каждый запрос по
+// индексу — проверяет ещё и tests/premium_policy.py, ScaleTest).
+static void million() {
+    using clk = std::chrono::steady_clock;
+    const auto ms = [](clk::time_point t0) { return std::chrono::duration<double, std::milli>(clk::now() - t0).count(); };
+    std::ostringstream report;
+    const auto took = [&](const char* what, clk::time_point t0, double limitMs) {
+        const double v = ms(t0);
+        report << what << " " << static_cast<long long>(v) << " мс; ";
+        if (v >= limitMs) {
+            ++g_fail;
+            std::cerr << "миллион: " << what << " — " << v << " мс (предел " << limitMs << ")" << std::endl;
+        }
+    };
+    freshDb();
+    premium::setClock(&fakeNow);
+    g_now = 1'900'000'000;
+    const std::string upTo = "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < ";
+    exec("INSERT INTO users(chat_id, created_at, is_premium, premium_expire) " + upTo + "999999) "
+         "SELECT CAST(100000000 + i AS TEXT), 1, i % 10 = 0, "
+         "CASE WHEN i % 10 != 0 THEN 0 WHEN i % 50 = 0 THEN 5 ELSE 9999999999 END FROM n");
+    exec("INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at, paid_at, tx_hash, kind, days) " + upTo +
+         "999999) SELECT 'WT-P' || i, CAST(100000000 + i AS TEXT), 4990000, 'paid', 1, 2, 'h' || i, 'usdt', 30 FROM n");
+    exec("INSERT INTO ton_invoices(memo, chat_id, nano_amount, status, created_at, kind) " + upTo +
+         "1999) SELECT 'WT-A' || i, CAST(100000001 + i * 10 AS TEXT), 4990000, 'active', 1899999000, 'usdt' FROM n");
+    exec("INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, payload, amount, currency, paid_at, sub_until) " +
+         upTo + "199999) SELECT CAST(100000000 + i AS TEXT), 'c' || i, 'premium_30_days', 250, 'XTR', 1, "
+         "CASE WHEN i < 50 THEN 1900000999 ELSE 0 END FROM n");
+
+    // Индексы на готовой большой базе (первый запуск новой версии).
+    for (const char* idx : {"idx_users_premium", "idx_ton_hash", "idx_premium_sub"})
+        exec(std::string("DROP INDEX ") + idx);
+    auto t0 = clk::now();
+    CHECK(initPremium("777", "owner"));
+    took("индексы", t0, 20000);
+
+    std::vector<std::string> ids;
+    ids.reserve(1'000'000);
+    for (int i = 0; i < 1'000'000; ++i) ids.push_back(std::to_string(100'000'000 + i));
+    t0 = clk::now();
+    int n = 0;
+    for (size_t i = 0; i < ids.size(); i += 10) n += isPremium(ids[i]) ? 1 : 0;
+    CHECK(n == 80'000);
+    took("isPremium×100000", t0, 5000);
+
+    t0 = clk::now();
+    CHECK(premiumSubsetOf(ids).size() == 80'000);
+    took("подписчики из миллиона", t0, 20000);
+
+    // Опрос: 50 оплат живых счетов среди миллиона оплаченных — потом тот же
+    // список ещё раз (всё уже оплачено — ничего).
+    json list = json::array();
+    for (int i = 0; i < 50; ++i) list.push_back(transfer("WT-A" + std::to_string(i), 4990000, "n" + std::to_string(i)));
+    g_explorer = json{{"jetton_transfers", list}}.dump();
+    t0 = clk::now();
+    pollUsdtPayments();
+    took("опрос с 50 оплатами", t0, 3000);
+    CHECK(num("SELECT COUNT(*) FROM ton_invoices WHERE status='paid'") == 1'000'050);
+    t0 = clk::now();
+    pollUsdtPayments();
+    took("опрос без новых", t0, 500);
+
+    g_ended.clear();
+    g_pauses.clear();
+    t0 = clk::now();
+    cleanupExpiredPremium();
+    took("снятие 20000 истёкших", t0, 20000);
+    CHECK(g_ended.size() == 20'000 && g_pauses.size() == 20'000);
+
+    t0 = clk::now();
+    CHECK(cancelStarSubscriptions("", false) == 50);
+    took("отмена 50 автопродлений", t0, 3000);
+
+    t0 = clk::now();
+    for (int i = 0; i < 1000; ++i) CHECK(grantPremiumDays(ids[static_cast<size_t>(i) * 997], 30));
+    took("1000 выдач", t0, 10000);
+    premium::setClock(nullptr);
+    std::cout << "premium: миллион человек — " << report.str() << std::endl;
+}
+
 int main() {
     unsetenv("TON_WALLET_ADDRESS");  // кошелёк по умолчанию — тот же, что у API
+    premium::setPause(&fakePause);   // паузы — записываются, а не ждутся
+    if (std::getenv("PREMIUM_MILLION") != nullptr) {  // NOLINT(concurrency-mt-unsafe)
+        million();
+        closeDb();
+        return g_fail != 0 ? 1 : 0;
+    }
     rules();
     fuzz();
     schema();
@@ -1511,6 +1670,7 @@ int main() {
     stars();
     grantAndExpire();
     autorenew();
+    endedInBatches();
     texts();
     fixtures();
     contract();
