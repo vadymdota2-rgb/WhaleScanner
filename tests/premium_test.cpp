@@ -82,7 +82,11 @@ void ensureUser(const std::string& chatId, const std::string&) {
     sqlite3_step(s);
     sqlite3_finalize(s);
 }
-void refreshWatchers() { ++g_refreshed; }
+static std::vector<size_t> g_refreshAt;        // сколько писем ушло к каждой пересборке
+void refreshWatchers() {
+    ++g_refreshed;
+    g_refreshAt.push_back(g_ended.size());
+}
 static bool g_reenter = false;                  // письмо зовёт снятие истёкших ещё раз
 void sendPremiumEnded(const std::string& chatId) {
     g_ended.push_back(chatId);
@@ -497,23 +501,26 @@ static void schema() {
     exec("CREATE TABLE idx_premium_sub(x)");
     CHECK(!initPremium("777"));
     disabled();
-    // Старая таблица платежей без столбца sub_until, а база только на чтение:
-    // столбцы людей уже есть, таблицы тоже — не добавился один столбец, и
-    // оплата всё равно выключена.
+    // Старая таблица счетов без столбца days, а база только на чтение:
+    // столбцы людей, таблицы и все индексы уже есть — не добавился один
+    // столбец, и оплата всё равно выключена.
     openBare();
     exec("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0");
     exec("ALTER TABLE users ADD COLUMN premium_start INTEGER DEFAULT 0");
     exec("ALTER TABLE users ADD COLUMN premium_expire INTEGER DEFAULT 0");
     exec("CREATE TABLE premium_payments(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, "
          "telegram_payment_charge_id TEXT NOT NULL UNIQUE, provider_payment_charge_id TEXT, payload TEXT NOT NULL, "
-         "amount INTEGER NOT NULL, currency TEXT NOT NULL, paid_at INTEGER NOT NULL)");
+         "amount INTEGER NOT NULL, currency TEXT NOT NULL, paid_at INTEGER NOT NULL, sub_until INTEGER NOT NULL DEFAULT 0)");
     exec("CREATE INDEX idx_premium_chat ON premium_payments(chat_id)");
     exec("CREATE INDEX idx_premium_paid ON premium_payments(paid_at)");
     exec("CREATE TABLE ton_invoices(memo TEXT PRIMARY KEY, chat_id TEXT NOT NULL, nano_amount INTEGER NOT NULL, "
          "status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, paid_at INTEGER NOT NULL DEFAULT 0, "
-         "tx_hash TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'ton', days INTEGER NOT NULL DEFAULT 30)");
+         "tx_hash TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'ton')");
     exec("CREATE INDEX idx_ton_active ON ton_invoices(status, created_at)");
     exec("CREATE INDEX idx_ton_chat ON ton_invoices(chat_id)");
+    exec("CREATE INDEX idx_users_premium ON users(premium_expire) WHERE is_premium=1");
+    exec("CREATE INDEX idx_ton_hash ON ton_invoices(tx_hash) WHERE tx_hash!=''");
+    exec("CREATE INDEX idx_premium_sub ON premium_payments(sub_until) WHERE sub_until>0");
     exec("PRAGMA query_only=1");
     CHECK(!initPremium(""));
     exec("PRAGMA query_only=0");
@@ -866,6 +873,7 @@ static void endedInBatches() {
         exec("COMMIT");
         g_ended.clear();
         g_pauses.clear();
+        g_refreshAt.clear();
         g_reenter = true;
         cleanupExpiredPremium();
         g_reenter = false;
@@ -873,6 +881,7 @@ static void endedInBatches() {
         CHECK(std::adjacent_find(g_ended.begin(), g_ended.end()) == g_ended.end());
         CHECK(g_pauses == std::vector<int>(static_cast<size_t>(n), 250));
         CHECK(g_refreshed == (n + 999) / 1000);
+        for (size_t b = 0; b < g_refreshAt.size(); ++b) CHECK(g_refreshAt[b] == b * 1000);  // пачки — ровно по 1000
         CHECK(num("SELECT COUNT(*) FROM users WHERE is_premium=1") == 0);
     }
     // Проход закончился — следующий снова работает.
@@ -1335,16 +1344,56 @@ static void faults() {
     // Счёт старше суток погасить не дали — в базе он «active», но живым не
     // считается: один такой — обозреватель не спрашиваем; рядом свежий —
     // спрашиваем, а по старому перевод всё равно не засчитываем.
+    // Граница — ровно сутки: такой счёт уже не живой.
     freshDb();
-    invoice("WT-XSTAL", "x1", 4990000, now() - DAY_SEC - 5);
+    premium::setClock(&fakeNow);
+    g_now = 1'900'000'000;
+    invoice("WT-XSTAL", "x1", 4990000, g_now - DAY_SEC);
     exec("CREATE TRIGGER x_boom BEFORE UPDATE ON ton_invoices WHEN OLD.memo='WT-XSTAL' BEGIN SELECT RAISE(ABORT,'x'); END");
     g_explorer = json{{"jetton_transfers", {transfer("WT-XSTAL", 4990000, "x1")}}}.dump();
     pollUsdtPayments();
     CHECK(g_urls.empty() && text("SELECT status FROM ton_invoices WHERE memo='WT-XSTAL'") == "active");
-    invoice("WT-XFRSH", "x2", 4990000, now());
+    invoice("WT-XFRSH", "x2", 4990000, g_now);
     g_explorer = json{{"jetton_transfers", {transfer("WT-XSTAL", 4990000, "x1"), transfer("WT-XFRSH", 4990000, "x2")}}}.dump();
     pollUsdtPayments();
-    CHECK(g_urls.size() == 1 && expireOf("x1") == LLONG_MIN && expireOf("x2") > now());
+    CHECK(g_urls.size() == 1 && expireOf("x1") == LLONG_MIN && expireOf("x2") > g_now);
+
+    // Гасить нечего — запись не начинается вовсе: база только на чтение, а
+    // опрос молчит (нет ни счетов, ни только свежие счета).
+    std::ostringstream err;
+    std::streambuf* old = std::cerr.rdbuf(err.rdbuf());
+    freshDb();
+    g_explorer = json{{"jetton_transfers", json::array()}}.dump();
+    exec("PRAGMA query_only=1");
+    pollUsdtPayments();
+    exec("PRAGMA query_only=0");
+    invoice("WT-QFRSH", "q1", 4990000, g_now - 10);
+    exec("PRAGMA query_only=1");
+    pollUsdtPayments();
+    exec("PRAGMA query_only=0");
+    std::cerr.rdbuf(old);
+    CHECK(err.str().empty());
+    CHECK(g_urls.size() == 1);
+
+    // Два перевода с одной памяткой в одном ответе. Первый оплатил счёт —
+    // второй (недоплата) его уже не ищет: ни выдачи, ни строки «недоплата».
+    // Первый — повтор чужого хеша — счёт остаётся, второй его оплачивает.
+    freshDb();
+    invoice("WT-TWICE", "t1", 4990000, g_now);
+    invoice("WT-OTHER", "t0", 4990000, g_now);
+    exec("UPDATE ton_invoices SET status='paid', tx_hash='used' WHERE memo='WT-OTHER'");
+    invoice("WT-AGAIN", "t2", 4990000, g_now);
+    g_explorer = json{{"jetton_transfers", {transfer("WT-TWICE", 4990000, "w1"), transfer("WT-TWICE", 1000000, "w2"),
+                                            transfer("WT-AGAIN", 4990000, "used"), transfer("WT-AGAIN", 4990000, "w3")}}}.dump();
+    err.str("");
+    old = std::cerr.rdbuf(err.rdbuf());
+    pollUsdtPayments();
+    std::cerr.rdbuf(old);
+    CHECK(err.str().find("недоплата") == std::string::npos);
+    CHECK(err.str().find("уже оплатил другой счёт") != std::string::npos);
+    CHECK(text("SELECT tx_hash FROM ton_invoices WHERE memo='WT-TWICE'") == "w1");
+    CHECK(text("SELECT tx_hash FROM ton_invoices WHERE memo='WT-AGAIN'") == "w3" && expireOf("t2") > g_now);
+    premium::setClock(nullptr);
 }
 
 // Остальные развилки разбора — по одной на ветку.

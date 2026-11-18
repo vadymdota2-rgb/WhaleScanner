@@ -29,6 +29,9 @@ TARGETS = ["premium_logic.h", "premium.cpp"]
 STATIC = ["utils.cpp", "ru.cpp", "translations.cpp"]
 CXX = os.environ.get("CXX", "g++")
 # Окружение проверки: кошелёк по умолчанию, образцы ответов — из репозитория.
+SCALE_TEST = ("import sys, unittest; sys.path.insert(0, 'tests'); import premium_policy as p; "
+              "r = unittest.TextTestRunner(verbosity=0).run(unittest.defaultTestLoader.loadTestsFromTestCase(p.ScaleTest)); "
+              "sys.exit(0 if r.wasSuccessful() else 1)")
 TEST_ENV = {**os.environ, "TON_WALLET_ADDRESS": "", "FIXTURES": os.path.join(ROOT, "tests", "fixtures"), "PREMIUM_QUICK": "1"}
 FLAGS = ["-std=c++20", "-O0", "-pthread", "-w"]
 
@@ -189,6 +192,14 @@ EQUIV: dict = {
         'запас памяти, не результат',
     ('premium_logic.h', "out += c < 0x20U || c == 0x7FU ? ' ' : ch;", ' < → <= @8'):
         'пробел и так остаётся пробелом',
+    ('premium.cpp', 'long long newest = 0;  // самый молодой активный счёт', '0→1@19'):
+        'перезаписывается до чтения (MAX из базы)',
+    ('premium.cpp', 'long long oldest = 0;', '0→1@19'):
+        'перезаписывается до чтения (MIN из базы)',
+    ('premium.cpp', 'if (!live.row() || live.null(0)) return;', '0→1@29'):
+        'MIN и MAX пусты вместе: живых счетов нет — оба NULL',
+    ('premium.cpp', "s.bind(1, cutoff).bind(2, memos.dump(-1, ' ', false, json::error_handler_t::replace));", 'false→true@46'):
+        'ensure_ascii: \\uXXXX json_each раскодирует в те же байты',
 }
 
 
@@ -326,7 +337,17 @@ def run_one(args) -> tuple[str, str]:
                                env=TEST_ENV)
         except subprocess.TimeoutExpired:
             return "killed", "timeout"
-        return ("killed" if r.returncode else "survived"), ""
+        if r.returncode:
+            return "killed", ""
+        # Порча, которой C++-тесты не видят, но которая лишает запрос индекса
+        # (условие частичного индекса, условие запроса), — ловит ScaleTest:
+        # план каждого запроса на схеме копии.
+        if path == "premium.cpp":
+            s = subprocess.run([sys.executable, "-c", SCALE_TEST], capture_output=True, text=True, check=False,
+                               cwd=ROOT, env={**os.environ, "PREMIUM_CPP": p})
+            if s.returncode:
+                return "killed", ""
+        return "survived", ""
 
 
 def main() -> int:

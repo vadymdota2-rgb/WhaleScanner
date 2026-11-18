@@ -16,7 +16,8 @@ import sys
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CPP = os.path.join(ROOT, "premium.cpp")
+# PREMIUM_CPP — копия с подложенной порчей (tools/mutate.py, план запросов).
+CPP = os.environ.get("PREMIUM_CPP") or os.path.join(ROOT, "premium.cpp")
 LOGIC = os.path.join(ROOT, "premium_logic.h")
 HEADER = os.path.join(ROOT, "premium.h")
 
