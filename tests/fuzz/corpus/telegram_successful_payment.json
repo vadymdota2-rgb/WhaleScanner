@@ -1,0 +1,7 @@
+{
+  "currency": "XTR",
+  "total_amount": 250,
+  "invoice_payload": "premium_30_days",
+  "telegram_payment_charge_id": "stxFixtureChargeId0000000000000000000000000000",
+  "provider_payment_charge_id": ""
+}

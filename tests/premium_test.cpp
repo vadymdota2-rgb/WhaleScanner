@@ -16,6 +16,8 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <sqlite3.h>
@@ -43,8 +45,15 @@ static std::vector<std::string> g_ended;
 static int g_refreshed = 0;
 static std::set<std::string> g_ghosts;          // ensureUser «не смог» завести строку
 
-std::string http(const std::string& url, const std::string& post, int) {
+static std::vector<size_t> g_caps;             // предел ответа каждого запроса
+static std::string g_netError;                  // «сбой сети» для следующих запросов
+std::string httpsCapped(const std::string& url, const std::string& post, int, size_t maxBytes, std::string* error) {
     g_urls.push_back(url);
+    g_caps.push_back(maxBytes);
+    if (!g_netError.empty()) {
+        if (error != nullptr) *error = g_netError;
+        return "";
+    }
     if (url.find("toncenter.com") != std::string::npos) return g_explorer;
     g_tgPosts.push_back(json::parse(post, nullptr, false));
     return g_tgAnswer;
@@ -52,7 +61,7 @@ std::string http(const std::string& url, const std::string& post, int) {
 std::string tgApi(const std::string& method) { return "https://tg.test/bot/" + method; }
 SendResult sendMsg(const std::string& chatId, const std::string& text, const std::string&) {
     g_sent.emplace_back(chatId, text);
-    return {true, false, 0};
+    return {chatId != "mute", false, 0};  // «mute» — Telegram не доставил
 }
 std::string openAppKeyboard(Lang, const std::string&, const char*) { return ""; }
 std::string getUserLanguage(const std::string&) { return "ru"; }
@@ -101,8 +110,17 @@ static std::string text(const std::string& sql) {
 static long long expireOf(const std::string& chat) {
     return num("SELECT premium_expire FROM users WHERE chat_id='" + chat + "'");
 }
+// Каждый запрос модуля закрыт (Stmt закрывает сам): незакрытый держал бы
+// базу и память. Проверяется перед каждой новой базой и в конце.
+static void closeDb() {
+    if (db == nullptr) return;
+    CHECK(sqlite3_next_stmt(db, nullptr) == nullptr);
+    CHECK(sqlite3_close(db) == SQLITE_OK);
+    db = nullptr;
+}
+
 static void freshDb() {
-    if (db) sqlite3_close(db);
+    closeDb();
     sqlite3_open(":memory:", &db);
     exec("CREATE TABLE users(chat_id TEXT PRIMARY KEY, language TEXT NOT NULL DEFAULT 'en', "
          "threshold_nanos INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)");
@@ -112,9 +130,10 @@ static void freshDb() {
     g_urls.clear(); g_tgPosts.clear(); g_sent.clear(); g_ended.clear(); g_refreshed = 0;
     g_tgAnswer = R"({"ok":true,"result":true})";
 }
-static json transfer(const std::string& memo, long long units, const std::string& hash = "h1") {
+static json transfer(const std::string& memo, long long units, const std::string& hash = "h1",
+                     long long at = 2'000'000'000) {
     return {{"jetton_master", USDT_MASTER}, {"destination", WALLET_RAW}, {"amount", std::to_string(units)},
-            {"transaction_aborted", false}, {"transaction_hash", hash},
+            {"transaction_aborted", false}, {"transaction_hash", hash}, {"transaction_now", at},
             {"decoded_forward_payload", {{"@type", "text_comment"}, {"comment", memo}}}};
 }
 static void invoice(const std::string& memo, const std::string& chat, long long units, long long made, int days = 30) {
@@ -327,6 +346,15 @@ static void rules() {
     CHECK(!usdtTransfer(spoil("amount", "4990000.5"), WALLET_RAW));
     CHECK(!usdtTransfer(spoil("amount", "99999999999999999999"), WALLET_RAW));
     CHECK(!usdtTransfer(spoil("decoded_forward_payload", nullptr), WALLET_RAW));
+    CHECK(!usdtTransfer(spoil("transaction_hash", ""), WALLET_RAW));
+    CHECK(!usdtTransfer(spoil("transaction_hash", std::string(129, 'h')), WALLET_RAW));
+    CHECK(usdtTransfer(spoil("transaction_hash", std::string(128, 'h')), WALLET_RAW).has_value());
+    CHECK(!usdtTransfer(spoil("transaction_hash", 5), WALLET_RAW));
+    CHECK(!usdtTransfer(spoil("transaction_now", 0), WALLET_RAW));
+    CHECK(!usdtTransfer(spoil("transaction_now", "1795000000"), WALLET_RAW));
+    CHECK(!usdtTransfer(spoil("transaction_now", 1795000000.5), WALLET_RAW));
+    CHECK(usdtTransfer(spoil("transaction_now", 1), WALLET_RAW)->at == 1);
+    CHECK(transferFitsInvoice(1000 - 600, 1000) && !transferFitsInvoice(1000 - 601, 1000) && transferFitsInvoice(5000, 1000));
     CHECK(!usdtTransfer(spoil("decoded_forward_payload", {{"comment", 5}}), WALLET_RAW));
     CHECK(!usdtTransfer(spoil("decoded_forward_payload", {{"comment", "   "}}), WALLET_RAW));
     CHECK(!usdtTransfer(transfer("WT-ABCDE", 4990000), ""));
@@ -382,7 +410,7 @@ static void fuzz() {
 
 // ── premium.cpp на базе ──────────────────────────────────────────────────────
 static void openBare() {
-    if (db) sqlite3_close(db);
+    closeDb();
     sqlite3_open(":memory:", &db);
     exec("CREATE TABLE users(chat_id TEXT PRIMARY KEY, language TEXT NOT NULL DEFAULT 'en', "
          "threshold_nanos INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)");
@@ -417,7 +445,7 @@ static void schema() {
     CHECK(num("SELECT is_premium + premium_expire FROM users WHERE chat_id='777'") == 0);
     CHECK(num("SELECT sub_until FROM premium_payments") == LLONG_MIN);  // столбец есть, строк нет
     // Миграция, которая не удалась по-настоящему, — оплата выключена.
-    if (db) sqlite3_close(db);
+    closeDb();
     sqlite3_open(":memory:", &db);
     exec("CREATE TABLE real_users(chat_id TEXT, created_at INTEGER)");
     exec("CREATE VIEW users AS SELECT chat_id, created_at FROM real_users");
@@ -430,6 +458,14 @@ static void schema() {
     exec("CREATE VIEW premium_payments AS SELECT chat_id FROM x");
     CHECK(!initPremium("777"));
     disabled();
+    // Не добавился только столбец (users — представление), а всё прочее
+    // встало и служебного аккаунта нет — всё равно выключена.
+    closeDb();
+    sqlite3_open(":memory:", &db);
+    exec("CREATE TABLE real_users(chat_id TEXT, created_at INTEGER)");
+    exec("CREATE VIEW users AS SELECT chat_id, created_at FROM real_users");
+    CHECK(!initPremium(""));
+    disabled();
     // Таблицы и столбцы на месте, а индекс не встал (имя занято таблицей) —
     // схема не та, что ждёт код: выключена.
     openBare();
@@ -437,7 +473,7 @@ static void schema() {
     CHECK(!initPremium("777"));
     disabled();
     // Нет таблицы людей — выдавать некуда, оплата выключена.
-    if (db) sqlite3_close(db);
+    closeDb();
     sqlite3_open(":memory:", &db);
     CHECK(!initPremium("777"));
     disabled();
@@ -615,7 +651,9 @@ static void stars() {
                             successful("nope", 250, "b3"), successful("premium_30_days", 250, ""),
                             json{{"total_amount", 250.0}, {"currency", "XTR"}, {"invoice_payload", "premium_30_days"},
                                  {"telegram_payment_charge_id", "b4"}},
-                            json{{"invoice_payload", 5}}, json::array(), json(nullptr)})
+                            json{{"invoice_payload", 5}}, json::array(), json(nullptr),
+                            json{{"currency", "XTR"}, {"total_amount", 250}, {"invoice_payload", "premium_30_days"},
+                                 {"telegram_payment_charge_id", "b5"}, {"provider_payment_charge_id", 5}}})
         CHECK(!handleSuccessfulPayment("43", bad));
     CHECK(num("SELECT COUNT(*) FROM premium_payments") == 2 && !isPremium("43") && g_sent.size() == sent);
 
@@ -746,6 +784,269 @@ static void autorenew() {
     g_sent.clear();
     CHECK(cancelStarSubscriptions("", false) == 0 && cancelStarSubscriptions("owner", false) == 0 && g_sent.empty());
     CHECK(cancelStarSubscriptions("owner", true) == 0 && g_sent.size() == 1 && g_sent[0].first == "owner");
+    // Ровно одна неудача — тоже в отчёте.
+    exec("INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, payload, amount, currency, paid_at, sub_until) "
+         "VALUES('-5','e','premium_30_days',250,'XTR',1," + std::to_string(t + 99) + ")");
+    g_sent.clear();
+    CHECK(cancelStarSubscriptions("owner", false) == 0);
+    CHECK(g_sent.size() == 1 && g_sent[0].second.find("Не вышло: 1") != std::string::npos);
+}
+
+// Образцы ответов — договор с toncenter и Telegram: форма полей как в
+// настоящих ответах (значения выдуманы). Поменяется формат у них — упадёт
+// проверка, а не оплата у людей.
+static json fixture(const char* name) {
+    // Запуск — из корня репозитория (tests/run.sh); FIXTURES — если иначе.
+    const char* dir = std::getenv("FIXTURES");  // NOLINT(concurrency-mt-unsafe)
+    std::ifstream f(std::string(dir != nullptr ? dir : "tests/fixtures") + "/" + name);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const json j = json::parse(ss.str(), nullptr, false);
+    CHECK(j.is_object());
+    return j;
+}
+
+static void fixtures() {
+    const json ton = fixture("toncenter_jetton_transfers.json");
+    if (!ton.is_object() || !ton.contains("jetton_transfers")) return;  // провал уже засчитан
+    const auto& list = ton["jetton_transfers"];
+    CHECK(list.is_array() && list.size() == 2);
+    const auto pay = usdtTransfer(list[0], WALLET_RAW);
+    CHECK(pay && pay->memo == "WT-ABCDE" && pay->units == 3990000 && !pay->hash.empty());
+    CHECK(!usdtTransfer(list[1], WALLET_RAW));  // без памятки (decoded_forward_payload: null)
+
+    freshDb();
+    invoice("WT-ABCDE", "900", 3990000, list[0]["transaction_now"].get<long long>() - 60);
+    g_explorer = ton.dump();
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-ABCDE'") == "paid");
+    CHECK(expireOf("900") > now() + 29 * 86400);
+
+    CHECK(handleSuccessfulPayment("901", fixture("telegram_successful_payment.json")));
+    CHECK(expireOf("901") > now() + 29 * 86400);
+    handlePreCheckoutQuery(fixture("telegram_pre_checkout_query.json"));
+    CHECK(lastAnswerOk() && g_tgPosts.back()["pre_checkout_query_id"] == "4382bfdwdsb323b2d9");
+}
+
+// Подменённые часы: границы сроков — до секунды.
+static long long g_now = 0;
+static long long fakeNow() { return g_now; }
+
+static void clockEdges() {
+    freshDb();
+    premium::setClock(&fakeNow);
+    g_now = 1'800'000'000;
+    const std::string n = std::to_string(g_now);
+    exec("INSERT INTO users(chat_id, created_at, is_premium, premium_expire) VALUES"
+         "('at', 1, 1, " + n + "), ('next', 1, 1, " + std::to_string(g_now + 1) + ")");
+    // Срок, равный «сейчас», — уже кончился; на секунду позже — ещё идёт.
+    CHECK(!isPremium("at") && isPremium("next"));
+    CHECK(premiumSubsetOf({"at", "next"}) == std::set<std::string>{"next"});
+    cleanupExpiredPremium();
+    CHECK(g_ended == std::vector<std::string>{"at"});
+    g_now += 1;  // теперь и второй
+    CHECK(!isPremium("next"));
+    // Выдача — ровно от «сейчас», продление — ровно от конца.
+    CHECK(grantPremiumDays("fresh", 1) && expireOf("fresh") == g_now + 86400);
+    CHECK(num("SELECT premium_start FROM users WHERE chat_id='fresh'") == g_now);
+    CHECK(grantPremiumDays("fresh", 2) && expireOf("fresh") == g_now + 3 * 86400);
+    // Счёт USD₮ живёт ровно сутки: ровно сутки назад — истёк, на секунду моложе — жив.
+    invoice("WT-EDGE0", "e0", 4990000, g_now - 86400);
+    invoice("WT-EDGE1", "e1", 4990000, g_now - 86399);
+    g_explorer = json{{"jetton_transfers", {transfer("WT-EDGE0", 4990000, "x0"), transfer("WT-EDGE1", 4990000, "x1")}}}.dump();
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-EDGE0'") == "expired");
+    CHECK(text("SELECT status || paid_at FROM ton_invoices WHERE memo='WT-EDGE1'") == "paid" + std::to_string(g_now));
+    CHECK(expireOf("e1") == g_now + 30 * 86400);
+    // Воронка пишет день по часам модуля (UTC).
+    CHECK(text("SELECT day FROM funnel_events WHERE chat_id='e1'") == "2027-01-15");
+    // Звёзды: время оплаты и срок — по тем же часам.
+    CHECK(handleSuccessfulPayment("s1", successful("premium_30_days", 250, "edge")));
+    CHECK(num("SELECT paid_at FROM premium_payments WHERE telegram_payment_charge_id='edge'") == g_now);
+    CHECK(expireOf("s1") == g_now + 30 * 86400);
+    // Вводная цена — до конца окна плюс 15 минут включительно.
+    handlePreCheckoutQuery(preCheckout("premium_30_intro:42:" + std::to_string(g_now - 900), 150, 42));
+    CHECK(lastAnswerOk());
+    handlePreCheckoutQuery(preCheckout("premium_30_intro:42:" + std::to_string(g_now - 901), 150, 42));
+    CHECK(!lastAnswerOk());
+    // Автопродление: действующее — sub_until строго в будущем.
+    exec("INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, payload, amount, currency, paid_at, sub_until) "
+         "VALUES('71','p1','premium_30_days',250,'XTR',1," + n + "),('72','p2','premium_30_days',250,'XTR',1," +
+         std::to_string(g_now + 1) + ")");
+    g_tgPosts.clear();
+    CHECK(cancelStarSubscriptions("", false) == 1 && g_tgPosts.size() == 1 && g_tgPosts[0]["user_id"] == 72);
+    premium::setClock(nullptr);
+    CHECK(isPremium("fresh") == (expireOf("fresh") > static_cast<long long>(time(nullptr))));
+}
+
+// Журнал: строка из чужих рук — одной строкой, без управляющих знаков, с
+// пределом длины. Подделать в журнале «выдан Премиум» нельзя.
+static void logging() {
+    CHECK(premium::logSafe("ok") == "ok");
+    CHECK(premium::logSafe("a\nb\r\x1b[31mc\x7f\td") == "a b  [31mc  d");
+    CHECK(premium::logSafe(std::string(300, 'x')) == std::string(300, 'x'));
+    CHECK(premium::logSafe(std::string(301, 'x')) == std::string(300, 'x') + "…");
+    // Обрезка — по границе знака UTF-8: «ж» — два байта.
+    std::string cyr;
+    for (int i = 0; i < 200; ++i) cyr += "ж";
+    const std::string cut = premium::logSafe(cyr, 5);
+    CHECK(cut == "жж…");
+    CHECK(premium::logSafe("", 0).empty() && premium::logSafe("x", 0) == "…");
+    // Битый UTF-8 из одних байтов-продолжений — обрезка не уходит за начало.
+    CHECK(premium::logSafe(std::string(10, '\x80'), 5) == "…");
+    CHECK(premium::logSafe("ab" + std::string(10, '\x80'), 5) == "a…");  // «b»+продолжения — один знак
+
+    premium::Once once(3);
+    CHECK(once.first("a") && !once.first("a") && once.first("b") && once.first("c") && once.size() == 3);
+    CHECK(once.first("d") && once.size() == 1);  // полон — начинается заново, а не растёт
+    CHECK(once.first("a"));
+    premium::Once big;
+    for (int i = 0; i < 1000; ++i) (void)big.first("k" + std::to_string(i));
+    CHECK(big.size() == 1000);
+    CHECK(big.first("k1000") && big.size() == 1);  // по умолчанию — ровно 1000
+    for (int i = 0; i < 20000; ++i) (void)big.first("k" + std::to_string(i));
+    CHECK(big.size() <= 1000);
+
+    // Подделка строки журнала через нагрузку счёта и ответ Telegram.
+    freshDb();
+    std::ostringstream err;
+    std::streambuf* old = std::cerr.rdbuf(err.rdbuf());
+    (void)handleSuccessfulPayment("1", successful("evil\n[PREMIUM] Activated for 666 (charge x)", 250, "z"));
+    g_tgAnswer = "{\"ok\":false,\"description\":\"bad\\n[PREMIUM] Activated for 777\"}";
+    handlePreCheckoutQuery(preCheckout("premium_30_days", 250, 1));
+    std::cerr.rdbuf(old);
+    const std::string log = err.str();
+    CHECK(log.find("\n[PREMIUM] Activated") == std::string::npos);
+    CHECK(log.find("evil [PREMIUM] Activated for 666") != std::string::npos);
+    CHECK(log.find("bad [PREMIUM] Activated for 777") != std::string::npos);
+    for (const char c : log) CHECK(c == '\n' || static_cast<unsigned char>(c) >= 0x20);
+    g_tgAnswer = R"({"ok":true,"result":true})";
+}
+
+// Атаки на опрос USD₮: старый перевод с совпавшей памяткой, повтор хеша,
+// HTML в ответах, сбой сети, пределы ответа.
+static void attacks() {
+    freshDb();
+    premium::setClock(&fakeNow);
+    g_now = 1'800'000'000;
+    // Перевод сделан раньше счёта (больше чем на 10 минут) — не оплачивает его.
+    invoice("WT-OLDTX", "a1", 4990000, g_now);
+    invoice("WT-SKEWD", "a2", 4990000, g_now);
+    g_explorer = json{{"jetton_transfers", {transfer("WT-OLDTX", 4990000, "old", g_now - 601),
+                                            transfer("WT-SKEWD", 4990000, "skew", g_now - 600)}}}.dump();
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLDTX'") == "active");
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-SKEWD'") == "paid");
+    // Один перевод (хеш) оплачивает один счёт: подделанный ответ с тем же
+    // хешем и другой памяткой второй счёт не оплатит.
+    invoice("WT-TWICE", "a3", 4990000, g_now);
+    g_explorer = json{{"jetton_transfers", {transfer("WT-TWICE", 4990000, "skew", g_now)}}}.dump();
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-TWICE'") == "active" && !isPremium("a3"));
+    // Вложенность в сотни тысяч уровней (ответ под предел в 1 МБ) — ни
+    // переполнения стека при разборе и удалении, ни выдачи.
+    for (const std::string& deep : {std::string(500'000, '[') + std::string(500'000, ']'),
+                                    "{\"jetton_transfers\":" + std::string(400'000, '[') + std::string(400'000, ']') + "}",
+                                    std::string(500'000, '[')}) {
+        g_explorer = deep;
+        pollUsdtPayments();
+    }
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLDTX'") == "active");
+    // Пределы ответа: toncenter — 1 МБ, Bot API — 64 КБ; адрес — только https.
+    CHECK(!g_caps.empty() && g_caps.back() == (1U << 20U));
+    g_caps.clear();
+    handlePreCheckoutQuery(preCheckout("premium_30_days", 250, 1));
+    CHECK(g_caps.size() == 1 && g_caps[0] == (64U << 10U) && g_urls.back().rfind("https://", 0) == 0);
+    for (const auto& u : g_urls) CHECK(u.rfind("https://", 0) == 0);
+    // Сбой сети — ничего не меняется, в журнал одна строка на причину.
+    g_netError = "Timeout was reached";
+    std::ostringstream err;
+    std::streambuf* old = std::cerr.rdbuf(err.rdbuf());
+    pollUsdtPayments();
+    pollUsdtPayments();
+    handlePreCheckoutQuery(preCheckout("premium_30_days", 250, 1));
+    std::cerr.rdbuf(old);
+    g_netError.clear();
+    const std::string log = err.str();
+    size_t n = 0;
+    for (size_t at = log.find("[USDT] toncenter: Timeout"); at != std::string::npos;
+         at = log.find("[USDT] toncenter: Timeout", at + 1))
+        ++n;
+    CHECK(n == 1);
+    CHECK(log.find("answerPreCheckoutQuery failed: Timeout was reached") != std::string::npos);
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLDTX'") == "active");
+    // HTML из ответа Telegram не ломает сообщение владельцу (parse_mode HTML).
+    g_sent.clear();
+    exec("CREATE TRIGGER html_boom BEFORE INSERT ON premium_payments WHEN NEW.chat_id='h1' BEGIN SELECT RAISE(ABORT,'x'); END");
+    CHECK(!handleSuccessfulPayment("h1", successful("premium_30_days", 250, "<b>x</b>&\n")));
+    CHECK(g_sent.size() == 1 && g_sent[0].second.find("&lt;b&gt;x&lt;/b&gt;&amp; ") != std::string::npos);
+    CHECK(g_sent[0].second.find("<b>x") == std::string::npos);
+    premium::setClock(nullptr);
+}
+
+// Ручная выдача владельцем: строгий разбор, ответ с датой.
+static void grantByOwner() {
+    for (const char* ok : {"42 30", " 42   30 ", "42 3650", "42 1"}) CHECK(parseGrant(ok).has_value());
+    const auto g = parseGrant("  777123  365 ");
+    CHECK(g && g->chat == "777123" && g->days == 365);
+    for (const char* bad : {"", " ", "42", "42 ", "42 0", "42 3651", "42 -1", "-42 30", "0 30", "x 30", "42 30 1",
+                            "42 30x", "42\t30", "4 2 30", "042 30x", "99999999999999999999 30"})
+        CHECK(!parseGrant(bad));
+    CHECK(parseGrant("042 30")->chat == "42");  // номер — как число, без ведущих нулей
+    CHECK(parseGrant("1 30")->chat == "1");
+
+    freshDb();
+    premium::setClock(&fakeNow);
+    g_now = 1'800'000'000;
+    const std::string r = grantCommand(" 555 30");
+    CHECK(r.find("✅") == 0 && r.find("<code>555</code>") != std::string::npos);
+    CHECK(r.find("2027-02-14 08:00 UTC") != std::string::npos);
+    CHECK(expireOf("555") == g_now + 30 * 86400);
+    CHECK(grantCommand("777 30").find("⚠️ Не выдано: 777") == 0);  // служебный аккаунт
+    CHECK(grantCommand("abc").find("Использование") == 0);
+    CHECK(grantCommand("").find("Использование") == 0);
+    premium::setClock(nullptr);
+}
+
+// Сбои, которые в жизни редки, но обязаны кончаться ничем, а не полуделом.
+static void failures() {
+    // COMMIT не прошёл (отложенный внешний ключ, сработавший на фиксации) —
+    // откат целиком: срок прежний, выдача — отказ.
+    freshDb();
+    exec("PRAGMA foreign_keys=ON");
+    exec("CREATE TABLE fk_parent(id INTEGER PRIMARY KEY)");
+    exec("CREATE TABLE fk_child(p INTEGER REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)");
+    exec("CREATE TRIGGER fk_boom AFTER UPDATE ON users WHEN NEW.chat_id='boom' BEGIN INSERT INTO fk_child VALUES(42); END");
+    CHECK(!grantPremiumDays("boom", 30));
+    CHECK(num("SELECT premium_expire FROM users WHERE chat_id='boom'") == 0);
+    CHECK(num("SELECT COUNT(*) FROM fk_child") == 0);
+    CHECK(grantPremiumDays("fine", 30));  // база после отката живая
+
+    // Запись платежа отклонена базой не как повтор — Премиум не выдан,
+    // владельцу сообщение, звёзды выдать вручную.
+    exec("CREATE TRIGGER pay_boom BEFORE INSERT ON premium_payments WHEN NEW.chat_id='payboom' "
+         "BEGIN SELECT RAISE(ABORT, 'boom'); END");
+    g_sent.clear();
+    CHECK(!handleSuccessfulPayment("payboom", successful("premium_30_days", 250, "pb1")));
+    CHECK(g_sent.size() == 1 && g_sent[0].first == "owner" && g_sent[0].second.find("pb1") != std::string::npos);
+    CHECK(!isPremium("payboom") && num("SELECT COUNT(*) FROM premium_payments WHERE chat_id='payboom'") == 0);
+
+    // Сообщение «оплата прошла» не доставлено — оплата всё равно записана.
+    CHECK(handleSuccessfulPayment("mute", successful("premium_30_days", 250, "m1")) && isPremium("mute"));
+
+    // Кошелёк приёма в окружении испорчен — опрос молчит и в сеть не ходит.
+    invoice("WT-WALLT", "w1", 4990000, now());
+    setenv("TON_WALLET_ADDRESS", "garbage", 1);  // NOLINT(concurrency-mt-unsafe)
+    g_urls.clear();
+    pollUsdtPayments();
+    pollUsdtPayments();
+    CHECK(g_urls.empty() && text("SELECT status FROM ton_invoices WHERE memo='WT-WALLT'") == "active");
+    // Свой кошелёк в окружении — запрос идёт на него, в сыром виде.
+    setenv("TON_WALLET_ADDRESS", "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs", 1);  // NOLINT(concurrency-mt-unsafe)
+    g_explorer = "{}";
+    pollUsdtPayments();
+    CHECK(g_urls.size() == 1 && g_urls[0].find(std::string("owner_address=") + USDT_MASTER) != std::string::npos);
+    unsetenv("TON_WALLET_ADDRESS");  // NOLINT(concurrency-mt-unsafe)
 }
 
 // Тексты оплаты есть на всех 16 языках, «{n}» — там, где подставляется срок.
@@ -772,7 +1073,13 @@ int main() {
     grantAndExpire();
     autorenew();
     texts();
-    if (db) sqlite3_close(db);
+    fixtures();
+    grantByOwner();
+    attacks();
+    failures();
+    clockEdges();
+    logging();
+    closeDb();
     if (g_fail) {
         std::cerr << "premium: ПРОВАЛОВ " << g_fail << std::endl;
         return 1;

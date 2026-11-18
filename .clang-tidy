@@ -1,0 +1,33 @@
+# Статический анализ файлов оплаты (tests/run.sh, CI). Остальной код бота
+# пока не проверяется: правила включаются по файлу, когда он прошёл ревизию.
+# std::endl оставлен намеренно: под systemd stdout буферизуется блоками, и
+# без сброса строка о выдаче Премиума появилась бы в журнале с опозданием.
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  concurrency-*,
+  cppcoreguidelines-*,
+  misc-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  -bugprone-easily-swappable-parameters,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -modernize-use-trailing-return-type,
+  -readability-identifier-length,
+  -readability-braces-around-statements,
+  -readability-implicit-bool-conversion,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -misc-include-cleaner,
+  -misc-use-anonymous-namespace,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -readability-function-cognitive-complexity,
+  -modernize-use-std-print,
+  -performance-avoid-endl
+WarningsAsErrors: '*'
+HeaderFilterRegex: '(premium.*|safe_http)\.h$'
+FormatStyle: none

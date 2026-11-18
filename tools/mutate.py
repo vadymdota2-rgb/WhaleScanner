@@ -28,157 +28,181 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGETS = ["premium_logic.h", "premium.cpp"]
 STATIC = ["utils.cpp", "ru.cpp", "translations.cpp"]
 CXX = os.environ.get("CXX", "g++")
+# Окружение проверки: кошелёк по умолчанию, образцы ответов — из репозитория.
+TEST_ENV = {**os.environ, "TON_WALLET_ADDRESS": "", "FIXTURES": os.path.join(ROOT, "tests", "fixtures")}
 FLAGS = ["-std=c++20", "-O0", "-pthread", "-w"]
 
 # Строка (без пробелов по краям) и замена, которые ничего не меняют в
 # поведении, — с причиной. Сверяются по файлу, тексту строки и замене.
 EQUIV: dict = {
+    ('premium.cpp', 'if (!open_) std::cerr << "[PREMIUM] " << what_ << ": BEGIN failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
+        'только журнал',
+    ('premium.cpp', 'if (!open_) return false;', 'return false;→return true;@12'):
+        'commit() зовётся только после проверки ok()',
+    ('premium.cpp', 'if (!open_) return false; ⏎ if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK) { ⏎ open_ = false;', 'false→true@8'):
+        'после удачного COMMIT лишний ROLLBACK в деструкторе ничего не делает',
+    ('premium.cpp', ' ⏎ struct PremiumRow { ⏎ int flag = 0;', '0→1@11'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'long long start = 0;', '0→1@18'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'long long expire = 0;', '0→1@19'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'return PremiumRow{s.int64(0) != 0 ? 1 : 0, s.int64(1), s.int64(2)};', '1→2@36'):
+        'флаг сравнивается с нулём — 1 и 2 одинаковы',
+    ('premium.cpp', 'return s.run() && sqlite3_changes(db) == 1;', ' && → || @14'):
+        'строка человека прочитана выше — удачный UPDATE меняет ровно её',
+    ('premium.cpp', 'if (e.find("duplicate column") != std::string::npos) return true;', 'if (→if (!@0'):
+        '«!e.find(…)» истинно ровно когда сообщение начинается с «duplicate column» — так у SQLite и есть',
+    ('premium.cpp', 'sub_until INTEGER NOT NULL DEFAULT 0', '0→1@35'):
+        'бот и API всегда пишут столбец явно',
+    ('premium.cpp', 'paid_at INTEGER NOT NULL DEFAULT 0,', '0→1@33'):
+        'бот и API всегда пишут столбец явно',
+    ('premium.cpp', 'days INTEGER NOT NULL DEFAULT 30', '30→31@30'):
+        'API всегда пишет срок счёта явно (pay_usdt)',
+    ('premium.cpp', ' ⏎ g_schemaOk = ok; ⏎ if (ok)', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', '<< STAR_PLANS[0].days << " days, " << STAR_PLANS[1].stars << " / " << STAR_PLANS[1].days << ")"', '1→2@49'):
+        'только журнал',
+    ('premium.cpp', '<< STAR_PLANS[0].days << " days, " << STAR_PLANS[1].stars << " / " << STAR_PLANS[1].days << ")"', '1→2@81'):
+        'только журнал',
+    ('premium.cpp', 'if (chatIds.empty() || !g_schemaOk) return out;', ' || → && @19'):
+        'до initPremium нет столбцов Премиума — запрос не подготовится, ответ тот же пустой',
+    ('premium.cpp', 'constexpr size_t CHUNK = 500;', '500→501@25'):
+        'размер куска — любой до предела SQLite',
+    ('premium.cpp', 'for (size_t from = 0; from < chatIds.size(); from += CHUNK) {', ' < → <= @26'):
+        'пустой хвост — запрос IN () без строк',
+    ('premium.cpp', 'for (size_t i = 0; i < n; i++) sql += i != 0 ? ",?" : "?";', ' < → <= @20'):
+        'лишний «?» остаётся NULL и ни с чем не совпадает',
+    ('premium.cpp', 'for (size_t i = 0; i < n; i++) s.bind(static_cast<int>(i + 2), chatIds[from + i]);', ' < → <= @20'):
+        'лишний параметр SQLite отклоняет (SQLITE_RANGE); чтение за концом списка ловит ASan в tests/run.sh',
+    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' <= → < @26'):
+        'второй рубеж: extendTerm отклоняет те же дни',
+    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' || → && @31'):
+        'второй рубеж: extendTerm отклоняет те же дни',
+    ('premium.cpp', 'ensureUser(chatId); ⏎ const long long now = nowSec(); ⏎ bool ok = false;', 'false→true@10'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'bool wasActive = false;', 'false→true@17'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'long long until = 0;', '0→1@18'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'std::array<char, 32> when{};', '32→33@17'):
+        'размер буфера с запасом',
+    ('premium.cpp', 'if (std::strftime(when.data(), when.size(), "%Y-%m-%d %H:%M UTC", &u) == 0) when[0] = \'\\0\';', '0→1@73'):
+        'strftime в буфер с запасом не ошибается',
+    ('premium.cpp', 'std::array<char, 16> day{};', '16→17@17'):
+        'размер буфера с запасом',
+    ('premium.cpp', 'if (std::strftime(day.data(), day.size(), "%Y-%m-%d", &g) == 0) return;', '0→1@61'):
+        'strftime в буфер с запасом не ошибается',
+    ('premium.cpp', 'if (!s.run()) std::cerr << "[PREMIUM] funnel: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
+        'только журнал',
+    ('premium.cpp', 'long long need = 0;', '0→1@17'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'int days = 30;  // месяц; год — только если так записано в счёте', '30→31@11'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'long long created = 0;', '0→1@20'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'if (said.first("wallet"))', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'bool anyActive = false;', 'false→true@17'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'if (!expire.run()) std::cerr << "[USDT] истечение счетов: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
+        'только журнал',
+    ('premium.cpp', 'const json j = json::parse(httpsCapped(url, "", 15, TONCENTER_MAX_BYTES, &err), nullptr, false);', '15→16@48'):
+        'тайм-аут сети',
+    ('premium.cpp', 'if (!inv || inv->chatId.empty() || inv->need < premium::USDT_MIN_UNITS) continue;', ' || → && @8'):
+        'пустой optional дальше не разыменуется в исходном коде; в мутанте — UB, его ловит UBSan',
+    ('premium.cpp', 'if (said.first("old:" + pay->hash))', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'if (said.first("under:" + pay->hash))', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'if (said.first("service:" + memo))', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'bool taken = false;  // счёт успели занять раньше нас — не ошибка', 'false→true@13'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'bool reused = false;  // этот перевод уже оплатил другой счёт', 'false→true@14'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'bool granted = false;', 'false→true@15'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'if (said.first("reused:" + pay->hash))', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'alertOwner("пришло " + premium::usdText(pay->units) + " USD₮ по счёту " + forOwner(memo, 64) + " (chat " +', '64→65@89'):
+        'длина строки в сообщении владельцу',
+    ('premium.cpp', 'forOwner(inv->chatId, 32) +', '32→33@22'):
+        'длина строки в сообщении владельцу',
+    ('premium.cpp', 'if (!sp.is_object()) return {Applied::Rejected, 0};', '0→1@48'):
+        'срок у отказа не читается',
+    ('premium.cpp', 'if (badString(sp, "invoice_payload") || badString(sp, "currency") ||', ' || → && @36'):
+        'битая нагрузка или валюта и так отклоняются ниже: пустая строка не совпадёт с тарифом',
+    ('premium.cpp', 'return {Applied::Rejected, 0};', '0→1@27'):
+        'срок у отказа не читается',
+    ('premium.cpp', 'if (rc != SQLITE_DONE && !duplicate)', ' != → == @6'):
+        'только журнал',
+    ('premium.cpp', 'if (rc != SQLITE_DONE && !duplicate)', ' && → || @21'):
+        'только журнал',
+    ('premium.cpp', 'if (rc != SQLITE_DONE && !duplicate)', '&& !→&&@22'):
+        'только журнал',
+    ('premium.cpp', 'if (rc != SQLITE_DONE && !duplicate)', 'if (→if (!@0'):
+        'только журнал',
+    ('premium.cpp', 'const bool parseOk = !badString(q, "invoice_payload") && !badString(q, "currency");', ' && → || @53'):
+        'битое поле становится пустым — тариф и валюта не совпадут',
+    ('premium.cpp', 'if (!tgAnswerOk(httpsCapped(tgApi("answerPreCheckoutQuery"), a.dump(), 8, TELEGRAM_MAX_BYTES, &why), why))', '8→9@71'):
+        'тайм-аут сети',
+    ('premium.cpp', 'const std::string charge = forOwner(premium::strField(sp, "telegram_payment_charge_id"), 80);', '80→81@89'):
+        'длина строки в сообщении владельцу',
+    ('premium.cpp', 'alertOwner("звёзды списаны (" + std::to_string(amount) + " XTR, chat " + forOwner(chatId, 32) + ", charge " +', '32→33@90'):
+        'длина строки в сообщении владельцу',
+    ('premium.cpp', 'if (!sendMsg(chatId, text, openAppKeyboard(lang)).ok)', 'if (!→if (@0'):
+        'только журнал',
+    ('premium.cpp', 'long long userId = 0;', '0→1@19'):
+        'начальное значение перезаписывается до чтения',
+    ('premium.cpp', 'if (!tgAnswerOk(httpsCapped(tgApi("editUserStarSubscription"), req.dump(), 15, TELEGRAM_MAX_BYTES, &why), why)) {', '15→16@75'):
+        'тайм-аут сети',
+    ('premium.cpp', 'if (!s.run()) std::cerr << "[PREMIUM] cancel: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
+        'только журнал',
+    ('premium.cpp', 'std::this_thread::sleep_for(std::chrono::milliseconds(60));', '60→61@54'):
+        'пауза между вызовами Telegram',
+    ('premium_logic.h', 'if (a == std::string_view::npos) return false;', 'if (→if (!@0'):
+        '«!a == npos» всегда ложно; без двоеточия строка не пройдёт strictInt',
+    ('premium_logic.h', "const size_t b = payload.find(':', a + 1);", '1→2@39'):
+        'пустой номер чата отклоняет strictInt',
+    ('premium_logic.h', 'if (b == std::string_view::npos) return false;', 'if (→if (!@0'):
+        '«!b == npos» всегда ложно; без второго двоеточия строка не пройдёт strictInt',
+    ('premium_logic.h', 'long long id = 0;', '0→1@15'):
+        'начальное значение перезаписывается до чтения',
+    ('premium_logic.h', 'long long until = 0;', '0→1@18'):
+        'начальное значение перезаписывается до чтения',
+    ('premium_logic.h', 'if (!introBinding(payload, chat, until) || buyer.empty() || chat != buyer || now > until + INTRO_GRACE_SEC)', ' || → && @39'):
+        'пустой покупатель и так отклонён; номер чата в нагрузке не бывает пустым',
     ('premium_logic.h', 'if (units < 0) units = 0;', ' < → <= @9'):
         'ноль и единица дают одинаковые «0.00» — сумма до цента',
     ('premium_logic.h', 'if (units < 0) units = 0;', '0→1@12'):
         'ноль и единица дают одинаковые «0.00» — сумма до цента',
     ('premium_logic.h', 'if (units < 0) units = 0;', '0→1@23'):
         'ноль и единица дают одинаковые «0.00» — сумма до цента',
-    ('premium.cpp', 'if (!prepareOrLog(db, &s, ⏎ "SELECT is_premium, premium_start, premium_expire FROM users WHERE chat_id=?")) ⏎ return false;', 'return false;→return true;@0'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', 'std::cerr << "[PREMIUM] " << what << ": COMMIT failed: " << sqlite3_errmsg(db) << std::endl; ⏎ sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); ⏎ return false;', 'return false;→return true;@0'):
-        'сбой COMMIT после удачного BEGIN IMMEDIATE не воспроизводится в памяти',
-    ('premium.cpp', 'sqlite3_stmt* s; ⏎ if (!prepareOrLog(db, &s, "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire<=?")) ⏎ return false;', 'return false;→return true;@0'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', 'if (expired.empty()) return true; ⏎ if (!prepareOrLog(db, &s, "UPDATE users SET is_premium=0 WHERE is_premium=1 AND premium_expire<=?")) ⏎ return false;', 'return false;→return true;@0'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', 'if (!prepareOrLog(db, &s, ⏎ "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?")) ⏎ return false;', 'return false;→return true;@0'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', '"INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, provider_payment_charge_id, " ⏎ "payload, amount, currency, paid_at, sub_until) VALUES(?,?,?,?,?,?,?,?)")) ⏎ return false;', 'return false;→return true;@0'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', 'if (rc == SQLITE_CONSTRAINT && ext == SQLITE_CONSTRAINT_UNIQUE) { ⏎ duplicate = true; ⏎ return false;', 'return false;→return true;@0'):
-        'повтор помечен duplicate — ответ тот же при любом исходе транзакции',
-    ('premium.cpp', 'if (rc != SQLITE_DONE) { ⏎ std::cerr << "[PREMIUM] apply: payment INSERT failed (" << rc << "): " << sqlite3_errmsg(db) << std::endl; ⏎ return false;', 'return false;→return true;@0'):
-        'сбой вставки, кроме повтора, не воспроизводится',
-    ('premium.cpp', 'bool found = false;', 'false→true@13'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'sub_until INTEGER NOT NULL DEFAULT 0', '0→1@35'):
-        'бот и API всегда пишут столбец явно',
-    ('premium.cpp', 'paid_at INTEGER NOT NULL DEFAULT 0,', '0→1@33'):
-        'бот и API всегда пишут столбец явно',
-    ('premium.cpp', 'days INTEGER NOT NULL DEFAULT 30', '30→31@30'):
-        'бот и API всегда пишут столбец явно',
-    ('premium.cpp', 'if (ok && !g_serviceChatId.empty()) {', ' && → || @6'):
-        'при неудачной миграции UPDATE снятия отметки всё равно ничего не меняет',
-    ('premium.cpp', ' ⏎ g_premiumSchemaOk = ok; ⏎ if (ok)', 'if (→if (!@0'):
-        'только журнал',
-    ('premium.cpp', '<< STAR_PLANS[0].days << " days, " << STAR_PLANS[1].stars << " / " << STAR_PLANS[1].days', '1→2@49'):
-        'только журнал',
-    ('premium.cpp', '<< STAR_PLANS[0].days << " days, " << STAR_PLANS[1].stars << " / " << STAR_PLANS[1].days', '1→2@81'):
-        'только журнал',
-    ('premium.cpp', 'if (chatIds.empty() || !g_premiumSchemaOk) return out;', ' || → && @19'):
-        'пустой список и так даёт пустой ответ: цикл по кускам не начнётся',
-    ('premium.cpp', 'constexpr size_t CHUNK = 500;', '500→501@25'):
-        'размер куска — любой до предела SQLite',
-    ('premium.cpp', 'for (size_t from = 0; from < chatIds.size(); from += CHUNK) {', ' < → <= @26'):
-        'пустой хвост — запрос IN () без строк',
-    ('premium.cpp', 'for (size_t i = 0; i < n; i++) sql += (i ? ",?" : "?");', ' < → <= @20'):
-        'лишний «?» остаётся NULL и ни с чем не совпадает',
-    ('premium.cpp', 'for (size_t i = 0; i < n; i++)', ' < → <= @20'):
-        'лишний параметр SQLite отклоняет (SQLITE_RANGE); чтение за концом списка ловит ASan в tests/run.sh',
-    ('premium.cpp', 'int flag = 0; long long start = 0, expire = 0;', '0→1@11'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'int flag = 0; long long start = 0, expire = 0;', '0→1@32'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'int flag = 0; long long start = 0, expire = 0;', '0→1@44'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'return flag != 0 && expire > now;', ' > → >= @26'):
-        'граница в одну секунду: срок истекает «сейчас» — тест на часах ненадёжен',
-    ('premium.cpp', 'bool duplicate = false; ⏎ bool wasActive = false; ⏎ bool ok = false;', 'false→true@10'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'const long long now = static_cast<long long>(time(nullptr)); ⏎ std::vector<std::string> expired; ⏎ bool ok = false;', 'false→true@10'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'ensureUser(chatId); ⏎ const long long now = static_cast<long long>(time(nullptr)); ⏎ bool ok = false;', 'false→true@10'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'if (expired.empty()) return true;', 'return true;→return false;@21'):
-        'пустой список: откат вместо фиксации — в базе всё равно ничего не менялось',
-    ('premium.cpp', 'return rc == SQLITE_DONE && sqlite3_changes(db) == 1;', ' && → || @24'):
-        'шаг UPDATE без ошибки — changes() решает сам',
-    ('premium.cpp', 'if (seen.size() > 1000) seen.clear();', '1000→1001@18'):
-        'граница очистки памяти журнала',
-    ('premium.cpp', 'if (seen.size() > 1000) seen.clear();', ' > → >= @15'):
-        'граница очистки памяти журнала',
-    ('premium.cpp', 'if (seen.size() > 1000) seen.clear();', 'if (→if (!@0'):
-        'граница очистки памяти журнала',
-    ('premium.cpp', 'if (firstTime(said, "wallet"))', 'if (→if (!@0'):
-        'только журнал',
-    ('premium.cpp', 'bool anyActive = false;', 'false→true@17'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'const json j = json::parse(http(url, "", 15), nullptr, false);', '15→16@41'):
-        'тайм-аут сети',
-    ('premium.cpp', 'if (!j.is_object() || list == j.end() || !list->is_array()) return;', ' || → && @18'):
-        'не-массив и отсутствие ключа ниже отсекаются; разыменование конца ловит ASan',
-    ('premium.cpp', 'if (!j.is_object() || list == j.end() || !list->is_array()) return;', ' || → && @37'):
-        'не-массив и отсутствие ключа ниже отсекаются; разыменование конца ловит ASan',
-    ('premium.cpp', 'long long need = 0;', '0→1@17'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'if (firstTime(said, "under:" + pay->hash))', 'if (→if (!@0'):
-        'только журнал',
-    ('premium.cpp', 'if (firstTime(said, "service:" + memo))', 'if (→if (!@0'):
-        'только журнал',
-    ('premium.cpp', 'bool granted = false;', 'false→true@15'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', '"WHERE memo=? AND status=\'active\' AND kind=\'usdt\'")) return false;', 'return false;→return true;@53'):
-        'сбой подготовки запроса к своей же таблице не воспроизводится',
-    ('premium.cpp', 'if (rc != SQLITE_DONE) return false;', 'return false;→return true;@23'):
-        'сбой шага UPDATE не воспроизводится',
-    ('premium.cpp', 'if (sqlite3_changes(db) != 1) { taken = true; return false; }', 'return false;→return true;@46'):
-        'счёт заняли между SELECT и UPDATE — гонка, опрос идёт из одного потока',
-    ('premium.cpp', 'if (sqlite3_changes(db) != 1) { taken = true; return false; }', 'true→false@40'):
-        'счёт заняли между SELECT и UPDATE — гонка, опрос идёт из одного потока',
-    ('premium.cpp', 'bool wasActive = false;', 'false→true@17'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', '// только бот — пишем её здесь. ⏎ const long long t = static_cast<long long>(time(nullptr)); ⏎ char day[16];', '16→17@9'):
-        'размер буфера с запасом',
-    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' <= → < @26'):
-        'второй рубеж: extendTerm отклоняет те же дни',
-    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' || → && @31'):
-        'второй рубеж: extendTerm отклоняет те же дни',
-    ('premium.cpp', 'if (!sp.is_object()) return {Applied::Rejected, 0};', '0→1@48'):
-        'срок у отказа не читается',
-    ('premium.cpp', 'return {Applied::Rejected, 0};', '0→1@27'):
-        'срок у отказа не читается',
-    ('premium.cpp', 'if (rc == SQLITE_CONSTRAINT && ext == SQLITE_CONSTRAINT_UNIQUE) {', ' && → || @27'):
-        'при успешном шаге расширенный код — не UNIQUE',
-    ('premium.cpp', '} catch (const json::exception& e) { ⏎ std::cerr << "[PREMIUM] pre_checkout malformed JSON: " << e.what() << std::endl; ⏎ parseOk = false;', 'false→true@10'):
-        'при битом поле нагрузка пуста — тариф не найдётся',
-    ('premium.cpp', 'if (!tgAnswerOk(http(tgApi("answerPreCheckoutQuery"), a.dump(), 8), why))', 'if (!→if (@0'):
-        'только журнал',
-    ('premium.cpp', 'if (!tgAnswerOk(http(tgApi("answerPreCheckoutQuery"), a.dump(), 8), why))', '8→9@64'):
-        'тайм-аут сети',
-    ('premium.cpp', 'if (!sendMsg(chatId, text, openAppKeyboard(lang)).ok)', 'if (!→if (@0'):
-        'только журнал',
-    ('premium.cpp', 'long long userId = 0;', '0→1@19'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'if (!tgAnswerOk(http(tgApi("editUserStarSubscription"), req.dump(), 15), why)) {', '15→16@68'):
-        'тайм-аут сети',
-    ('premium.cpp', 'std::this_thread::sleep_for(std::chrono::milliseconds(60));', '60→61@54'):
-        'пауза между вызовами Telegram',
-    ('premium_logic.h', 'if (a == std::string::npos) return false;', 'if (→if (!@0'):
-        '«!a == npos» всегда ложно; без двоеточия строка не пройдёт strictInt',
-    ('premium_logic.h', "const size_t b = payload.find(':', a + 1);", '1→2@39'):
-        'пустой номер чата отклоняет strictInt',
-    ('premium_logic.h', 'if (b == std::string::npos) return false;', 'if (→if (!@0'):
-        '«!b == npos» всегда ложно; без второго двоеточия строка не пройдёт strictInt',
-    ('premium_logic.h', 'long long id = 0;', '0→1@15'):
-        'начальное значение перезаписывается до чтения',
-    ('premium_logic.h', 'long long until = 0;', '0→1@18'):
-        'начальное значение перезаписывается до чтения',
-    ('premium_logic.h', 'if (!introBinding(payload, chat, until) || buyer.empty() || chat != buyer ||', ' || → && @39'):
-        'пустой покупатель и так отклонён; номер чата в нагрузке не бывает пустым',
     ('premium_logic.h', 'long long wc = 0;', '0→1@15'):
         'начальное значение перезаписывается до чтения',
     ('premium_logic.h', 'std::array<uint8_t, 36> b{};', '36→37@20'):
         'размер массива с запасом',
     ('premium_logic.h', 'uint32_t acc = 0;', '0→1@15'):
         'начальная единица уходит за пределы байта (& 0xFF)',
+    ('premium_logic.h', 'size_t n = 0; ⏎ for (const char c : addr) { ⏎ uint32_t v = 0;', '0→1@13'):
+        'начальное значение перезаписывается до чтения',
     ('premium_logic.h', 'long long units = 0;', '0→1@18'):
         'начальное значение перезаписывается до чтения',
+    ('premium_logic.h', "while (i < args.size() && args[i] == ' ') ++i;", ' < → <= @8'):
+        'за концом строки — нулевой знак, не пробел: пропуск остановится там же',
+    ('premium_logic.h', 'if (a == a_end || b == b_end || skip(b_end) != args.size()) return std::nullopt;', ' || → && @14'):
+        'пустые части отклоняет strictInt; «!a» относится только к первому сравнению',
+    ('premium_logic.h', 'if (a == a_end || b == b_end || skip(b_end) != args.size()) return std::nullopt;', 'if (→if (!@0'):
+        'пустые части отклоняет strictInt; «!a» относится только к первому сравнению',
+    ('premium_logic.h', 'long long chat = 0;', '0→1@17'):
+        'начальное значение перезаписывается до чтения',
+    ('premium_logic.h', 'long long days = 0;', '0→1@17'):
+        'начальное значение перезаписывается до чтения',
+    ('premium_logic.h', 'out.reserve(s.size() < max ? s.size() : max);', ' < → <= @20'):
+        'запас памяти, не результат',
+    ('premium_logic.h', "out += c < 0x20U || c == 0x7FU ? ' ' : ch;", ' < → <= @8'):
+        'пробел и так остаётся пробелом',
 }
 
 
@@ -216,7 +240,8 @@ def mutants(path: str, root: str) -> list[tuple[int, str, str, str]]:
     """(номер строки, новая строка, ярлык, исходная строка без пробелов)."""
     out = []
     in_block = False
-    lines = open(os.path.join(root, path), encoding="utf-8").read().split("\n")
+    with open(os.path.join(root, path), encoding="utf-8") as f:
+        lines = f.read().split("\n")
     for n, line in enumerate(lines):
         s = line.strip()
         if in_block:
@@ -236,7 +261,8 @@ def mutants(path: str, root: str) -> list[tuple[int, str, str, str]]:
             key = " ⏎ ".join([x.strip() for x in lines[max(0, n - 2): n]] + [s])
         indent = len(line) - len(line.lstrip())
 
-        def add(a: int, b: int, rep: str, label: str) -> None:
+        def add(a: int, b: int, rep: str, label: str, *, line: str = line, seen: set = seen, n: int = n,
+                indent: int = indent, key: str = key) -> None:
             new = line[:a] + rep + line[b:]
             if new != line and new not in seen:
                 seen.add(new)
@@ -276,12 +302,13 @@ def build(work: str, objs: dict, log: list, test_o: str = "") -> bool:
     for src in (["premium.cpp"] if test_o else ["tests/premium_test.cpp", "premium.cpp"]):
         o = os.path.join(work, os.path.basename(src) + ".o")
         r = subprocess.run([CXX, *FLAGS, "-I", work, "-c", os.path.join(work, src), "-o", o],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, check=False)
         if r.returncode:
             log.append(r.stderr[-500:])
             return False
     r = subprocess.run([CXX, "-pthread", os.path.join(work, "premium_test.cpp.o"), os.path.join(work, "premium.cpp.o"),
-                        *objs.values(), "-lsqlite3", "-o", os.path.join(work, "t")], capture_output=True, text=True)
+                        *objs.values(), "-lsqlite3", "-o", os.path.join(work, "t")], capture_output=True, text=True,
+                       check=False)
     return r.returncode == 0
 
 
@@ -296,19 +323,21 @@ def setup(dst: str, src: str = ROOT) -> None:
 
 
 def run_one(args) -> tuple[str, str]:
-    path, n, new, label, objs, test_o, base = args
+    path, n, new, _label, objs, test_o, base = args
     with tempfile.TemporaryDirectory() as work:
         setup(work, base)
         p = os.path.join(work, path)
-        lines = open(p, encoding="utf-8").read().split("\n")
+        with open(p, encoding="utf-8") as f:
+            lines = f.read().split("\n")
         lines[n] = new
-        open(p, "w", encoding="utf-8").write("\n".join(lines))
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
         log: list = []
         if not build(work, objs, log, test_o if path == "premium.cpp" else ""):
             return "build", ""
         try:
-            r = subprocess.run([os.path.join(work, "t")], capture_output=True, text=True, timeout=120,
-                               env={**os.environ, "TON_WALLET_ADDRESS": ""})
+            r = subprocess.run([os.path.join(work, "t")], capture_output=True, text=True, timeout=120, check=False,
+                               env=TEST_ENV)
         except subprocess.TimeoutExpired:
             return "killed", "timeout"
         return ("killed" if r.returncode else "survived"), ""
@@ -353,8 +382,8 @@ def main() -> int:
             o = os.path.join(base, src + ".o")
             subprocess.run([CXX, *FLAGS, "-c", os.path.join(base, src), "-o", o], check=True)
             objs[src] = o
-        if not build(base, objs, []) or subprocess.run([os.path.join(base, "t")], capture_output=True,
-                                                         env={**os.environ, "TON_WALLET_ADDRESS": ""}).returncode:
+        if not build(base, objs, []) or subprocess.run([os.path.join(base, "t")], capture_output=True, check=False,
+                                                         env=TEST_ENV).returncode:
             print("исходный код не проходит тесты — мутировать нечего", file=sys.stderr)
             return 2
         res = {"killed": 0, "survived": 0, "build": 0}

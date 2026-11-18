@@ -2581,6 +2581,11 @@ bool handleOwnerCommand(const std::string& cid, const std::string& txt) {
     else if (txt == "/partner" || txt.rfind("/partner ", 0) == 0) {
         partnerCommand(cid, trim(txt.substr(8)));
     }
+    else if (txt.rfind("/grant", 0) == 0 && (txt.size() == 6 || txt[6] == ' ')) {
+        // Ручная выдача Премиума — когда деньги пришли, а бот выдать не смог
+        // (о таком он пишет сюда сам, premium.cpp: alertOwner).
+        sendMsg(cid, grantCommand(txt.substr(6)));
+    }
     else if (txt == "/autorenew") {
         // Проверить и отменить автопродления звёздами, если какие-то остались.
         std::thread([cid]{ cancelStarSubscriptions(cid, true); }).detach();

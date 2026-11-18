@@ -1,0 +1,44 @@
+{
+  "jetton_transfers": [
+    {
+      "query_id": "1731900000000",
+      "source": "0:1111111111111111111111111111111111111111111111111111111111111111",
+      "destination": "0:C088D62FCB62942308C47200F56713D5C3E08FC1D93859B050C2956C410E63B0",
+      "amount": "3990000",
+      "source_wallet": "0:2222222222222222222222222222222222222222222222222222222222222222",
+      "jetton_master": "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE",
+      "transaction_hash": "q4D9yAmFdkd+V3rQm1ZbQq4D9yAmFdkd+V3rQm1ZbQo=",
+      "transaction_lt": "61000000000001",
+      "transaction_now": 1795000000,
+      "transaction_aborted": false,
+      "response_destination": "0:1111111111111111111111111111111111111111111111111111111111111111",
+      "custom_payload": null,
+      "decoded_custom_payload": null,
+      "forward_ton_amount": "1",
+      "forward_payload": "te6cckEBAQEAEAAAHAAAAABXVC1BQkNERWaJbmM=",
+      "decoded_forward_payload": {"@type": "text_comment", "comment": "WT-ABCDE", "type": "text_comment"},
+      "trace_id": "Zm9yLXRlc3RzLW9ubHktbm90LWEtcmVhbC10cmFjZT0="
+    },
+    {
+      "query_id": "0",
+      "source": "0:3333333333333333333333333333333333333333333333333333333333333333",
+      "destination": "0:C088D62FCB62942308C47200F56713D5C3E08FC1D93859B050C2956C410E63B0",
+      "amount": "999939",
+      "source_wallet": "0:4444444444444444444444444444444444444444444444444444444444444444",
+      "jetton_master": "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE",
+      "transaction_hash": "c2Vjb25kLXRyYW5zZmVyLW5vLWNvbW1lbnQtdGVzdD0=",
+      "transaction_lt": "53634482000009",
+      "transaction_now": 1738699403,
+      "transaction_aborted": false,
+      "response_destination": "0:3333333333333333333333333333333333333333333333333333333333333333",
+      "custom_payload": null,
+      "decoded_custom_payload": null,
+      "forward_ton_amount": "0",
+      "forward_payload": null,
+      "decoded_forward_payload": null,
+      "trace_id": "dGhpcmQtdHJhY2UtZm9yLXRlc3RzLW9ubHk9PT09PT0="
+    }
+  ],
+  "address_book": {},
+  "metadata": {}
+}

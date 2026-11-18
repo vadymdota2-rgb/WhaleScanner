@@ -1,11 +1,16 @@
 name: tests
 
-# Бот собирается целиком с предупреждениями-ошибками, а проверки без сети
-# (tests/run.sh) идут под ASan и UBSan: выход за массив, переполнение и
-# утечка в коде оплаты роняют проверку, а не сервер.
+# Бот собирается целиком с предупреждениями-ошибками; проверки без сети
+# (tests/run.sh) — под ASan и UBSan; файлы оплаты — ещё clang-tidy,
+# фаззинг, покрытие 100 % и мутации (docs/premium.md, «Качество»).
+#
+# Цепочка поставки: стороннее действие закреплено по хешу коммита (метку
+# v4 можно перевесить на подменённый код, хеш — нет), права — только
+# чтение, токен после checkout на диске не остаётся.
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,10 +20,38 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
       - name: Зависимости
         run: sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
       - name: Проверки без сети (ASan + UBSan)
         run: SANITIZE=1 bash tests/run.sh
       - name: Сборка бота, предупреждения — ошибки
         run: g++ -std=c++20 -O1 -pthread -Wall -Wextra -Werror ./*.cpp -lcurl -lsqlite3 -o whale_bot
+
+  premium-quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Зависимости
+        run: >
+          sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
+          clang clang-tidy libclang-rt-18-dev
+      - name: clang-tidy, фаззинг минуту, покрытие 100 %
+        run: FULL=1 FUZZ_SECONDS=60 bash tests/run.sh
+
+  premium-mutation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Зависимости
+        run: sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
+      - name: Мутационная проверка оплаты (все порчи кода убиты)
+        run: python3 tools/mutate.py
