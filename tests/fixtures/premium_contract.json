@@ -1,0 +1,31 @@
+{
+  "about": "Договор оплаты Премиума между ботом (WhaleScanner: premium_logic.h, premium.cpp) и API (Wallet-Tracker: whale_api.py). Файл одинаковый в обоих репозиториях: tests/fixtures/premium_contract.json. Каждая сторона сверяет с ним свои константы; поменять — в обоих сразу.",
+  "star_plans": [
+    {"plan": "m", "payload": "premium_30_days", "stars": 250, "days": 30},
+    {"plan": "y", "payload": "premium_365_days", "stars": 1990, "days": 365},
+    {"plan": "intro", "payload": "premium_30_intro", "stars": 150, "days": 30}
+  ],
+  "currency": "XTR",
+  "intro_payload": "premium_30_intro:<chat_id>:<until_unix>",
+  "intro_window_sec": 172800,
+  "intro_grace_sec": 900,
+  "usdt": {
+    "kind": "usdt",
+    "plans": [{"plan": "m", "days": 30}, {"plan": "y", "days": 365}],
+    "decimals": 6,
+    "min_units": 1000000,
+    "memo_regex": "^WT-[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{5}$",
+    "master_ui": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+    "master_raw": "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE",
+    "wallet_default": "UQDAiNYvy2KUIwjEcgD1ZxPVw-CPwdk4WbBQwpVsQQ5jsO6o",
+    "wallet_default_raw": "0:C088D62FCB62942308C47200F56713D5C3E08FC1D93859B050C2956C410E63B0",
+    "wallet_env": "TON_WALLET_ADDRESS",
+    "invoice_shown_sec": 3600,
+    "invoice_accepted_sec": 86400
+  },
+  "ton_invoices": {
+    "api_writes": ["memo", "chat_id", "nano_amount", "status", "created_at", "kind", "days"],
+    "bot_writes": ["status", "paid_at", "tx_hash"],
+    "statuses": ["active", "paid", "expired"]
+  }
+}

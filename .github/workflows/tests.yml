@@ -16,19 +16,27 @@ permissions:
   contents: read
 
 jobs:
+  # Два компилятора: на сервере — g++, а clang видит другие ошибки (и
+  # другие предупреждения). Оба — с ASan и UBSan.
   build-and-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           persist-credentials: false
       - name: Зависимости
-        run: sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
-      - name: Проверки без сети (ASan + UBSan)
-        run: SANITIZE=1 bash tests/run.sh
-      - name: Сборка бота, предупреждения — ошибки
-        run: g++ -std=c++20 -O1 -pthread -Wall -Wextra -Werror ./*.cpp -lcurl -lsqlite3 -o whale_bot
+        run: >
+          sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
+          clang libclang-rt-18-dev
+      - name: Проверки без сети (ASan + UBSan, ${{ matrix.cxx }})
+        run: CXX=${{ matrix.cxx }} SANITIZE=1 bash tests/run.sh
+      - name: Сборка бота, предупреждения — ошибки (${{ matrix.cxx }})
+        run: ${{ matrix.cxx }} -std=c++20 -O1 -pthread -Wall -Wextra -Werror ./*.cpp -lcurl -lsqlite3 -o whale_bot
 
   premium-quality:
     runs-on: ubuntu-24.04
@@ -40,8 +48,8 @@ jobs:
       - name: Зависимости
         run: >
           sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
-          clang clang-tidy libclang-rt-18-dev
-      - name: clang-tidy, фаззинг минуту, покрытие 100 %
+          clang clang-tidy libclang-rt-18-dev llvm
+      - name: clang-tidy, фаззинг минуту, покрытие 100 % (строки, ветвления, функции, области)
         run: FULL=1 FUZZ_SECONDS=60 bash tests/run.sh
 
   premium-mutation:

@@ -29,20 +29,28 @@ TARGETS = ["premium_logic.h", "premium.cpp"]
 STATIC = ["utils.cpp", "ru.cpp", "translations.cpp"]
 CXX = os.environ.get("CXX", "g++")
 # Окружение проверки: кошелёк по умолчанию, образцы ответов — из репозитория.
-TEST_ENV = {**os.environ, "TON_WALLET_ADDRESS": "", "FIXTURES": os.path.join(ROOT, "tests", "fixtures")}
+TEST_ENV = {**os.environ, "TON_WALLET_ADDRESS": "", "FIXTURES": os.path.join(ROOT, "tests", "fixtures"), "PREMIUM_QUICK": "1"}
 FLAGS = ["-std=c++20", "-O0", "-pthread", "-w"]
 
 # Строка (без пробелов по краям) и замена, которые ничего не меняют в
 # поведении, — с причиной. Сверяются по файлу, тексту строки и замене.
 EQUIV: dict = {
+    ('premium_logic.h', 'const long long era = (days >= 0 ? days : days - 146096) / 146097;', ' >= → > @27'):
+        'при days = 0 обе ветки дают эру 0 (деление округляет к нулю)',
+    ('premium_logic.h', 'const long long era = (days >= 0 ? days : days - 146096) / 146097;', '0→1@31'):
+        'при days = 0 обе ветки дают эру 0 (деление округляет к нулю)',
+    ('premium.cpp', '[[nodiscard]] bool commit() { ⏎ if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK) { ⏎ open_ = false;', 'false→true@8'):
+        'после удачного COMMIT лишний ROLLBACK в деструкторе ничего не делает',
+    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return std::nullopt;', ' <= → < @26'):
+        'второй рубеж: extendTerm отклоняет те же дни',
+    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return std::nullopt;', ' || → && @31'):
+        'второй рубеж: extendTerm отклоняет те же дни',
+    ('premium.cpp', 'wasActive = term && term->wasActive;', ' && → || @16'):
+        'Activated и Extended различаются только словом в журнале',
     ('premium.cpp', 'static long long lastPoll = 0;', '0→1@28'):
         'время прошлого опроса — любое давнее: первый проход всё равно спросит',
     ('premium.cpp', 'if (!open_) std::cerr << "[PREMIUM] " << what_ << ": BEGIN failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
-    ('premium.cpp', 'if (!open_) return false;', 'return false;→return true;@12'):
-        'commit() зовётся только после проверки ok()',
-    ('premium.cpp', 'if (!open_) return false; ⏎ if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK) { ⏎ open_ = false;', 'false→true@8'):
-        'после удачного COMMIT лишний ROLLBACK в деструкторе ничего не делает',
     ('premium.cpp', ' ⏎ struct PremiumRow { ⏎ int flag = 0;', '0→1@11'):
         'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'long long start = 0;', '0→1@18'):
@@ -51,8 +59,6 @@ EQUIV: dict = {
         'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'return PremiumRow{s.int64(0) != 0 ? 1 : 0, s.int64(1), s.int64(2)};', '1→2@36'):
         'флаг сравнивается с нулём — 1 и 2 одинаковы',
-    ('premium.cpp', 'return s.run() && sqlite3_changes(db) == 1;', ' && → || @14'):
-        'строка человека прочитана выше — удачный UPDATE меняет ровно её',
     ('premium.cpp', 'if (e.find("duplicate column") != std::string::npos) return true;', 'if (→if (!@0'):
         '«!e.find(…)» истинно ровно когда сообщение начинается с «duplicate column» — так у SQLite и есть',
     ('premium.cpp', 'sub_until INTEGER NOT NULL DEFAULT 0', '0→1@35'):
@@ -77,24 +83,8 @@ EQUIV: dict = {
         'лишний «?» остаётся NULL и ни с чем не совпадает',
     ('premium.cpp', 'for (size_t i = 0; i < n; i++) s.bind(static_cast<int>(i + 2), chatIds[from + i]);', ' < → <= @20'):
         'лишний параметр SQLite отклоняет (SQLITE_RANGE); чтение за концом списка ловит ASan в tests/run.sh',
-    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' <= → < @26'):
-        'второй рубеж: extendTerm отклоняет те же дни',
-    ('premium.cpp', 'if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;', ' || → && @31'):
-        'второй рубеж: extendTerm отклоняет те же дни',
-    ('premium.cpp', 'ensureUser(chatId); ⏎ const long long now = nowSec(); ⏎ bool ok = false;', 'false→true@10'):
-        'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'bool wasActive = false;', 'false→true@17'):
         'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'long long until = 0;', '0→1@18'):
-        'начальное значение перезаписывается до чтения',
-    ('premium.cpp', 'std::array<char, 32> when{};', '32→33@17'):
-        'размер буфера с запасом',
-    ('premium.cpp', 'if (std::strftime(when.data(), when.size(), "%Y-%m-%d %H:%M UTC", &u) == 0) when[0] = \'\\0\';', '0→1@73'):
-        'strftime в буфер с запасом не ошибается',
-    ('premium.cpp', 'std::array<char, 16> day{};', '16→17@17'):
-        'размер буфера с запасом',
-    ('premium.cpp', 'if (std::strftime(day.data(), day.size(), "%Y-%m-%d", &g) == 0) return;', '0→1@61'):
-        'strftime в буфер с запасом не ошибается',
     ('premium.cpp', 'if (!s.run()) std::cerr << "[PREMIUM] funnel: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
     ('premium.cpp', 'long long need = 0;', '0→1@17'):

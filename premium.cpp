@@ -17,7 +17,6 @@
 
 #include <sqlite3.h>
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <cstdint>
 #include <chrono>
@@ -132,8 +131,8 @@ public:
     Tx& operator=(Tx&&) = delete;
 
     [[nodiscard]] bool ok() const { return open_; }
+    // Звать только после ok(): без открытой транзакции COMMIT и так ошибка.
     [[nodiscard]] bool commit() {
-        if (!open_) return false;
         if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK) {
             open_ = false;
             return true;
@@ -164,29 +163,29 @@ std::optional<PremiumRow> readPremiumRowLocked(const std::string& chatId) {
 }
 
 // Продлить срок на days дней. Звать внутри Tx. Нет строки человека или срок
-// не продлить (premium::extendTerm) — false, ничего не записано.
-bool extendPremiumLocked(const std::string& chatId, long long now, int days, bool& wasActive) {
+// не продлить (premium::extendTerm) — nullopt, ничего не записано.
+std::optional<premium::Term> extendPremiumLocked(const std::string& chatId, long long now, int days) {
     const auto row = readPremiumRowLocked(chatId);
-    if (!row) return false;
+    if (!row) return std::nullopt;
     const auto term = premium::extendTerm(row->flag, row->start, row->expire, now, days);
     if (!term) {
         std::cerr << "[PREMIUM] extend: срок не продлить (chat " << logSafe(chatId) << ", expire=" << row->expire
                   << ", days=" << days << ")" << std::endl;
-        return false;
+        return std::nullopt;
     }
-    wasActive = term->wasActive;
     Stmt s("UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?");
     s.bind(1, term->start).bind(2, term->expire).bind(3, chatId);
-    return s.run() && sqlite3_changes(db) == 1;
+    // Строка человека прочитана выше в той же транзакции — удачный UPDATE
+    // меняет ровно её.
+    if (!s.run()) return std::nullopt;
+    return term;
 }
 
 // ALTER TABLE … ADD COLUMN: «столбец уже есть» — обычное дело на старой
 // базе; любая другая ошибка — оплата выключается.
 bool addColumnLocked(const char* sql) {
-    char* err = nullptr;
-    const bool ok = sqlite3_exec(db, sql, nullptr, nullptr, &err) == SQLITE_OK;
-    const std::string e = err != nullptr ? err : "";
-    sqlite3_free(err);
+    const bool ok = sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK;
+    const std::string e = sqlite3_errmsg(db);
     if (ok) {
         std::cout << "[PREMIUM] migration: " << sql << std::endl;
         return true;
@@ -226,9 +225,11 @@ bool initPremium(const std::string& serviceChatId, const std::string& ownerChatI
 
     // Таблицу users заводит бот (initDB) — здесь только столбцы Премиума.
     // Без неё оплату включать нельзя: выдать подписку было бы некуда.
-    bool ok = addColumnLocked("ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0") &&
-              addColumnLocked("ALTER TABLE users ADD COLUMN premium_start INTEGER DEFAULT 0") &&
-              addColumnLocked("ALTER TABLE users ADD COLUMN premium_expire INTEGER DEFAULT 0");
+    bool ok = true;
+    for (const char* sql : {"ALTER TABLE users ADD COLUMN is_premium INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE users ADD COLUMN premium_start INTEGER DEFAULT 0",
+                            "ALTER TABLE users ADD COLUMN premium_expire INTEGER DEFAULT 0"})
+        ok = ok && addColumnLocked(sql);
 
     // Платежи звёздами и счета USD₮. Счёт в USD₮ кладёт API (whale_api.py,
     // pay_usdt) с kind='usdt' и сроком days; kind='ton' — старые счета на
@@ -262,20 +263,17 @@ bool initPremium(const std::string& serviceChatId, const std::string& ownerChatI
         CREATE INDEX IF NOT EXISTS idx_ton_active ON ton_invoices(status, created_at);
         CREATE INDEX IF NOT EXISTS idx_ton_chat ON ton_invoices(chat_id);
     )";
-    if (ok) {
-        char* err = nullptr;
-        if (sqlite3_exec(db, tablesSql, nullptr, nullptr, &err) != SQLITE_OK) {
-            std::cerr << "[PREMIUM][FATAL] payment tables failed: " << logSafe(err != nullptr ? err : "") << std::endl;
-            ok = false;
-        }
-        sqlite3_free(err);
+    if (ok && sqlite3_exec(db, tablesSql, nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM][FATAL] payment tables failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;
+        ok = false;
     }
     // Столбцы, которых не было у таблиц из старых версий: подписка Telegram
     // (до какого времени оплачен период — по нему cancelStarSubscriptions
     // находит, что отменять), вид счёта и его срок (старые счета — месяц).
-    ok = ok && addColumnLocked("ALTER TABLE premium_payments ADD COLUMN sub_until INTEGER NOT NULL DEFAULT 0") &&
-         addColumnLocked("ALTER TABLE ton_invoices ADD COLUMN kind TEXT NOT NULL DEFAULT 'ton'") &&
-         addColumnLocked("ALTER TABLE ton_invoices ADD COLUMN days INTEGER NOT NULL DEFAULT 30");
+    for (const char* sql : {"ALTER TABLE premium_payments ADD COLUMN sub_until INTEGER NOT NULL DEFAULT 0",
+                            "ALTER TABLE ton_invoices ADD COLUMN kind TEXT NOT NULL DEFAULT 'ton'",
+                            "ALTER TABLE ton_invoices ADD COLUMN days INTEGER NOT NULL DEFAULT 30"})
+        ok = ok && addColumnLocked(sql);
 
     // Сервисному аккаунту Премиума не бывает: старую отметку в базе снимаем,
     // чтобы он не считался подписчиком ни в /stats, ни в API.
@@ -368,25 +366,33 @@ void cleanupExpiredPremium() {
 
 // ── выдача дней ──────────────────────────────────────────────────────────────
 
-bool grantPremiumDays(const std::string& chatId, int days) {
-    if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;
-    if (isService(chatId) || !g_schemaOk) return false;
+namespace {
+
+// Прибавить дни; новый конец срока или nullopt — не выдано.
+std::optional<long long> grantDays(const std::string& chatId, int days) {
+    if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return std::nullopt;
+    if (isService(chatId) || !g_schemaOk) return std::nullopt;
 
     ensureUser(chatId);
     const long long now = nowSec();
-    bool ok = false;
+    std::optional<premium::Term> term;
     {
         // Чтение срока и запись нового — одной транзакцией. Без неё API, в ту
         // же секунду прибавивший дни за бонус или приглашение (extend_premium),
         // мог оказаться между чтением и записью — и одно из продлений затиралось.
         const std::lock_guard<std::mutex> l(dbMutex);
         Tx tx("grant");
-        bool wasActive = false;
-        ok = tx.ok() && extendPremiumLocked(chatId, now, days, wasActive) && tx.commit();
+        if (tx.ok()) term = extendPremiumLocked(chatId, now, days);
+        if (term && !tx.commit()) term.reset();
     }
-    if (ok) refreshWatchers();
-    return ok;
+    if (!term) return std::nullopt;
+    refreshWatchers();
+    return term->expire;
 }
+
+}  // namespace
+
+bool grantPremiumDays(const std::string& chatId, int days) { return grantDays(chatId, days).has_value(); }
 
 namespace {
 
@@ -395,14 +401,9 @@ void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
     // track): событие раз в сутки на человека, вид и источник. Оплату видит
     // только бот — пишем её здесь.
     const long long t = nowSec();
-    const auto tt = static_cast<time_t>(t);
-    struct tm g {};
-    gmtime_r(&tt, &g);
-    std::array<char, 16> day{};
-    if (std::strftime(day.data(), day.size(), "%Y-%m-%d", &g) == 0) return;
     const std::lock_guard<std::mutex> l(dbMutex);
     Stmt s("INSERT OR IGNORE INTO funnel_events(chat_id, ev, src, day, at) VALUES(?,?,?,?,?)");
-    s.bind(1, chatId).bind(2, std::string(ev)).bind(3, std::string(src)).bind(4, std::string(day.data())).bind(5, t);
+    s.bind(1, chatId).bind(2, std::string(ev)).bind(3, std::string(src)).bind(4, premium::utcDate(t)).bind(5, t);
     if (!s.run()) std::cerr << "[PREMIUM] funnel: " << logSafe(sqlite3_errmsg(db)) << std::endl;
 }
 
@@ -411,20 +412,12 @@ void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
 std::string grantCommand(const std::string& args) {
     const auto g = premium::parseGrant(args);
     if (!g) return "Использование: /grant &lt;chat_id&gt; &lt;дней 1–3650&gt;";
-    if (!grantPremiumDays(g->chat, g->days))
+    const auto until = grantDays(g->chat, g->days);
+    if (!until)
         return "⚠️ Не выдано: " + g->chat + " — служебный аккаунт, оплата выключена или сбой базы (журнал [PREMIUM]).";
     std::cout << "[PREMIUM] выдано вручную: chat=" << g->chat << " +" << g->days << "d" << std::endl;
-    long long until = 0;
-    {
-        const std::lock_guard<std::mutex> l(dbMutex);
-        if (const auto row = readPremiumRowLocked(g->chat)) until = row->expire;
-    }
-    const auto tt = static_cast<time_t>(until);
-    struct tm u {};
-    gmtime_r(&tt, &u);
-    std::array<char, 32> when{};
-    if (std::strftime(when.data(), when.size(), "%Y-%m-%d %H:%M UTC", &u) == 0) when[0] = '\0';
-    return "✅ Премиум +" + std::to_string(g->days) + " дн.: <code>" + g->chat + "</code>, до " + when.data();
+    return "✅ Премиум +" + std::to_string(g->days) + " дн.: <code>" + g->chat + "</code>, до " +
+           premium::utcDateTime(*until);
 }
 
 
@@ -557,10 +550,9 @@ void pollUsdtPayments() {
                 "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
                 "WHERE memo=? AND status='active' AND kind='usdt'");
             claim.bind(1, now).bind(2, pay->hash).bind(3, memo);
-            bool wasActive = false;
             if (tx.ok() && !reused && claim.run()) {
                 taken = sqlite3_changes(db) != 1;
-                granted = !taken && extendPremiumLocked(inv->chatId, now, inv->days, wasActive) && tx.commit();
+                granted = !taken && extendPremiumLocked(inv->chatId, now, inv->days) && tx.commit();
             }
         }
         if (taken) continue;
@@ -664,7 +656,9 @@ ApplyResult applySuccessfulPayment(const std::string& chatId, const json& sp) {
             if (rc != SQLITE_DONE && !duplicate)
                 std::cerr << "[PREMIUM] apply: payment INSERT failed (" << rc << "): " << logSafe(sqlite3_errmsg(db))
                           << std::endl;
-            ok = rc == SQLITE_DONE && extendPremiumLocked(chatId, paidAt, plan->days, wasActive) && tx.commit();
+            const auto term = rc == SQLITE_DONE ? extendPremiumLocked(chatId, paidAt, plan->days) : std::nullopt;
+            wasActive = term && term->wasActive;
+            ok = term && tx.commit();
         }
     }
     if (duplicate) {

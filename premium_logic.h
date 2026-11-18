@@ -320,6 +320,46 @@ struct GrantArgs {
     return GrantArgs{std::to_string(chat), static_cast<int>(days)};
 }
 
+/* Дата и время UTC из секунд Unix — без gmtime и strftime, без буферов и
+   их ошибок: «дни → год, месяц, день» по алгоритму civil_from_days (Говард
+   Хиннант, описан как общедоступный), записанному здесь заново. Годится и
+   для отрицательного времени, и для сроков в далёком будущем. */
+struct UtcTime {
+    long long year;
+    long long month;
+    long long day;
+    long long hour;
+    long long minute;
+};
+[[nodiscard]] inline UtcTime utcTime(long long t) {
+    long long days = t / DAY_SEC;
+    long long rem = t % DAY_SEC;
+    if (rem < 0) {
+        rem += DAY_SEC;
+        --days;
+    }
+    days += 719468;  // от 0000-03-01 до 1970-01-01
+    const long long era = (days >= 0 ? days : days - 146096) / 146097;
+    const long long doe = days - era * 146097;
+    const long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    const long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    const long long mp = (5 * doy + 2) / 153;
+    const long long month = mp < 10 ? mp + 3 : mp - 9;
+    return UtcTime{yoe + era * 400 + (month <= 2 ? 1 : 0), month, doy - (153 * mp + 2) / 5 + 1, rem / 3600,
+                   rem % 3600 / 60};
+}
+[[nodiscard]] inline std::string pad2(long long v) { return (v < 10 ? "0" : "") + std::to_string(v); }
+// «2027-01-15» — день события воронки (так же его пишет API).
+[[nodiscard]] inline std::string utcDate(long long t) {
+    const UtcTime u = utcTime(t);
+    return std::to_string(u.year) + "-" + pad2(u.month) + "-" + pad2(u.day);
+}
+// «2027-02-14 08:00 UTC» — срок в ответе владельцу.
+[[nodiscard]] inline std::string utcDateTime(long long t) {
+    const UtcTime u = utcTime(t);
+    return utcDate(t) + " " + pad2(u.hour) + ":" + pad2(u.minute) + " UTC";
+}
+
 /* Строка из чужих рук (ответ Telegram или обозревателя, ошибка SQLite) —
    в журнал одной строкой: управляющие знаки (перевод строки, ESC-коды
    терминала) — пробелом, не длиннее max байт, обрезка — по границе знака

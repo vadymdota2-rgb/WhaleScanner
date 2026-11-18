@@ -114,9 +114,13 @@ class PolicyTest(unittest.TestCase):
                             f"в SQL склеивается не литерал: {m.group(0)!r}")
         for m in re.finditer(r"\bsqlite3_exec\s*\(\s*db\s*,\s*([^,]+),", code):
             self.assertIn(m.group(1).strip(), {'""', "sql", "tablesSql"}, f"sqlite3_exec не из литерала: {m.group(1)!r}")
-        # sql в addColumnLocked — только литералы при вызове.
+        # sql в addColumnLocked — только из списка литералов в цикле.
         for m in re.finditer(r"\baddColumnLocked\s*\(\s*([^)]*)\)", code):
-            self.assertIn(m.group(1).strip(), {'""', "const char* sql"}, f"addColumnLocked не из литерала: {m.group(1)!r}")
+            self.assertIn(m.group(1).strip(), {"sql", "const char* sql"}, f"addColumnLocked не из литерала: {m.group(1)!r}")
+        loops = re.findall(r"for\s*\(\s*const char\*\s+sql\s*:\s*\{([^}]*)\}\s*\)\s*ok\s*=\s*ok\s*&&\s*addColumnLocked\(sql\)", code)
+        self.assertEqual(len(loops), 2, "миграции — два цикла по спискам литералов")
+        for body in loops:
+            self.assertRegex(body, r'^\s*""(\s*,\s*"")*\s*$', "в списке миграций — не только литералы")
 
     def test_network_goes_only_to_known_hosts(self):
         """В сеть — только httpsCapped (safe_http): к toncenter (адрес —
@@ -139,7 +143,7 @@ class PolicyTest(unittest.TestCase):
         """Где меняется срок или счёт — там Tx: продление без транзакции
         оставило бы «оплачен, а подписки нет»."""
         code = strip(read(CPP))
-        for fn in ("grantPremiumDays", "cleanupExpiredPremium", "pollUsdtPayments", "applySuccessfulPayment"):
+        for fn in ("grantDays", "cleanupExpiredPremium", "pollUsdtPayments", "applySuccessfulPayment"):
             m = re.search(r"\b" + fn + r"\s*\([^)]*\)\s*\{", code)
             self.assertIsNotNone(m, fn)
             body, depth, i = [], 1, m.end()
@@ -213,6 +217,29 @@ class LicenseTest(unittest.TestCase):
         self.assertIn("SPDX-License-Identifier: MIT", head)
 
 
+class ContractTest(unittest.TestCase):
+    """Договор с API (tests/fixtures/premium_contract.json; тот же файл — в
+    Wallet-Tracker). Константы правил сверяет tests/premium_test.cpp; здесь —
+    то, что живёт в тексте premium.cpp, и одинаковость двух копий."""
+
+    def setUp(self):
+        import json
+        self.c = json.loads(read(os.path.join(ROOT, "tests", "fixtures", "premium_contract.json")))
+
+    def test_wallet_default_and_env(self):
+        src = read(CPP)
+        u = self.c["usdt"]
+        self.assertIn(f'std::getenv("{u["wallet_env"]}")', src)
+        self.assertIn(f'return "{u["wallet_default"]}";', src)
+
+    def test_same_file_as_the_api_when_both_are_here(self):
+        api = os.path.join(os.path.dirname(ROOT), "Wallet-Tracker", "tests", "fixtures", "premium_contract.json")
+        if not os.path.exists(api):
+            self.skipTest("репозитория API рядом нет")
+        with open(api, "rb") as a, open(os.path.join(ROOT, "tests", "fixtures", "premium_contract.json"), "rb") as b:
+            self.assertEqual(a.read(), b.read(), "договор у бота и у API разный")
+
+
 class PolicyCatchesTest(unittest.TestCase):
     """Сами правила тоже проверены: в копию кода подкладываем по одному
     нарушению — каждое должно быть поймано. Иначе правило, ослабленное
@@ -227,6 +254,8 @@ class PolicyCatchesTest(unittest.TestCase):
         ('const json j = json::parse(httpsCapped(', 'const json j = json::parse(http(url) + httpsCapped('),
         ("logSafe(payload)", "payload"),
         ('Tx tx("grant");', ";"),
+        ('"ALTER TABLE ton_invoices ADD COLUMN kind TEXT NOT NULL DEFAULT \'ton\'",',
+         '(std::string("ALTER TABLE ") + g_serviceChatId).c_str(),'),
         ("#include <vector>", "#include <vector>\n#include <fstream>"),
         ('std::getenv("TON_WALLET_ADDRESS")', 'std::getenv("HOME")'),
         ("const json j = json::parse(", "try { } catch (...) { }\n    const json j = json::parse("),

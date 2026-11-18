@@ -35,6 +35,19 @@ run markup_test
 
 g++ "${STRICT[@]}" -I. -fsyntax-only premium.cpp
 g++ "${STRICT[@]}" -I. -fsyntax-only safe_http.cpp
+# И clang со всеми предупреждениями сразу (-Weverything), кроме тех, что про
+# совместимость с C++98, выравнивание и макросы curl. json.hpp — системным
+# заголовком: его предупреждения — не наши. Для этого файлы модуля — в
+# отдельный каталог, где json.hpp нет, а сам он — через -isystem.
+if command -v clang++ >/dev/null; then
+    mkdir -p "$out/every"
+    cp premium.cpp premium.h premium_logic.h safe_http.cpp safe_http.h utils.h telegram.h ru.h lifecycle.h "$out/every/"
+    for f in premium.cpp safe_http.cpp; do
+        clang++ -std=c++20 -Weverything -Werror -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded \
+            -Wno-unsafe-buffer-usage -Wno-exit-time-destructors -Wno-global-constructors -Wno-disabled-macro-expansion \
+            -isystem . -I"$out/every" -fsyntax-only "$out/every/$f"
+    done
+fi
 echo "premium: строгая сборка — без замечаний"
 "$CXX" "${FLAGS[@]}" tests/premium_test.cpp premium.cpp utils.cpp ru.cpp translations.cpp -lsqlite3 -o "$out/premium_test"
 run premium_test
