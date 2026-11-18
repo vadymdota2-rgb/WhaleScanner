@@ -10,6 +10,11 @@
  * whale_api.py (createInvoiceLink), счёт в USD₮ он же кладёт в ton_invoices.
  * Бот подтверждает оплату звёздами, видит приход USD₮ и продлевает срок —
  * выдача подписки живёт здесь, в одном месте.
+ *
+ * Правила (тарифы, вводная цена, срок, приём перевода USD₮) — чистыми
+ * функциями в premium_logic.h. Проверки: tests/premium_test.cpp (примеры,
+ * фаззинг ответов обозревателя, база SQLite в памяти), мутации —
+ * tools/mutate.py.
  */
 
 bool initPremium(const std::string& serviceChatId = "");

@@ -1,0 +1,24 @@
+name: tests
+
+# Бот собирается целиком с предупреждениями-ошибками, а проверки без сети
+# (tests/run.sh) идут под ASan и UBSan: выход за массив, переполнение и
+# утечка в коде оплаты роняют проверку, а не сервер.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Зависимости
+        run: sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
+      - name: Проверки без сети (ASan + UBSan)
+        run: SANITIZE=1 bash tests/run.sh
+      - name: Сборка бота, предупреждения — ошибки
+        run: g++ -std=c++20 -O1 -pthread -Wall -Wextra -Werror ./*.cpp -lcurl -lsqlite3 -o whale_bot

@@ -1,4 +1,5 @@
 #include "premium.h"
+#include "premium_logic.h"
 #include "telegram.h"
 #include "lifecycle.h"
 #include <climits>
@@ -16,7 +17,6 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
-#include "rpc_client.h"
 #include "utils.h"
 #include "ru.h"
 
@@ -29,62 +29,9 @@ std::string http(const std::string& url, const std::string& post, int timeout);
 
 namespace {
 
-/* Тарифы в звёздах. Счёт выставляет API (whale_api.py, STAR_PLANS) — там те
-   же полезная нагрузка, цена и срок; здесь их сверяют перед выдачей.
-
-   Все тарифы — разовые: автопродления (подписки Telegram) нет, продлевать
-   или нет решает человек. Подписки, оформленные раньше, бот отменяет сам
-   (cancelStarSubscriptions); списание, успевшее прийти, засчитывается как
-   обычная оплата. Год — разовая оплата со скидкой. Вводная цена месяца —
-   предложение тем, у кого только что кончилась пробная неделя; кому его
-   показывать, решает API, бот лишь узнаёт нагрузку. */
-struct StarPlan { const char* payload; long long stars; int days; };
-constexpr StarPlan STAR_PLANS[] = {
-    {"premium_30_days", 250, 30},
-    {"premium_365_days", 1990, 365},
-    {"premium_30_intro", 150, 30},
-};
-// «{n}» в тексте — число дней тарифа: месяц и год пишутся одной строкой.
-std::string withDays(std::string text, int days) {
-    const size_t at = text.find("{n}");
-    if (at != std::string::npos) text.replace(at, 3, std::to_string(days));
-    return text;
-}
-
-// Нагрузка бывает с хвостом после «:» — у вводной цены там покупатель и
-// срок (introBinding). Тариф определяет начало.
-const StarPlan* starPlan(const std::string& payload) {
-    const std::string base = payload.substr(0, payload.find(':'));
-    for (const auto& p : STAR_PLANS)
-        if (base == p.payload) return &p;
-    return nullptr;
-}
-
-/* Вводная цена привязана к человеку и к сроку: «premium_30_intro:<chat>:<до>».
-   Ссылку на счёт можно сохранить или переслать, а Telegram её не гасит —
-   без привязки по ней платили бы 150 звёзд вместо 250 кто угодно и сколько
-   угодно раз. Скидка — только тому, кому её выдал API, и только в её окно
-   (плюс INTRO_GRACE_SEC: счёт могли открыть за минуту до конца). */
-constexpr long long INTRO_GRACE_SEC = 900;
-bool introBinding(const std::string& payload, std::string& chat, long long& until) {
-    const size_t a = payload.find(':');
-    if (a == std::string::npos) return false;
-    const size_t b = payload.find(':', a + 1);
-    if (b == std::string::npos) return false;
-    chat = payload.substr(a + 1, b - a - 1);
-    try { until = std::stoll(payload.substr(b + 1)); } catch (...) { return false; }
-    return !chat.empty() && until > 0;
-}
-
-// Переводы жетонов отдаёт только третья версия обозревателя: во второй
-// пришлось бы разбирать тело сообщения вручную.
-const char* const TON_API_V3 = "https://toncenter.com/api/v3/";
-// USD₮ в сети TON: адрес мастер-контракта в сыром виде и шесть знаков после
-// запятой. Без сверки с ним подписку можно было бы купить за любой жетон,
-// нарисованный кем угодно.
-const char* const USDT_MASTER =
-    "0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE";
-constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниже счёт не бывает
+using premium::STAR_PLANS;
+using premium::starPlan;
+using premium::withDays;
 
 constexpr size_t FREE_MAX_WALLETS    = 3;
 constexpr size_t PREMIUM_MAX_WALLETS = 50;
@@ -155,7 +102,8 @@ bool initPremium(const std::string& serviceChatId) {
             payload TEXT NOT NULL,
             amount INTEGER NOT NULL,
             currency TEXT NOT NULL,
-            paid_at INTEGER NOT NULL
+            paid_at INTEGER NOT NULL,
+            sub_until INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_premium_chat ON premium_payments(chat_id);
         CREATE INDEX IF NOT EXISTS idx_premium_paid ON premium_payments(paid_at);
@@ -226,20 +174,25 @@ std::set<std::string> premiumSubsetOf(const std::vector<std::string>& chatIds) {
     if (chatIds.empty() || !g_premiumSchemaOk) return out;
 
     const long long now = static_cast<long long>(time(nullptr));
-
-    std::string sql =
-        "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire>? AND chat_id IN (";
-    for (size_t i = 0; i < chatIds.size(); i++) sql += (i ? ",?" : "?");
-    sql += ")";
+    // Кусками: у SQLite предел числа параметров в запросе (в старых сборках —
+    // 999), и алерт большому кругу людей иначе ушёл бы всем как бесплатным.
+    constexpr size_t CHUNK = 500;
 
     std::lock_guard<std::mutex> l(dbMutex);
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s, sql.c_str())) return out;
-    sqlite3_bind_int64(s, 1, now);
-    for (size_t i = 0; i < chatIds.size(); i++)
-        sqlite3_bind_text(s, static_cast<int>(i + 2), chatIds[i].c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) out.insert(safeColumnText(s, 0));
-    sqlite3_finalize(s);
+    for (size_t from = 0; from < chatIds.size(); from += CHUNK) {
+        const size_t n = std::min(CHUNK, chatIds.size() - from);
+        std::string sql =
+            "SELECT chat_id FROM users WHERE is_premium=1 AND premium_expire>? AND chat_id IN (";
+        for (size_t i = 0; i < n; i++) sql += (i ? ",?" : "?");
+        sql += ")";
+        sqlite3_stmt* s;
+        if (!prepareOrLog(db, &s, sql.c_str())) return {};
+        sqlite3_bind_int64(s, 1, now);
+        for (size_t i = 0; i < n; i++)
+            sqlite3_bind_text(s, static_cast<int>(i + 2), chatIds[from + i].c_str(), -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(s) == SQLITE_ROW) out.insert(safeColumnText(s, 0));
+        sqlite3_finalize(s);
+    }
     // Сервисный аккаунт — не подписчик, даже если в базе осталась отметка.
     if (!g_serviceChatId.empty()) out.erase(g_serviceChatId);
     return out;
@@ -308,39 +261,62 @@ namespace {
 bool extendPremiumLocked(const std::string& chatId, long long now, int days, bool& wasAlreadyActive) {
     int flag = 0; long long start = 0, expire = 0;
     if (!readPremiumRowLocked(chatId, flag, start, expire)) return false;
-
-    wasAlreadyActive = (flag != 0 && expire > now);
-    long long newExpire = (wasAlreadyActive ? expire : now) + static_cast<long long>(days) * 86400LL;
-    long long newStart = wasAlreadyActive ? (start > 0 ? start : now) : now;
+    const auto term = premium::extendTerm(flag, start, expire, now, days);
+    if (!term) {
+        std::cerr << "[PREMIUM] extend: срок не помещается (chat " << chatId
+                  << ", expire=" << expire << ", days=" << days << ")" << std::endl;
+        return false;
+    }
+    wasAlreadyActive = term->wasActive;
 
     sqlite3_stmt* s;
     if (!prepareOrLog(db, &s,
         "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?"))
         return false;
-    sqlite3_bind_int64(s, 1, newStart);
-    sqlite3_bind_int64(s, 2, newExpire);
+    sqlite3_bind_int64(s, 1, term->start);
+    sqlite3_bind_int64(s, 2, term->expire);
     sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(s);
     sqlite3_finalize(s);
-    return rc == SQLITE_DONE;
+    return rc == SQLITE_DONE && sqlite3_changes(db) == 1;
+}
+
+// Тело — внутри BEGIN IMMEDIATE … COMMIT; false из тела или сбой COMMIT —
+// ROLLBACK, и в базе не остаётся ничего. Вызывать под dbMutex.
+template <class Body>
+bool inTransactionLocked(const char* what, Body&& body) {
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM] " << what << ": BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    if (!body()) {
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::cerr << "[PREMIUM] " << what << ": COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
 }
 
 }
 
 namespace {
 
+// Переводы жетонов отдаёт только третья версия обозревателя: во второй
+// пришлось бы разбирать тело сообщения вручную.
+const char* const TON_API_V3 = "https://toncenter.com/api/v3/";
+
+// Кошелёк приёма — тот же, что показывает API (whale_api.py, TON_WALLET):
+// одна переменная окружения и одно значение по умолчанию у обоих.
 std::string tonWallet() {
     const char* a = std::getenv("TON_WALLET_ADDRESS");
     if (a && *a) return a;
     return "UQDAiNYvy2KUIwjEcgD1ZxPVw-CPwdk4WbBQwpVsQQ5jsO6o";
 }
 
-std::string jstrField(const json& j, const char* key, const char* def = "") {
-    if (!j.is_object()) return def;
-    auto it = j.find(key);
-    if (it == j.end() || !it->is_string()) return def;
-    return it->get<std::string>();
-}
 
 }
 
@@ -350,7 +326,13 @@ void pollUsdtPayments() {
     // одним UPDATE и только потом выдать подписку.
     if (!g_premiumSchemaOk) return;
     const std::string wallet = tonWallet();
-    if (wallet.empty()) return;
+    const std::string walletRaw = premium::tonRawAddress(wallet);
+    if (walletRaw.empty()) {
+        static bool said = false;
+        if (!said) std::cerr << "[USDT] адрес кошелька приёма не разобран — оплату USD₮ не проверяю" << std::endl;
+        said = true;
+        return;
+    }
 
     const long long now = static_cast<long long>(time(nullptr));
 
@@ -385,30 +367,14 @@ void pollUsdtPayments() {
     if (!j.is_object() || !j.contains("jetton_transfers") || !j["jetton_transfers"].is_array())
         return;
 
-    for (const auto& jt : j["jetton_transfers"]) {
-        if (!jt.is_object()) continue;
-        if (jt.value("transaction_aborted", false)) continue;
-
-        std::string master = jstrField(jt, "jetton_master");
-        for (char& c : master) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        if (master != USDT_MASTER) continue;
-
-        std::string memo;
-        if (jt.contains("decoded_forward_payload") && jt["decoded_forward_payload"].is_object())
-            memo = jstrField(jt["decoded_forward_payload"], "comment");
-        if (memo.empty()) continue;
-
-        std::string clean;
-        for (char c : memo) {
-            if (c == ' ' || c == '\n' || c == '\r' || c == '\t') continue;
-            clean += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        }
-
-        long long got = 0;
-        try { got = std::stoll(jstrField(jt, "amount", "0")); } catch (...) { continue; }
-        if (got < USDT_MIN_UNITS) continue;
-
-        const std::string hash = jstrField(jt, "transaction_hash");
+    // Недоплату пишем в журнал один раз на перевод, а не каждые 20 секунд.
+    static std::set<std::string> underpaidSeen;
+    for (const auto& item : j["jetton_transfers"]) {
+        const auto pay = premium::usdtTransfer(item, walletRaw);
+        if (!pay) continue;
+        const std::string& clean = pay->memo;
+        const long long got = pay->units;
+        const std::string& hash = pay->hash;
 
         std::string chatId;
         long long need = 0;
@@ -428,36 +394,48 @@ void pollUsdtPayments() {
             }
             sqlite3_finalize(s);
         }
-        if (chatId.empty() || need < USDT_MIN_UNITS) continue;
+        if (chatId.empty() || need < premium::USDT_MIN_UNITS) continue;
 
-        // Два процента запаса — на случай, если кошелёк округлил сумму вниз.
-        if (got * 100 < need * 98) {
-            std::cerr << "[USDT] недоплата по " << clean << ": пришло " << got
-                      << ", ждали " << need << std::endl;
+        if (!premium::paidEnough(got, need)) {
+            if (underpaidSeen.size() > 1000) underpaidSeen.clear();
+            if (underpaidSeen.insert(hash).second)
+                std::cerr << "[USDT] недоплата по " << clean << ": пришло " << got
+                          << ", ждали " << need << std::endl;
             continue;
         }
 
-        bool claimed = false;
+        // Занять счёт и продлить срок — одной транзакцией: либо счёт оплачен
+        // и подписка выдана, либо не изменилось ничего и следующий опрос
+        // попробует снова. Счёта «оплачен, а подписки нет» не бывает.
+        if (!g_serviceChatId.empty() && chatId == g_serviceChatId) continue;
+        ensureUser(chatId);
+        bool taken = false;
+        bool granted = false;
         {
             std::lock_guard<std::mutex> l(dbMutex);
-            sqlite3_stmt* s;
-            if (prepareOrLog(db, &s,
-                "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
-                "WHERE memo=? AND status='active' AND kind='usdt'")) {
+            granted = inTransactionLocked("usdt", [&]() {
+                sqlite3_stmt* s;
+                if (!prepareOrLog(db, &s,
+                    "UPDATE ton_invoices SET status='paid', paid_at=?, tx_hash=? "
+                    "WHERE memo=? AND status='active' AND kind='usdt'")) return false;
                 sqlite3_bind_int64(s, 1, now);
                 sqlite3_bind_text(s, 2, hash.c_str(), -1, SQLITE_TRANSIENT);
                 sqlite3_bind_text(s, 3, clean.c_str(), -1, SQLITE_TRANSIENT);
-                if (sqlite3_step(s) == SQLITE_DONE) claimed = sqlite3_changes(db) > 0;
+                const int rc = sqlite3_step(s);
                 sqlite3_finalize(s);
-            }
+                if (rc != SQLITE_DONE) return false;
+                if (sqlite3_changes(db) != 1) { taken = true; return false; }
+                bool wasActive = false;
+                return extendPremiumLocked(chatId, now, days, wasActive);
+            });
         }
-        if (!claimed) continue;
-
-        if (!grantPremiumDays(chatId, days)) {
+        if (taken) continue;
+        if (!granted) {
             std::cerr << "[USDT] ОПЛАЧЕНО, НО ПОДПИСКА НЕ ВЫДАНА: chat=" << chatId
-                      << " memo=" << clean << " — выдать вручную" << std::endl;
+                      << " memo=" << clean << " — счёт остался активным, повторю" << std::endl;
             continue;
         }
+        refreshWatchers();
         trackFunnel(chatId, "paid", "usdt");
         std::cout << "[USDT] premium " << days << "d выдан: chat=" << chatId
                   << " memo=" << clean << " " << (got / 1e6) << " USDT" << std::endl;
@@ -488,55 +466,25 @@ void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
 }
 
 bool grantPremiumDays(const std::string& chatId, int days) {
-    if (chatId.empty() || days <= 0 || days > 3650) return false;
+    if (chatId.empty() || days <= 0 || days > premium::MAX_GRANT_DAYS) return false;
     if (!g_serviceChatId.empty() && chatId == g_serviceChatId) return false;
     if (!g_premiumSchemaOk) return false;
 
     ensureUser(chatId);
     const long long now = static_cast<long long>(time(nullptr));
-    std::unique_lock<std::mutex> lock(dbMutex);
-
-    // Чтение срока и запись нового — одной транзакцией. Без неё API, в ту же
-    // секунду прибавивший дни за бонус или приглашение (extend_premium), мог
-    // оказаться между чтением и записью — и одно из продлений затиралось.
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        std::cerr << "[PREMIUM] grant: BEGIN failed: " << sqlite3_errmsg(db) << std::endl;
-        return false;
+    bool ok = false;
+    {
+        // Чтение срока и запись нового — одной транзакцией. Без неё API, в ту
+        // же секунду прибавивший дни за бонус или приглашение (extend_premium),
+        // мог оказаться между чтением и записью — и одно из продлений затиралось.
+        std::lock_guard<std::mutex> l(dbMutex);
+        ok = inTransactionLocked("grant", [&]() {
+            bool wasActive = false;
+            return extendPremiumLocked(chatId, now, days, wasActive);
+        });
     }
-    auto fail = [&]() { sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr); return false; };
-
-    int flag = 0; long long start = 0, expire = 0;
-    if (!readPremiumRowLocked(chatId, flag, start, expire)) return fail();
-
-    const bool active = (flag != 0 && expire > now);
-    const long long base = active ? expire : now;
-    const long long addSec = static_cast<long long>(days) * 86400LL;
-    if (base > LLONG_MAX - addSec) {
-        std::cerr << "[PREMIUM] grant: expire overflow for " << chatId
-                  << " (base=" << base << "), rejected" << std::endl;
-        return fail();
-    }
-    const long long newExpire = base + addSec;
-    const long long newStart  = active ? (start > 0 ? start : now) : now;
-
-    sqlite3_stmt* s;
-    if (!prepareOrLog(db, &s,
-        "UPDATE users SET is_premium=1, premium_start=?, premium_expire=? WHERE chat_id=?"))
-        return fail();
-    sqlite3_bind_int64(s, 1, newStart);
-    sqlite3_bind_int64(s, 2, newExpire);
-    sqlite3_bind_text(s, 3, chatId.c_str(), -1, SQLITE_TRANSIENT);
-    const int rc = sqlite3_step(s);
-    sqlite3_finalize(s);
-    if (rc != SQLITE_DONE) return fail();
-    if (sqlite3_exec(db, "COMMIT", nullptr, nullptr, nullptr) != SQLITE_OK) {
-        std::cerr << "[PREMIUM] grant: COMMIT failed: " << sqlite3_errmsg(db) << std::endl;
-        return fail();
-    }
-
-    lock.unlock();
-    refreshWatchers();
-    return true;
+    if (ok) refreshWatchers();
+    return ok;
 }
 
 enum class PaymentApplyResult { Activated, Extended, Duplicate, Rejected, Error };
@@ -551,7 +499,7 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
         subUntil = sp.value("subscription_expiration_date", 0LL);
         payload = sp.value("invoice_payload", "");
         currency = sp.value("currency", "");
-        amount = sp.value("total_amount", 0);
+        amount = premium::intField(sp, "total_amount");
         chargeId = sp.value("telegram_payment_charge_id", "");
         providerChargeId = sp.value("provider_payment_charge_id", "");
     } catch (const nlohmann::json::exception& e) {
@@ -560,7 +508,7 @@ PaymentApplyResult applySuccessfulPayment(const std::string& chatId, const nlohm
         return PaymentApplyResult::Rejected;
     }
 
-    const StarPlan* plan = starPlan(payload);
+    const auto* plan = starPlan(payload);
     if (!plan) {
         std::cerr << "[PREMIUM] successful_payment with unknown payload: "
                   << payload << " (chat " << chatId << ")" << std::endl;
@@ -660,7 +608,7 @@ void handlePreCheckoutQuery(const json& q) {
     try {
         payload = q.value("invoice_payload", "");
         currency = q.value("currency", "");
-        amount = q.value("total_amount", 0);
+        amount = premium::intField(q, "total_amount");
     } catch (const nlohmann::json::exception& e) {
         std::cerr << "[PREMIUM] pre_checkout malformed JSON: " << e.what() << std::endl;
         parseOk = false;
@@ -676,27 +624,17 @@ void handlePreCheckoutQuery(const json& q) {
 
     json a;
     a["pre_checkout_query_id"] = q["id"].get<std::string>();
-    bool schemaReady = g_premiumSchemaOk.load();
-    const StarPlan* plan = starPlan(payload);
-    bool valid = parseOk && schemaReady && plan && currency == "XTR" && amount == plan->stars;
-    // Вводная цена — только своему покупателю и только в её окно.
-    bool introGone = false;
-    if (valid && std::string(plan->payload) == "premium_30_intro") {
-        std::string introChat;
-        long long introUntil = 0;
-        const long long now = static_cast<long long>(time(nullptr));
-        if (!introBinding(payload, introChat, introUntil) || introChat != buyerChatId ||
-            now > introUntil + INTRO_GRACE_SEC) {
-            valid = false;
-            introGone = true;
-        }
-    }
-    if (valid) {
+    const bool schemaReady = g_premiumSchemaOk.load();
+    const premium::Checkout verdict = parseOk
+        ? premium::checkStars(payload, currency, amount, buyerChatId, static_cast<long long>(time(nullptr)))
+        : premium::Checkout::Unknown;
+    if (schemaReady && verdict == premium::Checkout::Ok) {
         a["ok"] = true;
     } else {
         a["ok"] = false;
-        a["error_message"] = introGone ? tr(lang, "intro_gone")
-                           : schemaReady ? tr(lang, "invoice_unknown_product") : tr(lang, "payments_unavailable");
+        a["error_message"] = !schemaReady ? tr(lang, "payments_unavailable")
+                           : verdict == premium::Checkout::IntroGone ? tr(lang, "intro_gone")
+                           : tr(lang, "invoice_unknown_product");
         std::cerr << "[PREMIUM] pre_checkout rejected: schemaReady=" << schemaReady
                   << " payload=" << payload << " currency=" << currency << " amount=" << amount << std::endl;
     }
@@ -730,10 +668,14 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
     refreshWatchers();
 
     Lang lang = langFromCode(getUserLanguage(chatId));
-    const StarPlan* plan = starPlan(sp.value("invoice_payload", std::string()));
+    // Нагрузку applySuccessfulPayment уже прочёл как строку — здесь она есть.
+    const auto* plan = starPlan(sp.value("invoice_payload", std::string()));
     // Ежемесячное списание по подписке Telegram — не новая покупка, а
     // продление: человеку достаточно короткого «продлено на 30 дней».
-    const bool renewal = sp.value("is_recurring", false) && !sp.value("is_first_recurring", false);
+    // Флаги читаем осторожно: подписка уже выдана, исключение здесь
+    // оставило бы человека без сообщения.
+    auto flag = [&](const char* k) { auto it = sp.find(k); return it != sp.end() && it->is_boolean() && it->get<bool>(); };
+    const bool renewal = flag("is_recurring") && !flag("is_first_recurring");
     const std::string text = renewal
         ? withDays(tr(lang, "payment_renewed"), plan ? plan->days : 30)
         : tr(lang, "payment_success_title") + "\n\n" + tr(lang, "payment_success_activated") + "\n\n" +
@@ -745,19 +687,19 @@ bool handleSuccessfulPayment(const std::string& chatId, const json& sp) {
 
 int cancelStarSubscriptions(const std::string& reportTo, bool sayNone) {
     // Действующая подписка — последний платёж человека с sub_until в будущем.
-    struct Sub { std::string chat, charge; long long until = 0; };
+    struct Sub { std::string chat, charge; };
     std::vector<Sub> subs;
     const long long now = static_cast<long long>(time(nullptr));
     {
         std::lock_guard<std::mutex> l(dbMutex);
         sqlite3_stmt* s;
         if (prepareOrLog(db, &s,
-                "SELECT p.chat_id, p.telegram_payment_charge_id, p.sub_until FROM premium_payments p "
+                "SELECT p.chat_id, p.telegram_payment_charge_id FROM premium_payments p "
                 "WHERE p.sub_until > ? AND p.paid_at = (SELECT MAX(q.paid_at) FROM premium_payments q "
                 "WHERE q.chat_id = p.chat_id AND q.sub_until > 0)")) {
             sqlite3_bind_int64(s, 1, now);
             while (sqlite3_step(s) == SQLITE_ROW)
-                subs.push_back({safeColumnText(s, 0), safeColumnText(s, 1), sqlite3_column_int64(s, 2)});
+                subs.push_back({safeColumnText(s, 0), safeColumnText(s, 1)});
             sqlite3_finalize(s);
         }
     }
