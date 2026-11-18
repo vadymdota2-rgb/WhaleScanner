@@ -17,7 +17,10 @@
  * tools/mutate.py.
  */
 
-bool initPremium(const std::string& serviceChatId = "");
+/** Схема оплаты. serviceChatId — служебный аккаунт (Премиума у него не
+ *  бывает), ownerChatId — кому писать, если деньги пришли, а выдать Премиум
+ *  не вышло. false — оплата выключена до исправления. */
+bool initPremium(const std::string& serviceChatId = "", const std::string& ownerChatId = "");
 
 bool isPremium(const std::string& chatId);
 

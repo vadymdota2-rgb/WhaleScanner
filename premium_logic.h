@@ -148,6 +148,15 @@ inline std::string memoKey(const std::string& memo) {
     return out;
 }
 
+// Сумма USD₮ для человека: «3.99» — до цента, вниз (шесть знаков после
+// запятой в сети, нам хватает двух).
+inline std::string usdText(long long units) {
+    if (units < 0) units = 0;
+    const long long cents = units / 10000;
+    const long long c = cents % 100;
+    return std::to_string(cents / 100) + "." + (c < 10 ? "0" : "") + std::to_string(c);
+}
+
 // Хватает ли денег: два процента запаса — на случай, если кошелёк округлил
 // сумму вниз. Так же, как got·100 ≥ need·98, но без переполнения.
 inline bool paidEnough(long long got, long long need) {

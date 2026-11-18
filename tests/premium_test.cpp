@@ -108,7 +108,7 @@ static void freshDb() {
          "threshold_nanos INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL)");
     exec("CREATE TABLE funnel_events(chat_id TEXT NOT NULL, ev TEXT NOT NULL, src TEXT NOT NULL DEFAULT '', "
          "day TEXT NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (chat_id, ev, src, day))");
-    CHECK(initPremium("777"));
+    CHECK(initPremium("777", "owner"));
     g_urls.clear(); g_tgPosts.clear(); g_sent.clear(); g_ended.clear(); g_refreshed = 0;
     g_tgAnswer = R"({"ok":true,"result":true})";
 }
@@ -241,6 +241,9 @@ static void rules() {
     CHECK(paidEnough(4990000, 4990000) && paidEnough(4890200, 4990000) && !paidEnough(4890199, 4990000));
     CHECK(!paidEnough(LLONG_MAX, 0) && !paidEnough(LLONG_MAX, -5) && paidEnough(LLONG_MAX, LLONG_MAX));
     CHECK(paidEnough(1, 1) && !paidEnough(0, 1));
+    CHECK(usdText(3990000) == "3.99" && usdText(4100000) == "4.10" && usdText(4090000) == "4.09" &&
+          usdText(4099999) == "4.09" && usdText(101000000) == "101.00" && usdText(0) == "0.00" && usdText(-5) == "0.00" &&
+          usdText(-50000) == "0.00" && usdText(-1990000) == "0.00");
     std::mt19937_64 r(0x5eed);
     for (int i = 0; i < 100000; ++i) {
         const long long need = static_cast<long long>(r() % 100'000'000'000ULL) + 1;
@@ -391,6 +394,8 @@ static void openBare() {
 // До initPremium (или после неудачного) оплата выключена целиком: ни выдачи,
 // ни опроса, а на счёт — «оплата временно недоступна».
 static void disabled() {
+    g_urls.clear();
+    g_tgPosts.clear();
     CHECK(!grantPremiumDays("1", 30));
     CHECK(!handleSuccessfulPayment("1", successful("premium_30_days", 250, "z1")));
     CHECK(premiumSubsetOf({"1"}).empty());
@@ -417,13 +422,23 @@ static void schema() {
     exec("CREATE TABLE real_users(chat_id TEXT, created_at INTEGER)");
     exec("CREATE VIEW users AS SELECT chat_id, created_at FROM real_users");
     CHECK(!initPremium("777"));
-    g_urls.clear(); g_tgPosts.clear();
     disabled();
     // Столбцы добавились, а таблица платежей не создалась (на её месте
     // представление, индекс на него не встаёт) — тоже выключена.
     openBare();
     exec("CREATE TABLE x(chat_id TEXT)");
     exec("CREATE VIEW premium_payments AS SELECT chat_id FROM x");
+    CHECK(!initPremium("777"));
+    disabled();
+    // Таблицы и столбцы на месте, а индекс не встал (имя занято таблицей) —
+    // схема не та, что ждёт код: выключена.
+    openBare();
+    exec("CREATE TABLE idx_ton_chat(x)");
+    CHECK(!initPremium("777"));
+    disabled();
+    // Нет таблицы людей — выдавать некуда, оплата выключена.
+    if (db) sqlite3_close(db);
+    sqlite3_open(":memory:", &db);
     CHECK(!initPremium("777"));
     disabled();
 }
@@ -446,7 +461,10 @@ static void usdt() {
     g_explorer = json{{"jetton_transfers", {fake, elsewhere, aborted, transfer("wt-under", 4890199, "u1"),
                                             transfer("WT-OLDXX", 4990000, "o1"), "junk", 5}}}.dump();
     pollUsdtPayments();
-    CHECK(g_urls.size() == 1 && g_urls[0].find("owner_address=" + WALLET) != std::string::npos);
+    // Спрашиваем только переводы USD₮ на наш кошелёк, адреса — в сыром виде.
+    CHECK(g_urls.size() == 1 && g_urls[0].find("owner_address=" + WALLET_RAW + "&") != std::string::npos);
+    CHECK(g_urls[0].find(std::string("jetton_master=") + USDT_MASTER + "&") != std::string::npos);
+    CHECK(g_urls[0].find("direction=in") != std::string::npos && g_urls[0].find("limit=50") != std::string::npos);
     CHECK(num("SELECT COUNT(*) FROM ton_invoices WHERE status='paid'") == 0);
     CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLDXX'") == "expired");
     CHECK(expireOf("100") == LLONG_MIN && g_sent.empty());
@@ -481,6 +499,18 @@ static void usdt() {
                                             transfer("WT-GHOST", 4990000, "gh")}}}.dump();
     const long long t1 = now();
     pollUsdtPayments();
+    auto ownerAlerts = [&]() {
+        int n = 0;
+        for (const auto& [to, msg] : g_sent)
+            if (to == "owner") {
+                ++n;
+                CHECK(msg.find("4.99 USD₮") != std::string::npos && msg.find("WT-GHOST") != std::string::npos);
+            }
+        return n;
+    };
+    CHECK(ownerAlerts() == 1);  // сразу, с первого круга
+    pollUsdtPayments();  // второй круг — владельцу не пишем повторно
+    CHECK(ownerAlerts() == 1);
     for (const char* c : {"601", "602", "604"}) {
         const long long e = expireOf(c);
         CHECK(e >= t1 + 30 * 86400 && e <= now() + 30 * 86400);
@@ -488,6 +518,8 @@ static void usdt() {
     CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-CHEAP'") == "active" && expireOf("603") == LLONG_MIN);
     CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-GHOST'") == "active");
     g_ghosts.clear();
+    pollUsdtPayments();  // человек появился — следующий круг выдаёт
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-GHOST'") == "paid");
 
     // Нет живых счетов — к обозревателю не ходим вовсе.
     exec("UPDATE ton_invoices SET status='paid' WHERE status='active'");
@@ -510,6 +542,14 @@ static void usdt() {
     pollUsdtPayments();
     CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-SERVC'") == "active");
     CHECK(num("SELECT COUNT(*) FROM users WHERE chat_id='777' AND is_premium=1") == 0);
+    // Счёт старше суток — истёк, даже если перевод по нему пришёл.
+    exec("UPDATE ton_invoices SET created_at=created_at-86400 WHERE memo='WT-SERVC'");
+    invoice("WT-OLD24", "800", 4990000, now() - 86400 - 5);
+    g_explorer = json{{"jetton_transfers", {transfer("WT-OLD24", 4990000, "o2")}}}.dump();
+    g_urls.clear();
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLD24'") == "expired" && expireOf("800") == LLONG_MIN);
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-SERVC'") == "expired");
 }
 
 static void stars() {
@@ -594,6 +634,18 @@ static void stars() {
     CHECK(g_sent.size() == sent + 3 && g_sent[sent].second != g_sent[sent + 2].second);
     CHECK(g_sent[sent].second == withDays(tr(Lang::RU, "payment_renewed"), 30));
 
+    // Звёзды списаны, а база занята — Премиум не выдан, владельцу сообщение;
+    // тот же платёж потом проходит (запись откатилась целиком).
+    g_sent.clear();
+    exec("BEGIN");
+    CHECK(!handleSuccessfulPayment("47", successful("premium_365_days", 1990, "c9")));
+    exec("ROLLBACK");
+    CHECK(g_sent.size() == 1 && g_sent[0].first == "owner");
+    CHECK(g_sent[0].second.find("1990 XTR") != std::string::npos && g_sent[0].second.find("c9") != std::string::npos &&
+          g_sent[0].second.find("365") != std::string::npos);
+    CHECK(num("SELECT COUNT(*) FROM premium_payments WHERE telegram_payment_charge_id='c9'") == 0);
+    CHECK(handleSuccessfulPayment("47", successful("premium_365_days", 1990, "c9")) && isPremium("47"));
+
     // Служебный аккаунт — никогда не подписчик.
     CHECK(!grantPremiumDays("777", 30) && !isPremium("777"));
     exec("UPDATE users SET is_premium=1, premium_expire=9999999999 WHERE chat_id='42'");
@@ -639,6 +691,10 @@ static void grantAndExpire() {
     CHECK(!grantPremiumDays("9", 1) && expireOf("9") == LLONG_MAX - 10);
     CHECK(num("SELECT COUNT(*) FROM users") == 1);
 
+    // Истёкших нет — ни писем, ни пересборки наблюдателей.
+    const int refreshed = g_refreshed;
+    cleanupExpiredPremium();
+    CHECK(g_refreshed == refreshed && g_ended.empty());
     // Истёкшие — в бесплатные, каждому письмо, кроме служебного.
     exec("UPDATE users SET is_premium=1, premium_expire=5 WHERE chat_id='9'");
     exec("INSERT INTO users(chat_id, created_at, is_premium, premium_expire) VALUES('777', 1, 1, 5), ('8', 1, 1, 9999999999)");
@@ -651,6 +707,15 @@ static void grantAndExpire() {
     exec("UPDATE users SET is_premium=1, premium_expire=5 WHERE chat_id='8'");
     cleanupExpiredPremium();
     CHECK((g_ended == std::vector<std::string>{"9", "8"}));
+    // База занята чужой записью — проход ничего не меняет и писем не шлёт;
+    // следующий проход сделает всё.
+    exec("UPDATE users SET is_premium=1, premium_expire=5 WHERE chat_id='8'");
+    exec("BEGIN");
+    cleanupExpiredPremium();
+    exec("ROLLBACK");
+    CHECK(g_ended.size() == 2 && num("SELECT is_premium FROM users WHERE chat_id='8'") == 1);
+    cleanupExpiredPremium();
+    CHECK(g_ended.size() == 3 && num("SELECT is_premium FROM users WHERE chat_id='8'") == 0);
 }
 
 static void autorenew() {
@@ -659,22 +724,25 @@ static void autorenew() {
     exec("INSERT INTO premium_payments(chat_id, telegram_payment_charge_id, payload, amount, currency, paid_at, sub_until) "
          "VALUES('1','a','premium_30_days',250,'XTR'," + std::to_string(t - 10) + "," + std::to_string(t + 99) + "),"
          "('2','b','premium_30_days',250,'XTR'," + std::to_string(t - 10) + "," + std::to_string(t + 99) + "),"
-         "('3','c','premium_30_days',250,'XTR'," + std::to_string(t - 10) + ",0)");
+         "('3','c','premium_30_days',250,'XTR'," + std::to_string(t - 10) + ",0),"
+         "('-100','d','premium_30_days',250,'XTR'," + std::to_string(t - 10) + "," + std::to_string(t + 99) + ")");
     for (const char* bad : {R"({"ok":false,"description":"x"})", "{}", "", "garbage"}) {
         g_tgAnswer = bad;
         CHECK(cancelStarSubscriptions("", false) == 0);
-        CHECK(num("SELECT COUNT(*) FROM premium_payments WHERE sub_until>0") == 2);  // не вышло — не трогаем
+        CHECK(num("SELECT COUNT(*) FROM premium_payments WHERE sub_until>0") == 3);  // не вышло — не трогаем
     }
     g_sent.clear();
     CHECK(cancelStarSubscriptions("owner", false) == 0);
-    CHECK(g_sent.size() == 1 && g_sent[0].first == "owner" && g_sent[0].second.find("Не вышло: 2") != std::string::npos);
+    CHECK(g_sent.size() == 1 && g_sent[0].first == "owner" && g_sent[0].second.find("Не вышло: 3") != std::string::npos);
     g_tgAnswer = R"({"ok":true,"result":true})";
     g_tgPosts.clear();
     CHECK(cancelStarSubscriptions("", false) == 2);
+    // Номер «-100» — не человек: в Telegram не уходит, считается неудачей.
     CHECK(g_tgPosts.size() == 2 && g_tgPosts[0]["is_canceled"] == true);
     CHECK(g_tgPosts[0]["telegram_payment_charge_id"] == "a" && g_tgPosts[1]["telegram_payment_charge_id"] == "b");
     CHECK(g_tgPosts[0]["user_id"] == 1 && g_tgPosts[1]["user_id"] == 2);
-    CHECK(num("SELECT COUNT(*) FROM premium_payments WHERE sub_until>0") == 0);
+    CHECK(num("SELECT COUNT(*) FROM premium_payments WHERE sub_until>0") == 1);
+    exec("DELETE FROM premium_payments WHERE chat_id='-100'");
     g_sent.clear();
     CHECK(cancelStarSubscriptions("", false) == 0 && cancelStarSubscriptions("owner", false) == 0 && g_sent.empty());
     CHECK(cancelStarSubscriptions("owner", true) == 0 && g_sent.size() == 1 && g_sent[0].first == "owner");

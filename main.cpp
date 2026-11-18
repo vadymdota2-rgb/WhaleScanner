@@ -301,6 +301,11 @@ void initDB() {
     if (sqlite3_open(DB_FILE.c_str(), &db) != SQLITE_OK) {
         std::cerr << "[FATAL] Cannot open DB: " << sqlite3_errmsg(db) << std::endl; std::exit(1);
     }
+    // В ту же базу пишет API (whale_api.py) из своего процесса. Без ожидания
+    // любая запись бота в момент его записи падала бы сразу с «database is
+    // locked» — и платёж звёздами, уже списанный Telegram, оставался бы без
+    // Премиума. Ждём до 5 секунд, как и API (у него 8).
+    sqlite3_busy_timeout(db, 5000);
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
@@ -2713,7 +2718,7 @@ int main() {
         g_stats.rpc_giveups.fetch_add(1, std::memory_order_relaxed);
     });
     initDB(); initRankingDB();
-    if (!initPremium(SERVICE_CHAT_ID)) {
+    if (!initPremium(SERVICE_CHAT_ID, OWNER_CHAT_ID)) {
         std::cerr << "[STARTUP][FATAL] Premium schema init failed — payments are DISABLED for this run" << std::endl;
     }
     initLifecycle();
