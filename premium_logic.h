@@ -1,3 +1,4 @@
+// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 #pragma once
 
 /*
@@ -190,6 +191,16 @@ inline constexpr long long USDT_MIN_UNITS = 1000000;  // доллар — ниж
 inline constexpr long long CLOCK_SKEW_SEC = 600;
 [[nodiscard]] inline bool transferFitsInvoice(long long transferAt, long long invoiceCreated) {
     return transferAt >= invoiceCreated - CLOCK_SKEW_SEC;
+}
+
+/* Пора ли спрашивать обозреватель. Пока есть счёт моложе часа (столько API
+   показывает его человеку) — каждый проход главного цикла (20 с): оплату
+   ждут сейчас. Все живые счета старше — раз в 2 минуты: опоздавшая оплата
+   редка, а запросов к toncenter в сутки по такому счёту — в 6 раз меньше. */
+inline constexpr long long FRESH_INVOICE_SEC = 3600;
+inline constexpr long long SLOW_POLL_SEC = 120;
+[[nodiscard]] inline bool pollDue(long long now, long long newestInvoice, long long lastPoll) {
+    return now - newestInvoice < FRESH_INVOICE_SEC || now - lastPoll >= SLOW_POLL_SEC;
 }
 
 // Хватает ли денег: два процента запаса — на случай, если кошелёк округлил

@@ -1,3 +1,4 @@
+// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 #pragma once
 
 /*

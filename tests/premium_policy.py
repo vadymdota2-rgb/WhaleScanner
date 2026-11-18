@@ -188,6 +188,31 @@ class SupplyChainTest(unittest.TestCase):
         self.assertRegex(raw, r"#ifdef SAFE_HTTP_TEST_CAINFO\s+(//[^\n]*\n\s*)*curl_easy_setopt\(c, CURLOPT_CAINFO")
 
 
+class LicenseTest(unittest.TestCase):
+    """Авторские права: модуль — Wallet Tracker, сторонний код — под своей
+    лицензией и с её текстом (MIT требует прикладывать уведомление)."""
+
+    MODULE = ("premium.h", "premium.cpp", "premium_logic.h", "safe_http.h", "safe_http.cpp")
+
+    def test_module_files_carry_copyright(self):
+        for name in self.MODULE:
+            first = read(os.path.join(ROOT, name)).splitlines()[0]
+            self.assertEqual(first, "// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.", name)
+
+    def test_third_party_notices_are_present(self):
+        lic = read(os.path.join(ROOT, "LICENSE"))
+        self.assertIn("All rights reserved", lic)
+        self.assertIn("json.hpp", lic)
+        self.assertIn("LICENSES/nlohmann-json.txt", lic)
+        mit = read(os.path.join(ROOT, "LICENSES", "nlohmann-json.txt"))
+        for must in ("MIT License", "Copyright (c) 2013-2022 Niels Lohmann",
+                     "The above copyright notice and this permission notice shall be included"):
+            self.assertIn(must, mit)
+        head = read(os.path.join(ROOT, "json.hpp"))[:600]
+        self.assertIn("SPDX-FileCopyrightText: 2013-2023 Niels Lohmann", head)
+        self.assertIn("SPDX-License-Identifier: MIT", head)
+
+
 class PolicyCatchesTest(unittest.TestCase):
     """Сами правила тоже проверены: в копию кода подкладываем по одному
     нарушению — каждое должно быть поймано. Иначе правило, ослабленное

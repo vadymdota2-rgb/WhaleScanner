@@ -1,3 +1,4 @@
+// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 // Премиум: выдача подписки после оплаты. Спецификация — docs/premium.md,
 // правила — premium_logic.h, договор с остальным ботом — premium.h.
 //
@@ -103,6 +104,7 @@ public:
     // Выполнить запрос без строк; true — без ошибки.
     [[nodiscard]] bool run() { return step() == SQLITE_DONE; }
     [[nodiscard]] long long int64(int col) const { return sqlite3_column_int64(s_, col); }
+    [[nodiscard]] bool null(int col) const { return sqlite3_column_type(s_, col) == SQLITE_NULL; }
     [[nodiscard]] std::string text(int col) const { return safeColumnText(s_, col); }
 
 private:
@@ -386,6 +388,26 @@ bool grantPremiumDays(const std::string& chatId, int days) {
     return ok;
 }
 
+namespace {
+
+void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
+    // Таблица воронки (заводит бот в initDB, пишет и API — whale_api.py,
+    // track): событие раз в сутки на человека, вид и источник. Оплату видит
+    // только бот — пишем её здесь.
+    const long long t = nowSec();
+    const auto tt = static_cast<time_t>(t);
+    struct tm g {};
+    gmtime_r(&tt, &g);
+    std::array<char, 16> day{};
+    if (std::strftime(day.data(), day.size(), "%Y-%m-%d", &g) == 0) return;
+    const std::lock_guard<std::mutex> l(dbMutex);
+    Stmt s("INSERT OR IGNORE INTO funnel_events(chat_id, ev, src, day, at) VALUES(?,?,?,?,?)");
+    s.bind(1, chatId).bind(2, std::string(ev)).bind(3, std::string(src)).bind(4, std::string(day.data())).bind(5, t);
+    if (!s.run()) std::cerr << "[PREMIUM] funnel: " << logSafe(sqlite3_errmsg(db)) << std::endl;
+}
+
+}  // namespace
+
 std::string grantCommand(const std::string& args) {
     const auto g = premium::parseGrant(args);
     if (!g) return "Использование: /grant &lt;chat_id&gt; &lt;дней 1–3650&gt;";
@@ -405,21 +427,6 @@ std::string grantCommand(const std::string& args) {
     return "✅ Премиум +" + std::to_string(g->days) + " дн.: <code>" + g->chat + "</code>, до " + when.data();
 }
 
-void trackFunnel(const std::string& chatId, const char* ev, const char* src) {
-    // Таблица воронки (заводит бот в initDB, пишет и API — whale_api.py,
-    // track): событие раз в сутки на человека, вид и источник. Оплату видит
-    // только бот — пишем её здесь.
-    const long long t = nowSec();
-    const auto tt = static_cast<time_t>(t);
-    struct tm g {};
-    gmtime_r(&tt, &g);
-    std::array<char, 16> day{};
-    if (std::strftime(day.data(), day.size(), "%Y-%m-%d", &g) == 0) return;
-    const std::lock_guard<std::mutex> l(dbMutex);
-    Stmt s("INSERT OR IGNORE INTO funnel_events(chat_id, ev, src, day, at) VALUES(?,?,?,?,?)");
-    s.bind(1, chatId).bind(2, std::string(ev)).bind(3, std::string(src)).bind(4, std::string(day.data())).bind(5, t);
-    if (!s.run()) std::cerr << "[PREMIUM] funnel: " << logSafe(sqlite3_errmsg(db)) << std::endl;
-}
 
 // ── USD₮ ─────────────────────────────────────────────────────────────────────
 
@@ -477,17 +484,20 @@ void pollUsdtPayments() {
     }
 
     const long long now = nowSec();
-    bool anyActive = false;
+    std::optional<long long> newest;  // самый молодой живой счёт
     {
         const std::lock_guard<std::mutex> l(dbMutex);
         Stmt expire("UPDATE ton_invoices SET status='expired' WHERE status='active' AND kind='usdt' AND created_at <= ?");
         expire.bind(1, now - USDT_INVOICE_LIVE_SEC);
         if (!expire.run()) std::cerr << "[USDT] истечение счетов: " << logSafe(sqlite3_errmsg(db)) << std::endl;
-        Stmt any("SELECT 1 FROM ton_invoices WHERE status='active' AND kind='usdt' LIMIT 1");
-        anyActive = any.row();
+        Stmt any("SELECT MAX(created_at) FROM ton_invoices WHERE status='active' AND kind='usdt'");
+        if (any.row() && !any.null(0)) newest = any.int64(0);
     }
-    // Живых счетов нет — обозреватель не спрашиваем вовсе.
-    if (!anyActive) return;
+    // Живых счетов нет — обозреватель не спрашиваем вовсе; есть только
+    // старые — реже (premium::pollDue).
+    static long long lastPoll = 0;
+    if (!newest || !premium::pollDue(now, *newest, lastPoll)) return;
+    lastPoll = now;
 
     // Только переводы USD₮ (jetton_master): рассылки чужих жетонов на кошелёк
     // иначе вытеснили бы настоящую оплату из полусотни последних. Адреса — в

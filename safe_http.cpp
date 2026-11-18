@@ -1,3 +1,4 @@
+// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 // Запрос к чужому серверу с пределами — см. safe_http.h.
 #include "safe_http.h"
 
@@ -13,12 +14,9 @@ struct Sink {
     bool over;
 };
 
+// size у curl всегда 1 (документация CURLOPT_WRITEFUNCTION) — n и есть длина.
 size_t writeCapped(char* data, size_t size, size_t n, void* user) {
     auto* sink = static_cast<Sink*>(user);
-    if (n != 0 && size > static_cast<size_t>(-1) / n) {
-        sink->over = true;
-        return 0;
-    }
     const size_t len = size * n;
     if (!capAppend(*sink->out, data, len, sink->max)) {
         sink->over = true;

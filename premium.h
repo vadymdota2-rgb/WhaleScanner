@@ -1,3 +1,4 @@
+// © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 #pragma once
 
 /*
@@ -42,7 +43,8 @@ void cleanupExpiredPremium();
  *  главного цикла): занять счёт и продлить срок одной транзакцией. */
 void pollUsdtPayments();
 
-/** Прибавить дни (бонус, приглашение, ручная выдача владельцем). */
+/** Прибавить дни: ручная выдача владельцем (/grant → grantCommand).
+ *  Бонусы и приглашения прибавляет API сам (whale_api.py, extend_premium). */
 [[nodiscard]] bool grantPremiumDays(const std::string& chatId, int days);
 
 /** Отменить автопродление у всех, кто когда-то оформил подписку звёздами:
@@ -50,9 +52,6 @@ void pollUsdtPayments();
  *  (reportTo) — отчёт; sayNone=false — молчать, если отменять нечего (так
  *  зовётся при каждом запуске бота). Возвращает, сколько подписок отменено. */
 int cancelStarSubscriptions(const std::string& reportTo, bool sayNone = true);
-
-/** Событие воронки продаж (таблица funnel_events, её же пишет API). */
-void trackFunnel(const std::string& chatId, const char* ev, const char* src = "");
 
 /** Команда владельца «/grant <chat_id> <дней>»: выдать Премиум вручную.
  *  Возвращает ответ владельцу. Звать только для владельца (main.cpp). */

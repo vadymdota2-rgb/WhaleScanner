@@ -1,0 +1,28 @@
+Copyright (c) 2026 Wallet Tracker. All rights reserved.
+
+This repository (the Wallet Tracker Telegram bot, "WhaleScanner") and
+everything in it — source code, texts and translations, data files, address
+labels and the methodology of our own calculations — is proprietary to
+Wallet Tracker.
+
+No license is granted. You may not use, copy, modify, merge, publish,
+distribute, sublicense, sell or create derivative works from any part of this
+repository, in whole or in part, without prior written permission from
+Wallet Tracker. The fact that the repository can be viewed on GitHub does not
+grant any license; GitHub's Terms of Service allow only viewing and forking
+within GitHub.
+
+Third-party components remain under their own licenses, which this notice
+does not change:
+  - JSON for Modern C++ (json.hpp, vendored, version 3.11.3) — © 2013-2023
+    Niels Lohmann, MIT License; full text: LICENSES/nlohmann-json.txt;
+  - libcurl (linked, not included) — © Daniel Stenberg and contributors,
+    curl license (https://curl.se/docs/copyright.html);
+  - SQLite (linked, not included) — public domain;
+  - Boost.Multiprecision (headers, not included) — Boost Software License 1.0.
+
+Data from third parties (blockchain explorers and RPC providers such as
+toncenter, Telegram Bot API responses, exchange and market data) belongs to
+its owners and is used under their terms.
+
+Contact for permissions: @WalletTrackerHelp (Telegram).

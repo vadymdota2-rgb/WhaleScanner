@@ -130,8 +130,10 @@ static void freshDb() {
     g_urls.clear(); g_tgPosts.clear(); g_sent.clear(); g_ended.clear(); g_refreshed = 0;
     g_tgAnswer = R"({"ok":true,"result":true})";
 }
+// Время перевода по умолчанию — заведомо после любого счёта в проверках,
+// и через годы тоже (проверки не должны зависеть от сегодняшней даты).
 static json transfer(const std::string& memo, long long units, const std::string& hash = "h1",
-                     long long at = 2'000'000'000) {
+                     long long at = 4'000'000'000'000) {
     return {{"jetton_master", USDT_MASTER}, {"destination", WALLET_RAW}, {"amount", std::to_string(units)},
             {"transaction_aborted", false}, {"transaction_hash", hash}, {"transaction_now", at},
             {"decoded_forward_payload", {{"@type", "text_comment"}, {"comment", memo}}}};
@@ -355,6 +357,10 @@ static void rules() {
     CHECK(!usdtTransfer(spoil("transaction_now", 1795000000.5), WALLET_RAW));
     CHECK(usdtTransfer(spoil("transaction_now", 1), WALLET_RAW)->at == 1);
     CHECK(transferFitsInvoice(1000 - 600, 1000) && !transferFitsInvoice(1000 - 601, 1000) && transferFitsInvoice(5000, 1000));
+    // Опрос: счёт моложе часа — всегда; все старше — раз в 2 минуты.
+    CHECK(FRESH_INVOICE_SEC == 3600 && SLOW_POLL_SEC == 120);
+    CHECK(pollDue(10000, 10000 - 3599, 9999) && !pollDue(10000, 10000 - 3600, 9999));
+    CHECK(pollDue(10000, 0, 10000 - 120) && !pollDue(10000, 0, 10000 - 119) && pollDue(10000, 0, 0));
     CHECK(!usdtTransfer(spoil("decoded_forward_payload", {{"comment", 5}}), WALLET_RAW));
     CHECK(!usdtTransfer(spoil("decoded_forward_payload", {{"comment", "   "}}), WALLET_RAW));
     CHECK(!usdtTransfer(transfer("WT-ABCDE", 4990000), ""));
@@ -795,6 +801,10 @@ static void autorenew() {
 // Образцы ответов — договор с toncenter и Telegram: форма полей как в
 // настоящих ответах (значения выдуманы). Поменяется формат у них — упадёт
 // проверка, а не оплата у людей.
+// Подменённые часы: границы сроков — до секунды.
+static long long g_now = 0;
+static long long fakeNow() { return g_now; }
+
 static json fixture(const char* name) {
     // Запуск — из корня репозитория (tests/run.sh); FIXTURES — если иначе.
     const char* dir = std::getenv("FIXTURES");  // NOLINT(concurrency-mt-unsafe)
@@ -815,12 +825,17 @@ static void fixtures() {
     CHECK(pay && pay->memo == "WT-ABCDE" && pay->units == 3990000 && !pay->hash.empty());
     CHECK(!usdtTransfer(list[1], WALLET_RAW));  // без памятки (decoded_forward_payload: null)
 
+    // Часы — на минуту позже перевода из образца: проверка не зависит от
+    // сегодняшней даты (иначе через сутки счёт в ней «истёк» бы).
     freshDb();
-    invoice("WT-ABCDE", "900", 3990000, list[0]["transaction_now"].get<long long>() - 60);
+    premium::setClock(&fakeNow);
+    g_now = list[0]["transaction_now"].get<long long>() + 60;
+    invoice("WT-ABCDE", "900", 3990000, g_now - 120);
     g_explorer = ton.dump();
     pollUsdtPayments();
     CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-ABCDE'") == "paid");
-    CHECK(expireOf("900") > now() + 29 * 86400);
+    CHECK(expireOf("900") == g_now + 30 * 86400);
+    premium::setClock(nullptr);
 
     CHECK(handleSuccessfulPayment("901", fixture("telegram_successful_payment.json")));
     CHECK(expireOf("901") > now() + 29 * 86400);
@@ -828,9 +843,6 @@ static void fixtures() {
     CHECK(lastAnswerOk() && g_tgPosts.back()["pre_checkout_query_id"] == "4382bfdwdsb323b2d9");
 }
 
-// Подменённые часы: границы сроков — до секунды.
-static long long g_now = 0;
-static long long fakeNow() { return g_now; }
 
 static void clockEdges() {
     freshDb();
@@ -984,6 +996,47 @@ static void attacks() {
     premium::setClock(nullptr);
 }
 
+// Редкий опрос старых счетов: toncenter спрашиваем реже, но спрашиваем.
+static void slowPoll() {
+    freshDb();
+    premium::setClock(&fakeNow);
+    g_now = 1'900'000'000;
+    invoice("WT-OLD2H", "p1", 4990000, g_now - 7200);
+    g_explorer = "{}";
+    g_urls.clear();
+    pollUsdtPayments();  // давно не спрашивали — сейчас
+    CHECK(g_urls.size() == 1);
+    for (int i = 0; i < 5; ++i) {  // 100 секунд по 20 — тишина
+        g_now += 20;
+        pollUsdtPayments();
+    }
+    CHECK(g_urls.size() == 1);
+    g_now += 20;  // 120 секунд с прошлого запроса
+    pollUsdtPayments();
+    CHECK(g_urls.size() == 2);
+    // Новый счёт — снова каждый проход.
+    invoice("WT-NEW00", "p2", 4990000, g_now);
+    g_now += 20;
+    pollUsdtPayments();
+    g_now += 20;
+    pollUsdtPayments();
+    CHECK(g_urls.size() == 4);
+    // Оплата старого счёта находится и в редком режиме.
+    exec("UPDATE ton_invoices SET status='paid' WHERE memo='WT-NEW00'");
+    g_explorer = json{{"jetton_transfers", {transfer("WT-OLD2H", 4990000, "late", g_now)}}}.dump();
+    g_now += 120;
+    pollUsdtPayments();
+    CHECK(text("SELECT status FROM ton_invoices WHERE memo='WT-OLD2H'") == "paid");
+    // Живых счетов не осталось — сколько бы ни прошло, toncenter не спрашиваем.
+    const size_t asked = g_urls.size();
+    for (int i = 0; i < 3; ++i) {
+        g_now += 1000;
+        pollUsdtPayments();
+    }
+    CHECK(g_urls.size() == asked);
+    premium::setClock(nullptr);
+}
+
 // Ручная выдача владельцем: строгий разбор, ответ с датой.
 static void grantByOwner() {
     for (const char* ok : {"42 30", " 42   30 ", "42 3650", "42 1"}) CHECK(parseGrant(ok).has_value());
@@ -1076,6 +1129,7 @@ int main() {
     fixtures();
     grantByOwner();
     attacks();
+    slowPoll();
     failures();
     clockEdges();
     logging();

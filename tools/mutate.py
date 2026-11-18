@@ -35,6 +35,8 @@ FLAGS = ["-std=c++20", "-O0", "-pthread", "-w"]
 # Строка (без пробелов по краям) и замена, которые ничего не меняют в
 # поведении, — с причиной. Сверяются по файлу, тексту строки и замене.
 EQUIV: dict = {
+    ('premium.cpp', 'static long long lastPoll = 0;', '0→1@28'):
+        'время прошлого опроса — любое давнее: первый проход всё равно спросит',
     ('premium.cpp', 'if (!open_) std::cerr << "[PREMIUM] " << what_ << ": BEGIN failed: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
     ('premium.cpp', 'if (!open_) return false;', 'return false;→return true;@12'):
@@ -103,8 +105,6 @@ EQUIV: dict = {
         'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'if (said.first("wallet"))', 'if (→if (!@0'):
         'только журнал',
-    ('premium.cpp', 'bool anyActive = false;', 'false→true@17'):
-        'начальное значение перезаписывается до чтения',
     ('premium.cpp', 'if (!expire.run()) std::cerr << "[USDT] истечение счетов: " << logSafe(sqlite3_errmsg(db)) << std::endl;', 'if (!→if (@0'):
         'только журнал',
     ('premium.cpp', 'const json j = json::parse(httpsCapped(url, "", 15, TONCENTER_MAX_BYTES, &err), nullptr, false);', '15→16@48'):
