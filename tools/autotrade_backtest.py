@@ -23,9 +23,11 @@
 
 Правила владельца (значения по умолчанию): сигнал — от 2 разных китов в
 одну сторону на одной бумаге за 2 часа, у каждого от 1000 $; цена входа не
-хуже средней китов больше чем на 0,3 %; маржа 10 % депозита, плечо 10×,
-кросс; одна позиция за раз; выход — только тейк 1 % движения цены, без
-стопа и срока (пересиживаем); после выхода 3 часа в ту же бумагу не входим.
+хуже средней китов больше чем на 0,3 %; маржа 10 % депозита на сделку,
+плечо 10×, кросс; торгуем нон-стоп — позиций сразу до 10 (10 × 10 % = весь
+депозит); в одну и ту же бумагу — не чаще раза в 3 часа (и не пока в ней
+открыта позиция), в другие — сразу; выход — только тейк 1 % движения
+цены, без стопа и срока (пересиживаем).
 
 Модель исполнения (консервативная):
 - вход — через D секунд после сделки кита, по цене внутри свечи (линейно от
@@ -720,6 +722,8 @@ class Stats:
     unrealized: float = 0.0    # их результат по рынку (входит в net)
     max_mae: float = 0.0       # самая глубокая просадка внутри одной сделки, $
     longest_h: float = 0.0     # самая долгая сделка, ч (открытая — до конца данных)
+    max_open_at_once: int = 0  # больше всего позиций сразу
+    max_overlap_mae: float = 0.0  # худшие провалы одновременно открытых вместе, $ (верхняя граница риска кросса)
 
     def row(self) -> dict:
         return {"сделок": self.trades, "прибыльных_%": round(100 * self.wins / self.trades, 1) if self.trades else 0,
@@ -728,7 +732,8 @@ class Stats:
                 "итог_$": round(self.net, 2), "просадка_$": round(self.max_dd, 2),
                 "худшая_серия": self.worst_streak, "худшая_серия_$": round(self.worst_streak_usd, 2),
                 "открытых": self.open_trades, "открытые_$": round(self.unrealized, 2),
-                "просадка_в_сделке_$": round(self.max_mae, 2), "дольше_всех_ч": round(self.longest_h, 1)}
+                "просадка_в_сделке_$": round(self.max_mae, 2), "дольше_всех_ч": round(self.longest_h, 1),
+                "позиций_сразу_макс": self.max_open_at_once, "провал_всех_сразу_$": round(self.max_overlap_mae, 2)}
 
 
 def stats_json(st: Stats) -> dict:
@@ -739,7 +744,8 @@ def stats_json(st: Stats) -> dict:
             "pf": round(st.pf, 3) if math.isfinite(st.pf) else None, "net": round(st.net, 2),
             "max_dd": round(st.max_dd, 2), "worst_streak": st.worst_streak,
             "worst_streak_usd": round(st.worst_streak_usd, 2), "open": st.open_trades,
-            "unrealized": round(st.unrealized, 2), "max_mae": round(st.max_mae, 2), "longest_h": round(st.longest_h, 1)}
+            "unrealized": round(st.unrealized, 2), "max_mae": round(st.max_mae, 2), "longest_h": round(st.longest_h, 1),
+            "max_open_at_once": st.max_open_at_once, "max_overlap_mae": round(st.max_overlap_mae, 2)}
 
 
 def stats(trades: Sequence[Trade]) -> Stats:
@@ -758,6 +764,15 @@ def stats(trades: Sequence[Trade]) -> Stats:
     s.unrealized = sum(t.pnl_usd for t in trades if t.open)
     s.max_mae = max(t.mae_usd for t in trades)
     s.longest_h = max(t.exit_t - t.entry_t for t in trades) / HOUR_MS
+    # Кросс: все открытые держит один счёт. Сколько их бывало сразу и чем
+    # грозили вместе — сумма худших провалов тех, что открыты одновременно
+    # (провалы могли быть и в разное время — это верхняя граница).
+    active: list[Trade] = []
+    for t in sorted(trades, key=lambda x: x.entry_t):
+        active = [x for x in active if x.exit_t > t.entry_t]
+        active.append(t)
+        s.max_open_at_once = max(s.max_open_at_once, len(active))
+        s.max_overlap_mae = max(s.max_overlap_mae, sum(x.mae_usd for x in active))
     eq = peak = 0.0
     run = run_usd = 0
     for t in sorted(trades, key=lambda x: (x.exit_t, x.entry_t)):
@@ -812,9 +827,10 @@ class Sizing:
 
     Ликвидация. Изолированная маржа: убыток съел маржу позиции до
     поддерживающей — ход против нас 1/плечо − maint, потеряна маржа. Кросс-
-    маржа: позицию держит весь счёт (на позицию — его доля, если позиций
-    может быть несколько) — ход против нас доля счёта / позиция − maint,
-    потеряна эта доля счёта."""
+    маржа: позицию держит весь счёт — у одной позиции ликвидации на деле
+    нет (ход против нас счёт / позиция − maint). Риск кросса — общий: все
+    открытые позиции вместе против счёта; его показывает Stats.max_overlap_mae
+    (сумма худших провалов одновременно открытых — верхняя граница)."""
     deposit: float
     margin_frac: float
     leverage: float
@@ -830,7 +846,7 @@ class Sizing:
     def backing(self) -> float:
         """Сколько денег держит одну позицию (доля от её размера)."""
         if self.cross:
-            return self.deposit / max(1, self.max_open) / self.notional
+            return self.deposit / self.notional
         return 1 / self.leverage
 
     @property
@@ -1195,8 +1211,12 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
             ho = best[2]
             w(f"Пересиживаем (срока нет): на отложенных не дошли до тейка и открыты {ho.open_trades} "
               f"({ho.unrealized:.2f} $ по рынку); самая долгая сделка — {ho.longest_h:.1f} ч; худшая просадка "
-              f"внутри сделки — {ho.max_mae:.2f} $ ({ho.max_mae / a.deposit * 100:.1f} % депозита). Пока позиция "
-              f"открыта, новых сделок нет (одна позиция за раз).")
+              f"внутри сделки — {ho.max_mae:.2f} $ ({ho.max_mae / a.deposit * 100:.1f} % депозита). Открытая "
+              f"позиция занимает место: позиций сразу до {a.max_open or 'без предела'}, бывало "
+              f"{ho.max_open_at_once}; худшие провалы открытых одновременно вместе — до "
+              f"{ho.max_overlap_mae:.2f} $ ({ho.max_overlap_mae / a.deposit * 100:.1f} % депозита"
+              + ("; БОЛЬШЕ ДЕПОЗИТА — на кроссе это ликвидация счёта" if ho.max_overlap_mae >= a.deposit else "")
+              + ").")
         w(f"Против китов (тот же набор, обратная сторона) на отложенных: сделок {fade.trades}, прибыльных "
           f"{fade.row()['прибыльных_%']} %, итог {fade.net:.2f} $ — за китами "
           + ("лучше" if best[2].net > fade.net else "НЕ лучше: преимущества китов нет, только форма стратегии")
@@ -1359,8 +1379,8 @@ def count_report(signals: Sequence[Signal], raw: int, k_min: int, a: argparse.Na
              "По дням (UTC): " + ", ".join(f"{d} — {n}" for d, n in sorted(by_day.items())[-30:]),
              "По часам (UTC): " + ", ".join(f"{h:02d} — {by_hour[h]}" for h in range(24)),
              "Бумаги: " + ", ".join(f"{c} — {n}" for c, n in sorted(by_coin.items(), key=lambda kv: -kv[1])[:30]),
-             "Это верхняя граница: сделка — только если цена не ушла от средней китов дальше предела, и пока "
-             "открытая позиция не дошла до тейка, новые не открываются (одна за раз)."]
+             "Это верхняя граница: сделка — только если цена не ушла от средней китов дальше предела и есть "
+             f"свободное место (позиций сразу до {a.max_open or 'без предела'}; не дошедшая до тейка его держит)."]
     return "\n".join(lines) + "\n"
 
 
@@ -1449,9 +1469,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-account", type=float, default=0, help="счёт кита от Y $ (0 — выкл)")
     ap.add_argument("--max-leverage", type=int, default=0, help="плечо кита до Z (0 — выкл)")
     ap.add_argument("--pnl30", default="1,0", help="требовать PnL кита за 30 дней > 0: 1 — да, 0 — нет (сетка)")
-    ap.add_argument("--cooldown", type=int, default=120, help="не чаще одного входа на бумагу за N минут")
-    ap.add_argument("--rest", type=int, default=180,
-                    help="после выхода из бумаги столько минут в неё снова не входим (правило владельца — 180)")
+    ap.add_argument("--cooldown", type=int, default=180,
+                    help="в одну и ту же бумагу — не чаще одного входа за N минут (правило владельца — 180, "
+                         "раз в 3 часа; в другие бумаги — сразу)")
+    ap.add_argument("--rest", type=int, default=0,
+                    help="ещё и пауза после выхода из бумаги, мин (0 — выкл; правило владельца — раз в 3 часа от входа)")
     ap.add_argument("--tp", default="1",
                     help="тейк, %% движения цены (правило владельца — 1 %%: при 10× это 10 %% на маржу; 0 — выкл; сетка)")
     ap.add_argument("--whale-exit", default="0", help="выходить, когда кит закрыл: 1 — да, 0 — нет (сетка)")
@@ -1469,7 +1491,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--deposit", type=float, default=10000, help="условный депозит, $")
     ap.add_argument("--margin-pct", type=float, default=10, help="маржа на сделку, %% депозита")
     ap.add_argument("--leverage", type=float, default=10, help="плечо")
-    ap.add_argument("--max-open", type=int, default=1, help="позиций одновременно, по всем бумагам (0 — без предела)")
+    ap.add_argument("--max-open", type=int, default=10,
+                    help="позиций одновременно, по всем бумагам (правило владельца — нон-стоп: 10 × маржа 10 %% = "
+                         "весь депозит; 0 — без предела)")
     ap.add_argument("--max-market-leverage", type=float, default=10,
                     help="предел плеча рынка: поддерживающая маржа — половина начальной при нём")
     ap.add_argument("--min-train-trades", type=int, default=30, help="наборы с меньшим числом сделок в подборе не ранжируются")

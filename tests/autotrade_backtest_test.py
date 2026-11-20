@@ -385,7 +385,7 @@ class OwnerRulesTest(Base):
             r = bt.run(bt.parser().parse_args(["--db", self.db, "--out", self.out, "--cache", self.cache,
                                                "--count-only"]), fetch=boom, now_ms=NOW)
         self.assertEqual(r["signals"], 6)
-        self.assertIn("возможностей входа (пауза 120 мин на бумагу): 3 за 3 дн. — в среднем 1.0 в день", r["text"])
+        self.assertIn("возможностей входа (пауза 180 мин на бумагу): 3 за 3 дн. — в среднем 1.0 в день", r["text"])
         self.assertIn("2+ кита от 1000 $: 1.0 / 1.0", r["text"])
         self.assertIn("2+ кита от 20000 $: 0.0 / 0.0", r["text"])
         self.assertFalse(os.path.exists(os.path.join(self.cache, "okx_map.json")))
@@ -394,10 +394,10 @@ class OwnerRulesTest(Base):
         a = bt.parser().parse_args([])
         self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.margin, a.markets), ("1", "0", "0", "0", "cross", "all"))
         self.assertEqual(bt.num_list(a.min_whale), [1000, 20000, 50000])  # ваше правило и строже — по подсчёту сервера
-        self.assertEqual((a.no_conflict, a.cooldown), ("1,0", 120))
+        self.assertEqual((a.no_conflict, a.cooldown), ("1,0", 180))  # в бумагу — раз в 3 часа
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
         self.assertEqual((a.cluster_hours, a.chase), (2, "0.3"))  # 2 часа; предел догона 0,3 %
-        self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
+        self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 10))  # нон-стоп: до 10 позиций × 10 %
         self.assertEqual(a.max_hold, 0)  # пересиживаем всегда: срока нет
 
 
@@ -511,20 +511,24 @@ class ExitTest(unittest.TestCase):
 
     def test_cross_margin_backs_position_with_whole_account(self):
         """Кросс-маржа, одна позиция 10 % × 10× = весь депозит: позицию держит
-        весь счёт — ликвидация лишь при ходе против нас на 95 %; при двух
-        позициях сразу на каждую — половина счёта."""
+        весь счёт — ликвидация лишь при ходе против нас на 95 %, и при
+        нескольких позициях тоже (риск — общий, max_overlap_mae)."""
         one = bt.Sizing(10_000, 0.1, 10, 1, 0.05, cross=True)
         self.assertAlmostEqual(one.backing, 1.0)
         self.assertAlmostEqual(one.liq_move, 0.95)
-        two = bt.Sizing(10_000, 0.1, 10, 2, 0.05, cross=True)
-        self.assertAlmostEqual(two.liq_move, 0.45)
+        ten = bt.Sizing(10_000, 0.1, 10, 10, 0.05, cross=True)
+        self.assertAlmostEqual(ten.liq_move, 0.95)
         c = self.flat()
         c[30] = (T0 + 30 * MIN, 100, 100, 50, 52)  # −50 %
         p = bt.build_path(self.sig(), 0, market(c), 300 * MIN, [0], 0.0, {})
         prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0, 0, 0, False))
         self.assertEqual(bt.simulate([self.sig()], {0: p}, prm, 0, 0, one)[0].why, "предел удержания")
-        tr = bt.simulate([self.sig()], {0: p}, prm, 0, 0, two)[0]
-        self.assertEqual((tr.why, tr.pnl_usd), ("ликвидация", -5_000))
+        tr = bt.simulate([self.sig()], {0: p}, prm, 0, 0, ten)[0]
+        self.assertEqual(tr.why, "предел удержания")
+        # Общий риск: две сделки открыты одновременно, провалы 300 $ и 500 $ — вместе до 800 $.
+        mk = lambda e, x, m: bt.Trade(self.sig(), e, x, 0.0, 0.0, "тейк", "1m", m)  # noqa: E731
+        st = bt.stats([mk(0, 100, 300), mk(50, 200, 500), mk(300, 400, 900)])
+        self.assertEqual((st.max_open_at_once, st.max_overlap_mae), (2, 900))
 
     def test_chase_filter(self):
         """Лонг: цена ниже средней китов — входим всегда; выше больше чем на
@@ -608,6 +612,32 @@ class ExitTest(unittest.TestCase):
         tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(1_000, 1.0, 10, 0, 0.0, cross=True))
         self.assertEqual([(t.why, round(t.pnl_usd)) for t in tr], [("ликвидация", -1_000)])
 
+    def test_nonstop_other_coins_same_coin_once_per_3h(self):
+        """Правило владельца: торгуем нон-стоп — пока бумага A открыта, входим
+        в B, C, …; в одну и ту же бумагу — не чаще раза в 3 часа от входа и не
+        пока в ней открыта позиция; мест — до 10."""
+        c = self.flat(2000)
+        c[10] = (T0 + 10 * MIN, 100, 102, 100, 101)  # тейк 1 % на 10-й минуте
+        sigs = [self.sig(ts=T0 + k * MIN) for k in (0, 60, 179, 181)]
+        for k in range(12):  # 12 разных бумаг в один час
+            o = self.sig(ts=T0 + (5 + k) * MIN)
+            o.coin = f"xyz:C{k}"
+            sigs.append(o)
+        sigs.sort(key=lambda s: s.ts)
+        flat = self.flat(2000)  # у остальных тейка нет — места держат
+        paths = {i: bt.build_path(sg, 0, market(c if sg.coin == "xyz:A" else flat), 0, [0], 0.0, {})
+                 for i, sg in enumerate(sigs)}
+        a = bt.parser().parse_args([])
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, a.cooldown, rest_min=a.rest), bt.Exits(0.01, 0, 0, False))
+        tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(10_000, 0.1, 10, a.max_open, 0.05, cross=True))
+        got = [(t.sig.coin, (t.sig.ts - T0) // MIN) for t in tr]
+        # A: вход в 0, тейк ~11; 60 и 179 — рано (раз в 3 ч); 181 — но мест уже нет (9 бумаг C держат + …)
+        self.assertEqual(got[0], ("xyz:A", 0))
+        others = [g for g in got if g[0] != "xyz:A"]
+        self.assertEqual(len(others), 10)  # A вышла на 11-й — её место занял десятый C
+        self.assertNotIn(("xyz:A", 60), got)
+        self.assertNotIn(("xyz:A", 179), got)
+
     def test_rest_after_exit(self):
         """Отторговали бумагу — 3 часа после выхода в неё не входим; в
         другую бумагу — можно сразу."""
@@ -623,7 +653,7 @@ class ExitTest(unittest.TestCase):
         # A: вход 0, выход ~11 мин; 60-я — отдых (до ~191); 200-я — можно. B — сразу.
         self.assertEqual([(t.sig.coin, t.sig.ts) for t in tr],
                          [("xyz:A", T0), ("xyz:B", T0 + 30 * MIN), ("xyz:A", T0 + 200 * MIN)])
-        self.assertEqual(bt.parser().parse_args([]).rest, 180)
+        self.assertEqual(bt.parser().parse_args([]).rest, 0)  # по умолчанию — раз в 3 ч от входа (--cooldown)
 
     def test_filters(self):
         s = self.sig()
