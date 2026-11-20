@@ -509,6 +509,7 @@ class Path:
     whale_exit: tuple[int, float] | None
     end_t: int             # до какого момента путь известен
     funding: list[tuple[int, float]]
+    open_end: bool = False  # срока нет: не дошли до тейка — позиция открыта на конец данных
 
 
 def price_at(c: list, sec: int, t: int) -> float | None:
@@ -526,10 +527,12 @@ def price_at(c: list, sec: int, t: int) -> float | None:
 def build_path(sig: Signal, delay: int, m: Market, hold_ms: int, holds: Sequence[int], slip: float,
                funding: dict[int, float]) -> Path | None:
     entry_t = sig.ts + delay * 1000
-    horizon = entry_t + hold_ms
     for interval, sec in INTERVALS:
         c = m.by_interval.get(interval) or []
-        if not c or c[0][0] > entry_t or c[-1][0] + sec * 1000 < horizon:
+        # hold_ms = 0 — срока нет («пересиживаем всегда»): путь — до конца
+        # данных этого интервала (у Hyperliquid — до «сейчас»).
+        horizon = entry_t + hold_ms if hold_ms else (c[-1][0] + sec * 1000 if c else 0)
+        if not c or c[0][0] > entry_t or c[-1][0] + sec * 1000 < horizon or horizon <= entry_t:
             continue
         px = price_at(c, sec, entry_t)
         if px is None:
@@ -565,7 +568,8 @@ def build_path(sig: Signal, delay: int, m: Market, hold_ms: int, holds: Sequence
         cap = price_at(c, sec, horizon)
         times_exit[-1] = (horizon, cap if cap is not None else c[-1][4])
         fund = sorted((h, r) for h, r in funding.items() if entry_t < h <= horizon)
-        return Path(interval, sec, entry_t, entry_px, starts, hi, negmin, times_exit, whale_exit, horizon, fund)
+        return Path(interval, sec, entry_t, entry_px, starts, hi, negmin, times_exit, whale_exit, horizon, fund,
+                    open_end=not hold_ms)
     return None
 
 
@@ -578,50 +582,59 @@ class Exits:
 
 
 def exit_trade(p: Path, side: int, ex: Exits, slip: float, fee: float, liq: float = 0.0,
-               liq_loss: float = 1.0) -> tuple[int, float, str]:
+               liq_loss: float = 1.0) -> tuple[int, float, str, float]:
     """Момент выхода, доход (доля от размера позиции, после комиссий и
-    фандинга) и причина. Стоп — в начале свечи касания, тейк — в конце: при
-    обоих в одной свече побеждает стоп. liq — ход цены против нас, на котором
-    биржа ликвидирует (доля; 0 — не считать): тогда потеряно liq_loss (доля
-    от размера: маржа позиции или доля счёта при кросс-марже) и комиссия
-    входа; стоп ближе ликвидации — сработает раньше неё."""
-    events: list[tuple[int, int, float, str]] = []  # (момент, приоритет, цена, причина)
+    фандинга), причина и худший ход против нас до выхода (доля, MAE). Стоп —
+    в начале свечи касания, тейк — в конце: при обоих в одной свече
+    побеждает стоп. liq — ход цены против нас, на котором биржа ликвидирует
+    (доля; 0 — не считать): тогда потеряно liq_loss (доля от размера: маржа
+    позиции или доля счёта при кросс-марже) и комиссия входа; стоп ближе
+    ликвидации — сработает раньше неё. Срока нет (open_end) и тейк не
+    достигнут — «открыта»: доход — по рынку на конец данных, без комиссии
+    выхода (позиция не закрыта)."""
+    events: list[tuple[int, int, float, str, int]] = []  # (момент, приоритет, цена, причина, свеча)
     sec_ms = p.sec * 1000
+    last = len(p.starts) - 1
 
     def adverse(move: float) -> int:
         level = p.entry_px * (1 - side * move)
         return bisect.bisect_left(p.negcummin, -level) if side > 0 else bisect.bisect_left(p.cummax, level)
 
+    def candle(t: int) -> int:
+        return max(0, min(last, bisect.bisect_right(p.starts, t) - 1))
+
     if ex.sl:
         i = adverse(ex.sl)
-        if i < len(p.starts):
-            events.append((p.starts[i], 0, p.entry_px * (1 - side * ex.sl), "стоп"))
+        if i <= last:
+            events.append((p.starts[i], 0, p.entry_px * (1 - side * ex.sl), "стоп", i))
     if liq > 0:
         i = adverse(liq)
-        if i < len(p.starts):
-            events.append((p.starts[i], 1, p.entry_px * (1 - side * liq), "ликвидация"))
+        if i <= last:
+            events.append((p.starts[i], 1, p.entry_px * (1 - side * liq), "ликвидация", i))
     if ex.tp:
         level = p.entry_px * (1 + side * ex.tp)
         i = (bisect.bisect_left(p.cummax, level) if side > 0 else bisect.bisect_left(p.negcummin, -level))
-        if i < len(p.starts):
+        if i <= last:
             # В свече входа тейка не бывает (там учтено только движение против
             # нас), поэтому i ≥ 1 и свеча начинается с границы интервала.
-            events.append((p.starts[i] + sec_ms, 2, level, "тейк"))
+            events.append((p.starts[i] + sec_ms, 2, level, "тейк", i))
     if ex.hold and ex.hold in p.times_exit:
         t, px = p.times_exit[ex.hold]
-        events.append((t, 3, px, "время"))
+        events.append((t, 3, px, "время", candle(t)))
     if ex.whale and p.whale_exit is not None:
         t, px = p.whale_exit
-        events.append((t, 3, px, "кит закрыл"))
+        events.append((t, 3, px, "кит закрыл", candle(t)))
     t, px = p.times_exit[-1]
-    events.append((t, 4, px, "предел удержания"))
-    t, _prio, px, why = min(events)
+    events.append((t, 4, px, "открыта" if p.open_end else "предел удержания", last))
+    t, _prio, px, why, idx = min(events)
+    worst = -p.negcummin[idx] if side > 0 else p.cummax[idx]
+    mae = max(0.0, side * (1 - worst / p.entry_px))
     if why == "ликвидация":
-        return t, -liq_loss - fee, why
-    out = px * (1 - side * slip)
+        return t, -liq_loss - fee, why, mae
+    out = px if why == "открыта" else px * (1 - side * slip)
     gross = side * (out / p.entry_px - 1)
     fund = side * sum(r for h, r in p.funding if h <= t)
-    return t, gross - 2 * fee - fund, why
+    return t, gross - (fee if why == "открыта" else 2 * fee) - fund, why, mae
 
 
 # ── итоги ────────────────────────────────────────────────────────────────────
@@ -635,6 +648,11 @@ class Trade:
     pnl_usd: float
     why: str
     interval: str
+    mae_usd: float = 0.0   # худший ход против нас до выхода, $ (просадка внутри сделки)
+
+    @property
+    def open(self) -> bool:
+        return self.why == "открыта"
 
 
 @dataclass
@@ -648,13 +666,19 @@ class Stats:
     max_dd: float = 0.0
     worst_streak: int = 0
     worst_streak_usd: float = 0.0
+    open_trades: int = 0       # не дошли до тейка — открыты на конец данных
+    unrealized: float = 0.0    # их результат по рынку (входит в net)
+    max_mae: float = 0.0       # самая глубокая просадка внутри одной сделки, $
+    longest_h: float = 0.0     # самая долгая сделка, ч (открытая — до конца данных)
 
     def row(self) -> dict:
         return {"сделок": self.trades, "прибыльных_%": round(100 * self.wins / self.trades, 1) if self.trades else 0,
                 "ср_прибыль_$": round(self.avg_win, 2), "ср_убыток_$": round(self.avg_loss, 2),
                 "profit_factor": round(self.pf, 2) if math.isfinite(self.pf) else "inf",
                 "итог_$": round(self.net, 2), "просадка_$": round(self.max_dd, 2),
-                "худшая_серия": self.worst_streak, "худшая_серия_$": round(self.worst_streak_usd, 2)}
+                "худшая_серия": self.worst_streak, "худшая_серия_$": round(self.worst_streak_usd, 2),
+                "открытых": self.open_trades, "открытые_$": round(self.unrealized, 2),
+                "просадка_в_сделке_$": round(self.max_mae, 2), "дольше_всех_ч": round(self.longest_h, 1)}
 
 
 def stats_json(st: Stats) -> dict:
@@ -664,7 +688,8 @@ def stats_json(st: Stats) -> dict:
             "avg_win": round(st.avg_win, 2), "avg_loss": round(st.avg_loss, 2),
             "pf": round(st.pf, 3) if math.isfinite(st.pf) else None, "net": round(st.net, 2),
             "max_dd": round(st.max_dd, 2), "worst_streak": st.worst_streak,
-            "worst_streak_usd": round(st.worst_streak_usd, 2)}
+            "worst_streak_usd": round(st.worst_streak_usd, 2), "open": st.open_trades,
+            "unrealized": round(st.unrealized, 2), "max_mae": round(st.max_mae, 2), "longest_h": round(st.longest_h, 1)}
 
 
 def stats(trades: Sequence[Trade]) -> Stats:
@@ -679,9 +704,17 @@ def stats(trades: Sequence[Trade]) -> Stats:
     gl = -sum(losses)
     s.pf = sum(wins) / gl if gl > 0 else (math.inf if wins else 0.0)
     s.net = sum(t.pnl_usd for t in trades)
+    s.open_trades = sum(t.open for t in trades)
+    s.unrealized = sum(t.pnl_usd for t in trades if t.open)
+    s.max_mae = max(t.mae_usd for t in trades)
+    s.longest_h = max(t.exit_t - t.entry_t for t in trades) / HOUR_MS
     eq = peak = 0.0
     run = run_usd = 0
     for t in sorted(trades, key=lambda x: (x.exit_t, x.entry_t)):
+        # Просадка счёта — и внутри сделки (пересиживаем: позиция могла уйти
+        # против нас глубоко, прежде чем дошла до тейка), а не только по
+        # закрытым.
+        s.max_dd = max(s.max_dd, peak - (eq - t.mae_usd))
         eq += t.pnl_usd
         peak = max(peak, eq)
         s.max_dd = max(s.max_dd, peak - eq)
@@ -795,11 +828,11 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, sli
         open_until = [u for u in open_until if u > p.entry_t]
         if sz.max_open and len(open_until) >= sz.max_open:
             continue
-        t, pct, why = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
+        t, pct, why, mae = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
         last_entry[s.coin] = p.entry_t
         busy_until[s.coin] = t
         open_until.append(t)
-        trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval))
+        trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval, mae * sz.notional))
     return trades
 
 
@@ -852,9 +885,16 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
     signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000,
                            a.min_whale)
+    # Свечи и пути — только для ордеров, которые могут пройти правило китов:
+    # остальные не станут сделкой ни при каком наборе сетки.
+    raw_signals = len(signals)
+    k_min, n_min = min(int_list(a.cluster)), min(num_list(a.min_notional))
+    signals = [s for s in signals if s.wallets >= k_min and s.cluster_notional >= n_min]
     md = MarketData(a.cache, a.offline, fetch, a.pause, now_ms)
     delays, holds = int_list(a.delays), int_list(a.hold)
-    hold_ms = max([*holds, a.max_hold]) * 60_000
+    # Срока нет (--max-hold 0, правило владельца — «пересиживаем всегда»):
+    # путь — до конца данных; позиция, не дошедшая до тейка, — «открыта».
+    hold_ms = max([*holds, a.max_hold]) * 60_000 if a.max_hold else 0
     db_funding = funding_from_db(con, sorted({s.coin for s in signals}))
     con.close()
     if a.fee is None:
@@ -879,7 +919,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     no_data = 0
     for coin, idxs in sorted(by_coin.items()):
         start = signals[idxs[0]].ts
-        end = signals[idxs[-1]].ts + max(delays) * 1000 + hold_ms
+        end = signals[idxs[-1]].ts + max(delays) * 1000 + hold_ms if hold_ms else md.now_ms
         if a.venue == "okx":
             inst = str(okx[coin]["inst"])
             market = md.okx_candles(inst, start, end)
@@ -898,7 +938,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
             no_data += not got
 
     if not signals:
-        raise SystemExit("сигналов нет: в hl_fills нет открытий по акциям")
+        raise SystemExit(f"сигналов нет: из {raw_signals} открытий китов правило «от {k_min} китов в одну сторону» "
+                         "не прошло ни одно")
     t_lo, t_hi = signals[0].ts, signals[-1].ts
     cut = t_lo + (t_hi - t_lo) * 3 // 4
     train = [i for i, s in enumerate(signals) if s.ts < cut]
@@ -975,7 +1016,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         if renamed:
             w("На OKX под другим именем: " + ", ".join(renamed))
     w(f"Период сигналов: {fmt(t_lo)} — {fmt(t_hi)}; подбор — до {fmt(cut)}, отложенные — после.")
-    w(f"Сигналов (ордеров китов): {len(signals)}; без свечей на весь срок удержания: {no_data}.")
+    w(f"Ордеров китов: {raw_signals}; из них проходят правило китов (от {k_min} в одну сторону): {len(signals)}; "
+      f"без свечей: {no_data}.")
     res = defaultdict(int)
     for i in range(len(signals)):
         p = paths[delays[0]].get(i)
@@ -1005,6 +1047,12 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
           f"{0.15 * a.deposit:.0f} $ (15 % депозита). Лучший набор подбора на отложенных: "
           + ", ".join(f"{k} {v}" for k, v in best[2].row().items()))
         w(f"Из лучших 10 критерий на отложенных проходят: {sum(passes(c[2]) for c in checked)}.")
+        if a.max_hold == 0:
+            ho = best[2]
+            w(f"Пересиживаем (срока нет): на отложенных не дошли до тейка и открыты {ho.open_trades} "
+              f"({ho.unrealized:.2f} $ по рынку); самая долгая сделка — {ho.longest_h:.1f} ч; худшая просадка "
+              f"внутри сделки — {ho.max_mae:.2f} $ ({ho.max_mae / a.deposit * 100:.1f} % депозита). Пока позиция "
+              f"открыта, новых сделок нет (одна позиция за раз).")
         w(f"Против китов (тот же набор, обратная сторона) на отложенных: сделок {fade.trades}, прибыльных "
           f"{fade.row()['прибыльных_%']} %, итог {fade.net:.2f} $ — за китами "
           + ("лучше" if best[2].net > fade.net else "НЕ лучше: преимущества китов нет, только форма стратегии")
@@ -1181,8 +1229,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--whale-exit", default="0", help="выходить, когда кит закрыл: 1 — да, 0 — нет (сетка)")
     ap.add_argument("--sl", default="0", help="стоп, %% (0 — выкл — пересиживаем; сетка)")
     ap.add_argument("--hold", default="0", help="выход по времени, мин (0 — выкл; сетка)")
-    ap.add_argument("--max-hold", type=int, default=4320,
-                    help="предел удержания, мин: дальше позиция считается закрытой по рынку (не дождались)")
+    ap.add_argument("--max-hold", type=int, default=0,
+                    help="предел удержания, мин; 0 — нет (правило владельца — пересиживаем всегда: не дошла до тейка — "
+                         "позиция открыта на конец данных, результат по рынку)")
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание, %% на каждую сторону")
     ap.add_argument("--venue", choices=("hl", "okx"), default="hl",
                     help="где торговать: hl — Hyperliquid; okx — OKX (только бумаги, сверенные по цене; свечи и фандинг OKX)")

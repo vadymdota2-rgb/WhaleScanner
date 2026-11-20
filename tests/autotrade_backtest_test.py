@@ -84,8 +84,10 @@ class FakeApi:
 
 
 def args(db: str, out: str, cache: str, *extra: str):
-    a = bt.parser().parse_args(["--db", db, "--out", out, "--cache", cache, "--pause", "0", *extra])
-    return a
+    """Проверки механики, а не правила владельца: по умолчанию — один кит
+    достаточен (правило «от 2 китов» проверяет OwnerRulesTest)."""
+    one = [] if "--cluster" in extra else ["--cluster", "1"]
+    return bt.parser().parse_args(["--db", db, "--out", out, "--cache", cache, "--pause", "0", *one, *extra])
 
 
 class Base(unittest.TestCase):
@@ -320,6 +322,7 @@ class OwnerRulesTest(Base):
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
         self.assertEqual((a.cluster_hours, a.chase), (2, "0.2,0.3,0.5"))  # 2 часа; предел догона 0,2–0,5 %
         self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
+        self.assertEqual(a.max_hold, 0)  # пересиживаем всегда: срока нет
 
 
 class ExitTest(unittest.TestCase):
@@ -333,7 +336,7 @@ class ExitTest(unittest.TestCase):
         c = self.flat()
         c[10] = (T0 + 10 * MIN, 100, 105, 95, 100)  # и тейк 2 %, и стоп 2 % — в одной свече
         p = bt.build_path(self.sig(), 0, market(c), 300 * MIN, [0], 0.0, {})
-        t, pct, why = bt.exit_trade(p, 1, bt.Exits(0.02, 0.02, 0, False), 0.0, 0.0)
+        t, pct, why, _mae = bt.exit_trade(p, 1, bt.Exits(0.02, 0.02, 0, False), 0.0, 0.0)
         self.assertEqual(why, "стоп")
         self.assertAlmostEqual(pct, -0.02)
         self.assertEqual(t, T0 + 10 * MIN)
@@ -342,7 +345,7 @@ class ExitTest(unittest.TestCase):
         c = self.flat()
         c[20] = (T0 + 20 * MIN, 100, 100, 96, 97)
         p = bt.build_path(self.sig(-1), 0, market(c), 300 * MIN, [0], 0.0, {})
-        _t, pct, why = bt.exit_trade(p, -1, bt.Exits(0.03, 0, 0, False), 0.0, 0.001)
+        _t, pct, why, _mae = bt.exit_trade(p, -1, bt.Exits(0.03, 0, 0, False), 0.0, 0.001)
         self.assertEqual(why, "тейк")
         self.assertAlmostEqual(pct, 0.03 - 0.002)
 
@@ -350,9 +353,9 @@ class ExitTest(unittest.TestCase):
         c = self.flat()
         c[0] = (T0, 100, 110, 99.5, 100)  # всплеск вверх в свече входа — не наш тейк
         p = bt.build_path(self.sig(), 0, market(c), 300 * MIN, [0], 0.0, {})
-        _t, _pct, why = bt.exit_trade(p, 1, bt.Exits(0.05, 0, 0, False), 0.0, 0.0)
+        _t, _pct, why, _mae = bt.exit_trade(p, 1, bt.Exits(0.05, 0, 0, False), 0.0, 0.0)
         self.assertEqual(why, "предел удержания")
-        _t, _pct, why = bt.exit_trade(p, 1, bt.Exits(0, 0.004, 0, False), 0.0, 0.0)
+        _t, _pct, why, _mae = bt.exit_trade(p, 1, bt.Exits(0, 0.004, 0, False), 0.0, 0.0)
         self.assertEqual(why, "стоп")
 
     def test_slippage_delay_time_exit_and_whale_close(self):
@@ -361,9 +364,9 @@ class ExitTest(unittest.TestCase):
         s.whale_close = T0 + 30 * MIN
         p = bt.build_path(s, 30, market(c), 300 * MIN, [60], 0.001, {})
         self.assertAlmostEqual(p.entry_px, 100.5 * 1.001)  # середина первой минуты + проскальзывание
-        t, _pct, why = bt.exit_trade(p, 1, bt.Exits(0, 0, 60, True), 0.0, 0.0)
+        t, _pct, why, _mae = bt.exit_trade(p, 1, bt.Exits(0, 0, 60, True), 0.0, 0.0)
         self.assertEqual((why, t), ("кит закрыл", T0 + 30 * MIN + 30_000))
-        t, _pct, why = bt.exit_trade(p, 1, bt.Exits(0, 0, 60, False), 0.0, 0.0)
+        t, _pct, why, _mae = bt.exit_trade(p, 1, bt.Exits(0, 0, 60, False), 0.0, 0.0)
         self.assertEqual((why, t), ("время", T0 + 30_000 + 60 * MIN))
 
     def test_funding_long_pays_short_receives(self):
@@ -371,7 +374,7 @@ class ExitTest(unittest.TestCase):
         fund = {T0 + h * 3_600_000: 0.0001 for h in range(1, 10)}
         for side in (1, -1):
             p = bt.build_path(self.sig(side), 0, market(c), 300 * MIN, [0], 0.0, fund)
-            _t, pct, _ = bt.exit_trade(p, side, bt.Exits(0, 0, 0, False), 0.0, 0.0)
+            _t, pct, _, _mae = bt.exit_trade(p, side, bt.Exits(0, 0, 0, False), 0.0, 0.0)
             self.assertAlmostEqual(pct, -side * 5 * 0.0001)  # 5 часов удержания
 
     def test_coarse_candles_when_minutes_are_gone(self):
@@ -427,7 +430,7 @@ class ExitTest(unittest.TestCase):
         up = self.flat()
         up[5] = (T0 + 5 * MIN, 100, 106, 100, 105)
         p = bt.build_path(self.sig(-1), 0, market(up), 300 * MIN, [0], 0.0, {})
-        _t, pct, why = bt.exit_trade(p, -1, bt.Exits(0, 0, 0, False), 0.0, 0.0, 0.05, 0.1)
+        _t, pct, why, _mae = bt.exit_trade(p, -1, bt.Exits(0, 0, 0, False), 0.0, 0.0, 0.05, 0.1)
         self.assertEqual((why, pct), ("ликвидация", -0.1))
 
     def test_cross_margin_backs_position_with_whole_account(self):
@@ -464,6 +467,43 @@ class ExitTest(unittest.TestCase):
         p = bt.build_path(s, 0, market(c), 300 * MIN, [0], 0.0, {})
         self.assertEqual(len(bt.simulate([s], {0: p}, bt.Params(0, bt.Filters(0, 0, 0, False, 0), prm.exits),
                                          0, 0, sz)), 1)
+
+    def test_sit_through_never_closes_and_counts_the_dip(self):
+        """Пересиживаем всегда: срока нет — путь до конца данных; не дошли
+        до тейка — «открыта», результат по рынку (комиссия выхода не
+        взята: не закрыта). Просадка внутри сделки — MAE, и она входит в
+        просадку счёта, даже если сделка потом дошла до тейка. Пока позиция
+        открыта, новых нет (одна за раз)."""
+        c = [(T0 + k * MIN, 100, 100, 100, 100) for k in range(2000)]
+        for k in range(10, 400):          # провал до −20 %, потом возврат
+            px = 100 - 20 * min(k - 10, 390 - k + 10) / 195 if k < 400 else 100
+            c[k] = (T0 + k * MIN, px, px, px, px)
+        c[500] = (T0 + 500 * MIN, 100, 101.5, 100, 101)  # тейк +1 % — после провала
+        sz = bt.Sizing(10_000, 0.1, 10, 1, 0.05, cross=True)
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0.01, 0, 0, False))
+        first = self.sig()
+        p = bt.build_path(first, 0, market(c), 0, [0], 0.0, {})
+        self.assertTrue(p.open_end)
+        self.assertEqual(p.end_t, T0 + 2000 * MIN)  # до конца данных
+        tr = bt.simulate([first], {0: p}, prm, 0.0, 0.0, sz)[0]
+        self.assertEqual(tr.why, "тейк")
+        self.assertAlmostEqual(tr.mae_usd, 0.20 * 10_000, delta=60)  # просидели −20 %
+        st = bt.stats([tr])
+        self.assertGreater(st.max_dd, 1_900)  # провал внутри сделки — это просадка счёта
+        # Лонг на плоской цене тейка не дождался — «открыта», по рынку.
+        flat = [(T0 + k * MIN, 100, 100, 100, 100) for k in range(300)]
+        late = self.sig(ts=T0 + 10 * MIN)
+        p2 = bt.build_path(late, 0, market(flat), 0, [0], 0.0, {})
+        tr2 = bt.simulate([late], {0: p2}, prm, 0.0, 0.001, sz)[0]
+        self.assertEqual(tr2.why, "открыта")
+        self.assertTrue(tr2.open)
+        self.assertAlmostEqual(tr2.pnl_pct, -0.001)  # только комиссия входа
+        st2 = bt.stats([tr2])
+        self.assertEqual((st2.open_trades, round(st2.unrealized)), (1, -10))
+        # Открытая позиция держит место: следующий сигнал не входит.
+        nxt = self.sig(ts=T0 + 200 * MIN)
+        paths = {0: p2, 1: bt.build_path(nxt, 0, market(flat), 0, [0], 0.0, {})}
+        self.assertEqual(len(bt.simulate([late, nxt], paths, prm, 0.0, 0.0, sz)), 1)
 
     def test_filters(self):
         s = self.sig()
