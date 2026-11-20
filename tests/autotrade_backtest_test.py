@@ -647,6 +647,28 @@ class ExitTest(unittest.TestCase):
         self.assertNotIn(("xyz:A", 60), got)
         self.assertNotIn(("xyz:A", 179), got)
 
+    def test_memory_cap_any_flavour_is_code_3(self):
+        """Предел памяти: MemoryError, «out of memory» от SQLite и SystemError
+        (так падает sqlite3 в некоторых сборках, когда malloc отказал) — код 3
+        и понятная строка; без предела SystemError — настоящая ошибка, не 3."""
+        import io as _io
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        out = tmp.name
+        from unittest import mock as _mock
+        for exc in (MemoryError(), sqlite3.OperationalError("out of memory"),
+                    SystemError("error return without exception set")):
+            err = _io.StringIO()
+            with _mock.patch.object(bt, "run", side_effect=exc), _mock.patch.object(bt, "limit_memory"), \
+                    _mock.patch("sys.stderr", err):
+                self.assertEqual(bt.main(["--out", out, "--max-mem-mb", "150"]), 3, repr(exc))
+            self.assertIn("предела памяти", err.getvalue())
+        with _mock.patch.object(bt, "run", side_effect=SystemError("x")), self.assertRaises(SystemError):
+            bt.main(["--out", out, "--max-mem-mb", "0"])
+        with _mock.patch.object(bt, "run", side_effect=sqlite3.OperationalError("no such table")), \
+                _mock.patch.object(bt, "limit_memory"), self.assertRaises(sqlite3.OperationalError):
+            bt.main(["--out", out, "--max-mem-mb", "150"])
+
     def test_rest_after_exit(self):
         """Отторговали бумагу — 3 часа после выхода в неё не входим; в
         другую бумагу — можно сразу."""

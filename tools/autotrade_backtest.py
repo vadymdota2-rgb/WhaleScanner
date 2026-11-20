@@ -1530,6 +1530,19 @@ def limit_memory(mb: int) -> None:
     resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
 
 
+def out_of_memory(e: BaseException, capped: bool) -> bool:
+    """Упёрлись в предел памяти? Python говорит MemoryError, но SQLite на
+    нехватке памяти — по-разному в разных сборках: sqlite3.Error «out of
+    memory» или SystemError (функция вернула ошибку без исключения — так
+    падает модуль sqlite3, когда malloc отказал). SystemError считаем
+    нехваткой только под пределом памяти: без него это настоящая ошибка."""
+    if isinstance(e, MemoryError):
+        return True
+    if isinstance(e, sqlite3.Error) and "memory" in str(e).lower():
+        return True
+    return capped and isinstance(e, SystemError)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     a = parser().parse_args(argv)
     if not a.out:
@@ -1537,9 +1550,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     limit_memory(a.max_mem_mb)
     try:
         r = run(a)
-    except MemoryError:
+    except (MemoryError, SystemError, sqlite3.Error) as e:
+        if not out_of_memory(e, a.max_mem_mb > 0):
+            raise
         sys.stderr.write(f"бэктест: не хватило предела памяти {a.max_mem_mb} МБ (--max-mem-mb) — остановлен сам, "
-                         "сервер не тронут. Уменьшите объём: --since-days, --markets stocks, меньше сетка.\n")
+                         f"сервер не тронут ({type(e).__name__}). Уменьшите объём: --since-days, --markets stocks, "
+                         "меньше сетка.\n")
         return 3
     sys.stdout.write(r["text"])
     print(f"\nФайлы: {a.out}/report.txt, trades.csv, grid.csv, top10.csv")

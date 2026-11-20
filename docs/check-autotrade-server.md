@@ -66,7 +66,7 @@ grep -n '^MAX_MEM_MB\|autotrade_data' ~/WalletTracker/wt_autotrade.py
 mkdir -p "$T/ws/tools" "$T/ws/tests"
 cp ~/WhaleScanner/tools/autotrade_backtest.py "$T/ws/tools/"
 cp ~/WhaleScanner/tests/autotrade_backtest_test.py ~/WhaleScanner/tests/autotrade_scale_test.py "$T/ws/tests/"
-(cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «34 проверок без сети и без записи в базу»
+(cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «35 проверок без сети и без записи в базу»
 (cd "$T/ws" && nice -n 19 python3 tests/autotrade_scale_test.py)      # 300 000 ордеров, пик < 700 МБ; ~20 с
 ```
 
