@@ -828,6 +828,10 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, sli
         open_until = [u for u in open_until if u > p.entry_t]
         if sz.max_open and len(open_until) >= sz.max_open:
             continue
+        # Депозит кончился (закрытые к этому моменту съели его) — торговать
+        # нечем: дальше сделок нет. Без этого модель «торговала» бы в долг.
+        if sz.deposit + sum(t.pnl_usd for t in trades if t.exit_t <= p.entry_t) <= 0:
+            break
         t, pct, why, mae = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
         last_entry[s.coin] = p.entry_t
         busy_until[s.coin] = t
@@ -890,6 +894,11 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     raw_signals = len(signals)
     k_min, n_min = min(int_list(a.cluster)), min(num_list(a.min_notional))
     signals = [s for s in signals if s.wallets >= k_min and s.cluster_notional >= n_min]
+    if a.count_only:
+        con.close()
+        text = count_report(signals, raw_signals, k_min, a)
+        sys.stdout.write(text)
+        return {"text": text, "signals": len(signals)}
     md = MarketData(a.cache, a.offline, fetch, a.pause, now_ms)
     delays, holds = int_list(a.delays), int_list(a.hold)
     # Срока нет (--max-hold 0, правило владельца — «пересиживаем всегда»):
@@ -991,6 +1000,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         return simulate(flipped, ps, prm, slip, fee, sizing)
 
     by_chase: list[dict] = []
+    pace: list[dict] = []
     checked = [(prm, st, stats(on(hold_out, prm))) for prm, st in top]
     best = checked[0] if checked else None
     fade = stats(against(hold_out, best[0])) if best else Stats()
@@ -1086,6 +1096,31 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         breakdown("По времени суток:", lambda t: "рынок США открыт" if us_open(t.entry_t) else "рынок США закрыт")
         breakdown("По причине выхода:", lambda t: t.why)
         w("")
+        days = max(1.0, (t_hi - t_lo) / DAY_MS)
+        w(f"Сколько сделок в день (лучший набор, весь период {days:.0f} дн., возможностей входа "
+          f"{len(episodes(signals, a.cooldown))}):")
+        for mo in (1, 3, 10):
+            sz_mo = replace(sizing, max_open=mo)
+            sigs_all = list(range(len(signals)))
+            tr = simulate([signals[i] for i in sigs_all], {k: paths[prm.delay][i] for k, i in enumerate(sigs_all)
+                                                         if i in paths[prm.delay]}, prm, slip, fee, sz_mo)
+            st_mo = stats(tr)
+            tp_h = sorted((t.exit_t - t.entry_t) / HOUR_MS for t in tr if t.why == "тейк")
+            med = tp_h[len(tp_h) // 2] if tp_h else 0.0
+            eq, bust = a.deposit, 0
+            for t in sorted(tr, key=lambda x: x.exit_t):
+                eq += t.pnl_usd
+                if eq <= 0:
+                    bust = t.exit_t
+                    break
+            w(f"  позиций сразу {mo} (маржа {mo * a.margin_pct:g} % депозита): сделок {len(tr)} — "
+              f"{len(tr) / days:.1f} в день; до тейка обычно {med:.1f} ч; открыты на конец {st_mo.open_trades}; "
+              f"итог {st_mo.net:.2f} $; просадка {st_mo.max_dd:.2f} $"
+              + (f"; ДЕПОЗИТ КОНЧИЛСЯ {fmt(bust)}" if bust else ""))
+            pace.append({"max_open": mo, "trades": len(tr), "per_day": round(len(tr) / days, 2),
+                         "median_tp_h": round(med, 2), "open": st_mo.open_trades, "net": round(st_mo.net, 2),
+                         "max_dd": round(st_mo.max_dd, 2), "bust": bust})
+        w("")
         w("По пределу догона (лучший набор подбора для каждого предела; подбор → отложенные):")
         for chase in pct_list(a.chase):
             cand = [g for g in ranked if g[0].filters.max_chase == chase]
@@ -1138,11 +1173,51 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
                             on(list(range(len(signals))), best[0]) if best else [], passes, fade if best else None)
     summary["okx"] = {"venue": a.venue, "map": okx}
     summary["by_chase"] = by_chase
+    summary["pace"] = pace
+    summary["entries_per_day"] = round(len(episodes(signals, a.cooldown)) / max(1.0, (t_hi - t_lo) / DAY_MS), 2)
     with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False)
     os.replace(os.path.join(a.out, "summary.json.tmp"), os.path.join(a.out, "summary.json"))
     return {"summary": summary, "text": text, "verdict": verdict, "signals": len(signals), "grid": grid, "top": checked,
             "requests": md.requests}
+
+
+def episodes(signals: Sequence[Signal], cooldown_min: int) -> list[Signal]:
+    """Возможности входа: первый ордер, прошедший правило китов, на бумаге;
+    следующие на той же бумаге раньше паузы — тот же случай, не новый."""
+    last: dict[str, int] = {}
+    out = []
+    for s in signals:
+        if s.ts - last.get(s.coin, -10**18) >= cooldown_min * 60_000:
+            out.append(s)
+            last[s.coin] = s.ts
+    return out
+
+
+def count_report(signals: Sequence[Signal], raw: int, k_min: int, a: argparse.Namespace) -> str:
+    """--count-only: сколько возможностей входа по правилу китов в день — без
+    сети и без свечей (только чтение базы), за секунды. Это верхняя граница
+    сделок: при одной позиции за раз, пока она не дошла до тейка, новые не
+    открываются."""
+    ep = episodes(signals, a.cooldown)
+    by_day: dict[str, int] = defaultdict(int)
+    by_coin: dict[str, int] = defaultdict(int)
+    by_hour: dict[int, int] = defaultdict(int)
+    for s in ep:
+        d = datetime.fromtimestamp(s.ts / 1000, tz=timezone.utc)
+        by_day[d.strftime("%Y-%m-%d")] += 1
+        by_coin[s.coin] += 1
+        by_hour[d.hour] += 1
+    days = max(1, len(by_day) if not ep else (ep[-1].ts - ep[0].ts) // DAY_MS + 1)
+    lines = [f"Ордеров китов: {raw}; проходят правило (от {k_min} китов в одну сторону за {a.cluster_hours:g} ч, "
+             f"у каждого от {a.min_whale:g} $): {len(signals)}; возможностей входа (пауза {a.cooldown} мин на "
+             f"бумагу): {len(ep)} за {days} дн. — в среднем {len(ep) / days:.1f} в день.",
+             "По дням (UTC): " + ", ".join(f"{d} — {n}" for d, n in sorted(by_day.items())[-30:]),
+             "По часам (UTC): " + ", ".join(f"{h:02d} — {by_hour[h]}" for h in range(24)),
+             "Бумаги: " + ", ".join(f"{c} — {n}" for c, n in sorted(by_coin.items(), key=lambda kv: -kv[1])[:30]),
+             "Это верхняя граница: сделка — только если цена не ушла от средней китов дальше предела, и пока "
+             "открытая позиция не дошла до тейка, новые не открываются (одна за раз)."]
+    return "\n".join(lines) + "\n"
 
 
 def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signal], cut: int, res: dict,
@@ -1201,6 +1276,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache", default=os.path.join(tempfile.gettempdir(), "whale-autotrade-cache"),
                     help="кеш свечей и фандинга (копится между запусками)")
     ap.add_argument("--offline", action="store_true", help="без сети: только кеш")
+    ap.add_argument("--count-only", action="store_true",
+                    help="только посчитать возможности входа по правилу китов по дням (без сети и свечей)")
     ap.add_argument("--pause", type=float, default=1.0, help="пауза между запросами к API, с")
     ap.add_argument("--markets", choices=("all", "stocks"), default="all",
                     help="all — все фьючерсы (крипта, акции, металлы); stocks — только площадки --dexes")
@@ -1213,8 +1290,8 @@ def parser() -> argparse.ArgumentParser:
     # Предел догона: тейк — 1 % от нашего входа; цена, уже ушедшая от средней
     # китов на треть цели (0,3 %), — вход «по хаям». 0,1 % режет почти всё
     # (за D секунд цена почти всегда чуть сдвигается), 0,5 % — уже догонялки.
-    # Сетка — чтобы выбрать по данным (отчёт: «По пределу догона»).
-    ap.add_argument("--chase", default="0.2,0.3,0.5",
+    # Владелец выбрал 0,3 %; сетку можно задать (отчёт: «По пределу догона»).
+    ap.add_argument("--chase", default="0.3",
                     help="на сколько %% цена входа может быть хуже средней цены китов (сетка; 0 — без предела)")
     ap.add_argument("--margin", choices=("cross", "isolated"), default="cross", help="кросс- или изолированная маржа")
     ap.add_argument("--since-days", type=int, default=0, help="только последние N дней (0 — все)")

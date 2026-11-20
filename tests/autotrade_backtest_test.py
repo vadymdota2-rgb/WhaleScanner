@@ -10,6 +10,7 @@
 бота ничего не пишется, без сети — ни одного запроса.
 """
 import hashlib
+import io
 import math
 import os
 import sqlite3
@@ -17,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from typing import ClassVar
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import autotrade_backtest as bt
@@ -315,12 +317,38 @@ class OwnerRulesTest(Base):
         rule = bt.Filters(0, 0, 0, False, 0, 2)
         self.assertEqual([rule.ok(s) for s in sigs], [False, False, False, True])
 
+    def test_count_only_per_day_without_network(self):
+        """--count-only: возможности входа по правилу китов по дням — без
+        сети, без свечей; повтор на той же бумаге раньше паузы — тот же
+        случай."""
+        f = Fills()
+        h = 3_600_000
+        day = 86_400_000
+        for d in range(3):
+            base = T0 + d * day
+            f.add("a", "xyz:GOOGL", bt.OPEN_LONG, base, notional=5_000, oid=10 * d + 1)
+            f.add("b", "xyz:GOOGL", bt.OPEN_LONG, base + h, notional=5_000, oid=10 * d + 2)        # 2 кита — вход
+            f.add("c", "xyz:GOOGL", bt.OPEN_LONG, base + h + 60_000, notional=5_000, oid=10 * d + 3)  # тот же случай
+            f.add("d", "BTC", bt.OPEN_SHORT, base + 5 * h, notional=500, oid=10 * d + 4)          # мелкий — не кит
+        f.write(self.db)
+
+        def boom(_body):
+            raise AssertionError("сеть в --count-only")
+
+        out = io.StringIO()
+        with mock.patch("sys.stdout", out):
+            r = bt.run(bt.parser().parse_args(["--db", self.db, "--out", self.out, "--cache", self.cache,
+                                               "--count-only"]), fetch=boom, now_ms=NOW)
+        self.assertEqual(r["signals"], 6)
+        self.assertIn("возможностей входа (пауза 60 мин на бумагу): 3 за 3 дн. — в среднем 1.0 в день", r["text"])
+        self.assertFalse(os.path.exists(os.path.join(self.cache, "okx_map.json")))
+
     def test_defaults_are_the_owner_rules(self):
         a = bt.parser().parse_args([])
         self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.min_whale, a.margin, a.markets),
                          ("1", "0", "0", "0", 1000, "cross", "all"))
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
-        self.assertEqual((a.cluster_hours, a.chase), (2, "0.2,0.3,0.5"))  # 2 часа; предел догона 0,2–0,5 %
+        self.assertEqual((a.cluster_hours, a.chase), (2, "0.3"))  # 2 часа; предел догона 0,3 %
         self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
         self.assertEqual(a.max_hold, 0)  # пересиживаем всегда: срока нет
 
@@ -505,6 +533,21 @@ class ExitTest(unittest.TestCase):
         paths = {0: p2, 1: bt.build_path(nxt, 0, market(flat), 0, [0], 0.0, {})}
         self.assertEqual(len(bt.simulate([late, nxt], paths, prm, 0.0, 0.0, sz)), 1)
 
+    def test_no_trading_after_the_deposit_is_gone(self):
+        """Депозит кончился — сделок дальше нет (модель не торгует в долг).
+        Депозит 1000 $, позиция 10 000 $ (кросс): ход против на 10 % съедает
+        весь счёт — ликвидация; следующие сигналы — уже без денег."""
+        c = self.flat(3000)
+        for k in range(20, 3000):
+            c[k] = (T0 + k * MIN, 80, 80, 80, 80)   # −20 % и не возвращается
+        sigs = [self.sig(ts=T0 + k * 30 * MIN) for k in range(5)]
+        for k, sg in enumerate(sigs):
+            sg.coin = f"xyz:{k}"
+        paths = {i: bt.build_path(sg, 0, market(c), 30 * MIN, [0], 0.0, {}) for i, sg in enumerate(sigs)}
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0.01, 0, 0, False))
+        tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(1_000, 1.0, 10, 0, 0.0, cross=True))
+        self.assertEqual([(t.why, round(t.pnl_usd)) for t in tr], [("ликвидация", -1_000)])
+
     def test_filters(self):
         s = self.sig()
         s.pnl30 = -1
@@ -577,6 +620,10 @@ class VerdictTest(Base):
         self.assertLess(sm["fade"]["net"], sm["top"][0]["holdout"]["net"])
         self.assertIn("за китами лучше", r["text"])
         self.assertIn("По пределу догона", r["text"])
+        self.assertIn("Сколько сделок в день", r["text"])
+        self.assertEqual([x["max_open"] for x in sm["pace"]], [1, 3, 10])
+        self.assertGreaterEqual(sm["pace"][2]["trades"], sm["pace"][0]["trades"])  # больше мест — не меньше сделок
+        self.assertGreater(sm["entries_per_day"], 0)
         self.assertTrue(sm["by_chase"] and {"chase", "train", "holdout"} <= set(sm["by_chase"][0]))
         self.assertLessEqual(len(sm["equity"]), 501)
         # Без преимущества — комиссии съедают всё.
