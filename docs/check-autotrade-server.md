@@ -26,7 +26,7 @@ T=$(mktemp -d)
 mkdir -p "$T/tools" "$T/tests"
 cp tools/autotrade_backtest.py "$T/tools/"
 cp tests/autotrade_backtest_test.py "$T/tests/"
-(cd "$T" && python3 tests/autotrade_backtest_test.py)   # «17 проверок без сети и без записи в базу»
+(cd "$T" && python3 tests/autotrade_backtest_test.py)   # «19 проверок без сети и без записи в базу»
 ```
 
 Тесты не ходят в сеть и не трогают базу бота: база — синтетическая во
@@ -42,7 +42,7 @@ cp tests/autotrade_backtest_test.py "$T/tests/"
 ```bash
 DB=~/WhaleScanner/hyperliquid.db        # путь — из шага выше
 python3 "$T/tools/autotrade_backtest.py" --db "$DB" --out "$T/out" --cache "$T/cache"
-ls -la "$T/out"                          # report.txt, trades.csv, grid.csv, top10.csv
+ls -la "$T/out"                          # report.txt, summary.json, trades.csv, grid.csv, top10.csv
 ```
 
 - База открывается как `file:…?mode=ro` + `PRAGMA query_only`: запись в неё

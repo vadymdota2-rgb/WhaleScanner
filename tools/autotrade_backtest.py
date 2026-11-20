@@ -381,33 +381,47 @@ class Exits:
     whale: bool    # выходить, когда кит закрыл
 
 
-def exit_trade(p: Path, side: int, ex: Exits, slip: float, fee: float) -> tuple[int, float, str]:
-    """Момент выхода, доход (доля от размера, после комиссий и фандинга) и
-    причина. Стоп — в начале свечи касания, тейк — в конце: при обоих в одной
-    свече побеждает стоп."""
+def exit_trade(p: Path, side: int, ex: Exits, slip: float, fee: float, liq: float = 0.0,
+               leverage: float = 1.0) -> tuple[int, float, str]:
+    """Момент выхода, доход (доля от размера позиции, после комиссий и
+    фандинга) и причина. Стоп — в начале свечи касания, тейк — в конце: при
+    обоих в одной свече побеждает стоп. liq — ход цены против нас, на котором
+    биржа ликвидирует (доля; 0 — не считать): тогда потеряна вся маржа
+    (1/плечо от размера) и комиссия входа; стоп ближе ликвидации — сработает
+    раньше неё."""
     events: list[tuple[int, int, float, str]] = []  # (момент, приоритет, цена, причина)
     sec_ms = p.sec * 1000
+
+    def adverse(move: float) -> int:
+        level = p.entry_px * (1 - side * move)
+        return bisect.bisect_left(p.negcummin, -level) if side > 0 else bisect.bisect_left(p.cummax, level)
+
     if ex.sl:
-        level = p.entry_px * (1 - side * ex.sl)
-        i = (bisect.bisect_left(p.negcummin, -level) if side > 0 else bisect.bisect_left(p.cummax, level))
+        i = adverse(ex.sl)
         if i < len(p.starts):
-            events.append((p.starts[i], 0, level, "стоп"))
+            events.append((p.starts[i], 0, p.entry_px * (1 - side * ex.sl), "стоп"))
+    if liq > 0:
+        i = adverse(liq)
+        if i < len(p.starts):
+            events.append((p.starts[i], 1, p.entry_px * (1 - side * liq), "ликвидация"))
     if ex.tp:
         level = p.entry_px * (1 + side * ex.tp)
         i = (bisect.bisect_left(p.cummax, level) if side > 0 else bisect.bisect_left(p.negcummin, -level))
         if i < len(p.starts):
             # В свече входа тейка не бывает (там учтено только движение против
             # нас), поэтому i ≥ 1 и свеча начинается с границы интервала.
-            events.append((p.starts[i] + sec_ms, 1, level, "тейк"))
+            events.append((p.starts[i] + sec_ms, 2, level, "тейк"))
     if ex.hold and ex.hold in p.times_exit:
         t, px = p.times_exit[ex.hold]
-        events.append((t, 2, px, "время"))
+        events.append((t, 3, px, "время"))
     if ex.whale and p.whale_exit is not None:
         t, px = p.whale_exit
-        events.append((t, 2, px, "кит закрыл"))
+        events.append((t, 3, px, "кит закрыл"))
     t, px = p.times_exit[-1]
-    events.append((t, 3, px, "предел удержания"))
+    events.append((t, 4, px, "предел удержания"))
     t, _prio, px, why = min(events)
+    if why == "ликвидация":
+        return t, -1 / leverage - fee, why
     out = px * (1 - side * slip)
     gross = side * (out / p.entry_px - 1)
     fund = side * sum(r for h, r in p.funding if h <= t)
@@ -494,6 +508,26 @@ class Filters:
 
 
 @dataclass(frozen=True)
+class Sizing:
+    """Размер и риск: маржа — доля депозита, позиция = маржа × плечо; не
+    больше max_open позиций одновременно (по всем бумагам). Ликвидация — когда
+    убыток съел маржу до поддерживающей: ход против нас 1/плечо − maint."""
+    deposit: float
+    margin_frac: float
+    leverage: float
+    max_open: int
+    maint: float
+
+    @property
+    def notional(self) -> float:
+        return self.deposit * self.margin_frac * self.leverage
+
+    @property
+    def liq_move(self) -> float:
+        return max(0.0, 1 / self.leverage - self.maint)
+
+
+@dataclass(frozen=True)
 class Params:
     delay: int
     filters: Filters
@@ -509,12 +543,14 @@ class Params:
 
 
 def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, slip: float, fee: float,
-             size: float) -> list[Trade]:
+             sz: Sizing) -> list[Trade]:
     """Сделки по набору параметров: фильтр, пауза на бумагу, одна позиция на
-    бумагу."""
+    бумагу, не больше sz.max_open позиций сразу (сигнал при занятых местах
+    пропускается)."""
     trades: list[Trade] = []
     last_entry: dict[str, int] = {}
     busy_until: dict[str, int] = {}
+    open_until: list[int] = []
     cool = prm.filters.cooldown_min * 60_000
     for idx, s in enumerate(signals):
         p = paths.get(idx)
@@ -522,10 +558,14 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, sli
             continue
         if p.entry_t < busy_until.get(s.coin, 0) or p.entry_t - last_entry.get(s.coin, -cool - 1) < cool:
             continue
-        t, pct, why = exit_trade(p, s.side, prm.exits, slip, fee)
+        open_until = [u for u in open_until if u > p.entry_t]
+        if sz.max_open and len(open_until) >= sz.max_open:
+            continue
+        t, pct, why = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.leverage)
         last_entry[s.coin] = p.entry_t
         busy_until[s.coin] = t
-        trades.append(Trade(s, p.entry_t, t, pct, pct * size, why, p.interval))
+        open_until.append(t)
+        trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval))
     return trades
 
 
@@ -614,7 +654,10 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
                for x in num_list(a.min_notional) for p in int_list(a.pnl30)]
     exits = [Exits(tp, sl, h, w) for tp in pct_list(a.tp) for sl in pct_list(a.sl) for h in holds
              for w in (False, True)]
-    fee, slip, size = a.fee / 100, a.slippage / 100, a.size
+    fee, slip = a.fee / 100, a.slippage / 100
+    if not 0 < a.leverage <= a.max_market_leverage:
+        raise SystemExit(f"плечо {a.leverage} — вне 0…{a.max_market_leverage} (предел рынка)")
+    sizing = Sizing(a.deposit, a.margin_pct / 100, a.leverage, a.max_open, 1 / (2 * a.max_market_leverage))
 
     def subset(idx: list[int], d: int) -> tuple[list[Signal], dict[int, Path]]:
         return [signals[i] for i in idx], {k: paths[d][i] for k, i in enumerate(idx) if i in paths[d]}
@@ -625,13 +668,13 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         for f in filters:
             for e in exits:
                 prm = Params(d, f, e)
-                grid.append((prm, stats(simulate(sigs, ps, prm, slip, fee, size))))
+                grid.append((prm, stats(simulate(sigs, ps, prm, slip, fee, sizing))))
     ranked = sorted((g for g in grid if g[1].trades >= a.min_train_trades), key=lambda g: (g[1].net, g[1].pf), reverse=True)
     top = ranked[:10]
 
     def on(idx: list[int], prm: Params) -> list[Trade]:
         sigs, ps = subset(idx, prm.delay)
-        return simulate(sigs, ps, prm, slip, fee, size)
+        return simulate(sigs, ps, prm, slip, fee, sizing)
 
     def passes(st: Stats) -> bool:
         return st.net > 0 and st.pf >= 1.3 and st.trades >= 100 and st.max_dd <= 0.15 * a.deposit
@@ -653,8 +696,12 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         res[p.interval if p else "нет"] += 1
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
     w("Фандинг: " + ", ".join(f"{c}: {s}" for c, s in sorted(funding_src.items())))
-    w(f"Комиссия тейкера {a.fee} % с каждой стороны, проскальзывание {a.slippage} %, размер {size:.0f} $, "
-      f"условный депозит {a.deposit:.0f} $; запросов к API: {md.requests}" + (f", сбоев: {len(md.errors)}" if md.errors else ""))
+    w(f"Депозит {a.deposit:.0f} $, маржа на сделку {a.margin_pct:g} % ({a.deposit * sizing.margin_frac:.0f} $), плечо "
+      f"{a.leverage:g}× — позиция {sizing.notional:.0f} $; одновременно позиций до {a.max_open or 'без предела'}; "
+      f"ликвидация при ходе против позиции {sizing.liq_move * 100:.1f} % (поддерживающая маржа "
+      f"{sizing.maint * 100:.1f} % — половина начальной при пределе рынка {a.max_market_leverage:g}×).")
+    w(f"Комиссия тейкера {a.fee} % с каждой стороны, проскальзывание {a.slippage} %; запросов к API: {md.requests}"
+      + (f", сбоев: {len(md.errors)}" if md.errors else ""))
     w("")
     if not best:
         w(f"Ни один набор не набрал {a.min_train_trades} сделок на периоде подбора — судить не о чем.")
@@ -730,8 +777,58 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     text = "\n".join(lines) + "\n"
     with open(os.path.join(a.out, "report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
-    return {"text": text, "verdict": verdict, "signals": len(signals), "grid": grid, "top": checked,
+    summary = build_summary(a, sizing, signals, cut, res, funding_src, md, checked, verdict,
+                            on(list(range(len(signals))), best[0]) if best else [], passes)
+    with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False)
+    os.replace(os.path.join(a.out, "summary.json.tmp"), os.path.join(a.out, "summary.json"))
+    return {"summary": summary, "text": text, "verdict": verdict, "signals": len(signals), "grid": grid, "top": checked,
             "requests": md.requests}
+
+
+def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signal], cut: int, res: dict,
+                  funding_src: dict[str, str], md: MarketData, checked: list, verdict: bool,
+                  trades: list[Trade], passes: Callable[[Stats], bool]) -> dict:
+    """Итог для закрытой вкладки приложения (API читает summary.json): то же,
+    что в отчёте, машиночитаемо. Адреса китов — сокращённо."""
+    def short(w: str) -> str:
+        return w[:6] + "…" + w[-4:] if len(w) > 12 else w
+
+    def group(key: Callable[[Trade], str], limit: int = 0) -> list[dict]:
+        g: dict[str, list[Trade]] = defaultdict(list)
+        for t in trades:
+            g[key(t)].append(t)
+        items = sorted(g.items(), key=lambda kv: -len(kv[1]))[:limit or None]
+        return [{"key": k, **stats(v).row()} for k, v in items]
+
+    eq, curve = 0.0, []
+    for t in sorted(trades, key=lambda x: (x.exit_t, x.entry_t)):
+        eq += t.pnl_usd
+        curve.append([t.exit_t, round(eq, 2)])
+    if len(curve) > 500:  # для графика хватит 500 точек; последняя — всегда
+        curve = [*curve[::len(curve) // 500 + 1], curve[-1]]
+    return {
+        "generated_at": int(time.time()),
+        "verdict": verdict,
+        "criteria": {"net_gt": 0, "pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2)},
+        "period": {"from": signals[0].ts if signals else 0, "to": signals[-1].ts if signals else 0, "cut": cut},
+        "sizing": {"deposit": a.deposit, "margin_pct": a.margin_pct, "leverage": a.leverage, "max_open": a.max_open,
+                   "notional": sizing.notional, "liq_move_pct": round(sizing.liq_move * 100, 3),
+                   "fee_pct": a.fee, "slippage_pct": a.slippage},
+        "data": {"signals": len(signals), "candles": dict(res), "requests": md.requests, "errors": len(md.errors),
+                 "funding": funding_src},
+        "top": [{"params": prm.row(), "train": st.row(), "holdout": ho.row(), "passes": passes(ho)}
+                for prm, st, ho in checked],
+        "full": stats(trades).row() if trades else None,
+        "equity": curve,
+        "by_coin": group(lambda t: t.sig.coin),
+        "by_whale": group(lambda t: short(t.sig.wallet), 15),
+        "by_session": group(lambda t: "open" if us_open(t.entry_t) else "closed"),
+        "by_exit": group(lambda t: t.why),
+        "trades": [{"coin": t.sig.coin, "side": t.sig.side, "whale": short(t.sig.wallet), "entry": t.entry_t,
+                    "exit": t.exit_t, "pct": round(t.pnl_pct * 100, 3), "usd": round(t.pnl_usd, 2), "why": t.why,
+                    "holdout": t.sig.ts >= cut} for t in sorted(trades, key=lambda x: x.entry_t)[-100:]],
+    }
 
 
 def parser() -> argparse.ArgumentParser:
@@ -757,8 +854,12 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание, %% на каждую сторону")
     ap.add_argument("--fee", type=float, default=0.09,
                     help="комиссия тейкера, %% на каждую сторону (базовая 0,045 %%; у HIP-3 до двойной)")
-    ap.add_argument("--size", type=float, default=1000, help="размер позиции, $")
-    ap.add_argument("--deposit", type=float, default=10000, help="условный депозит, $ (для просадки)")
+    ap.add_argument("--deposit", type=float, default=10000, help="условный депозит, $")
+    ap.add_argument("--margin-pct", type=float, default=10, help="маржа на сделку, %% депозита")
+    ap.add_argument("--leverage", type=float, default=10, help="плечо")
+    ap.add_argument("--max-open", type=int, default=1, help="позиций одновременно, по всем бумагам (0 — без предела)")
+    ap.add_argument("--max-market-leverage", type=float, default=10,
+                    help="предел плеча рынка: поддерживающая маржа — половина начальной при нём")
     ap.add_argument("--min-train-trades", type=int, default=30, help="наборы с меньшим числом сделок в подборе не ранжируются")
     return ap
 

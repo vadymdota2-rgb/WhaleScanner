@@ -240,11 +240,49 @@ class ExitTest(unittest.TestCase):
         sigs = [self.sig(ts=T0 + k * MIN) for k in (0, 10, 100, 400)]
         paths = {i: bt.build_path(s, 0, market(c), 300 * MIN, [0, 60], 0.0, {}) for i, s in enumerate(sigs)}
         f = bt.Filters(0, 0, 0, False, 60)
-        tr = bt.simulate(sigs, paths, bt.Params(0, f, bt.Exits(0, 0, 0, False)), 0, 0, 1000)
+        sz = bt.Sizing(10_000, 0.1, 1, 0, 0.0)
+        tr = bt.simulate(sigs, paths, bt.Params(0, f, bt.Exits(0, 0, 0, False)), 0, 0, sz)
         # 10-я минута — пауза 60 мин; 100-я — позиция ещё открыта (300 мин); 400-я — можно.
         self.assertEqual([t.sig.ts for t in tr], [T0, T0 + 400 * MIN])
-        tr = bt.simulate(sigs, paths, bt.Params(0, f, bt.Exits(0, 0, 60, False)), 0, 0, 1000)
+        tr = bt.simulate(sigs, paths, bt.Params(0, f, bt.Exits(0, 0, 60, False)), 0, 0, sz)
         self.assertEqual([t.sig.ts for t in tr], [T0, T0 + 100 * MIN, T0 + 400 * MIN])
+
+    def test_one_position_at_a_time_across_coins(self):
+        c = self.flat(2000)
+        sigs = [bt.Signal("w", coin, 1, T0 + k * MIN, 50_000, 1e6, 2)
+                for coin, k in (("xyz:A", 0), ("xyz:B", 30), ("xyz:C", 61))]
+        paths = {i: bt.build_path(s, 0, market(c), 300 * MIN, [0, 60], 0.0, {}) for i, s in enumerate(sigs)}
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0, 0, 60, False))
+        one = bt.simulate(sigs, paths, prm, 0, 0, bt.Sizing(10_000, 0.1, 10, 1, 0.05))
+        self.assertEqual([t.sig.coin for t in one], ["xyz:A", "xyz:C"])  # B — пока открыта A
+        many = bt.simulate(sigs, paths, prm, 0, 0, bt.Sizing(10_000, 0.1, 10, 0, 0.05))
+        self.assertEqual(len(many), 3)
+
+    def test_liquidation_at_ten_x(self):
+        """Маржа 10 % депозита, плечо 10×: позиция = депозит; поддерживающая
+        маржа — половина начальной, ликвидация на ходе против нас 5 %:
+        потеряна вся маржа (−10 % позиции) — 1000 $ из 10 000."""
+        sz = bt.Sizing(10_000, 0.1, 10, 1, 0.05)
+        self.assertAlmostEqual(sz.notional, 10_000)
+        self.assertAlmostEqual(sz.liq_move, 0.05)
+        c = self.flat()
+        c[30] = (T0 + 30 * MIN, 100, 100, 94, 95)  # −6 %
+        p = bt.build_path(self.sig(), 0, market(c), 300 * MIN, [0], 0.0, {})
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0, 0, 0, False))
+        tr = bt.simulate([self.sig()], {0: p}, prm, 0.0, 0.001, sz)
+        self.assertEqual(tr[0].why, "ликвидация")
+        self.assertAlmostEqual(tr[0].pnl_usd, (-0.1 - 0.001) * 10_000)
+        # Стоп 2 % — ближе ликвидации: сработает он, убыток 2 % позиции.
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0, 0.02, 0, False))
+        tr = bt.simulate([self.sig()], {0: p}, prm, 0.0, 0.0, sz)
+        self.assertEqual(tr[0].why, "стоп")
+        self.assertAlmostEqual(tr[0].pnl_usd, -200)
+        # Шорт: ликвидация на росте.
+        up = self.flat()
+        up[5] = (T0 + 5 * MIN, 100, 106, 100, 105)
+        p = bt.build_path(self.sig(-1), 0, market(up), 300 * MIN, [0], 0.0, {})
+        _t, pct, why = bt.exit_trade(p, -1, bt.Exits(0, 0, 0, False), 0.0, 0.0, 0.05, 10)
+        self.assertEqual((why, pct), ("ликвидация", -0.1))
 
     def test_filters(self):
         s = self.sig()
@@ -304,8 +342,16 @@ class VerdictTest(Base):
         r = bt.run(args(self.db, self.out, self.cache, *extra), fetch=self.scenario(0.02), now_ms=NOW)
         self.assertTrue(r["verdict"], r["text"])
         self.assertIn("МОЖНО ДАЛЬШЕ", r["text"])
-        for name in ("report.txt", "trades.csv", "grid.csv", "top10.csv"):
+        for name in ("report.txt", "trades.csv", "grid.csv", "top10.csv", "summary.json"):
             self.assertTrue(os.path.getsize(os.path.join(self.out, name)) > 0)
+        import json
+        with open(os.path.join(self.out, "summary.json"), encoding="utf-8") as fh:
+            sm = json.load(fh)
+        self.assertTrue(sm["verdict"])
+        self.assertEqual(sm["sizing"]["notional"], 10_000)
+        self.assertEqual(len(sm["top"]), len(r["top"]))
+        self.assertTrue(sm["equity"] and sm["trades"] and sm["by_coin"])
+        self.assertLessEqual(len(sm["equity"]), 501)
         # Без преимущества — комиссии съедают всё.
         os.remove(self.db)
         r = bt.run(args(self.db, self.out, self.cache + "2", *extra), fetch=self.scenario(0.0), now_ms=NOW)
