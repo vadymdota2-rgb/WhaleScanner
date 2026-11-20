@@ -701,6 +701,9 @@ class Trade:
     why: str
     interval: str
     mae_usd: float = 0.0   # худший ход против нас до выхода, $ (просадка внутри сделки)
+    entry_px: float = 0.0  # цена входа (с проскальзыванием)
+    tp_px: float = 0.0     # цена тейка (0 — тейка нет)
+    last_px: float = 0.0   # цена выхода; у открытой — цена на конец данных (рынок сейчас)
 
     @property
     def open(self) -> bool:
@@ -994,7 +997,10 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path] | PathView, prm: 
         # Отторговали бумагу — rest_min минут после выхода в неё не входим.
         busy_until[s.coin] = t + prm.filters.rest_min * 60_000
         open_until.append(t)
-        trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval, mae * sz.notional))
+        tp_px = p.entry_px * (1 + s.side * prm.exits.tp) if prm.exits.tp else 0.0
+        last_px = p.times_exit[-1][1] if why == "открыта" else (tp_px if why == "тейк" else 0.0)
+        trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval, mae * sz.notional,
+                            p.entry_px, tp_px, last_px))
     return trades
 
 
@@ -1429,7 +1435,18 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
         "by_exit": group(lambda t: t.why),
         "trades": [{"coin": t.sig.coin, "side": t.sig.side, "whale": short(t.sig.wallet), "entry": t.entry_t,
                     "exit": t.exit_t, "pct": round(t.pnl_pct * 100, 3), "usd": round(t.pnl_usd, 2), "why": t.why,
-                    "holdout": t.sig.ts >= cut} for t in sorted(trades, key=lambda x: x.entry_t)[-100:]],
+                    "holdout": t.sig.ts >= cut, "px_in": t.entry_px, "px_out": t.last_px}
+                   for t in sorted(trades, key=lambda x: x.entry_t)[-100:]],
+        # Активные позиции модели: не дошли до тейка к концу данных (это и
+        # есть «сейчас» — свечи до последнего прогона). Позиция всегда одна,
+        # но список — на случай --max-open > 1.
+        "active": [{"coin": t.sig.coin, "side": t.sig.side, "whales": t.sig.wallets, "entry": t.entry_t,
+                    "px_in": t.entry_px, "px_now": t.last_px, "tp": t.tp_px, "at": t.exit_t,
+                    "usd": round(t.pnl_usd, 2), "pct": round(t.pnl_pct * 100, 3),
+                    "to_tp_pct": round(t.sig.side * (t.tp_px / t.last_px - 1) * 100, 3) if t.tp_px and t.last_px else None,
+                    "mae": round(t.mae_usd, 2), "held_h": round((t.exit_t - t.entry_t) / HOUR_MS, 1)}
+                   for t in trades if t.open],
+        "per_day": round(len(trades) / max(1.0, ((signals[-1].ts - signals[0].ts) / DAY_MS) if signals else 1.0), 2),
     }
 
 

@@ -589,6 +589,10 @@ class ExitTest(unittest.TestCase):
         tr2 = bt.simulate([late], {0: p2}, prm, 0.0, 0.001, sz)[0]
         self.assertEqual(tr2.why, "открыта")
         self.assertTrue(tr2.open)
+        # Для вкладки «Активные позиции»: цена входа, тейк и рынок сейчас.
+        self.assertEqual((tr2.entry_px, tr2.last_px), (100, 100))
+        self.assertAlmostEqual(tr2.tp_px, 101)
+        self.assertAlmostEqual(tr.tp_px, tr.last_px)  # закрытая по тейку — вышла по цене тейка
         self.assertAlmostEqual(tr2.pnl_pct, -0.001)  # только комиссия входа
         st2 = bt.stats([tr2])
         self.assertEqual((st2.open_trades, round(st2.unrealized)), (1, -10))
@@ -734,6 +738,11 @@ class VerdictTest(Base):
         self.assertIn("По пределу догона", r["text"])
         self.assertIn("Сколько сделок в день", r["text"])
         self.assertEqual([x["max_open"] for x in sm["pace"]], [1, 3, 10])
+        self.assertIsInstance(sm["active"], list)  # активные позиции модели — открытые на конец данных
+        self.assertEqual(len(sm["active"]), sm["full"]["open"])
+        for x in sm["active"]:
+            self.assertTrue({"coin", "side", "entry", "px_in", "px_now", "tp", "usd", "to_tp_pct", "held_h"} <= set(x))
+        self.assertGreater(sm["per_day"], 0)
         self.assertGreaterEqual(sm["pace"][2]["trades"], sm["pace"][0]["trades"])  # больше мест — не меньше сделок
         self.assertGreater(sm["entries_per_day"], 0)
         self.assertTrue(sm["by_chase"] and {"chase", "train", "holdout"} <= set(sm["by_chase"][0]))
