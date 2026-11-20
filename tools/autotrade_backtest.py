@@ -461,6 +461,16 @@ class Stats:
                 "худшая_серия": self.worst_streak, "худшая_серия_$": round(self.worst_streak_usd, 2)}
 
 
+def stats_json(st: Stats) -> dict:
+    """Те же итоги для приложения: ключи латиницей, PF без бесконечности
+    (убытков не было — null)."""
+    return {"trades": st.trades, "win_pct": round(100 * st.wins / st.trades, 1) if st.trades else 0.0,
+            "avg_win": round(st.avg_win, 2), "avg_loss": round(st.avg_loss, 2),
+            "pf": round(st.pf, 3) if math.isfinite(st.pf) else None, "net": round(st.net, 2),
+            "max_dd": round(st.max_dd, 2), "worst_streak": st.worst_streak,
+            "worst_streak_usd": round(st.worst_streak_usd, 2)}
+
+
 def stats(trades: Sequence[Trade]) -> Stats:
     s = Stats(trades=len(trades))
     if not trades:
@@ -532,6 +542,12 @@ class Params:
     delay: int
     filters: Filters
     exits: Exits
+
+    def json(self) -> dict:
+        f, e = self.filters, self.exits
+        return {"delay": self.delay, "min_notional": f.min_notional, "min_account": f.min_account,
+                "max_leverage": f.max_leverage, "pnl30": f.need_pnl30, "cooldown": f.cooldown_min,
+                "tp": round(e.tp * 100, 3), "sl": round(e.sl * 100, 3), "hold": e.hold, "whale": e.whale}
 
     def row(self) -> dict:
         f, e = self.filters, self.exits
@@ -799,7 +815,7 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
         for t in trades:
             g[key(t)].append(t)
         items = sorted(g.items(), key=lambda kv: -len(kv[1]))[:limit or None]
-        return [{"key": k, **stats(v).row()} for k, v in items]
+        return [{"key": k, **stats_json(stats(v))} for k, v in items]
 
     eq, curve = 0.0, []
     for t in sorted(trades, key=lambda x: (x.exit_t, x.entry_t)):
@@ -817,9 +833,9 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
                    "fee_pct": a.fee, "slippage_pct": a.slippage},
         "data": {"signals": len(signals), "candles": dict(res), "requests": md.requests, "errors": len(md.errors),
                  "funding": funding_src},
-        "top": [{"params": prm.row(), "train": st.row(), "holdout": ho.row(), "passes": passes(ho)}
+        "top": [{"params": prm.json(), "train": stats_json(st), "holdout": stats_json(ho), "passes": passes(ho)}
                 for prm, st, ho in checked],
-        "full": stats(trades).row() if trades else None,
+        "full": stats_json(stats(trades)) if trades else None,
         "equity": curve,
         "by_coin": group(lambda t: t.sig.coin),
         "by_whale": group(lambda t: short(t.sig.wallet), 15),
