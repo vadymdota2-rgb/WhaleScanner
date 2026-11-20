@@ -397,7 +397,7 @@ class OwnerRulesTest(Base):
         self.assertEqual((a.no_conflict, a.cooldown), ("1,0", 180))  # в бумагу — раз в 3 часа
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
         self.assertEqual((a.cluster_hours, a.chase), (2, "0.3"))  # 2 часа; предел догона 0,3 %
-        self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 10))  # нон-стоп: до 10 позиций × 10 %
+        self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))  # всегда одна открытая позиция
         self.assertEqual(a.max_hold, 0)  # пересиживаем всегда: срока нет
 
 
@@ -612,10 +612,11 @@ class ExitTest(unittest.TestCase):
         tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(1_000, 1.0, 10, 0, 0.0, cross=True))
         self.assertEqual([(t.why, round(t.pnl_usd)) for t in tr], [("ликвидация", -1_000)])
 
-    def test_nonstop_other_coins_same_coin_once_per_3h(self):
-        """Правило владельца: торгуем нон-стоп — пока бумага A открыта, входим
-        в B, C, …; в одну и ту же бумагу — не чаще раза в 3 часа от входа и не
-        пока в ней открыта позиция; мест — до 10."""
+    def test_one_open_position_then_any_coin_same_coin_once_per_3h(self):
+        """Правило владельца: всегда одна открытая позиция — пока A открыта,
+        в B, C, … не входим; закрыли — сразу ищем дальше по всем бумагам; в
+        одну и ту же бумагу — не чаще раза в 3 часа от входа. (С --max-open
+        10 — до 10 мест, это тоже проверено.)"""
         c = self.flat(2000)
         c[10] = (T0 + 10 * MIN, 100, 102, 100, 101)  # тейк 1 % на 10-й минуте
         sigs = [self.sig(ts=T0 + k * MIN) for k in (0, 60, 179, 181)]
@@ -629,7 +630,11 @@ class ExitTest(unittest.TestCase):
                  for i, sg in enumerate(sigs)}
         a = bt.parser().parse_args([])
         prm = bt.Params(0, bt.Filters(0, 0, 0, False, a.cooldown, rest_min=a.rest), bt.Exits(0.01, 0, 0, False))
-        tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(10_000, 0.1, 10, a.max_open, 0.05, cross=True))
+        one = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(10_000, 0.1, 10, a.max_open, 0.05, cross=True))
+        # A: вход в 0, тейк в конце 10-й минуты (11); C0…C5 (5–10 мин) — пропуск: A открыта; C6 (11) — вход,
+        # она не закрывается (плоская цена) — дальше ничего, и A на 181-й тоже нет: место занято.
+        self.assertEqual([(t.sig.coin, (t.sig.ts - T0) // MIN) for t in one], [("xyz:A", 0), ("xyz:C6", 11)])
+        tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(10_000, 0.1, 10, 10, 0.05, cross=True))
         got = [(t.sig.coin, (t.sig.ts - T0) // MIN) for t in tr]
         # A: вход в 0, тейк ~11; 60 и 179 — рано (раз в 3 ч); 181 — но мест уже нет (9 бумаг C держат + …)
         self.assertEqual(got[0], ("xyz:A", 0))
