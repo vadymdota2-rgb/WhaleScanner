@@ -669,6 +669,35 @@ class ExitTest(unittest.TestCase):
                 _mock.patch.object(bt, "limit_memory"), self.assertRaises(sqlite3.OperationalError):
             bt.main(["--out", out, "--max-mem-mb", "150"])
 
+    def test_window_counts_match_brute_force(self):
+        """Окно сговора считается по ходу (прибавили — вычли) — и даёт ровно
+        то же, что пересчёт с нуля: китов от каждого порога, общий объём,
+        средняя цена китов от наименьшего порога; ордера без штук и нулевой
+        порог — тоже."""
+        import random as _r
+        rnd = _r.Random(7)
+        for limits in ([0], [1000 * bt.NANOS, 20_000 * bt.NANOS]):
+            w = bt.Window(limits)
+            orders: list[tuple[int, str, int, float]] = []
+            t = 0
+            for _ in range(3000):
+                t += rnd.randrange(0, 600_000)
+                o = (t, f"w{rnd.randrange(30)}", rnd.choice([0, 300, 900, 1500, 25_000]) * bt.NANOS,
+                     rnd.choice([0.0, 1.5, 10.0]))
+                w.expire(t - 7_200_000)
+                w.add(*o)
+                orders = [x for x in orders if x[0] >= t - 7_200_000] + [o]
+                per: dict[str, list] = {}
+                for _t, wl, n, u in orders:
+                    v = per.setdefault(wl, [0, 0.0])
+                    v[0] += n
+                    v[1] += u
+                self.assertEqual(w.count, [sum(1 for v in per.values() if v[0] >= lim) for lim in limits])
+                self.assertEqual(w.total, sum(x[2] for x in orders))
+                big = [v for v in per.values() if v[0] >= limits[0] and v[1] > 0]
+                self.assertEqual(w.big_n, sum(v[0] for v in big))
+                self.assertAlmostEqual(w.big_u, sum(v[1] for v in big), places=6)
+
     def test_rest_after_exit(self):
         """Отторговали бумагу — 3 часа после выхода в неё не входим; в
         другую бумагу — можно сразу."""

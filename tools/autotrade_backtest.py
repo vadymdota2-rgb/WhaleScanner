@@ -160,7 +160,7 @@ def is_perp(coin: str) -> bool:
 
 def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms: int = 0,
                  cluster_ms: int = 24 * 3_600_000, min_whale: float | Sequence[float] = 0.0,
-                 keep_min: int = 0) -> list[Signal]:
+                 keep_min: int = 0, with_history: bool = True) -> list[Signal]:
     """Открытия лонга и шорта китов на фьючерсах (закрытия — не сигнал).
     dexes — только эти площадки HIP-3 (акции); None — все фьючерсы: крипта,
     акции, металлы. Ордер кита исполняется кусками (много строк с одним oid)
@@ -170,7 +170,9 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
     Память — не по числу ордеров: куски склеивает сама база (GROUP BY),
     ордера идут потоком, в памяти — только окно сговора на бумагу и
     ордера, прошедшие правило (keep_min китов от наименьшего порога; 0 —
-    все, для проверок). На базе бота — сотни тысяч ордеров."""
+    все, для проверок). На базе бота — больше миллиона ордеров.
+    with_history=False — без истории китов (PnL за 30 дней, закрытия):
+    подсчёту сделок в день она не нужна."""
     thresholds = sorted({float(min_whale)} if isinstance(min_whale, (int, float)) else {float(x) for x in min_whale})
     global THRESHOLDS  # пороги одни на прогон: по ним читаются кортежи сигналов
     THRESHOLDS = tuple(thresholds)
@@ -179,45 +181,95 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
         "MAX(account_value_nanos), MAX(leverage) FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? "
         "GROUP BY wallet, coin, dir_code, CASE WHEN oid != 0 THEN oid ELSE -tid END "
         "ORDER BY t0, wallet, coin", (since_ms,))
-    recent: dict[tuple[str, int], deque[tuple[int, str, float, float]]] = defaultdict(deque)
+    limits = [round(t * NANOS) for t in thresholds]
+    recent: dict[tuple[str, int], Window] = {}
 
-    def whales(bucket: deque[tuple[int, str, float, float]], now: int) -> dict[str, list[float]]:
-        """Кит → [объём $, штук] за окно (старше окна — выброшены)."""
-        while bucket and bucket[0][0] < now - cluster_ms:
-            bucket.popleft()
-        per: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
-        for _t, w, n, u in bucket:
-            per[w][0] += n
-            per[w][1] += u
-        return per
+    def window(key: tuple[str, int]) -> Window:
+        w = recent.get(key)
+        if w is None:
+            w = recent[key] = Window(limits)
+        return w
 
     out: list[Signal] = []
     for wallet, coin, code, ts, notional, units, account, lev in cur:
         if not is_perp(coin) or (dexes is not None and not is_stock(coin, dexes)):
             continue
         side = 1 if code == OPEN_LONG else -1
-        usd_n = (notional or 0) / NANOS
+        nanos = int(notional or 0)
+        usd_n = nanos / NANOS
         units = float(units or 0.0)
-        bucket = recent[(coin, side)]
-        bucket.append((ts, wallet, usd_n, units))
-        per_wallet = whales(bucket, ts)
-        against = whales(recent[(coin, -side)], ts)
-        wallets_by = tuple(sum(1 for v in per_wallet.values() if v[0] >= t) for t in thresholds)
+        mine, other = window((coin, side)), window((coin, -side))
+        mine.expire(ts - cluster_ms)
+        other.expire(ts - cluster_ms)
+        mine.add(ts, wallet, nanos, units)
+        wallets_by = tuple(mine.count)
         if wallets_by[0] < keep_min:
             continue
         # Средняя цена входа китов — объём в $ на число штук (как средняя
         # цена позиции). Только китов от наименьшего порога: мелочь, не
         # прошедшая правило, цену китов не сдвигает.
-        big = [v for v in per_wallet.values() if v[0] >= thresholds[0] and v[1] > 0]
-        big_units = sum(v[1] for v in big)
         px = usd_n / units if units > 0 else 0.0
         out.append(Signal(wallet, coin, side, ts, usd_n, (account or 0) / NANOS, int(lev or 0), px=px, size=units,
-                          wallets=wallets_by[0], cluster_notional=sum(n for _t, _w, n, _u in bucket),
-                          ref_px=sum(v[0] for v in big) / big_units if big_units > 0 else px,
-                          wallets_by=wallets_by,
-                          opp_by=tuple(sum(1 for v in against.values() if v[0] >= t) for t in thresholds)))
-    attach_history(con, out)
+                          wallets=wallets_by[0], cluster_notional=mine.total / NANOS,
+                          ref_px=(mine.big_n / NANOS) / mine.big_u if mine.big_u > 0 else px,
+                          wallets_by=wallets_by, opp_by=tuple(other.count)))
+    if with_history:
+        attach_history(con, out)
     return out
+
+
+class Window:
+    """Окно сговора одной бумаги и стороны: ордера за последние cluster_ms
+    и суммы по китам — считаются по ходу (добавили ордер — прибавили,
+    вышел из окна — вычли), а не пересобираются на каждый ордер: на базе
+    с миллионом ордеров и сотнями китов в окне BTC это в разы быстрее.
+    Объём — в нано-долларах целыми: сумма и разность точны, сравнение с
+    порогом не «плывёт» от округления."""
+    __slots__ = ("big_k", "big_n", "big_u", "count", "limits", "orders", "per", "total")
+
+    def __init__(self, limits: Sequence[int]) -> None:
+        self.limits = limits
+        self.orders: deque[tuple[int, str, int, float]] = deque()
+        self.per: dict[str, list] = {}   # кит → [нано $, штук, ордеров, ордеров со штуками]
+        self.count = [0] * len(limits)   # китов от каждого порога
+        self.total = 0                   # нано $ всех ордеров окна
+        self.big_n = 0                   # китов от наименьшего порога (со штуками): нано $
+        self.big_u = 0.0                 # … и штук — для их средней цены
+        self.big_k = 0                   # … и сколько их
+
+    def _change(self, wallet: str, dn: int, du: float, dk: int, dku: int) -> None:
+        v = self.per.get(wallet)
+        n0, u0, k0, ku0 = v if v is not None else (0, 0.0, 0, 0)
+        k1, ku1 = k0 + dk, ku0 + dku
+        n1 = n0 + dn if k1 else 0
+        u1 = u0 + du if ku1 else 0.0
+        for i, lim in enumerate(self.limits):
+            self.count[i] += (k1 > 0 and n1 >= lim) - (k0 > 0 and n0 >= lim)
+        lo = self.limits[0]
+        if k0 and ku0 and n0 >= lo:
+            self.big_n -= n0
+            self.big_u -= u0
+            self.big_k -= 1
+        if k1 and ku1 and n1 >= lo:
+            self.big_n += n1
+            self.big_u += u1
+            self.big_k += 1
+        if not self.big_k:  # китов-со-штуками нет — сумма штук ровно 0 (без накопленной погрешности)
+            self.big_n, self.big_u = 0, 0.0
+        if k1:
+            self.per[wallet] = [n1, u1, k1, ku1]
+        else:
+            self.per.pop(wallet, None)
+        self.total += dn
+
+    def add(self, ts: int, wallet: str, nanos: int, units: float) -> None:
+        self.orders.append((ts, wallet, nanos, units))
+        self._change(wallet, nanos, units, 1, int(units > 0))
+
+    def expire(self, before: int) -> None:
+        while self.orders and self.orders[0][0] < before:
+            _t, w, n, u = self.orders.popleft()
+            self._change(w, -n, -u, -1, -int(u > 0))
 
 
 def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
@@ -1052,7 +1104,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     con = open_ro(a.db)
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
     signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000,
-                           num_list(a.min_whale), keep_min=min(int_list(a.cluster)))
+                           num_list(a.min_whale), keep_min=min(int_list(a.cluster)), with_history=not a.count_only)
     # Свечи и пути — только для ордеров, которые могут пройти правило китов:
     # остальные не станут сделкой ни при каком наборе сетки.
     raw_signals = len(signals)

@@ -35,16 +35,18 @@ export PYTHONDONTWRITEBYTECODE=1        # никакого __pycache__ в кат
 ## 1. Версии — дошёл ли автодеплой
 
 ```bash
-git -C ~/WhaleScanner log --oneline -1     # ожидается 6485659 или новее
+git -C ~/WhaleScanner log --oneline -1     # ожидается коммит «быстрый подсчёт…» (после 4c0d139) или новее
 git -C ~/WalletTracker log --oneline -1    # ожидается e850157 или новее
-git -C ~/WhaleScanner status --short | head; git -C ~/WalletTracker status --short | head   # ожидается пусто
+git -C ~/WhaleScanner status --short | head; git -C ~/WalletTracker status --short | head   # изменённых файлов нет (?? — данные бота, это нормально)
 systemctl is-active whale-api; systemctl show whale-api -p ActiveEnterTimestamp
 git -C ~/WalletTracker log -1 --format=%ci
 ```
 
 Если версии старее — ничего не тянуть руками, доложить и подождать
-автодеплой. API должен быть перезапущен **после** последнего коммита
-Wallet-Tracker (время запуска службы позже времени коммита).
+автодеплой. API перезапускается только когда менялся его Python-код (`*.py`
+в корне Wallet-Tracker); правки одного приложения (`html/`, `src/`, тесты)
+перезапуска не требуют. Проверить: `git -C ~/WalletTracker log --format='%h %ci' -1 -- '*.py'`
+— это время должно быть раньше запуска службы.
 
 ## 2. Ограничения службы API — хватает ли модулю прав и памяти
 
@@ -66,8 +68,8 @@ grep -n '^MAX_MEM_MB\|autotrade_data' ~/WalletTracker/wt_autotrade.py
 mkdir -p "$T/ws/tools" "$T/ws/tests"
 cp ~/WhaleScanner/tools/autotrade_backtest.py "$T/ws/tools/"
 cp ~/WhaleScanner/tests/autotrade_backtest_test.py ~/WhaleScanner/tests/autotrade_scale_test.py "$T/ws/tests/"
-(cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «35 проверок без сети и без записи в базу»
-(cd "$T/ws" && nice -n 19 python3 tests/autotrade_scale_test.py)      # 300 000 ордеров, пик < 700 МБ; ~20 с
+(cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «36 проверок без сети и без записи в базу»
+(cd "$T/ws" && nice -n 19 python3 tests/autotrade_scale_test.py)      # 300 000 ордеров, пик < 700 МБ; ~20–60 с; с пределом 150 МБ — код 3
 ```
 
 Модуль API (без сети, без настоящих баз и ключей — всё подменено в тесте):
@@ -99,19 +101,22 @@ EOF
 10 %; **одна открытая позиция**; в одну бумагу — раз в 3 часа; выход —
 только тейк 1 %, без стопа и срока.
 
-## 5. Сколько сделок в день — за секунды, без сети
+## 5. Сколько сделок в день — без сети, несколько минут
 
 Путь к базе Hyperliquid — `WHALE_HL_DB` в `systemctl cat whale-api` (вывести
 только этот путь, не другие значения).
 
 ```bash
 DB=~/WhaleScanner/hyperliquid.db
-nice -n 19 python3 "$T/ws/tools/autotrade_backtest.py" --db "$DB" --out "$T/cnt" --cache "$T/cache" --count-only
+time nice -n 19 python3 "$T/ws/tools/autotrade_backtest.py" --db "$DB" --out "$T/cnt" --cache "$T/cache" --count-only
 ```
 
-Только чтение базы. Строку «в среднем … в день» и таблицу по правилам —
-владельцу. Это верхняя граница: позиция одна — пока она не дошла до тейка,
-новые не открываются.
+Только чтение базы. Считает **все рынки** — крипту, акции, металлы: это
+правило владельца (`--markets all` по умолчанию); только акции — добавить
+`--markets stocks`. На базе в ~1,2 млн ордеров — несколько минут (с nice 19
+дольше, если сервер занят); дольше 15 минут — доложить. Строку «в среднем …
+в день» и таблицу по правилам — владельцу. Это верхняя граница: позиция
+одна — пока она не дошла до тейка, новые не открываются.
 
 Полный бэктест руками **не запускать**: его считает API (шаг 6), второй
 прогон рядом — лишняя память и запросы к Hyperliquid.
@@ -183,8 +188,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8090/api/owner
 
 ```bash
 cd ~/WhaleScanner
-grep -n '"/auto' *.cpp || echo "команд /auto в боте нет — этапы 2–3 не построены"
-grep -rnE 'whale-autotrade\.env|AUTOTRADE_|agent_?wallet|api_?secret|passphrase' --include=*.cpp --include=*.h --include=*.py . ~/WalletTracker/wt_autotrade.py || echo "ключей и их загрузки в коде нет"
+grep -nE '"/auto(trade)?[" ]' *.cpp || echo "команд /auto в боте нет — этапы 2–3 не построены"   # /autorenew, /autobase — не то
+grep -rnE 'whale-autotrade\.env|\bAUTOTRADE_|agent_?wallet|api_?secret|passphrase' --include=*.cpp --include=*.h --include=*.py . ~/WalletTracker/wt_autotrade.py || echo "ключей и их загрузки в коде нет"   # WT_AUTOTRADE_DIR — путь, не ключ
 grep -noE 'https://[a-z0-9./-]+' tools/autotrade_backtest.py | sort -u   # только api.hyperliquid.xyz и www.okx.com
 grep -nE '/api/v5/(trade|account|asset)' tools/autotrade_backtest.py || echo "торговых и счётных адресов OKX нет"
 stat -c '%U %a' /etc/whale-autotrade.env 2>/dev/null || echo "/etc/whale-autotrade.env нет"   # если есть — root 600, не открывать
