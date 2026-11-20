@@ -114,9 +114,13 @@ class DataTest(Base):
         f.add("w1", "xyz:TSLA", bt.CLOSE_LONG, ts + 9 * MIN, pnl=5000)
         f.add("w2", "BTC", bt.OPEN_LONG, ts)          # не акция
         f.add("w3", "abc:TSLA", bt.OPEN_SHORT, ts)    # чужая площадка
+        f.add("w4", "@107", bt.OPEN_LONG, ts)         # спот — не фьючерс
+        f.add("w5", "PURR/USDC", bt.OPEN_LONG, ts)    # спот
         f.write(self.db)
         sigs = bt.load_signals(bt.open_ro(self.db), bt.STOCK_DEXES)
         self.assertEqual(len(sigs), 1)
+        every = bt.load_signals(bt.open_ro(self.db), None)  # все фьючерсы: крипта, акции, металлы
+        self.assertEqual(sorted(x.coin for x in every), ["BTC", "abc:TSLA", "xyz:TSLA"])
         s = sigs[0]
         self.assertEqual((s.coin, s.side, s.ts), ("xyz:TSLA", 1, ts))
         self.assertAlmostEqual(s.notional, 30_000)
@@ -174,6 +178,35 @@ class DataTest(Base):
 
 def market(prices: list[tuple[int, float, float, float, float]]) -> bt.Market:
     return bt.Market({"1m": prices})
+
+
+class ClusterTest(Base):
+    def test_whales_together_and_their_average_price(self):
+        """Сговор: разные кошельки в одну сторону на одной бумаге за окно —
+        счёт, общий объём, средняя цена по объёму; повтор того же кошелька
+        не считается вторым китом; старше окна и другая сторона — не в счёт."""
+        f = Fills()
+        h = 3_600_000
+        f.add("a", "xyz:GOOGL", bt.OPEN_LONG, T0, notional=81_800, oid=1)
+        f.add("b", "xyz:GOOGL", bt.OPEN_LONG, T0 + h, notional=10_000, oid=2)
+        f.add("a", "xyz:GOOGL", bt.OPEN_LONG, T0 + 2 * h, notional=1_000, oid=3)
+        f.add("c", "xyz:GOOGL", bt.OPEN_SHORT, T0 + 2 * h, notional=5_000, oid=4)
+        f.add("d", "xyz:GOOGL", bt.OPEN_LONG, T0 + 30 * h, notional=4_000, oid=5)
+        f.write(self.db)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE hl_fills SET sz = CAST(notional_nanos AS REAL) / 1e9 / CASE oid WHEN 1 THEN 272.5 "
+                    "WHEN 2 THEN 270.87 ELSE 271.0 END")
+        con.commit()
+        con.close()
+        sigs = bt.load_signals(bt.open_ro(self.db), None, cluster_ms=24 * h)
+        got = [(s.wallet, s.side, s.wallets, round(s.cluster_notional)) for s in sigs]
+        self.assertEqual(got, [("a", 1, 1, 81_800), ("b", 1, 2, 91_800), ("a", 1, 2, 92_800),
+                               ("c", -1, 1, 5_000), ("d", 1, 1, 4_000)])
+        self.assertAlmostEqual(sigs[0].px, 272.5)
+        self.assertAlmostEqual(sigs[1].ref_px, (81_800 + 10_000) / (81_800 / 272.5 + 10_000 / 270.87), places=6)
+        self.assertTrue(bt.Filters(90_000, 0, 0, False, 0, 2).ok(sigs[1]))
+        self.assertFalse(bt.Filters(90_000, 0, 0, False, 0, 3).ok(sigs[1]))
+        self.assertFalse(bt.Filters(95_000, 0, 0, False, 0, 2).ok(sigs[1]))
 
 
 class ExitTest(unittest.TestCase):
@@ -281,8 +314,43 @@ class ExitTest(unittest.TestCase):
         up = self.flat()
         up[5] = (T0 + 5 * MIN, 100, 106, 100, 105)
         p = bt.build_path(self.sig(-1), 0, market(up), 300 * MIN, [0], 0.0, {})
-        _t, pct, why = bt.exit_trade(p, -1, bt.Exits(0, 0, 0, False), 0.0, 0.0, 0.05, 10)
+        _t, pct, why = bt.exit_trade(p, -1, bt.Exits(0, 0, 0, False), 0.0, 0.0, 0.05, 0.1)
         self.assertEqual((why, pct), ("ликвидация", -0.1))
+
+    def test_cross_margin_backs_position_with_whole_account(self):
+        """Кросс-маржа, одна позиция 10 % × 10× = весь депозит: позицию держит
+        весь счёт — ликвидация лишь при ходе против нас на 95 %; при двух
+        позициях сразу на каждую — половина счёта."""
+        one = bt.Sizing(10_000, 0.1, 10, 1, 0.05, cross=True)
+        self.assertAlmostEqual(one.backing, 1.0)
+        self.assertAlmostEqual(one.liq_move, 0.95)
+        two = bt.Sizing(10_000, 0.1, 10, 2, 0.05, cross=True)
+        self.assertAlmostEqual(two.liq_move, 0.45)
+        c = self.flat()
+        c[30] = (T0 + 30 * MIN, 100, 100, 50, 52)  # −50 %
+        p = bt.build_path(self.sig(), 0, market(c), 300 * MIN, [0], 0.0, {})
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0), bt.Exits(0, 0, 0, False))
+        self.assertEqual(bt.simulate([self.sig()], {0: p}, prm, 0, 0, one)[0].why, "предел удержания")
+        tr = bt.simulate([self.sig()], {0: p}, prm, 0, 0, two)[0]
+        self.assertEqual((tr.why, tr.pnl_usd), ("ликвидация", -5_000))
+
+    def test_chase_filter(self):
+        """Лонг: цена ниже средней китов — входим всегда; выше больше чем на
+        предел — поздно. Шорт — наоборот."""
+        c = self.flat(px=101.0)
+        f = bt.Filters(0, 0, 0, False, 0, 1, 0.005)
+        prm = bt.Params(0, f, bt.Exits(0, 0, 0, False))
+        sz = bt.Sizing(10_000, 0.1, 10, 0, 0.05, cross=True)
+        for side, ref, enter in ((1, 100.0, False), (1, 100.6, True), (1, 110.0, True),
+                                 (-1, 102.0, False), (-1, 101.4, True), (-1, 90.0, True)):
+            s = bt.Signal("w", "xyz:A", side, T0, 50_000, 1e6, 2, px=ref)
+            p = bt.build_path(s, 0, market(c), 300 * MIN, [0], 0.0, {})
+            self.assertEqual(len(bt.simulate([s], {0: p}, prm, 0, 0, sz)), int(enter), (side, ref))
+        # 0 — без предела.
+        s = bt.Signal("w", "xyz:A", 1, T0, 50_000, 1e6, 2, px=50.0)
+        p = bt.build_path(s, 0, market(c), 300 * MIN, [0], 0.0, {})
+        self.assertEqual(len(bt.simulate([s], {0: p}, bt.Params(0, bt.Filters(0, 0, 0, False, 0), prm.exits),
+                                         0, 0, sz)), 1)
 
     def test_filters(self):
         s = self.sig()

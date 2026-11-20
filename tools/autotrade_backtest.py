@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
-"""Бэктест «автокопирования китов» по акциям Hyperliquid — этап 1 ТЗ.
+"""Бэктест «автокопирования китов» на фьючерсах Hyperliquid — этап 1 ТЗ.
 
 Вопрос один: заработала бы копия сделок китов на рынках акций (xyz:, io:,
 para:) после комиссий, фандинга и задержки — и не подгонка ли это. Скрипт
@@ -90,6 +90,19 @@ class Signal:
     leverage: int      # плечо кита (0 — неизвестно)
     pnl30: float = 0.0             # закрытый PnL кита за 30 дней до сделки
     whale_close: int | None = None  # когда кит начал закрывать (мс)
+    px: float = 0.0                 # средняя цена ордера кита
+    size: float = 0.0               # штук в ордере
+    # Сговор китов: за окно до этого ордера включительно — сколько разных
+    # кошельков открыли ту же сторону на той же бумаге, их общий объём и
+    # средняя цена входа (по объёму). Один кит — wallets = 1.
+    wallets: int = 1
+    cluster_notional: float = 0.0
+    ref_px: float = 0.0
+
+    def __post_init__(self) -> None:
+        # Одиночный ордер — сам себе сговор (пока attach_clusters не посчитал).
+        self.cluster_notional = self.cluster_notional or self.notional
+        self.ref_px = self.ref_px or self.px
 
 
 def open_ro(path: str) -> sqlite3.Connection:
@@ -106,28 +119,64 @@ def is_stock(coin: str, dexes: Sequence[str]) -> bool:
     return ":" in coin and coin.split(":", 1)[0] in dexes
 
 
-def load_signals(con: sqlite3.Connection, dexes: Sequence[str], since_ms: int = 0) -> list[Signal]:
-    """Открытия китов по акциям. Ордер кита исполняется кусками (много
-    строк с одним oid) — сигнал один на ордер: объём — сумма кусков, время —
-    первого куска."""
+def is_perp(coin: str) -> bool:
+    """Фьючерс (бессрочный): основная площадка (BTC, ETH, …) и HIP-3
+    (xyz:TSLA, …). Спот у Hyperliquid — «@107» или «PURR/USDC» — не берём."""
+    return bool(coin) and not coin.startswith("@") and "/" not in coin
+
+
+def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms: int = 0,
+                 cluster_ms: int = 24 * 3_600_000) -> list[Signal]:
+    """Открытия лонга и шорта китов на фьючерсах (закрытия — не сигнал).
+    dexes — только эти площадки HIP-3 (акции); None — все фьючерсы: крипта,
+    акции, металлы. Ордер кита исполняется кусками (много строк с одним oid)
+    — сигнал один на ордер: объём — сумма кусков, цена — средняя, время —
+    первого куска. К каждому — сговор за cluster_ms до него (Signal.wallets)."""
     rows = con.execute(
-        "SELECT wallet, coin, dir_code, oid, tid, ts, notional_nanos, account_value_nanos, leverage "
-        "FROM hl_fills WHERE dir_code IN (1, 2) AND instr(coin, ':') > 0 AND ts >= ? ORDER BY ts, tid",
+        "SELECT wallet, coin, dir_code, oid, tid, ts, notional_nanos, sz, account_value_nanos, leverage "
+        "FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? ORDER BY ts, tid",
         (since_ms,)).fetchall()
     orders: dict[tuple, Signal] = {}
-    for wallet, coin, code, oid, tid, ts, notional, account, lev in rows:
-        if not is_stock(coin, dexes):
+    for wallet, coin, code, oid, tid, ts, notional, sz, account, lev in rows:
+        if not is_perp(coin) or (dexes is not None and not is_stock(coin, dexes)):
             continue
+        try:
+            n = abs(float(sz))
+        except (TypeError, ValueError):
+            n = 0.0
         key = (wallet, coin, oid) if oid else (wallet, coin, "tid", tid)
         sig = orders.get(key)
         if sig is None:
             orders[key] = Signal(wallet, coin, 1 if code == OPEN_LONG else -1, ts, notional / NANOS,
-                                 account / NANOS, lev)
+                                 account / NANOS, lev, size=n)
         else:
             sig.notional += notional / NANOS
+            sig.size += n
     signals = sorted(orders.values(), key=lambda s: (s.ts, s.wallet, s.coin))
+    for sig in signals:
+        sig.px = sig.notional / sig.size if sig.size > 0 else 0.0
     attach_history(con, signals)
+    attach_clusters(signals, cluster_ms)
     return signals
+
+
+def attach_clusters(signals: list[Signal], window_ms: int) -> None:
+    """Сговор: на каждом ордере — сколько разных кошельков за окно до него
+    (включительно) открыли ту же сторону на той же бумаге, их общий объём и
+    средняя цена по объёму. Только прошлое — без заглядывания вперёд."""
+    recent: dict[tuple[str, int], list[Signal]] = defaultdict(list)
+    for sig in signals:
+        bucket = recent[(sig.coin, sig.side)]
+        bucket.append(sig)
+        while bucket and bucket[0].ts < sig.ts - window_ms:
+            bucket.pop(0)
+        sig.wallets = len({b.wallet for b in bucket})
+        sig.cluster_notional = sum(b.notional for b in bucket)
+        # Средняя цена входа всех — объём в $ на число штук (как средняя
+        # цена позиции), а не среднее цен с весами.
+        priced = [b for b in bucket if b.size > 0]
+        units = sum(b.size for b in priced)
+        sig.ref_px = sum(b.notional for b in priced) / units if units > 0 else sig.px
 
 
 def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
@@ -382,13 +431,13 @@ class Exits:
 
 
 def exit_trade(p: Path, side: int, ex: Exits, slip: float, fee: float, liq: float = 0.0,
-               leverage: float = 1.0) -> tuple[int, float, str]:
+               liq_loss: float = 1.0) -> tuple[int, float, str]:
     """Момент выхода, доход (доля от размера позиции, после комиссий и
     фандинга) и причина. Стоп — в начале свечи касания, тейк — в конце: при
     обоих в одной свече побеждает стоп. liq — ход цены против нас, на котором
-    биржа ликвидирует (доля; 0 — не считать): тогда потеряна вся маржа
-    (1/плечо от размера) и комиссия входа; стоп ближе ликвидации — сработает
-    раньше неё."""
+    биржа ликвидирует (доля; 0 — не считать): тогда потеряно liq_loss (доля
+    от размера: маржа позиции или доля счёта при кросс-марже) и комиссия
+    входа; стоп ближе ликвидации — сработает раньше неё."""
     events: list[tuple[int, int, float, str]] = []  # (момент, приоритет, цена, причина)
     sec_ms = p.sec * 1000
 
@@ -421,7 +470,7 @@ def exit_trade(p: Path, side: int, ex: Exits, slip: float, fee: float, liq: floa
     events.append((t, 4, px, "предел удержания"))
     t, _prio, px, why = min(events)
     if why == "ликвидация":
-        return t, -1 / leverage - fee, why
+        return t, -liq_loss - fee, why
     out = px * (1 - side * slip)
     gross = side * (out / p.entry_px - 1)
     fund = side * sum(r for h, r in p.funding if h <= t)
@@ -501,14 +550,16 @@ def stats(trades: Sequence[Trade]) -> Stats:
 
 @dataclass(frozen=True)
 class Filters:
-    min_notional: float
+    min_notional: float    # общий объём сговора за окно (один кит — его ордер и прежние)
     min_account: float
     max_leverage: int
     need_pnl30: bool
     cooldown_min: int
+    min_wallets: int = 1   # сколько разных китов открыли ту же сторону за окно
+    max_chase: float = 0.0  # насколько цена входа может быть хуже средней цены китов (доля; 0 — без предела)
 
     def ok(self, s: Signal) -> bool:
-        if s.notional < self.min_notional:
+        if s.wallets < self.min_wallets or s.cluster_notional < self.min_notional:
             return False
         if self.min_account and s.account < self.min_account:  # неизвестный счёт (0) — не проходит
             return False
@@ -520,21 +571,34 @@ class Filters:
 @dataclass(frozen=True)
 class Sizing:
     """Размер и риск: маржа — доля депозита, позиция = маржа × плечо; не
-    больше max_open позиций одновременно (по всем бумагам). Ликвидация — когда
-    убыток съел маржу до поддерживающей: ход против нас 1/плечо − maint."""
+    больше max_open позиций одновременно (по всем бумагам).
+
+    Ликвидация. Изолированная маржа: убыток съел маржу позиции до
+    поддерживающей — ход против нас 1/плечо − maint, потеряна маржа. Кросс-
+    маржа: позицию держит весь счёт (на позицию — его доля, если позиций
+    может быть несколько) — ход против нас доля счёта / позиция − maint,
+    потеряна эта доля счёта."""
     deposit: float
     margin_frac: float
     leverage: float
     max_open: int
     maint: float
+    cross: bool = False
 
     @property
     def notional(self) -> float:
         return self.deposit * self.margin_frac * self.leverage
 
     @property
+    def backing(self) -> float:
+        """Сколько денег держит одну позицию (доля от её размера)."""
+        if self.cross:
+            return self.deposit / max(1, self.max_open) / self.notional
+        return 1 / self.leverage
+
+    @property
     def liq_move(self) -> float:
-        return max(0.0, 1 / self.leverage - self.maint)
+        return max(0.0, self.backing - self.maint)
 
 
 @dataclass(frozen=True)
@@ -547,11 +611,13 @@ class Params:
         f, e = self.filters, self.exits
         return {"delay": self.delay, "min_notional": f.min_notional, "min_account": f.min_account,
                 "max_leverage": f.max_leverage, "pnl30": f.need_pnl30, "cooldown": f.cooldown_min,
+                "wallets": f.min_wallets, "chase": round(f.max_chase * 100, 3),
                 "tp": round(e.tp * 100, 3), "sl": round(e.sl * 100, 3), "hold": e.hold, "whale": e.whale}
 
     def row(self) -> dict:
         f, e = self.filters, self.exits
-        return {"D_сек": self.delay, "объём_от_$": f.min_notional, "счёт_от_$": f.min_account,
+        return {"D_сек": self.delay, "китов_от": f.min_wallets, "объём_от_$": f.min_notional,
+                "догонять_до_%": round(f.max_chase * 100, 3) or "выкл", "счёт_от_$": f.min_account,
                 "плечо_до": f.max_leverage or "выкл", "PnL30>0": "да" if f.need_pnl30 else "выкл",
                 "пауза_мин": f.cooldown_min, "тейк_%": round(e.tp * 100, 3) or "выкл",
                 "стоп_%": round(e.sl * 100, 3) or "выкл", "по_времени_мин": e.hold or "выкл",
@@ -568,16 +634,21 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, sli
     busy_until: dict[str, int] = {}
     open_until: list[int] = []
     cool = prm.filters.cooldown_min * 60_000
+    chase = prm.filters.max_chase
     for idx, s in enumerate(signals):
         p = paths.get(idx)
         if p is None or not prm.filters.ok(s):
             continue
         if p.entry_t < busy_until.get(s.coin, 0) or p.entry_t - last_entry.get(s.coin, -cool - 1) < cool:
             continue
+        # Цена ушла от китов: ниже их средней для лонга (выше — для шорта) —
+        # входим всегда; в другую сторону дальше chase — поздно, пропуск.
+        if chase and s.ref_px > 0 and s.side * (p.entry_px / s.ref_px - 1) > chase:
+            continue
         open_until = [u for u in open_until if u > p.entry_t]
         if sz.max_open and len(open_until) >= sz.max_open:
             continue
-        t, pct, why = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.leverage)
+        t, pct, why = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
         last_entry[s.coin] = p.entry_t
         busy_until[s.coin] = t
         open_until.append(t)
@@ -632,7 +703,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
 
     con = open_ro(a.db)
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
-    signals = load_signals(con, a.dexes, since)
+    signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000)
     md = MarketData(a.cache, a.offline, fetch, a.pause, now_ms)
     delays, holds = int_list(a.delays), int_list(a.hold)
     hold_ms = max([*holds, a.max_hold]) * 60_000
@@ -666,14 +737,16 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     train = [i for i, s in enumerate(signals) if s.ts < cut]
     hold_out = [i for i, s in enumerate(signals) if s.ts >= cut]
 
-    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown)
-               for x in num_list(a.min_notional) for p in int_list(a.pnl30)]
+    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown, k, c)
+               for x in num_list(a.min_notional) for p in int_list(a.pnl30)
+               for k in int_list(a.cluster) for c in pct_list(a.chase)]
     exits = [Exits(tp, sl, h, w) for tp in pct_list(a.tp) for sl in pct_list(a.sl) for h in holds
              for w in (False, True)]
     fee, slip = a.fee / 100, a.slippage / 100
     if not 0 < a.leverage <= a.max_market_leverage:
         raise SystemExit(f"плечо {a.leverage} — вне 0…{a.max_market_leverage} (предел рынка)")
-    sizing = Sizing(a.deposit, a.margin_pct / 100, a.leverage, a.max_open, 1 / (2 * a.max_market_leverage))
+    sizing = Sizing(a.deposit, a.margin_pct / 100, a.leverage, a.max_open, 1 / (2 * a.max_market_leverage),
+                    cross=a.margin == "cross")
 
     def subset(idx: list[int], d: int) -> tuple[list[Signal], dict[int, Path]]:
         return [signals[i] for i in idx], {k: paths[d][i] for k, i in enumerate(idx) if i in paths[d]}
@@ -703,7 +776,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     lines: list[str] = []
     w = lines.append
     fmt = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # noqa: E731
-    w("Бэктест автокопирования китов — акции Hyperliquid (этап 1)")
+    w("Бэктест автокопирования китов — фьючерсы Hyperliquid (этап 1): "
+      + ("все — крипта, акции, металлы" if a.markets == "all" else "акции (" + ", ".join(a.dexes) + ")"))
     w(f"Период сигналов: {fmt(t_lo)} — {fmt(t_hi)}; подбор — до {fmt(cut)}, отложенные — после.")
     w(f"Сигналов (ордеров китов): {len(signals)}; без свечей на весь срок удержания: {no_data}.")
     res = defaultdict(int)
@@ -712,7 +786,10 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         res[p.interval if p else "нет"] += 1
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
     w("Фандинг: " + ", ".join(f"{c}: {s}" for c, s in sorted(funding_src.items())))
-    w(f"Депозит {a.deposit:.0f} $, маржа на сделку {a.margin_pct:g} % ({a.deposit * sizing.margin_frac:.0f} $), плечо "
+    w(f"Сигнал — открытие лонга или шорта кита (закрытия не сигнал); сговор — разные кошельки в ту же сторону "
+      f"за {a.cluster_hours:g} ч; цена хуже средней китов дальше предела — вход пропускается.")
+    w(f"Маржа {'кросс' if sizing.cross else 'изолированная'}. "
+      f"Депозит {a.deposit:.0f} $, маржа на сделку {a.margin_pct:g} % ({a.deposit * sizing.margin_frac:.0f} $), плечо "
       f"{a.leverage:g}× — позиция {sizing.notional:.0f} $; одновременно позиций до {a.max_open or 'без предела'}; "
       f"ликвидация при ходе против позиции {sizing.liq_move * 100:.1f} % (поддерживающая маржа "
       f"{sizing.maint * 100:.1f} % — половина начальной при пределе рынка {a.max_market_leverage:g}×).")
@@ -829,6 +906,7 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
         "criteria": {"net_gt": 0, "pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2)},
         "period": {"from": signals[0].ts if signals else 0, "to": signals[-1].ts if signals else 0, "cut": cut},
         "sizing": {"deposit": a.deposit, "margin_pct": a.margin_pct, "leverage": a.leverage, "max_open": a.max_open,
+                   "cross": sizing.cross, "markets": a.markets, "cluster_hours": a.cluster_hours,
                    "notional": sizing.notional, "liq_move_pct": round(sizing.liq_move * 100, 3),
                    "fee_pct": a.fee, "slippage_pct": a.slippage},
         "data": {"signals": len(signals), "candles": dict(res), "requests": md.requests, "errors": len(md.errors),
@@ -855,7 +933,14 @@ def parser() -> argparse.ArgumentParser:
                     help="кеш свечей и фандинга (копится между запусками)")
     ap.add_argument("--offline", action="store_true", help="без сети: только кеш")
     ap.add_argument("--pause", type=float, default=1.0, help="пауза между запросами к API, с")
+    ap.add_argument("--markets", choices=("all", "stocks"), default="all",
+                    help="all — все фьючерсы (крипта, акции, металлы); stocks — только площадки --dexes")
     ap.add_argument("--dexes", type=lambda s: tuple(x for x in s.split(",") if x), default=STOCK_DEXES)
+    ap.add_argument("--cluster", default="1,2,3", help="китов в одну сторону за окно, от (сетка)")
+    ap.add_argument("--cluster-hours", type=float, default=24, help="окно сговора, ч")
+    ap.add_argument("--chase", default="0.1,0.3,1",
+                    help="на сколько %% цена входа может быть хуже средней цены китов (сетка; 0 — без предела)")
+    ap.add_argument("--margin", choices=("cross", "isolated"), default="cross", help="кросс- или изолированная маржа")
     ap.add_argument("--since-days", type=int, default=0, help="только последние N дней (0 — все)")
     ap.add_argument("--delays", default="5,30,120,300", help="задержка входа D, с (сетка)")
     ap.add_argument("--min-notional", default="20000,100000", help="объём ордера кита от X $ (сетка)")
@@ -863,10 +948,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-leverage", type=int, default=0, help="плечо кита до Z (0 — выкл)")
     ap.add_argument("--pnl30", default="1,0", help="требовать PnL кита за 30 дней > 0: 1 — да, 0 — нет (сетка)")
     ap.add_argument("--cooldown", type=int, default=60, help="не чаще одного входа на бумагу за N минут")
-    ap.add_argument("--tp", default="0,1,2,4", help="тейк, %% (0 — выкл; сетка)")
-    ap.add_argument("--sl", default="0,1,2", help="стоп, %% (0 — выкл; сетка)")
-    ap.add_argument("--hold", default="0,60,240", help="выход по времени, мин (0 — выкл; сетка)")
-    ap.add_argument("--max-hold", type=int, default=480, help="предел удержания, мин")
+    ap.add_argument("--tp", default="0.5,1,2,3", help="тейк, %% (0 — выкл; сетка)")
+    ap.add_argument("--sl", default="0", help="стоп, %% (0 — выкл — пересиживаем; сетка)")
+    ap.add_argument("--hold", default="0", help="выход по времени, мин (0 — выкл; сетка)")
+    ap.add_argument("--max-hold", type=int, default=4320,
+                    help="предел удержания, мин: дальше позиция считается закрытой по рынку (не дождались)")
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание, %% на каждую сторону")
     ap.add_argument("--fee", type=float, default=0.09,
                     help="комиссия тейкера, %% на каждую сторону (базовая 0,045 %%; у HIP-3 до двойной)")

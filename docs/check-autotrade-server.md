@@ -26,7 +26,7 @@ T=$(mktemp -d)
 mkdir -p "$T/tools" "$T/tests"
 cp tools/autotrade_backtest.py "$T/tools/"
 cp tests/autotrade_backtest_test.py "$T/tests/"
-(cd "$T" && python3 tests/autotrade_backtest_test.py)   # «19 проверок без сети и без записи в базу»
+(cd "$T" && python3 tests/autotrade_backtest_test.py)   # «22 проверок без сети и без записи в базу»
 ```
 
 Тесты не ходят в сеть и не трогают базу бота: база — синтетическая во
