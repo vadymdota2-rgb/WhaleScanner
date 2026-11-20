@@ -109,6 +109,10 @@ class Signal:
     wallets: int = 1
     cluster_notional: float = 0.0
     ref_px: float = 0.0
+    # По порогу кита ($): сколько китов за окно в эту сторону и сколько — в
+    # обратную (киты «спорят»). Только прошлое.
+    wallets_at: dict = field(default_factory=dict)
+    opp_at: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Одиночный ордер — сам себе сговор (пока attach_clusters не посчитал).
@@ -137,7 +141,7 @@ def is_perp(coin: str) -> bool:
 
 
 def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms: int = 0,
-                 cluster_ms: int = 24 * 3_600_000, min_whale: float = 0.0) -> list[Signal]:
+                 cluster_ms: int = 24 * 3_600_000, min_whale: float | Sequence[float] = 0.0) -> list[Signal]:
     """Открытия лонга и шорта китов на фьючерсах (закрытия — не сигнал).
     dexes — только эти площадки HIP-3 (акции); None — все фьючерсы: крипта,
     акции, металлы. Ордер кита исполняется кусками (много строк с одним oid)
@@ -171,22 +175,33 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
     return signals
 
 
-def attach_clusters(signals: list[Signal], window_ms: int, min_whale: float = 0.0) -> None:
+def attach_clusters(signals: list[Signal], window_ms: int, min_whale: float | Sequence[float] = 0.0) -> None:
     """Сговор: на каждом ордере — сколько разных китов за окно до него
     (включительно) открыли ту же сторону на той же бумаге, их общий объём и
     средняя цена по объёму. Кит считается, если его позиция в эту сторону
-    за окно (все его ордера) — не меньше min_whale $. Только прошлое — без
-    заглядывания вперёд."""
+    за окно (все его ордера) — не меньше порога $ (min_whale — один порог
+    или сетка). И сколько китов за то же окно открыли обратную сторону —
+    «спорят». Только прошлое — без заглядывания вперёд: живая торговля
+    будущего не видит."""
+    thresholds = sorted({float(min_whale)} if isinstance(min_whale, (int, float)) else {float(x) for x in min_whale})
     recent: dict[tuple[str, int], list[Signal]] = defaultdict(list)
+
+    def whales(bucket: list[Signal], now: int) -> dict[str, float]:
+        while bucket and bucket[0].ts < now - window_ms:
+            bucket.pop(0)
+        per: dict[str, float] = defaultdict(float)
+        for b in bucket:
+            per[b.wallet] += b.notional
+        return per
+
     for sig in signals:
         bucket = recent[(sig.coin, sig.side)]
         bucket.append(sig)
-        while bucket and bucket[0].ts < sig.ts - window_ms:
-            bucket.pop(0)
-        per_wallet: dict[str, float] = defaultdict(float)
-        for b in bucket:
-            per_wallet[b.wallet] += b.notional
-        sig.wallets = sum(1 for v in per_wallet.values() if v >= min_whale)
+        per_wallet = whales(bucket, sig.ts)
+        against = whales(recent[(sig.coin, -sig.side)], sig.ts)
+        sig.wallets_at = {t: sum(1 for v in per_wallet.values() if v >= t) for t in thresholds}
+        sig.opp_at = {t: sum(1 for v in against.values() if v >= t) for t in thresholds}
+        sig.wallets = sig.wallets_at[thresholds[0]]
         sig.cluster_notional = sum(b.notional for b in bucket)
         # Средняя цена входа всех — объём в $ на число штук (как средняя
         # цена позиции), а не среднее цен с весами.
@@ -737,9 +752,14 @@ class Filters:
     cooldown_min: int
     min_wallets: int = 1   # сколько разных китов открыли ту же сторону за окно
     max_chase: float = 0.0  # насколько цена входа может быть хуже средней цены китов (доля; 0 — без предела)
+    min_whale: float = 0.0  # порог кита, $ (его позиция в эту сторону за окно)
+    no_conflict: bool = False  # пропуск, если за окно есть встречный сигнал по тому же правилу
 
     def ok(self, s: Signal) -> bool:
-        if s.wallets < self.min_wallets or s.cluster_notional < self.min_notional:
+        n = s.wallets_at.get(self.min_whale, s.wallets) if s.wallets_at else s.wallets
+        if n < self.min_wallets or s.cluster_notional < self.min_notional:
+            return False
+        if self.no_conflict and s.opp_at.get(self.min_whale, 0) >= self.min_wallets:
             return False
         if self.min_account and s.account < self.min_account:  # неизвестный счёт (0) — не проходит
             return False
@@ -791,12 +811,14 @@ class Params:
         f, e = self.filters, self.exits
         return {"delay": self.delay, "min_notional": f.min_notional, "min_account": f.min_account,
                 "max_leverage": f.max_leverage, "pnl30": f.need_pnl30, "cooldown": f.cooldown_min,
-                "wallets": f.min_wallets, "chase": round(f.max_chase * 100, 3),
+                "wallets": f.min_wallets, "chase": round(f.max_chase * 100, 3), "min_whale": f.min_whale,
+                "no_conflict": f.no_conflict,
                 "tp": round(e.tp * 100, 3), "sl": round(e.sl * 100, 3), "hold": e.hold, "whale": e.whale}
 
     def row(self) -> dict:
         f, e = self.filters, self.exits
-        return {"D_сек": self.delay, "китов_от": f.min_wallets, "объём_от_$": f.min_notional,
+        return {"D_сек": self.delay, "китов_от": f.min_wallets, "кит_от_$": f.min_whale,
+                "без_споров": "да" if f.no_conflict else "нет", "объём_от_$": f.min_notional,
                 "догонять_до_%": round(f.max_chase * 100, 3) or "выкл", "счёт_от_$": f.min_account,
                 "плечо_до": f.max_leverage or "выкл", "PnL30>0": "да" if f.need_pnl30 else "выкл",
                 "пауза_мин": f.cooldown_min, "тейк_%": round(e.tp * 100, 3) or "выкл",
@@ -888,7 +910,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     con = open_ro(a.db)
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
     signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000,
-                           a.min_whale)
+                           num_list(a.min_whale))
     # Свечи и пути — только для ордеров, которые могут пройти правило китов:
     # остальные не станут сделкой ни при каком наборе сетки.
     raw_signals = len(signals)
@@ -954,9 +976,10 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     train = [i for i, s in enumerate(signals) if s.ts < cut]
     hold_out = [i for i, s in enumerate(signals) if s.ts >= cut]
 
-    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown, k, c)
+    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown, k, c, wh, bool(nc))
                for x in num_list(a.min_notional) for p in int_list(a.pnl30)
-               for k in int_list(a.cluster) for c in pct_list(a.chase)]
+               for k in int_list(a.cluster) for c in pct_list(a.chase)
+               for wh in num_list(a.min_whale) for nc in int_list(a.no_conflict)]
     exits = [Exits(tp, sl, h, w) for tp in pct_list(a.tp) for sl in pct_list(a.sl) for h in holds
              for w in (bool(x) for x in int_list(a.whale_exit))]
     fee, slip = a.fee / 100, a.slippage / 100
@@ -1035,7 +1058,9 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
     w("Фандинг: " + ", ".join(f"{c}: {s}" for c, s in sorted(funding_src.items())))
     w(f"Сигнал — открытие лонга или шорта кита (закрытия не сигнал); сговор — разные киты в ту же сторону "
-      f"за {a.cluster_hours:g} ч, у каждого позиция от {a.min_whale:g} $; цена хуже средней китов дальше "
+      f"за {a.cluster_hours:g} ч, у каждого позиция от {a.min_whale} $ (сетка); «без споров» — пропуск, если за "
+      f"те же {a.cluster_hours:g} ч по бумаге есть встречный сигнал по тому же правилу (только прошлое); "
+      f"цена хуже средней китов дальше "
       f"предела — вход пропускается.")
     tps = [x for x in pct_list(a.tp) if x]
     if tps:
@@ -1209,9 +1234,20 @@ def count_report(signals: Sequence[Signal], raw: int, k_min: int, a: argparse.Na
         by_coin[s.coin] += 1
         by_hour[d.hour] += 1
     days = max(1, len(by_day) if not ep else (ep[-1].ts - ep[0].ts) // DAY_MS + 1)
-    lines = [f"Ордеров китов: {raw}; проходят правило (от {k_min} китов в одну сторону за {a.cluster_hours:g} ч, "
-             f"у каждого от {a.min_whale:g} $): {len(signals)}; возможностей входа (пауза {a.cooldown} мин на "
-             f"бумагу): {len(ep)} за {days} дн. — в среднем {len(ep) / days:.1f} в день.",
+    last14 = (signals[-1].ts if signals else 0) - 14 * DAY_MS
+    table = ["Правило → возможностей входа в день (весь период / последние 14 дней):"]
+    for k in int_list(a.cluster):
+        for wh in num_list(a.min_whale):
+            for nc in int_list(a.no_conflict):
+                f = Filters(0, 0, 0, False, a.cooldown, k, 0.0, wh, bool(nc))
+                e = episodes([s for s in signals if f.ok(s)], a.cooldown)
+                e14 = [s for s in e if s.ts >= last14]
+                table.append(f"  {k}+ кита от {wh:g} $" + (", без споров" if nc else "") +
+                             f": {len(e) / days:.1f} / {len(e14) / min(14, days):.1f}")
+    lines = [f"Ордеров китов: {raw}; проходят мягчайшее правило (от {k_min} китов в одну сторону за "
+             f"{a.cluster_hours:g} ч, у каждого от {min(num_list(a.min_whale)):g} $): {len(signals)}; возможностей "
+             f"входа (пауза {a.cooldown} мин на бумагу): {len(ep)} за {days} дн. — в среднем {len(ep) / days:.1f} в день.",
+             *table,
              "По дням (UTC): " + ", ".join(f"{d} — {n}" for d, n in sorted(by_day.items())[-30:]),
              "По часам (UTC): " + ", ".join(f"{h:02d} — {by_hour[h]}" for h in range(24)),
              "Бумаги: " + ", ".join(f"{c} — {n}" for c, n in sorted(by_coin.items(), key=lambda kv: -kv[1])[:30]),
@@ -1249,7 +1285,7 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
         "period": {"from": signals[0].ts if signals else 0, "to": signals[-1].ts if signals else 0, "cut": cut},
         "sizing": {"deposit": a.deposit, "margin_pct": a.margin_pct, "leverage": a.leverage, "max_open": a.max_open,
                    "cross": sizing.cross, "markets": a.markets, "cluster_hours": a.cluster_hours,
-                   "min_whale": a.min_whale,
+                   "min_whale": min(num_list(a.min_whale)), "min_whale_grid": num_list(a.min_whale),
                    "notional": sizing.notional, "liq_move_pct": round(sizing.liq_move * 100, 3),
                    "fee_pct": a.fee, "slippage_pct": a.slippage},
         "data": {"signals": len(signals), "candles": dict(res), "requests": md.requests, "errors": len(md.errors),
@@ -1284,8 +1320,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--dexes", type=lambda s: tuple(x for x in s.split(",") if x), default=STOCK_DEXES)
     ap.add_argument("--cluster", default="2,3",
                     help="китов в одну сторону за окно, от (сетка; правило владельца — минимум 2)")
-    ap.add_argument("--min-whale", type=float, default=1000,
-                    help="кит считается, если его позиция в эту сторону за окно — от X $ (правило владельца — 1000)")
+    ap.add_argument("--min-whale", default="1000,20000,50000",
+                    help="кит считается, если его позиция в эту сторону за окно — от X $ (сетка; правило владельца — "
+                         "1000; по подсчёту на сервере 20 000 и 50 000 дают меньше сигналов и реже «спор» китов)")
+    ap.add_argument("--no-conflict", default="1,0",
+                    help="1 — пропуск, если за окно по бумаге есть встречный сигнал по тому же правилу (сетка)")
     ap.add_argument("--cluster-hours", type=float, default=2, help="окно сговора, ч (правило владельца — 2)")
     # Предел догона: тейк — 1 % от нашего входа; цена, уже ушедшая от средней
     # китов на треть цели (0,3 %), — вход «по хаям». 0,1 % режет почти всё
@@ -1300,7 +1339,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--min-account", type=float, default=0, help="счёт кита от Y $ (0 — выкл)")
     ap.add_argument("--max-leverage", type=int, default=0, help="плечо кита до Z (0 — выкл)")
     ap.add_argument("--pnl30", default="1,0", help="требовать PnL кита за 30 дней > 0: 1 — да, 0 — нет (сетка)")
-    ap.add_argument("--cooldown", type=int, default=60, help="не чаще одного входа на бумагу за N минут")
+    ap.add_argument("--cooldown", type=int, default=120, help="не чаще одного входа на бумагу за N минут")
     ap.add_argument("--tp", default="1",
                     help="тейк, %% движения цены (правило владельца — 1 %%: при 10× это 10 %% на маржу; 0 — выкл; сетка)")
     ap.add_argument("--whale-exit", default="0", help="выходить, когда кит закрыл: 1 — да, 0 — нет (сетка)")

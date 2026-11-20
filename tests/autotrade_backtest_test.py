@@ -317,6 +317,36 @@ class OwnerRulesTest(Base):
         rule = bt.Filters(0, 0, 0, False, 0, 2)
         self.assertEqual([rule.ok(s) for s in sigs], [False, False, False, True])
 
+    def test_whales_disagree(self):
+        """«Без споров»: за те же 2 ч по бумаге есть встречный сигнал по тому
+        же правилу (2 кита в обратную сторону) — пропуск. Встречный один кит
+        — не сигнал, вход есть. Только прошлое: встречные позже — не в счёт."""
+        f = Fills()
+        h = 3_600_000
+        f.add("s1", "xyz:CL", bt.OPEN_SHORT, T0, notional=5_000, oid=1)
+        f.add("s2", "xyz:CL", bt.OPEN_SHORT, T0 + 10 * MIN, notional=5_000, oid=2)   # 2 кита в шорт
+        f.add("l1", "xyz:CL", bt.OPEN_LONG, T0 + 30 * MIN, notional=5_000, oid=3)
+        f.add("l2", "xyz:CL", bt.OPEN_LONG, T0 + 40 * MIN, notional=5_000, oid=4)    # 2 в лонг — спорят
+        f.add("x1", "xyz:MU", bt.OPEN_LONG, T0, notional=5_000, oid=5)
+        f.add("x2", "xyz:MU", bt.OPEN_LONG, T0 + 10 * MIN, notional=5_000, oid=6)    # 2 в лонг
+        f.add("y1", "xyz:MU", bt.OPEN_SHORT, T0 + 20 * MIN, notional=5_000, oid=7)   # 1 в шорт — не сигнал
+        f.add("z1", "xyz:SKHX", bt.OPEN_LONG, T0, notional=5_000, oid=8)
+        f.add("z2", "xyz:SKHX", bt.OPEN_LONG, T0 + 10 * MIN, notional=5_000, oid=9)  # 2 в лонг, встречные — позже
+        f.add("w1", "xyz:SKHX", bt.OPEN_SHORT, T0 + h, notional=5_000, oid=10)
+        f.add("w2", "xyz:SKHX", bt.OPEN_SHORT, T0 + h + 10 * MIN, notional=5_000, oid=11)
+        f.write(self.db)
+        sigs = {(s.coin, s.wallet): s for s in bt.load_signals(bt.open_ro(self.db), None, cluster_ms=2 * h, min_whale=[1000])}
+        calm = bt.Filters(0, 0, 0, False, 0, 2, 0.0, 1000, True)
+        loose = bt.Filters(0, 0, 0, False, 0, 2, 0.0, 1000, False)
+        self.assertFalse(calm.ok(sigs[("xyz:CL", "l2")]))   # спорят — пропуск
+        self.assertTrue(loose.ok(sigs[("xyz:CL", "l2")]))
+        self.assertTrue(calm.ok(sigs[("xyz:MU", "x2")]))    # встречный один — не сигнал
+        self.assertTrue(calm.ok(sigs[("xyz:SKHX", "z2")]))  # встречные позже — не видны
+        self.assertFalse(calm.ok(sigs[("xyz:SKHX", "w2")]))  # а для встречных — первые видны
+        # Порог кита: от 20 000 $ ни один из них не кит.
+        big = bt.load_signals(bt.open_ro(self.db), None, cluster_ms=2 * h, min_whale=[1000, 20_000])
+        self.assertTrue(all(s.wallets_at[20_000.0] == 0 for s in big))
+
     def test_count_only_per_day_without_network(self):
         """--count-only: возможности входа по правилу китов по дням — без
         сети, без свечей; повтор на той же бумаге раньше паузы — тот же
@@ -340,13 +370,16 @@ class OwnerRulesTest(Base):
             r = bt.run(bt.parser().parse_args(["--db", self.db, "--out", self.out, "--cache", self.cache,
                                                "--count-only"]), fetch=boom, now_ms=NOW)
         self.assertEqual(r["signals"], 6)
-        self.assertIn("возможностей входа (пауза 60 мин на бумагу): 3 за 3 дн. — в среднем 1.0 в день", r["text"])
+        self.assertIn("возможностей входа (пауза 120 мин на бумагу): 3 за 3 дн. — в среднем 1.0 в день", r["text"])
+        self.assertIn("2+ кита от 1000 $: 1.0 / 1.0", r["text"])
+        self.assertIn("2+ кита от 20000 $: 0.0 / 0.0", r["text"])
         self.assertFalse(os.path.exists(os.path.join(self.cache, "okx_map.json")))
 
     def test_defaults_are_the_owner_rules(self):
         a = bt.parser().parse_args([])
-        self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.min_whale, a.margin, a.markets),
-                         ("1", "0", "0", "0", 1000, "cross", "all"))
+        self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.margin, a.markets), ("1", "0", "0", "0", "cross", "all"))
+        self.assertEqual(bt.num_list(a.min_whale), [1000, 20000, 50000])  # ваше правило и строже — по подсчёту сервера
+        self.assertEqual((a.no_conflict, a.cooldown), ("1,0", 120))
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
         self.assertEqual((a.cluster_hours, a.chase), (2, "0.3"))  # 2 часа; предел догона 0,3 %
         self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
