@@ -82,3 +82,7 @@ bash tools/coverage.sh | tail -n 1
 "$CXX" -std=c++20 -O2 -pthread -I. tests/premium_test.cpp premium.cpp utils.cpp ru.cpp translations.cpp -lsqlite3 \
     -o "$out/premium_million"
 PREMIUM_MILLION=1 run premium_million
+
+# Бэктест автокопирования на базе размером с настоящую — по памяти (на сервере
+# прежняя версия съела 5 ГБ): пик < 700 МБ, предел памяти останавливает сам.
+python3 tests/autotrade_scale_test.py

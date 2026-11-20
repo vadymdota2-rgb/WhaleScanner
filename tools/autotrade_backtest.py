@@ -45,7 +45,6 @@ from __future__ import annotations
 import argparse
 import bisect
 import csv
-import itertools
 import json
 import math
 import os
@@ -57,7 +56,7 @@ import time
 import urllib.parse
 import urllib.request
 from array import array
-from collections import defaultdict
+from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -73,6 +72,7 @@ OKX_ALIASES = {"GOLD": "XAU", "SILVER": "XAG", "COPPER": "XCU", "PLATINUM": "XPT
                "OAI": "OPENAI", "SMSN": "SAMSUNG", "SKHX": "SKHYNIX", "TCNT": "TENCENT"}
 OKX_PRICE_TOL = 0.02   # цены одной бумаги на двух биржах расходятся меньше чем на 2 %
 OKX_BAR, OKX_BAR_SEC = "5m", 300
+THRESHOLDS: tuple[float, ...] = ()   # пороги кита текущего прогона (load_signals)
 STOCK_DEXES = ("xyz", "io", "para")
 # Интервалы от мелкого к крупному; Hyperliquid хранит 5000 последних каждого.
 INTERVALS: tuple[tuple[str, int], ...] = (("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600))
@@ -90,7 +90,7 @@ Fetch = Callable[[dict], object]
 
 # ── данные из базы бота (только чтение) ──────────────────────────────────────
 
-@dataclass
+@dataclass(slots=True)
 class Signal:
     wallet: str
     coin: str
@@ -111,11 +111,21 @@ class Signal:
     ref_px: float = 0.0
     # По порогу кита ($): сколько китов за окно в эту сторону и сколько — в
     # обратную (киты «спорят»). Только прошлое.
-    wallets_at: dict = field(default_factory=dict)
-    opp_at: dict = field(default_factory=dict)
+    # Кортежи по порогам THRESHOLDS (не словари: на сотнях тысяч сигналов
+    # это сотни мегабайт). whales_at(порог) / opp(порог) — чтение.
+    wallets_by: tuple = ()
+    opp_by: tuple = ()
+
+    @property
+    def wallets_at(self) -> dict[float, int]:
+        return dict(zip(THRESHOLDS, self.wallets_by, strict=False))
+
+    @property
+    def opp_at(self) -> dict[float, int]:
+        return dict(zip(THRESHOLDS, self.opp_by, strict=False))
 
     def __post_init__(self) -> None:
-        # Одиночный ордер — сам себе сговор (пока attach_clusters не посчитал).
+        # Одиночный ордер — сам себе сговор (если сговор не посчитан).
         self.cluster_notional = self.cluster_notional or self.notional
         self.ref_px = self.ref_px or self.px
 
@@ -141,108 +151,101 @@ def is_perp(coin: str) -> bool:
 
 
 def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms: int = 0,
-                 cluster_ms: int = 24 * 3_600_000, min_whale: float | Sequence[float] = 0.0) -> list[Signal]:
+                 cluster_ms: int = 24 * 3_600_000, min_whale: float | Sequence[float] = 0.0,
+                 keep_min: int = 0) -> list[Signal]:
     """Открытия лонга и шорта китов на фьючерсах (закрытия — не сигнал).
     dexes — только эти площадки HIP-3 (акции); None — все фьючерсы: крипта,
     акции, металлы. Ордер кита исполняется кусками (много строк с одним oid)
     — сигнал один на ордер: объём — сумма кусков, цена — средняя, время —
-    первого куска. К каждому — сговор за cluster_ms до него (Signal.wallets)."""
-    rows = con.execute(
-        "SELECT wallet, coin, dir_code, oid, tid, ts, notional_nanos, sz, account_value_nanos, leverage "
-        "FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? ORDER BY ts, tid",
-        (since_ms,)).fetchall()
-    orders: dict[tuple, Signal] = {}
-    for wallet, coin, code, oid, tid, ts, notional, sz, account, lev in rows:
-        if not is_perp(coin) or (dexes is not None and not is_stock(coin, dexes)):
-            continue
-        try:
-            n = abs(float(sz))
-        except (TypeError, ValueError):
-            n = 0.0
-        key = (wallet, coin, oid) if oid else (wallet, coin, "tid", tid)
-        sig = orders.get(key)
-        if sig is None:
-            orders[key] = Signal(wallet, coin, 1 if code == OPEN_LONG else -1, ts, notional / NANOS,
-                                 account / NANOS, lev, size=n)
-        else:
-            sig.notional += notional / NANOS
-            sig.size += n
-    signals = sorted(orders.values(), key=lambda s: (s.ts, s.wallet, s.coin))
-    for sig in signals:
-        sig.px = sig.notional / sig.size if sig.size > 0 else 0.0
-    attach_history(con, signals)
-    attach_clusters(signals, cluster_ms, min_whale)
-    return signals
+    первого куска. К каждому — сговор за cluster_ms до него.
 
-
-def attach_clusters(signals: list[Signal], window_ms: int, min_whale: float | Sequence[float] = 0.0) -> None:
-    """Сговор: на каждом ордере — сколько разных китов за окно до него
-    (включительно) открыли ту же сторону на той же бумаге, их общий объём и
-    средняя цена по объёму. Кит считается, если его позиция в эту сторону
-    за окно (все его ордера) — не меньше порога $ (min_whale — один порог
-    или сетка). И сколько китов за то же окно открыли обратную сторону —
-    «спорят». Только прошлое — без заглядывания вперёд: живая торговля
-    будущего не видит."""
+    Память — не по числу ордеров: куски склеивает сама база (GROUP BY),
+    ордера идут потоком, в памяти — только окно сговора на бумагу и
+    ордера, прошедшие правило (keep_min китов от наименьшего порога; 0 —
+    все, для проверок). На базе бота — сотни тысяч ордеров."""
     thresholds = sorted({float(min_whale)} if isinstance(min_whale, (int, float)) else {float(x) for x in min_whale})
-    recent: dict[tuple[str, int], list[Signal]] = defaultdict(list)
+    global THRESHOLDS  # пороги одни на прогон: по ним читаются кортежи сигналов
+    THRESHOLDS = tuple(thresholds)
+    cur = con.execute(
+        "SELECT wallet, coin, dir_code, MIN(ts) AS t0, SUM(notional_nanos), SUM(ABS(CAST(sz AS REAL))), "
+        "MAX(account_value_nanos), MAX(leverage) FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? "
+        "GROUP BY wallet, coin, dir_code, CASE WHEN oid != 0 THEN oid ELSE -tid END "
+        "ORDER BY t0, wallet, coin", (since_ms,))
+    recent: dict[tuple[str, int], deque[tuple[int, str, float, float]]] = defaultdict(deque)
 
-    def whales(bucket: list[Signal], now: int) -> dict[str, float]:
-        while bucket and bucket[0].ts < now - window_ms:
-            bucket.pop(0)
+    def whales(bucket: deque[tuple[int, str, float, float]], now: int) -> dict[str, float]:
+        while bucket and bucket[0][0] < now - cluster_ms:
+            bucket.popleft()
         per: dict[str, float] = defaultdict(float)
-        for b in bucket:
-            per[b.wallet] += b.notional
+        for _t, w, n, _u in bucket:
+            per[w] += n
         return per
 
-    for sig in signals:
-        bucket = recent[(sig.coin, sig.side)]
-        bucket.append(sig)
-        per_wallet = whales(bucket, sig.ts)
-        against = whales(recent[(sig.coin, -sig.side)], sig.ts)
-        sig.wallets_at = {t: sum(1 for v in per_wallet.values() if v >= t) for t in thresholds}
-        sig.opp_at = {t: sum(1 for v in against.values() if v >= t) for t in thresholds}
-        sig.wallets = sig.wallets_at[thresholds[0]]
-        sig.cluster_notional = sum(b.notional for b in bucket)
+    out: list[Signal] = []
+    for wallet, coin, code, ts, notional, units, account, lev in cur:
+        if not is_perp(coin) or (dexes is not None and not is_stock(coin, dexes)):
+            continue
+        side = 1 if code == OPEN_LONG else -1
+        usd_n = (notional or 0) / NANOS
+        units = float(units or 0.0)
+        bucket = recent[(coin, side)]
+        bucket.append((ts, wallet, usd_n, units))
+        per_wallet = whales(bucket, ts)
+        against = whales(recent[(coin, -side)], ts)
+        wallets_by = tuple(sum(1 for v in per_wallet.values() if v >= t) for t in thresholds)
+        if wallets_by[0] < keep_min:
+            continue
         # Средняя цена входа всех — объём в $ на число штук (как средняя
         # цена позиции), а не среднее цен с весами.
-        priced = [b for b in bucket if b.size > 0]
-        units = sum(b.size for b in priced)
-        sig.ref_px = sum(b.notional for b in priced) / units if units > 0 else sig.px
+        total_units = sum(u for *_, u in bucket)
+        px = usd_n / units if units > 0 else 0.0
+        out.append(Signal(wallet, coin, side, ts, usd_n, (account or 0) / NANOS, int(lev or 0), px=px, size=units,
+                          wallets=wallets_by[0], cluster_notional=sum(n for _t, _w, n, _u in bucket),
+                          ref_px=(sum(n for _t, _w, n, u in bucket if u > 0) / total_units) if total_units > 0 else px,
+                          wallets_by=wallets_by,
+                          opp_by=tuple(sum(1 for v in against.values() if v >= t) for t in thresholds)))
+    attach_history(con, out)
+    return out
 
 
 def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
     """Закрытый PnL кита за 30 дней строго до сделки (без заглядывания
-    вперёд) и момент, когда кит начал закрывать позицию."""
-    wallets = sorted({s.wallet for s in signals})
-    pnl: dict[str, tuple[list[int], list[float]]] = {}
-    closes: dict[tuple[str, str, int], list[int]] = defaultdict(list)
-    for chunk in (wallets[i:i + 500] for i in range(0, len(wallets), 500)):
+    вперёд) и момент, когда кит начал закрывать позицию. По 200 китов за
+    раз: история одного куска — посчитали и выбросили (память не растёт с
+    числом китов)."""
+    by_wallet: dict[str, list[Signal]] = defaultdict(list)
+    for sig in signals:
+        by_wallet[sig.wallet].append(sig)
+    wallets = sorted(by_wallet)
+    for chunk in (wallets[i:i + 200] for i in range(0, len(wallets), 200)):
         marks = ",".join("?" * len(chunk))
-        acc: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        times: dict[str, array] = defaultdict(lambda: array("q"))
+        sums: dict[str, array] = defaultdict(lambda: array("d", [0.0]))
         for w, ts, p in con.execute(
                 f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE closed_pnl_nanos != 0 "  # noqa: S608 — только «?»
                 f"AND wallet IN ({marks}) ORDER BY ts", chunk):
-            acc[w].append((ts, p))
-        for w, items in acc.items():
-            times = [t for t, _ in items]
-            sums = list(itertools.accumulate((p / NANOS for _, p in items), initial=0.0))
-            pnl[w] = (times, sums)
+            times[w].append(ts)
+            sums[w].append(sums[w][-1] + p / NANOS)
+        wanted = {(sig.wallet, sig.coin) for w in chunk for sig in by_wallet[w]}
+        closes: dict[tuple[str, str, int], array] = defaultdict(lambda: array("q"))
         for w, coin, ts, code in con.execute(
                 f"SELECT wallet, coin, ts, dir_code FROM hl_fills WHERE dir_code IN (3, 4, 5, 6, 7) "  # noqa: S608
                 f"AND wallet IN ({marks}) ORDER BY ts", chunk):
+            if (w, coin) not in wanted:
+                continue
             for side, codes in CLOSES_FOR.items():
                 if code in codes:
                     closes[(w, coin, side)].append(ts)
-    for s in signals:
-        if s.wallet in pnl:
-            times, sums = pnl[s.wallet]
-            lo = bisect.bisect_left(times, s.ts - 30 * DAY_MS)
-            hi = bisect.bisect_left(times, s.ts)
-            s.pnl30 = sums[hi] - sums[lo]
-        lst = closes.get((s.wallet, s.coin, s.side))
-        if lst:
-            i = bisect.bisect_right(lst, s.ts)
-            s.whale_close = lst[i] if i < len(lst) else None
+        for w in chunk:
+            for sig in by_wallet[w]:
+                if w in times:
+                    lo = bisect.bisect_left(times[w], sig.ts - 30 * DAY_MS)
+                    hi = bisect.bisect_left(times[w], sig.ts)
+                    sig.pnl30 = sums[w][hi] - sums[w][lo]
+                lst = closes.get((w, sig.coin, sig.side))
+                if lst:
+                    k = bisect.bisect_right(lst, sig.ts)
+                    sig.whale_close = lst[k] if k < len(lst) else None
 
 
 # ── свечи и фандинг (сеть — только здесь) ────────────────────────────────────
@@ -268,8 +271,30 @@ def safe_name(coin: str) -> str:
 
 @dataclass
 class Market:
-    """Свечи одной бумаги по интервалам: время открытия (мс) и o, h, l, c."""
-    by_interval: dict[str, list[tuple[int, float, float, float, float]]] = field(default_factory=dict)
+    """Свечи одной бумаги по интервалам: время открытия (мс) и o, h, l, c —
+    столбцами (array), а не кортежами: в несколько раз меньше памяти."""
+    by_interval: dict[str, Candles] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.by_interval = {k: v if isinstance(v, Candles) else Candles(v) for k, v in self.by_interval.items()}
+
+
+class Candles:
+    """Свечи столбцами: t (мс открытия), o, h, l, c."""
+    __slots__ = ("c", "h", "l", "o", "t")
+
+    def __init__(self, rows: Sequence[Sequence[float]] = ()) -> None:
+        self.t, self.o, self.h = array("q"), array("d"), array("d")
+        self.l, self.c = array("d"), array("d")
+        for t, o, h, low, cl in rows:
+            self.t.append(int(t))
+            self.o.append(o)
+            self.h.append(h)
+            self.l.append(low)
+            self.c.append(cl)
+
+    def __len__(self) -> int:
+        return len(self.t)
 
 
 class MarketData:
@@ -409,7 +434,7 @@ class MarketData:
                 if have:
                     self._save(name, {str(k): v for k, v in have.items()})
             got_c = sorted((t, *v) for t, v in have.items() if all(x > 0 for x in v))
-            m.by_interval[interval] = got_c
+            m.by_interval[interval] = Candles(got_c)
             if got_c and got_c[0][0] <= start_ms and got_c[-1][0] + sec * 1000 >= end_ms:
                 break
         return m
@@ -527,13 +552,13 @@ class Path:
     open_end: bool = False  # срока нет: не дошли до тейка — позиция открыта на конец данных
 
 
-def price_at(c: list, sec: int, t: int) -> float | None:
+def price_at(c: Candles, sec: int, t: int) -> float | None:
     """Цена в момент t: внутри свечи — линейно от открытия к закрытию; в
     дыре между свечами — закрытие последней."""
-    i = bisect.bisect_right(c, (t, math.inf)) - 1
+    i = bisect.bisect_right(c.t, t) - 1
     if i < 0:
         return None
-    t0, o, _h, _l, cl = c[i]
+    t0, o, cl = c.t[i], c.o[i], c.c[i]
     if t >= t0 + sec * 1000:
         return cl
     return o + (cl - o) * (t - t0) / (sec * 1000)
@@ -543,21 +568,21 @@ def build_path(sig: Signal, delay: int, m: Market, hold_ms: int, holds: Sequence
                funding: dict[int, float]) -> Path | None:
     entry_t = sig.ts + delay * 1000
     for interval, sec in INTERVALS:
-        c = m.by_interval.get(interval) or []
+        c = m.by_interval.get(interval) or Candles()
         # hold_ms = 0 — срока нет («пересиживаем всегда»): путь — до конца
         # данных этого интервала (у Hyperliquid — до «сейчас»).
-        horizon = entry_t + hold_ms if hold_ms else (c[-1][0] + sec * 1000 if c else 0)
-        if not c or c[0][0] > entry_t or c[-1][0] + sec * 1000 < horizon or horizon <= entry_t:
+        horizon = entry_t + hold_ms if hold_ms else (c.t[-1] + sec * 1000 if len(c) else 0)
+        if not len(c) or c.t[0] > entry_t or c.t[-1] + sec * 1000 < horizon or horizon <= entry_t:
             continue
         px = price_at(c, sec, entry_t)
         if px is None:
             continue
         side = sig.side
         entry_px = px * (1 + side * slip)
-        i0 = bisect.bisect_right(c, (entry_t, math.inf)) - 1
+        i0 = bisect.bisect_right(c.t, entry_t) - 1
         starts, hi, lo = array("q"), array("d"), array("d")
         for k in range(i0, len(c)):
-            t0, _o, h, low, _cl = c[k]
+            t0, h, low = c.t[k], c.h[k], c.l[k]
             if t0 >= horizon:
                 break
             if k == i0:  # свеча входа: только движение против нас
@@ -581,7 +606,7 @@ def build_path(sig: Signal, delay: int, m: Market, hold_ms: int, holds: Sequence
                 if p is not None:
                     whale_exit = (t, p)
         cap = price_at(c, sec, horizon)
-        times_exit[-1] = (horizon, cap if cap is not None else c[-1][4])
+        times_exit[-1] = (horizon, cap if cap is not None else c.c[-1])
         fund = sorted((h, r) for h, r in funding.items() if entry_t < h <= horizon)
         return Path(interval, sec, entry_t, entry_px, starts, hi, negmin, times_exit, whale_exit, horizon, fund,
                     open_end=not hold_ms)
@@ -756,10 +781,11 @@ class Filters:
     no_conflict: bool = False  # пропуск, если за окно есть встречный сигнал по тому же правилу
 
     def ok(self, s: Signal) -> bool:
-        n = s.wallets_at.get(self.min_whale, s.wallets) if s.wallets_at else s.wallets
+        k = THRESHOLDS.index(self.min_whale) if s.wallets_by and self.min_whale in THRESHOLDS else -1
+        n = s.wallets_by[k] if k >= 0 else s.wallets
         if n < self.min_wallets or s.cluster_notional < self.min_notional:
             return False
-        if self.no_conflict and s.opp_at.get(self.min_whale, 0) >= self.min_wallets:
+        if self.no_conflict and k >= 0 and s.opp_by[k] >= self.min_wallets:
             return False
         if self.min_account and s.account < self.min_account:  # неизвестный счёт (0) — не проходит
             return False
@@ -826,34 +852,112 @@ class Params:
                 "кит_закрыл": "да" if e.whale else "выкл"}
 
 
-def simulate(signals: Sequence[Signal], paths: dict[int, Path], prm: Params, slip: float, fee: float,
+class PathBook:
+    """Пути цены — по требованию: строятся только для входов, которые
+    случились (их единицы на тысячи сигналов), и держатся в ограниченном
+    кеше. Раньше путь до конца данных строился заранее на каждый сигнал и
+    каждую задержку — на базе бота это десятки гигабайт."""
+
+    def __init__(self, signals: Sequence[Signal], markets: dict[str, tuple[Market, dict[int, float]]],
+                 hold_ms: int, holds: Sequence[int], slip: float, cap: int = 2000) -> None:
+        self.signals, self.markets = signals, markets
+        self.hold_ms, self.holds, self.slip, self.cap = hold_ms, holds, slip, cap
+        self.cache: OrderedDict[tuple[int, int], Path | None] = OrderedDict()
+
+    def interval(self, i: int, delay: int) -> str | None:
+        """Интервал свечей, на котором посчитан бы был вход (как build_path)."""
+        sig = self.signals[i]
+        got = self.markets.get(sig.coin)
+        if got is None:
+            return None
+        entry_t = sig.ts + delay * 1000
+        for interval, sec in INTERVALS:
+            c = got[0].by_interval.get(interval)
+            if not c or not len(c) or c.t[0] > entry_t:
+                continue
+            horizon = entry_t + self.hold_ms if self.hold_ms else c.t[-1] + sec * 1000
+            if c.t[-1] + sec * 1000 >= horizon > entry_t:
+                return interval
+        return None
+
+    def entry_px(self, i: int, delay: int) -> float | None:
+        """Цена входа (с проскальзыванием) — без построения пути."""
+        interval = self.interval(i, delay)
+        if interval is None:
+            return None
+        sig = self.signals[i]
+        px = price_at(self.markets[sig.coin][0].by_interval[interval], dict(INTERVALS)[interval], sig.ts + delay * 1000)
+        return None if px is None else px * (1 + sig.side * self.slip)
+
+    def get(self, i: int, delay: int) -> Path | None:
+        key = (i, delay)
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        sig = self.signals[i]
+        got = self.markets.get(sig.coin)
+        p = build_path(sig, delay, got[0], self.hold_ms, self.holds, self.slip, got[1]) if got else None
+        self.cache[key] = p
+        if len(self.cache) > self.cap:
+            self.cache.popitem(last=False)
+        return p
+
+    def view(self, idx: Sequence[int], delay: int) -> PathView:
+        return PathView(self, list(idx), delay)
+
+
+class PathView:
+    """Пути подмножества сигналов (номер в подмножестве → путь)."""
+
+    def __init__(self, book: PathBook, idx: list[int], delay: int) -> None:
+        self.book, self.idx, self.delay = book, idx, delay
+
+    def get(self, k: int) -> Path | None:
+        return self.book.get(self.idx[k], self.delay)
+
+    def entry_px(self, k: int) -> float | None:
+        return self.book.entry_px(self.idx[k], self.delay)
+
+
+def simulate(signals: Sequence[Signal], paths: dict[int, Path] | PathView, prm: Params, slip: float, fee: float,
              sz: Sizing) -> list[Trade]:
     """Сделки по набору параметров: фильтр, пауза на бумагу, одна позиция на
     бумагу, не больше sz.max_open позиций сразу (сигнал при занятых местах
-    пропускается)."""
+    пропускается). Путь цены запрашивается только у сигнала, прошедшего всё
+    остальное (у PathView — строится тогда же)."""
     trades: list[Trade] = []
     last_entry: dict[str, int] = {}
     busy_until: dict[str, int] = {}
     open_until: list[int] = []
     cool = prm.filters.cooldown_min * 60_000
     chase = prm.filters.max_chase
+    closed_pnl, closed_upto = 0.0, 0
     for idx, s in enumerate(signals):
-        p = paths.get(idx)
-        if p is None or not prm.filters.ok(s):
+        if not prm.filters.ok(s):
             continue
-        if p.entry_t < busy_until.get(s.coin, 0) or p.entry_t - last_entry.get(s.coin, -cool - 1) < cool:
+        entry_t = s.ts + prm.delay * 1000
+        if entry_t < busy_until.get(s.coin, 0) or entry_t - last_entry.get(s.coin, -cool - 1) < cool:
             continue
-        # Цена ушла от китов: ниже их средней для лонга (выше — для шорта) —
-        # входим всегда; в другую сторону дальше chase — поздно, пропуск.
-        if chase and s.ref_px > 0 and s.side * (p.entry_px / s.ref_px - 1) > chase:
-            continue
-        open_until = [u for u in open_until if u > p.entry_t]
+        open_until = [u for u in open_until if u > entry_t]
         if sz.max_open and len(open_until) >= sz.max_open:
             continue
         # Депозит кончился (закрытые к этому моменту съели его) — торговать
         # нечем: дальше сделок нет. Без этого модель «торговала» бы в долг.
-        if sz.deposit + sum(t.pnl_usd for t in trades if t.exit_t <= p.entry_t) <= 0:
+        if closed_upto < entry_t:
+            closed_pnl = sum(t.pnl_usd for t in trades if t.exit_t <= entry_t)
+            closed_upto = entry_t
+        if sz.deposit + closed_pnl <= 0:
             break
+        # Цена ушла от китов: ниже их средней для лонга (выше — для шорта) —
+        # входим всегда; в другую сторону дальше chase — поздно, пропуск.
+        if chase and s.ref_px > 0:
+            epx = paths.entry_px(idx) if isinstance(paths, PathView) else (
+                paths[idx].entry_px if idx in paths and paths[idx] is not None else None)
+            if epx is None or s.side * (epx / s.ref_px - 1) > chase:
+                continue
+        p = paths.get(idx)
+        if p is None:
+            continue
         t, pct, why, mae = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
         last_entry[s.coin] = p.entry_t
         busy_until[s.coin] = t
@@ -910,7 +1014,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     con = open_ro(a.db)
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
     signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000,
-                           num_list(a.min_whale))
+                           num_list(a.min_whale), keep_min=min(int_list(a.cluster)))
     # Свечи и пути — только для ордеров, которые могут пройти правило китов:
     # остальные не станут сделкой ни при каком наборе сетки.
     raw_signals = len(signals)
@@ -945,9 +1049,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     for i, s in enumerate(signals):
         by_coin[s.coin].append(i)
     funding_src: dict[str, str] = {}
-    paths: dict[int, dict[int, Path]] = {d: {} for d in delays}
     markets: dict[str, tuple[Market, dict[int, float]]] = {}
-    no_data = 0
     for coin, idxs in sorted(by_coin.items()):
         start = signals[idxs[0]].ts
         end = signals[idxs[-1]].ts + max(delays) * 1000 + hold_ms if hold_ms else md.now_ms
@@ -959,14 +1061,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
             market = md.candles(coin, start, end)
             fund, funding_src[coin] = md.funding(coin, start, end, db_funding.get(coin, {}))
         markets[coin] = (market, fund)
-        for i in idxs:
-            got = False
-            for d in delays:
-                p = build_path(signals[i], d, market, hold_ms, holds, a.slippage / 100, fund)
-                if p is not None:
-                    paths[d][i] = p
-                    got = True
-            no_data += not got
+    book = PathBook(signals, markets, hold_ms, holds, a.slippage / 100)
+    no_data = sum(1 for i in range(len(signals)) if all(book.interval(i, d) is None for d in delays))
 
     if not signals:
         raise SystemExit(f"сигналов нет: из {raw_signals} открытий китов правило «от {k_min} китов в одну сторону» "
@@ -988,13 +1084,16 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     sizing = Sizing(a.deposit, a.margin_pct / 100, a.leverage, a.max_open, 1 / (2 * a.max_market_leverage),
                     cross=a.margin == "cross")
 
-    def subset(idx: list[int], d: int) -> tuple[list[Signal], dict[int, Path]]:
-        return [signals[i] for i in idx], {k: paths[d][i] for k, i in enumerate(idx) if i in paths[d]}
+    def subset(idx: list[int], d: int) -> tuple[list[Signal], PathView]:
+        return [signals[i] for i in idx], book.view(idx, d)
 
     grid: list[tuple[Params, Stats]] = []
+    # Сигналы под каждый фильтр — один раз (фильтр не зависит от задержки и
+    # выхода): перебор сетки идёт по ним, а не по всем ордерам.
+    qualified = {f: [i for i in train if f.ok(signals[i])] for f in filters}
     for d in delays:
-        sigs, ps = subset(train, d)
         for f in filters:
+            sigs, ps = subset(qualified[f], d)
             for e in exits:
                 prm = Params(d, f, e)
                 grid.append((prm, stats(simulate(sigs, ps, prm, slip, fee, sizing))))
@@ -1014,13 +1113,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         перекрывает много тейков) — преимущество китов есть, только если
         повторять за ними лучше, чем делать наоборот."""
         flipped = [replace(signals[i], side=-signals[i].side) for i in idx]
-        ps: dict[int, Path] = {}
-        for k, sig in enumerate(flipped):
-            market, fund = markets[sig.coin]
-            p = build_path(sig, prm.delay, market, hold_ms, holds, slip, fund)
-            if p is not None:
-                ps[k] = p
-        return simulate(flipped, ps, prm, slip, fee, sizing)
+        flip_book = PathBook(flipped, markets, hold_ms, holds, slip, cap=500)
+        return simulate(flipped, flip_book.view(range(len(flipped)), prm.delay), prm, slip, fee, sizing)
 
     by_chase: list[dict] = []
     pace: list[dict] = []
@@ -1053,8 +1147,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
       f"без свечей: {no_data}.")
     res = defaultdict(int)
     for i in range(len(signals)):
-        p = paths[delays[0]].get(i)
-        res[p.interval if p else "нет"] += 1
+        res[book.interval(i, delays[0]) or "нет"] += 1
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
     w("Фандинг: " + ", ".join(f"{c}: {s}" for c, s in sorted(funding_src.items())))
     w(f"Сигнал — открытие лонга или шорта кита (закрытия не сигнал); сговор — разные киты в ту же сторону "
@@ -1127,8 +1220,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         for mo in (1, 3, 10):
             sz_mo = replace(sizing, max_open=mo)
             sigs_all = list(range(len(signals)))
-            tr = simulate([signals[i] for i in sigs_all], {k: paths[prm.delay][i] for k, i in enumerate(sigs_all)
-                                                         if i in paths[prm.delay]}, prm, slip, fee, sz_mo)
+            tr = simulate([signals[i] for i in sigs_all], book.view(sigs_all, prm.delay), prm, slip, fee, sz_mo)
             st_mo = stats(tr)
             tp_h = sorted((t.exit_t - t.entry_t) / HOUR_MS for t in tr if t.why == "тейк")
             med = tp_h[len(tp_h) // 2] if tp_h else 0.0
@@ -1315,6 +1407,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--count-only", action="store_true",
                     help="только посчитать возможности входа по правилу китов по дням (без сети и свечей)")
     ap.add_argument("--pause", type=float, default=1.0, help="пауза между запросами к API, с")
+    ap.add_argument("--max-mem-mb", type=int, default=2048,
+                    help="предел памяти процесса, МБ: дальше бэктест останавливается сам (0 — без предела)")
     ap.add_argument("--markets", choices=("all", "stocks"), default="all",
                     help="all — все фьючерсы (крипта, акции, металлы); stocks — только площадки --dexes")
     ap.add_argument("--dexes", type=lambda s: tuple(x for x in s.split(",") if x), default=STOCK_DEXES)
@@ -1364,11 +1458,30 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
+def limit_memory(mb: int) -> None:
+    """Жёсткий предел памяти процесса (RLIMIT_AS): дальше — MemoryError и
+    понятный выход, а не съеденная память сервера, где живут бот и API."""
+    if mb <= 0:
+        return
+    import resource
+    cap = mb * 1024 * 1024
+    _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+    if hard != resource.RLIM_INFINITY:
+        cap = min(cap, hard)
+    resource.setrlimit(resource.RLIMIT_AS, (cap, hard))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     a = parser().parse_args(argv)
     if not a.out:
         a.out = tempfile.mkdtemp(prefix="autotrade-backtest-")
-    r = run(a)
+    limit_memory(a.max_mem_mb)
+    try:
+        r = run(a)
+    except MemoryError:
+        sys.stderr.write(f"бэктест: не хватило предела памяти {a.max_mem_mb} МБ (--max-mem-mb) — остановлен сам, "
+                         "сервер не тронут. Уменьшите объём: --since-days, --markets stocks, меньше сетка.\n")
+        return 3
     sys.stdout.write(r["text"])
     print(f"\nФайлы: {a.out}/report.txt, trades.csv, grid.csv, top10.csv")
     return 0
