@@ -1,0 +1,44 @@
+# Автокопирование китов — реальная торговля на OKX (tools/autotrade_live.py).
+# Ключи OKX — только здесь: /etc/whale-autotrade.env (root, 600). API и бот
+# их не видят. Установка — sudo bash tools/autotrade-install.sh.
+[Unit]
+Description=Whale autotrade (OKX, owner only)
+After=network-online.target whalescanner.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vadymdota2
+WorkingDirectory=/home/vadymdota2/WhaleScanner
+EnvironmentFile=/etc/whale-autotrade.env
+Environment=WT_AUTOTRADE_DIR=/home/vadymdota2/WalletTracker/autotrade_data
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -I /home/vadymdota2/WhaleScanner/tools/autotrade_live.py --db /home/vadymdota2/WhaleScanner/hyperliquid.db
+# Код обновился (автодеплой) — трейдер выходит сам, systemd поднимает новый.
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Каталог бота — только ради служебного файла базы (-shm) при чтении:
+# база открывается mode=ro + query_only, писать в неё трейдер не может.
+ReadWritePaths=/home/vadymdota2/WalletTracker/autotrade_data /home/vadymdota2/WhaleScanner
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+LockPersonality=yes
+MemoryMax=384M
+
+[Install]
+WantedBy=multi-user.target
