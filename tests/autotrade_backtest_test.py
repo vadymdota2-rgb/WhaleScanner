@@ -581,6 +581,23 @@ class ExitTest(unittest.TestCase):
         tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(1_000, 1.0, 10, 0, 0.0, cross=True))
         self.assertEqual([(t.why, round(t.pnl_usd)) for t in tr], [("ликвидация", -1_000)])
 
+    def test_rest_after_exit(self):
+        """Отторговали бумагу — 3 часа после выхода в неё не входим; в
+        другую бумагу — можно сразу."""
+        c = self.flat(2000)
+        c[10] = (T0 + 10 * MIN, 100, 102, 100, 101)  # тейк 1 % на 10-й минуте
+        sigs = [self.sig(ts=T0 + k * MIN) for k in (0, 60, 200)]
+        other = self.sig(ts=T0 + 30 * MIN)
+        other.coin = "xyz:B"
+        sigs.insert(1, other)
+        paths = {i: bt.build_path(sg, 0, market(c), 300 * MIN, [0], 0.0, {}) for i, sg in enumerate(sigs)}
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0, rest_min=180), bt.Exits(0.01, 0, 60, False))
+        tr = bt.simulate(sigs, paths, prm, 0.0, 0.0, bt.Sizing(10_000, 0.1, 10, 0, 0.05, cross=True))
+        # A: вход 0, выход ~11 мин; 60-я — отдых (до ~191); 200-я — можно. B — сразу.
+        self.assertEqual([(t.sig.coin, t.sig.ts) for t in tr],
+                         [("xyz:A", T0), ("xyz:B", T0 + 30 * MIN), ("xyz:A", T0 + 200 * MIN)])
+        self.assertEqual(bt.parser().parse_args([]).rest, 180)
+
     def test_filters(self):
         s = self.sig()
         s.pnl30 = -1

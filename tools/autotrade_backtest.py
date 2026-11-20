@@ -779,6 +779,7 @@ class Filters:
     max_chase: float = 0.0  # насколько цена входа может быть хуже средней цены китов (доля; 0 — без предела)
     min_whale: float = 0.0  # порог кита, $ (его позиция в эту сторону за окно)
     no_conflict: bool = False  # пропуск, если за окно есть встречный сигнал по тому же правилу
+    rest_min: int = 0  # после выхода из бумаги — столько минут в неё снова не входим
 
     def ok(self, s: Signal) -> bool:
         k = THRESHOLDS.index(self.min_whale) if s.wallets_by and self.min_whale in THRESHOLDS else -1
@@ -838,6 +839,7 @@ class Params:
         return {"delay": self.delay, "min_notional": f.min_notional, "min_account": f.min_account,
                 "max_leverage": f.max_leverage, "pnl30": f.need_pnl30, "cooldown": f.cooldown_min,
                 "wallets": f.min_wallets, "chase": round(f.max_chase * 100, 3), "min_whale": f.min_whale,
+                "rest": f.rest_min,
                 "no_conflict": f.no_conflict,
                 "tp": round(e.tp * 100, 3), "sl": round(e.sl * 100, 3), "hold": e.hold, "whale": e.whale}
 
@@ -960,7 +962,8 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path] | PathView, prm: 
             continue
         t, pct, why, mae = exit_trade(p, s.side, prm.exits, slip, fee, sz.liq_move, sz.backing)
         last_entry[s.coin] = p.entry_t
-        busy_until[s.coin] = t
+        # Отторговали бумагу — rest_min минут после выхода в неё не входим.
+        busy_until[s.coin] = t + prm.filters.rest_min * 60_000
         open_until.append(t)
         trades.append(Trade(s, p.entry_t, t, pct, pct * sz.notional, why, p.interval, mae * sz.notional))
     return trades
@@ -1072,7 +1075,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     train = [i for i, s in enumerate(signals) if s.ts < cut]
     hold_out = [i for i, s in enumerate(signals) if s.ts >= cut]
 
-    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown, k, c, wh, bool(nc))
+    filters = [Filters(x, a.min_account, a.max_leverage, bool(p), a.cooldown, k, c, wh, bool(nc), a.rest)
                for x in num_list(a.min_notional) for p in int_list(a.pnl30)
                for k in int_list(a.cluster) for c in pct_list(a.chase)
                for wh in num_list(a.min_whale) for nc in int_list(a.no_conflict)]
@@ -1434,6 +1437,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-leverage", type=int, default=0, help="плечо кита до Z (0 — выкл)")
     ap.add_argument("--pnl30", default="1,0", help="требовать PnL кита за 30 дней > 0: 1 — да, 0 — нет (сетка)")
     ap.add_argument("--cooldown", type=int, default=120, help="не чаще одного входа на бумагу за N минут")
+    ap.add_argument("--rest", type=int, default=180,
+                    help="после выхода из бумаги столько минут в неё снова не входим (правило владельца — 180)")
     ap.add_argument("--tp", default="1",
                     help="тейк, %% движения цены (правило владельца — 1 %%: при 10× это 10 %% на маржу; 0 — выкл; сетка)")
     ap.add_argument("--whale-exit", default="0", help="выходить, когда кит закрыл: 1 — да, 0 — нет (сетка)")
