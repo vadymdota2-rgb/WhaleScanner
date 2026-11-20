@@ -295,6 +295,21 @@ class ClusterTest(Base):
                                ("c", -1, 1, 5_000), ("d", 1, 1, 4_000)])
         self.assertAlmostEqual(sigs[0].px, 272.5)
         self.assertAlmostEqual(sigs[1].ref_px, (81_800 + 10_000) / (81_800 / 272.5 + 10_000 / 270.87), places=6)
+        # Мелочь, не прошедшая порог кита, среднюю цену китов не сдвигает.
+        f2 = Fills()
+        f2.add("a", "xyz:X", bt.OPEN_LONG, T0, notional=10_000, oid=11)
+        f2.add("m", "xyz:X", bt.OPEN_LONG, T0 + 60_000, notional=500, oid=12)
+        f2.add("b", "xyz:X", bt.OPEN_LONG, T0 + 120_000, notional=10_000, oid=13)
+        db2 = os.path.join(self.tmp.name, "ref.db")
+        f2.write(db2)
+        con = sqlite3.connect(db2)
+        con.execute("UPDATE hl_fills SET sz = CAST(notional_nanos AS REAL) / 1e9 / CASE oid WHEN 12 THEN 50.0 "
+                    "ELSE 100.0 END")
+        con.commit()
+        con.close()
+        last = bt.load_signals(bt.open_ro(db2), None, cluster_ms=2 * h, min_whale=1000)[-1]
+        self.assertEqual(last.wallets, 2)
+        self.assertAlmostEqual(last.ref_px, 100.0)
         self.assertTrue(bt.Filters(90_000, 0, 0, False, 0, 2).ok(sigs[1]))
         self.assertFalse(bt.Filters(90_000, 0, 0, False, 0, 3).ok(sigs[1]))
         self.assertFalse(bt.Filters(95_000, 0, 0, False, 0, 2).ok(sigs[1]))
@@ -528,6 +543,18 @@ class ExitTest(unittest.TestCase):
         p = bt.build_path(s, 0, market(c), 300 * MIN, [0], 0.0, {})
         self.assertEqual(len(bt.simulate([s], {0: p}, bt.Params(0, bt.Filters(0, 0, 0, False, 0), prm.exits),
                                          0, 0, sz)), 1)
+
+    def test_chase_is_about_the_market_not_our_slippage(self):
+        """Предел догона — куда ушёл рынок от средней китов; наше
+        проскальзывание — цена исполнения и в предел не входит: рынок на
+        0,25 % выше китов при пределе 0,3 % и проскальзывании 0,1 % — вход."""
+        c = self.flat(px=100.25)
+        prm = bt.Params(0, bt.Filters(0, 0, 0, False, 0, 1, 0.003), bt.Exits(0, 0, 0, False))
+        sz = bt.Sizing(10_000, 0.1, 10, 0, 0.05, cross=True)
+        for ref, enter in ((100.0, True), (99.9, False)):
+            s = bt.Signal("w", "xyz:A", 1, T0, 50_000, 1e6, 2, px=ref)
+            p = bt.build_path(s, 0, market(c), 300 * MIN, [0], 0.001, {})
+            self.assertEqual(len(bt.simulate([s], {0: p}, prm, 0.001, 0, sz)), int(enter), ref)
 
     def test_sit_through_never_closes_and_counts_the_dip(self):
         """Пересиживаем всегда: срока нет — путь до конца данных; не дошли

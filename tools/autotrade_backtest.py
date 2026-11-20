@@ -2,9 +2,10 @@
 # © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 """Бэктест «автокопирования китов» на фьючерсах Hyperliquid — этап 1 ТЗ.
 
-Вопрос один: заработала бы копия сделок китов на рынках акций (xyz:, io:,
-para:) после комиссий, фандинга и задержки — и не подгонка ли это. Скрипт
-ничего не торгует и бота не трогает:
+Вопрос один: заработала бы копия сделок китов на фьючерсах (крипта, акции,
+металлы; --markets stocks — только акции xyz:, io:, para:) после комиссий,
+фандинга и задержки — и не подгонка ли это. Скрипт ничего не торгует и
+бота не трогает:
 
 - база бота (hyperliquid.db) открывается только на чтение
   (``file:…?mode=ro``); в каталог базы и рядом с ней скрипт не пишет —
@@ -20,16 +21,21 @@ para:) после комиссий, фандинга и задержки — и 
 целиком; доля сделок по интервалам — в отчёте. Разбивка по задержке D честна
 только на минутных свечах — отчёт показывает её отдельно для них.
 
+Правила владельца (значения по умолчанию): сигнал — от 2 разных китов в
+одну сторону на одной бумаге за 2 часа, у каждого от 1000 $; цена входа не
+хуже средней китов больше чем на 0,3 %; маржа 10 % депозита, плечо 10×,
+кросс; одна позиция за раз; выход — только тейк 1 % движения цены, без
+стопа и срока (пересиживаем); после выхода 3 часа в ту же бумагу не входим.
+
 Модель исполнения (консервативная):
 - вход — через D секунд после сделки кита, по цене внутри свечи (линейно от
   открытия к закрытию) плюс проскальзывание против нас;
-- в свече входа учитывается только движение против нас (стоп), не в нашу
-  пользу (тейк);
-- стоп и тейк в одной свече — считается стоп; стоп — в начале свечи, тейк —
-  в конце; любой выход — с проскальзыванием против нас;
+- в свече входа учитывается только движение против нас, не в нашу пользу;
+- тейк — в конце свечи касания, стоп (если задан) — в начале: при обоих в
+  одной свече считается стоп; любой выход — с проскальзыванием против нас;
 - комиссия тейкера — с обеих сторон; фандинг — по часам удержания
   (лонг платит положительную ставку);
-- одна позиция на бумагу; не чаще одного входа на бумагу за N минут.
+- не дошла до тейка к концу данных — «открыта», результат по рынку.
 
 Подбор и защита от подгонки: последние 25 % периода (по времени сигналов)
 в подборе не участвуют. Лучшие 10 наборов выбираются на первых 75 % и
@@ -173,12 +179,14 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
         "ORDER BY t0, wallet, coin", (since_ms,))
     recent: dict[tuple[str, int], deque[tuple[int, str, float, float]]] = defaultdict(deque)
 
-    def whales(bucket: deque[tuple[int, str, float, float]], now: int) -> dict[str, float]:
+    def whales(bucket: deque[tuple[int, str, float, float]], now: int) -> dict[str, list[float]]:
+        """Кит → [объём $, штук] за окно (старше окна — выброшены)."""
         while bucket and bucket[0][0] < now - cluster_ms:
             bucket.popleft()
-        per: dict[str, float] = defaultdict(float)
-        for _t, w, n, _u in bucket:
-            per[w] += n
+        per: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        for _t, w, n, u in bucket:
+            per[w][0] += n
+            per[w][1] += u
         return per
 
     out: list[Signal] = []
@@ -192,18 +200,20 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
         bucket.append((ts, wallet, usd_n, units))
         per_wallet = whales(bucket, ts)
         against = whales(recent[(coin, -side)], ts)
-        wallets_by = tuple(sum(1 for v in per_wallet.values() if v >= t) for t in thresholds)
+        wallets_by = tuple(sum(1 for v in per_wallet.values() if v[0] >= t) for t in thresholds)
         if wallets_by[0] < keep_min:
             continue
-        # Средняя цена входа всех — объём в $ на число штук (как средняя
-        # цена позиции), а не среднее цен с весами.
-        total_units = sum(u for *_, u in bucket)
+        # Средняя цена входа китов — объём в $ на число штук (как средняя
+        # цена позиции). Только китов от наименьшего порога: мелочь, не
+        # прошедшая правило, цену китов не сдвигает.
+        big = [v for v in per_wallet.values() if v[0] >= thresholds[0] and v[1] > 0]
+        big_units = sum(v[1] for v in big)
         px = usd_n / units if units > 0 else 0.0
         out.append(Signal(wallet, coin, side, ts, usd_n, (account or 0) / NANOS, int(lev or 0), px=px, size=units,
                           wallets=wallets_by[0], cluster_notional=sum(n for _t, _w, n, _u in bucket),
-                          ref_px=(sum(n for _t, _w, n, u in bucket if u > 0) / total_units) if total_units > 0 else px,
+                          ref_px=sum(v[0] for v in big) / big_units if big_units > 0 else px,
                           wallets_by=wallets_by,
-                          opp_by=tuple(sum(1 for v in against.values() if v >= t) for t in thresholds)))
+                          opp_by=tuple(sum(1 for v in against.values() if v[0] >= t) for t in thresholds)))
     attach_history(con, out)
     return out
 
@@ -952,10 +962,13 @@ def simulate(signals: Sequence[Signal], paths: dict[int, Path] | PathView, prm: 
             break
         # Цена ушла от китов: ниже их средней для лонга (выше — для шорта) —
         # входим всегда; в другую сторону дальше chase — поздно, пропуск.
+        # Сравнивается рыночная цена в момент решения — без нашего
+        # проскальзывания (оно — цена исполнения, а не «куда ушёл рынок»).
         if chase and s.ref_px > 0:
             epx = paths.entry_px(idx) if isinstance(paths, PathView) else (
                 paths[idx].entry_px if idx in paths and paths[idx] is not None else None)
-            if epx is None or s.side * (epx / s.ref_px - 1) > chase:
+            mkt = None if epx is None else epx / (1 + s.side * slip)
+            if mkt is None or s.side * (mkt / s.ref_px - 1) > chase:
                 continue
         p = paths.get(idx)
         if p is None:
@@ -1401,7 +1414,7 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="Бэктест автокопирования китов по акциям Hyperliquid (только чтение)")
+    ap = argparse.ArgumentParser(description="Бэктест автокопирования китов на фьючерсах Hyperliquid (только чтение)")
     ap.add_argument("--db", default=os.environ.get("WHALE_HL_DB_FILE", "hyperliquid.db"), help="база бота (только чтение)")
     ap.add_argument("--out", default="", help="каталог отчёта (по умолчанию — новый временный)")
     ap.add_argument("--cache", default=os.path.join(tempfile.gettempdir(), "whale-autotrade-cache"),
