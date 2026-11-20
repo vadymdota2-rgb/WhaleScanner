@@ -32,10 +32,25 @@ TPL
 fi
 chown root:root "$ENV"
 chmod 600 "$ENV"
+# Ключа ещё нет — спросить здесь же (ввод не показывается и не попадает в историю).
+if ! grep -qE '^OKX_API_KEY=.+' "$ENV" && [ -t 0 ]; then
+    echo "Ключ OKX (права — только «Торговля»). Ввод не отображается."
+    read -rsp "API key: " K; echo
+    read -rsp "Secret key: " S; echo
+    read -rsp "Passphrase: " P; echo
+    read -rp "Демо-счёт OKX? (y/N): " D
+    [ "$D" = y ] || [ "$D" = Y ] && D=1 || D=0
+    umask 077
+    printf 'OKX_API_KEY=%s\nOKX_API_SECRET=%s\nOKX_API_PASSPHRASE=%s\nOKX_SIMULATED=%s\n' "$K" "$S" "$P" "$D" >"$ENV"
+    unset K S P
+    chown root:root "$ENV"
+    chmod 600 "$ENV"
+    echo "ключ записан в $ENV (root, 600)"
+fi
 install -d -o "$USER_NAME" -g "$USER_NAME" -m 755 "$DATA" "$DATA/live"
 systemctl daemon-reload
 systemctl enable whale-autotrade >/dev/null
 systemctl restart whale-autotrade
 sleep 3
 systemctl --no-pager --lines=5 status whale-autotrade || true
-echo "готово. Ключ: sudoedit $ENV, затем sudo systemctl restart whale-autotrade. Торговля — после «Старт» во вкладке."
+echo "готово. Торговля — после «Старт» во вкладке «Автоторговля». Сменить ключ: sudoedit $ENV и sudo systemctl restart whale-autotrade."
