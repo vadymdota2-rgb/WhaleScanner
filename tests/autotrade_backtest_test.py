@@ -296,6 +296,31 @@ class ClusterTest(Base):
         self.assertFalse(bt.Filters(95_000, 0, 0, False, 0, 2).ok(sigs[1]))
 
 
+class OwnerRulesTest(Base):
+    def test_two_whales_each_from_1000(self):
+        """Правило владельца: минимум 2 кита в одну сторону, у каждого позиция
+        от 1000 $ (все его ордера за окно). Мелкий кит не считается; два
+        ордера одного по 600 $ — это 1200 $, он считается."""
+        f = Fills()
+        h = 3_600_000
+        f.add("big", "xyz:GOOGL", bt.OPEN_LONG, T0, notional=81_800, oid=1)
+        f.add("tiny", "xyz:GOOGL", bt.OPEN_LONG, T0 + h, notional=200, oid=2)       # мелочь — не кит
+        f.add("two", "xyz:GOOGL", bt.OPEN_LONG, T0 + 2 * h, notional=600, oid=3)
+        f.add("two", "xyz:GOOGL", bt.OPEN_LONG, T0 + 3 * h, notional=600, oid=4)    # 1200 $ — уже кит
+        f.write(self.db)
+        sigs = bt.load_signals(bt.open_ro(self.db), None, cluster_ms=24 * h, min_whale=1000)
+        self.assertEqual([s.wallets for s in sigs], [1, 1, 1, 2])
+        rule = bt.Filters(0, 0, 0, False, 0, 2)
+        self.assertEqual([rule.ok(s) for s in sigs], [False, False, False, True])
+
+    def test_defaults_are_the_owner_rules(self):
+        a = bt.parser().parse_args([])
+        self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.min_whale, a.margin, a.markets),
+                         ("1", "0", "0", "0", 1000, "cross", "all"))
+        self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
+        self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
+
+
 class ExitTest(unittest.TestCase):
     def sig(self, side=1, ts=T0):
         return bt.Signal("w", "xyz:A", side, ts, 50_000, 1e6, 2)
@@ -506,6 +531,10 @@ class VerdictTest(Base):
         self.assertEqual(sm["sizing"]["notional"], 10_000)
         self.assertEqual(len(sm["top"]), len(r["top"]))
         self.assertTrue(sm["equity"] and sm["trades"] and sm["by_coin"])
+        # За китами лучше, чем против них: на этой цене против — в минус.
+        self.assertIsNotNone(sm["fade"])
+        self.assertLess(sm["fade"]["net"], sm["top"][0]["holdout"]["net"])
+        self.assertIn("за китами лучше", r["text"])
         self.assertLessEqual(len(sm["equity"]), 501)
         # Без преимущества — комиссии съедают всё.
         os.remove(self.db)
@@ -564,7 +593,7 @@ class VerdictTest(Base):
             return 100 * 1.02 ** done
 
         extra = ["--delays", "5", "--tp", "0", "--sl", "0", "--hold", "60", "--max-hold", "60",
-                 "--min-notional", "20000", "--pnl30", "0", "--cooldown", "0"]
+                 "--min-notional", "20000", "--pnl30", "0", "--cooldown", "0", "--cluster", "1"]
         r = bt.run(args(self.db, self.out, self.cache, *extra), fetch=FakeApi(price), now_ms=NOW)
         _prm, train, hold = r["top"][0]
         self.assertGreater(train.net, 0)

@@ -59,7 +59,7 @@ import urllib.request
 from array import array
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
@@ -137,7 +137,7 @@ def is_perp(coin: str) -> bool:
 
 
 def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms: int = 0,
-                 cluster_ms: int = 24 * 3_600_000) -> list[Signal]:
+                 cluster_ms: int = 24 * 3_600_000, min_whale: float = 0.0) -> list[Signal]:
     """Открытия лонга и шорта китов на фьючерсах (закрытия — не сигнал).
     dexes — только эти площадки HIP-3 (акции); None — все фьючерсы: крипта,
     акции, металлы. Ордер кита исполняется кусками (много строк с одним oid)
@@ -167,21 +167,26 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
     for sig in signals:
         sig.px = sig.notional / sig.size if sig.size > 0 else 0.0
     attach_history(con, signals)
-    attach_clusters(signals, cluster_ms)
+    attach_clusters(signals, cluster_ms, min_whale)
     return signals
 
 
-def attach_clusters(signals: list[Signal], window_ms: int) -> None:
-    """Сговор: на каждом ордере — сколько разных кошельков за окно до него
+def attach_clusters(signals: list[Signal], window_ms: int, min_whale: float = 0.0) -> None:
+    """Сговор: на каждом ордере — сколько разных китов за окно до него
     (включительно) открыли ту же сторону на той же бумаге, их общий объём и
-    средняя цена по объёму. Только прошлое — без заглядывания вперёд."""
+    средняя цена по объёму. Кит считается, если его позиция в эту сторону
+    за окно (все его ордера) — не меньше min_whale $. Только прошлое — без
+    заглядывания вперёд."""
     recent: dict[tuple[str, int], list[Signal]] = defaultdict(list)
     for sig in signals:
         bucket = recent[(sig.coin, sig.side)]
         bucket.append(sig)
         while bucket and bucket[0].ts < sig.ts - window_ms:
             bucket.pop(0)
-        sig.wallets = len({b.wallet for b in bucket})
+        per_wallet: dict[str, float] = defaultdict(float)
+        for b in bucket:
+            per_wallet[b.wallet] += b.notional
+        sig.wallets = sum(1 for v in per_wallet.values() if v >= min_whale)
         sig.cluster_notional = sum(b.notional for b in bucket)
         # Средняя цена входа всех — объём в $ на число штук (как средняя
         # цена позиции), а не среднее цен с весами.
@@ -845,7 +850,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
 
     con = open_ro(a.db)
     since = 0 if not a.since_days else (now_ms or int(time.time() * 1000)) - a.since_days * DAY_MS
-    signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000)
+    signals = load_signals(con, None if a.markets == "all" else a.dexes, since, a.cluster_hours * 3_600_000,
+                           a.min_whale)
     md = MarketData(a.cache, a.offline, fetch, a.pause, now_ms)
     delays, holds = int_list(a.delays), int_list(a.hold)
     hold_ms = max([*holds, a.max_hold]) * 60_000
@@ -869,6 +875,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         by_coin[s.coin].append(i)
     funding_src: dict[str, str] = {}
     paths: dict[int, dict[int, Path]] = {d: {} for d in delays}
+    markets: dict[str, tuple[Market, dict[int, float]]] = {}
     no_data = 0
     for coin, idxs in sorted(by_coin.items()):
         start = signals[idxs[0]].ts
@@ -880,6 +887,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         else:
             market = md.candles(coin, start, end)
             fund, funding_src[coin] = md.funding(coin, start, end, db_funding.get(coin, {}))
+        markets[coin] = (market, fund)
         for i in idxs:
             got = False
             for d in delays:
@@ -900,7 +908,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
                for x in num_list(a.min_notional) for p in int_list(a.pnl30)
                for k in int_list(a.cluster) for c in pct_list(a.chase)]
     exits = [Exits(tp, sl, h, w) for tp in pct_list(a.tp) for sl in pct_list(a.sl) for h in holds
-             for w in (False, True)]
+             for w in (bool(x) for x in int_list(a.whale_exit))]
     fee, slip = a.fee / 100, a.slippage / 100
     if not 0 < a.leverage <= a.max_market_leverage:
         raise SystemExit(f"плечо {a.leverage} — вне 0…{a.max_market_leverage} (предел рынка)")
@@ -927,9 +935,25 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     def passes(st: Stats) -> bool:
         return st.net > 0 and st.pf >= 1.3 and st.trades >= 100 and st.max_dd <= 0.15 * a.deposit
 
+    def against(idx: list[int], prm: Params) -> list[Trade]:
+        """То же самое, но в обратную сторону от китов. Тейк без стопа
+        выигрывает часто и на случайной цене (редкий застрявший убыток
+        перекрывает много тейков) — преимущество китов есть, только если
+        повторять за ними лучше, чем делать наоборот."""
+        flipped = [replace(signals[i], side=-signals[i].side) for i in idx]
+        ps: dict[int, Path] = {}
+        for k, sig in enumerate(flipped):
+            market, fund = markets[sig.coin]
+            p = build_path(sig, prm.delay, market, hold_ms, holds, slip, fund)
+            if p is not None:
+                ps[k] = p
+        return simulate(flipped, ps, prm, slip, fee, sizing)
+
     checked = [(prm, st, stats(on(hold_out, prm))) for prm, st in top]
     best = checked[0] if checked else None
-    verdict = bool(best and passes(best[2]))
+    fade = stats(against(hold_out, best[0])) if best else Stats()
+    # Критерий ТЗ и сверх него: за китами лучше, чем против них.
+    verdict = bool(best and passes(best[2]) and best[2].net > fade.net)
 
     # ── отчёт ──
     lines: list[str] = []
@@ -957,8 +981,13 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         res[p.interval if p else "нет"] += 1
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
     w("Фандинг: " + ", ".join(f"{c}: {s}" for c, s in sorted(funding_src.items())))
-    w(f"Сигнал — открытие лонга или шорта кита (закрытия не сигнал); сговор — разные кошельки в ту же сторону "
-      f"за {a.cluster_hours:g} ч; цена хуже средней китов дальше предела — вход пропускается.")
+    w(f"Сигнал — открытие лонга или шорта кита (закрытия не сигнал); сговор — разные киты в ту же сторону "
+      f"за {a.cluster_hours:g} ч, у каждого позиция от {a.min_whale:g} $; цена хуже средней китов дальше "
+      f"предела — вход пропускается.")
+    tps = [x for x in pct_list(a.tp) if x]
+    if tps:
+        w("Тейк: " + ", ".join(f"{x * 100:g} % движения цены = {x * 100 * a.leverage:g} % на маржу" for x in tps)
+          + f" (плечо {a.leverage:g}×).")
     w(f"Маржа {'кросс' if sizing.cross else 'изолированная'}. "
       f"Депозит {a.deposit:.0f} $, маржа на сделку {a.margin_pct:g} % ({a.deposit * sizing.margin_frac:.0f} $), плечо "
       f"{a.leverage:g}× — позиция {sizing.notional:.0f} $; одновременно позиций до {a.max_open or 'без предела'}; "
@@ -975,6 +1004,10 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
           f"{0.15 * a.deposit:.0f} $ (15 % депозита). Лучший набор подбора на отложенных: "
           + ", ".join(f"{k} {v}" for k, v in best[2].row().items()))
         w(f"Из лучших 10 критерий на отложенных проходят: {sum(passes(c[2]) for c in checked)}.")
+        w(f"Против китов (тот же набор, обратная сторона) на отложенных: сделок {fade.trades}, прибыльных "
+          f"{fade.row()['прибыльных_%']} %, итог {fade.net:.2f} $ — за китами "
+          + ("лучше" if best[2].net > fade.net else "НЕ лучше: преимущества китов нет, только форма стратегии")
+          + ". Тейк без стопа часто выигрывает и на случайной цене: смотрите на редкие большие убытки.")
         w("")
         w("Лучшие 10 наборов (подбор → отложенные):")
         for n, (prm, st, ho) in enumerate(checked, 1):
@@ -1042,7 +1075,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     with open(os.path.join(a.out, "report.txt"), "w", encoding="utf-8") as f:
         f.write(text)
     summary = build_summary(a, sizing, signals, cut, res, funding_src, md, checked, verdict,
-                            on(list(range(len(signals))), best[0]) if best else [], passes)
+                            on(list(range(len(signals))), best[0]) if best else [], passes, fade if best else None)
     summary["okx"] = {"venue": a.venue, "map": okx}
     with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False)
@@ -1053,7 +1086,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
 
 def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signal], cut: int, res: dict,
                   funding_src: dict[str, str], md: MarketData, checked: list, verdict: bool,
-                  trades: list[Trade], passes: Callable[[Stats], bool]) -> dict:
+                  trades: list[Trade], passes: Callable[[Stats], bool], fade_st: Stats | None = None) -> dict:
     """Итог для закрытой вкладки приложения (API читает summary.json): то же,
     что в отчёте, машиночитаемо. Адреса китов — сокращённо."""
     def short(w: str) -> str:
@@ -1075,10 +1108,12 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
     return {
         "generated_at": int(time.time()),
         "verdict": verdict,
-        "criteria": {"net_gt": 0, "pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2)},
+        "criteria": {"net_gt": 0, "pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2),
+                     "beats_fade": True},
         "period": {"from": signals[0].ts if signals else 0, "to": signals[-1].ts if signals else 0, "cut": cut},
         "sizing": {"deposit": a.deposit, "margin_pct": a.margin_pct, "leverage": a.leverage, "max_open": a.max_open,
                    "cross": sizing.cross, "markets": a.markets, "cluster_hours": a.cluster_hours,
+                   "min_whale": a.min_whale,
                    "notional": sizing.notional, "liq_move_pct": round(sizing.liq_move * 100, 3),
                    "fee_pct": a.fee, "slippage_pct": a.slippage},
         "data": {"signals": len(signals), "candles": dict(res), "requests": md.requests, "errors": len(md.errors),
@@ -1086,6 +1121,7 @@ def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signa
         "top": [{"params": prm.json(), "train": stats_json(st), "holdout": stats_json(ho), "passes": passes(ho)}
                 for prm, st, ho in checked],
         "full": stats_json(stats(trades)) if trades else None,
+        "fade": stats_json(fade_st) if fade_st is not None else None,
         "equity": curve,
         "by_coin": group(lambda t: t.sig.coin),
         "by_whale": group(lambda t: short(t.sig.wallet), 15),
@@ -1108,19 +1144,24 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--markets", choices=("all", "stocks"), default="all",
                     help="all — все фьючерсы (крипта, акции, металлы); stocks — только площадки --dexes")
     ap.add_argument("--dexes", type=lambda s: tuple(x for x in s.split(",") if x), default=STOCK_DEXES)
-    ap.add_argument("--cluster", default="1,2,3", help="китов в одну сторону за окно, от (сетка)")
+    ap.add_argument("--cluster", default="2,3",
+                    help="китов в одну сторону за окно, от (сетка; правило владельца — минимум 2)")
+    ap.add_argument("--min-whale", type=float, default=1000,
+                    help="кит считается, если его позиция в эту сторону за окно — от X $ (правило владельца — 1000)")
     ap.add_argument("--cluster-hours", type=float, default=24, help="окно сговора, ч")
     ap.add_argument("--chase", default="0.1,0.3,1",
                     help="на сколько %% цена входа может быть хуже средней цены китов (сетка; 0 — без предела)")
     ap.add_argument("--margin", choices=("cross", "isolated"), default="cross", help="кросс- или изолированная маржа")
     ap.add_argument("--since-days", type=int, default=0, help="только последние N дней (0 — все)")
     ap.add_argument("--delays", default="5,30,120,300", help="задержка входа D, с (сетка)")
-    ap.add_argument("--min-notional", default="20000,100000", help="объём ордера кита от X $ (сетка)")
+    ap.add_argument("--min-notional", default="0", help="общий объём китов за окно от X $ (сетка; 0 — без предела)")
     ap.add_argument("--min-account", type=float, default=0, help="счёт кита от Y $ (0 — выкл)")
     ap.add_argument("--max-leverage", type=int, default=0, help="плечо кита до Z (0 — выкл)")
     ap.add_argument("--pnl30", default="1,0", help="требовать PnL кита за 30 дней > 0: 1 — да, 0 — нет (сетка)")
     ap.add_argument("--cooldown", type=int, default=60, help="не чаще одного входа на бумагу за N минут")
-    ap.add_argument("--tp", default="0.5,1,2,3", help="тейк, %% (0 — выкл; сетка)")
+    ap.add_argument("--tp", default="1",
+                    help="тейк, %% движения цены (правило владельца — 1 %%: при 10× это 10 %% на маржу; 0 — выкл; сетка)")
+    ap.add_argument("--whale-exit", default="0", help="выходить, когда кит закрыл: 1 — да, 0 — нет (сетка)")
     ap.add_argument("--sl", default="0", help="стоп, %% (0 — выкл — пересиживаем; сетка)")
     ap.add_argument("--hold", default="0", help="выход по времени, мин (0 — выкл; сетка)")
     ap.add_argument("--max-hold", type=int, default=4320,
