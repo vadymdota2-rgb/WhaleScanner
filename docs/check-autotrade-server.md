@@ -94,11 +94,11 @@ ls -la "$T/out"                          # report.txt, summary.json, trades.csv,
 API (Wallet-Tracker, `wt_autotrade.py`) сам запускает этот же бэктест раз в
 сутки, в 03:17 UTC (и через 15 минут после запуска API, если итога ещё
 нет), с паузой 15 с между запросами к Hyperliquid. Итог и кеш — в
-`~/.local/share/whale-autotrade/` пользователя, под которым работает API
+`~/WalletTracker/autotrade_data/` (рядом с API: служба whale-api пишет только в ReadWritePaths)
 (или в `WT_AUTOTRADE_DIR`), не в каталоге бота.
 
 ```bash
-D=~<пользователь API>/.local/share/whale-autotrade
+D=~/WalletTracker/autotrade_data
 ls -la "$D" "$D/latest" 2>/dev/null          # summary.json, report.txt, …; last_run.log
 tail -n 5 "$D/last_run.log" 2>/dev/null
 journalctl -u whale-api --since "-1 day" --no-pager | grep '\[AUTO\]' | tail -n 5

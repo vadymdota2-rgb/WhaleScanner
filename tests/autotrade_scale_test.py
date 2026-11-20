@@ -92,7 +92,7 @@ def main() -> int:
         base = ["--db", os.path.join(tmp, "bot", "hyperliquid.db"), "--out", os.path.join(tmp, "out"),
                 "--cache", os.path.join(tmp, "cache"), "--offline", "--markets", "stocks", "--dexes", "xyz"]
         t = time.time()
-        code, peak, err = run(*base, "--max-mem-mb", "1200")
+        code, peak, err = run(*base, "--max-mem-mb", "1000")
         took = time.time() - t
         if code != 0 or peak >= 700:
             sys.stderr.write(f"ПРОВАЛ: код {code}, пик {peak} МБ (предел проверки 700)\n{err[-2000:]}")
