@@ -1,148 +1,223 @@
-# Автокопирование китов — проверка на сервере (для Claude на сервере)
+# Автокопирование китов — полная проверка модуля на сервере (для Claude на сервере)
 
-Правило для этого сервера — **только чтение**: без sudo, без правок файлов
-бота, боевые базы не открываются на запись, ключи (`/etc/whale-api.env`,
-`/etc/whale-autotrade.env`) не печатаются ни целиком, ни частями. Всё, что
-создаётся, — только во временном каталоге (`mktemp -d`), и он удаляется в
-конце.
+Правило для этого сервера — **только чтение**:
+- без sudo, без правок файлов бота и API, без перезапуска служб;
+- `git pull` вручную **не делать**: код обновляет только автодеплой (иначе
+  бот не пересобирается);
+- боевые базы на запись не открываются;
+- ключи (`/etc/whale-api.env`, `/etc/whale-autotrade.env`) не печатаются ни
+  целиком, ни частями; значения переменных окружения служб не выводятся;
+- всё, что создаётся, — только во временном каталоге (`mktemp -d`), в конце
+  он удаляется.
 
-Сейчас построен **этап 1 — бэктест** (`tools/autotrade_backtest.py`). Этапов
-2 и 3 (бумажная и реальная торговля, команды `/auto …`) в коде пока нет:
-они строятся только после «да» владельца по отчёту бэктеста. Пока их нет,
-проверка «функция выключена и не отвечает чужим» сводится к тому, что
-команд `/auto` в боте нет вовсе (шаг 4).
+В модуле сейчас — **этап 1, бэктест**, и закрытая вкладка владельца.
+Бумажной и реальной торговли (этапы 2–3) в коде нет: они строятся только
+после «да» владельца по отчёту.
 
-## 1. Версия
+Части модуля:
+- `~/WhaleScanner/tools/autotrade_backtest.py` — бэктест;
+- `~/WalletTracker/wt_autotrade.py` — ночной пересчёт и кнопки «Старт»,
+  «Стоп», «Пересчитать» (внутри API);
+- `~/WalletTracker/whale_api.py` — маршруты `/api/owner/autotrade…`;
+- вкладка «Автоторговля» в приложении (`~/WalletTracker/html/`).
 
-```bash
-cd ~/WhaleScanner && git log --oneline -1
-ls tools/autotrade_backtest.py tests/autotrade_backtest_test.py
-```
+Устройство по строкам — `docs/autotrade-how-it-works.md`.
 
-## 2. Тесты бэктеста — во временной копии
+---
+
+## 0. Подготовка
 
 ```bash
 T=$(mktemp -d)
-mkdir -p "$T/tools" "$T/tests"
-cp tools/autotrade_backtest.py "$T/tools/"
-cp tests/autotrade_backtest_test.py "$T/tests/"
-(cd "$T" && python3 tests/autotrade_backtest_test.py)   # «34 проверок без сети и без записи в базу»
+export PYTHONDONTWRITEBYTECODE=1        # никакого __pycache__ в каталогах бота и API
 ```
 
-Тесты не ходят в сеть и не трогают базу бота: база — синтетическая во
-временном каталоге.
-
-## 3а. Сколько сделок в день — за секунды, без сети
+## 1. Версии — дошёл ли автодеплой
 
 ```bash
-python3 "$T/tools/autotrade_backtest.py" --db "$DB" --out "$T/cnt" --cache "$T/cache" --count-only
+git -C ~/WhaleScanner log --oneline -1     # ожидается 6485659 или новее
+git -C ~/WalletTracker log --oneline -1    # ожидается e850157 или новее
+git -C ~/WhaleScanner status --short | head; git -C ~/WalletTracker status --short | head   # ожидается пусто
+systemctl is-active whale-api; systemctl show whale-api -p ActiveEnterTimestamp
+git -C ~/WalletTracker log -1 --format=%ci
 ```
 
-Только чтение базы, без свечей и без сети. Печатает, сколько возможностей
-входа в день по каждому правилу сетки: от 2 и от 3 китов в одну сторону за
-2 часа, кит — от 1000 / 20 000 / 50 000 $, с фильтром «без споров» (нет
-встречного сигнала за те же 2 часа — только прошлое, как в живой торговле)
-и без; повтор на бумаге раньше 3 часов (`--cooldown 180`) — тот же случай. За весь период и
-за последние 14 дней; по дням, по часам (UTC) и по бумагам — для мягчайшего
-правила. Это верхняя граница
-сделок: позиция всегда одна — пока она не дошла до тейка, новые не
-открываются. Строку «в среднем … в день» — владельцу.
+Если версии старее — ничего не тянуть руками, доложить и подождать
+автодеплой. API должен быть перезапущен **после** последнего коммита
+Wallet-Tracker (время запуска службы позже времени коммита).
 
-## 3. Бэктест на настоящих данных — только чтение
-
-Где база Hyperliquid у бота: `WHALE_HL_DB_FILE` в окружении сервиса, иначе
-`hyperliquid.db` в рабочем каталоге сервиса (`systemctl cat <сервис бота>`,
-строка `WorkingDirectory`). Секреты из окружения не выводить — только имя
-файла базы.
+## 2. Ограничения службы API — хватает ли модулю прав и памяти
 
 ```bash
-DB=~/WhaleScanner/hyperliquid.db        # путь — из шага выше
-python3 "$T/tools/autotrade_backtest.py" --db "$DB" --out "$T/out" --cache "$T/cache"
-ls -la "$T/out"                          # report.txt, summary.json, trades.csv, grid.csv, top10.csv
+systemctl show whale-api -p User -p ProtectHome -p ReadWritePaths -p MemoryMax -p MemoryCurrent
+grep -n '^MAX_MEM_MB\|autotrade_data' ~/WalletTracker/wt_autotrade.py
 ```
 
-- Память: у бэктеста жёсткий предел `--max-mem-mb` (по умолчанию 2048 МБ):
-  дальше он останавливается сам с кодом 3 и сообщением «не хватило
-  предела памяти» — сервер не трогает. На базе размером с настоящую
-  (~700 тыс. ордеров) пик — около 750 МБ. Если сторож всё же нужен — следить
-  за самим процессом python (не за обёрткой `timeout`).
-- База открывается как `file:…?mode=ro` + `PRAGMA query_only`: запись в неё
-  невозможна. Отчёт и кеш в каталог бота скрипт класть отказывается.
-- В сеть — только `https://api.hyperliquid.xyz/info` за свечами
-  (`candleSnapshot`) и историей фандинга (`fundingHistory`), с паузой 1 с
-  между запросами; примерно 25 запросов на бумагу. Повторный прогон с тем же
-  `--cache` — почти без запросов. Вес запросов — копейки по сравнению с
-  бюджетом бота, но если бот рядом активно опрашивает Hyperliquid, лучше
-  `--pause 2`.
-- И к публичному API OKX (`https://www.okx.com`, без ключа): каталог
-  фьючерсов и цены — чтобы сказать, какие бумаги китов есть на OKX и под
-  каким именем (6 запросов, кеш на сутки). Имя — только кандидат: пара
-  принимается, если цены сходятся в пределах 2 % (на Hyperliquid `xyz:STX` —
-  акции Seagate, на OKX `STX` — токен Stacks). С `--venue okx` — ещё свечи
-  (5 минут) и фандинг OKX по каждой бумаге, комиссия 0,05 %.
-- Hyperliquid хранит только последние 5000 свечей каждого интервала
-  (минутных — на 3,5 дня). Отчёт показывает, на каких свечах посчитаны
-  сделки; разбивка по задержке D честна только на минутных. Кеш копится:
-  чтобы со временем было больше минутных свечей, можно сохранять `--cache`
-  между прогонами (вне каталога бота, например `~/autotrade-cache`).
+Ожидается: `ProtectHome=read-only`; в `ReadWritePaths` есть
+`/home/<пользователь>/WalletTracker`; `MemoryMax` ≈ 1,5 ГБ. Модуль пишет в
+`~/WalletTracker/autotrade_data` (внутри разрешённого); предел памяти
+бэктеста в API — 1024 МБ (меньше `MemoryMax`).
 
-Владельцу прислать: `report.txt` целиком (в нём вердикт, лучшие 10 наборов
-на подборе и на отложенных данных, разбивки) и, если попросит, CSV.
+## 3. Тесты — во временной копии
 
-## 4. Ночной пересчёт в API и закрытая вкладка
+Бэктест (без сети, база — синтетическая):
 
-API (Wallet-Tracker, `wt_autotrade.py`) сам запускает этот же бэктест раз в
-сутки, в 03:17 UTC (и через 15 минут после запуска API, если итога ещё
-нет), с паузой 15 с между запросами к Hyperliquid. Итог и кеш — в
-`~/WalletTracker/autotrade_data/` (рядом с API: служба whale-api пишет только в ReadWritePaths)
-(или в `WT_AUTOTRADE_DIR`), не в каталоге бота.
+```bash
+mkdir -p "$T/ws/tools" "$T/ws/tests"
+cp ~/WhaleScanner/tools/autotrade_backtest.py "$T/ws/tools/"
+cp ~/WhaleScanner/tests/autotrade_backtest_test.py ~/WhaleScanner/tests/autotrade_scale_test.py "$T/ws/tests/"
+(cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «34 проверок без сети и без записи в базу»
+(cd "$T/ws" && nice -n 19 python3 tests/autotrade_scale_test.py)      # 300 000 ордеров, пик < 700 МБ; ~20 с
+```
+
+Модуль API (без сети, без настоящих баз и ключей — всё подменено в тесте):
+
+```bash
+mkdir -p "$T/wt"
+cp ~/WalletTracker/*.py ~/WalletTracker/whale-api.service "$T/wt/"
+cp -r ~/WalletTracker/tests "$T/wt/"
+(cd "$T/wt" && env -u WHALE_API_KEY python3 tests/test_autotrade.py)   # «Ran 16 tests … OK»
+```
+
+## 4. Правила владельца — в коде по умолчанию
+
+```bash
+(cd "$T/ws/tools" && python3 - <<'EOF'
+import autotrade_backtest as bt
+a = bt.parser().parse_args([])
+want = {"cluster": "2,3", "cluster_hours": 2, "chase": "0.3", "tp": "1", "sl": "0", "hold": "0", "max_hold": 0,
+        "margin": "cross", "leverage": 10, "margin_pct": 10, "max_open": 1, "cooldown": 180, "rest": 0, "markets": "all"}
+bad = {k: (getattr(a, k), v) for k, v in want.items() if getattr(a, k) != v}
+print("правила — как у владельца" if not bad else f"РАСХОЖДЕНИЕ: {bad}")
+print("кит от, $ (сетка):", a.min_whale)
+EOF
+)
+```
+
+Ожидается «правила — как у владельца»: 2 кита за 2 часа, у каждого от
+1000 $; не дороже средней китов больше чем на 0,3 %; кросс, плечо 10×, маржа
+10 %; **одна открытая позиция**; в одну бумагу — раз в 3 часа; выход —
+только тейк 1 %, без стопа и срока.
+
+## 5. Сколько сделок в день — за секунды, без сети
+
+Путь к базе Hyperliquid — `WHALE_HL_DB` в `systemctl cat whale-api` (вывести
+только этот путь, не другие значения).
+
+```bash
+DB=~/WhaleScanner/hyperliquid.db
+nice -n 19 python3 "$T/ws/tools/autotrade_backtest.py" --db "$DB" --out "$T/cnt" --cache "$T/cache" --count-only
+```
+
+Только чтение базы. Строку «в среднем … в день» и таблицу по правилам —
+владельцу. Это верхняя граница: позиция одна — пока она не дошла до тейка,
+новые не открываются.
+
+Полный бэктест руками **не запускать**: его считает API (шаг 6), второй
+прогон рядом — лишняя память и запросы к Hyperliquid.
+
+## 6. Ночной пересчёт, кнопки и итог во вкладке
 
 ```bash
 D=~/WalletTracker/autotrade_data
-ls -la "$D" "$D/latest" 2>/dev/null          # summary.json, report.txt, …; last_run.log
-tail -n 5 "$D/last_run.log" 2>/dev/null
-journalctl -u whale-api --since "-1 day" --no-pager | grep '\[AUTO\]' | tail -n 5
+ls -la "$D" "$D/latest" 2>/dev/null
+cat "$D/switch.json" 2>/dev/null || echo "switch.json нет — модуль выключен («Старт» не нажимали)"
+tail -n 20 "$D/last_run.log" 2>/dev/null
+journalctl -u whale-api --since "-2 day" --no-pager | grep '\[AUTO\]' | tail -n 20
+pgrep -af autotrade_backtest || echo "пересчёт сейчас не идёт"
+for p in $(pgrep -f autotrade_backtest); do ps -o pid,ni,rss,etime,cmd -p "$p"; done   # NI 19, RSS < 1 ГБ
 ```
 
-Кнопки «Старт» и «Стоп» во вкладке: по умолчанию модуль выключен и ночью
-не считает; выбор владельца — в `$D/switch.json` (`{"on": true|false}`),
-«[AUTO] старт/стоп (владелец)» — в журнале API. Проверить: `cat
-"$D/switch.json"` (если файла нет — выключен).
+Что искать в журнале:
+- после «Старт» — `[AUTO] старт (владелец)` и `switch.json` с `"on": true`;
+- `[AUTO] старт: не записать …` — каталог закрыт на запись — **доложить сразу**;
+- `[AUTO] бэктест: …` — сбой прогона, причина — в строке и в `last_run.log`;
+- `[AUTO] чужой запрос` — кто-то, кроме владельца, стучался во вкладку
+  (номер чата — доложить).
 
-Вкладка «Автоторговля» в приложении — только владельцу: проверка на
-сервере по подписи Telegram. Чужому — тот же 404, что у несуществующего
-адреса, и строка `[AUTO] чужой запрос …` в журнале API. Ключ API лежит в
-`/etc/whale-api.env` (root, 600) — его не открывать: закрытость маршрута
-проверяют тесты API (`tests/test_autotrade.py`, `tests/e2e/autotrade.e2e.test.ts`),
-на сервере достаточно журнала.
+Итог, который видит вкладка:
 
-## 5. Функция торговли выключена, команд нет, ключей нет
+```bash
+python3 - <<'EOF'
+import json, os, time
+p = os.path.expanduser("~/WalletTracker/autotrade_data/latest/summary.json")
+if not os.path.exists(p):
+    raise SystemExit("итога ещё нет")
+s = json.load(open(p, encoding="utf-8"))
+f, z = s.get("full") or {}, s["sizing"]
+print("посчитан:", time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(s["generated_at"])))
+print("вердикт:", "можно дальше" if s["verdict"] else "нет")
+print("размер:", z["deposit"], "$, маржа", z["margin_pct"], "% ×", z["leverage"], ", позиций сразу", z["max_open"],
+      ", кросс" if z["cross"] else ", изолированная")
+print("сигналов:", s["data"]["signals"], "| свечи:", s["data"]["candles"], "| запросов:", s["data"]["requests"],
+      "| сбоев:", s["data"]["errors"])
+print("общая: сделок", f.get("trades"), "| винрейт", f.get("win_pct"), "% | итог", f.get("net"), "$ | PF", f.get("pf"),
+      "| просадка", f.get("max_dd"), "$ | дольше всех", f.get("longest_h"), "ч | сделок в день", s.get("per_day"))
+best = s["top"][0] if s["top"] else None
+if best:
+    print("лучший набор:", best["params"])
+    print("на отложенных:", best["holdout"], "— проходит" if best["passes"] else "— не проходит")
+print("против китов:", s.get("fade"))
+print("активные позиции:", s.get("active") if s.get("active") else "нет")
+EOF
+```
+
+Проверить: `max_open` = 1; у лучшего набора `cooldown` 180, `chase` 0,3,
+`tp` 1, `sl` 0. Если нет `per_day` и `active` — итог посчитан старой
+версией: нужен «Пересчитать сейчас» во вкладке (это делает владелец).
+
+Отчёт целиком — `cat "$D/latest/report.txt"`.
+
+## 7. Закрытость вкладки
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8090/api/owner/autotrade               # без подписи
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8090/api/owner/autotrade/start   # без подписи
+```
+
+Ожидается **не 200** (401, 403 или 404). Ключ API не подставлять и не
+читать. Что владельцу отвечает 200, а чужому с верной подписью — 404 и
+строка `[AUTO] чужой запрос`, проверяют тесты шага 3.
+
+## 8. Торговли нет, ключей нет, сеть — только публичная
 
 ```bash
 cd ~/WhaleScanner
 grep -n '"/auto' *.cpp || echo "команд /auto в боте нет — этапы 2–3 не построены"
-grep -rnE 'whale-autotrade\.env|AUTOTRADE_|agent_?wallet' --include=*.cpp --include=*.h --include=*.py . || echo "ключей и их загрузки в коде нет"
-journalctl -u <сервис бота> --since "-1 day" --no-pager | grep -c '\[AUTO\]'   # ожидается 0
+grep -rnE 'whale-autotrade\.env|AUTOTRADE_|agent_?wallet|api_?secret|passphrase' --include=*.cpp --include=*.h --include=*.py . ~/WalletTracker/wt_autotrade.py || echo "ключей и их загрузки в коде нет"
+grep -noE 'https://[a-z0-9./-]+' tools/autotrade_backtest.py | sort -u   # только api.hyperliquid.xyz и www.okx.com
+grep -nE '/api/v5/(trade|account|asset)' tools/autotrade_backtest.py || echo "торговых и счётных адресов OKX нет"
+stat -c '%U %a' /etc/whale-autotrade.env 2>/dev/null || echo "/etc/whale-autotrade.env нет"   # если есть — root 600, не открывать
 ```
 
-Если `/etc/whale-autotrade.env` уже существует — проверить только права
-(`stat -c '%U %a' /etc/whale-autotrade.env` → `root 600`), содержимое не
-открывать.
+## 9. Отчёт и кеш — не в каталоге бота
 
-## 6. Уборка
+```bash
+ls -la ~/WhaleScanner | grep -iE 'autotrade|report\.txt|summary\.json|candles_' || echo "в каталоге бота файлов бэктеста нет"
+```
+
+## 10. Уборка
 
 ```bash
 rm -rf "$T"
 ```
 
+---
+
 ## Что доложить владельцу
 
-1. Версия; тесты бэктеста — сколько проверок, прошли ли.
-2. Бэктест: период, число сигналов, на каких свечах, вердикт и строка
-   «Лучший набор подбора на отложенных», сколько из лучших 10 прошли
-   критерий; число запросов к API и сбоев.
-3. База не изменена (запись в неё невозможна по режиму открытия), в
-   каталоге бота новых файлов нет.
-4. Ночной пересчёт в API: когда был последний, итог (вердикт), сбои из
-   `last_run.log` и `[AUTO]` в журнале API.
-5. Команд `/auto` нет, ключей в коде и журнале нет.
+1. Версии обоих репозиториев и время перезапуска API; дошёл ли автодеплой.
+2. Ограничения службы (ProtectHome, ReadWritePaths, MemoryMax) — хватает ли
+   модулю прав на запись и памяти.
+3. Тесты: бэктест (34), объём (пик памяти), модуль API (16) — прошли ли.
+4. Правила в коде — «как у владельца» или расхождения.
+5. `--count-only`: сделок в день в среднем и за последние 14 дней.
+6. Ночной пересчёт: включён ли модуль, когда был последний, идёт ли сейчас
+   (память, приоритет), сбои из `last_run.log` и строки `[AUTO]`.
+7. Итог во вкладке: вердикт; общая статистика (сделок, винрейт, итог, PF,
+   просадка, самая долгая сделка, сделок в день); лучший набор и
+   отложенные; «против китов»; активные позиции.
+8. Вкладка закрыта (коды ответа без подписи); чужие запросы — есть или нет.
+9. Торговых команд, ключей и торговых адресов нет; сеть — только публичные
+   Hyperliquid и OKX; в каталоге бота файлов бэктеста нет.
+10. Что не так — отдельным списком, с точной строкой из журнала.
