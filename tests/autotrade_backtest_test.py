@@ -16,6 +16,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from typing import ClassVar
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import autotrade_backtest as bt
@@ -61,11 +62,13 @@ class FakeApi:
     def __init__(self, price) -> None:
         self.price = price
         self.calls = 0
+        self.candle_calls = 0
 
     def __call__(self, body: dict):
         self.calls += 1
-        if body["type"] != "candleSnapshot":
+        if body.get("type") != "candleSnapshot":
             return []
+        self.candle_calls += 1
         req = body["req"]
         sec = dict(bt.INTERVALS)[req["interval"]]
         step = sec * 1000
@@ -161,10 +164,10 @@ class DataTest(Base):
         bt.run(args(self.db, self.out, self.cache, "--offline", "--min-train-trades", "0"), fetch=boom, now_ms=NOW)
         r1 = bt.run(args(self.db, self.out, self.cache, "--min-train-trades", "0"), fetch=api, now_ms=NOW)
         self.assertGreater(r1["requests"], 0)
-        calls = api.calls
-        r2 = bt.run(args(self.db, self.out, self.cache, "--min-train-trades", "0"), fetch=api, now_ms=NOW)
-        self.assertEqual(r2["requests"], 1)  # свечи — из кеша; фандинга нет нигде — спросили один раз
-        self.assertLessEqual(api.calls - calls, 1)
+        candles = api.candle_calls
+        self.assertGreater(candles, 0)
+        bt.run(args(self.db, self.out, self.cache, "--min-train-trades", "0"), fetch=api, now_ms=NOW)
+        self.assertEqual(api.candle_calls, candles)  # свечи второй раз — из кеша
 
     def test_network_garbage_does_not_crash(self):
         f = Fills()
@@ -178,6 +181,90 @@ class DataTest(Base):
 
 def market(prices: list[tuple[int, float, float, float, float]]) -> bt.Market:
     return bt.Market({"1m": prices})
+
+
+class OkxTest(Base):
+    """Бумаги китов на OKX: имя — только кандидат, пару подтверждает цена.
+    Масштаб kPEPE, замены имён (GOLD → XAU), «другой актив с тем же именем»
+    (xyz:STX — акции Seagate, STX на OKX — токен Stacks), отсутствие."""
+
+    INSTS: ClassVar[list] = [{"instId": i, "state": "live"} for i in
+             ("BTC-USDT-SWAP", "PEPE-USDT-SWAP", "XAU-USDT-SWAP", "TSLA-USDT-SWAP", "STX-USDT-SWAP")]
+    LAST: ClassVar[dict] = {"BTC-USDT-SWAP": 90_000, "PEPE-USDT-SWAP": 0.00001, "XAU-USDT-SWAP": 4_000, "TSLA-USDT-SWAP": 400,
+            "STX-USDT-SWAP": 0.3}
+    MIDS: ClassVar[dict] = {"": {"BTC": "90100", "kPEPE": "0.01"},
+                            "xyz": {"xyz:GOLD": "3990", "xyz:TSLA": "401", "xyz:STX": "750", "xyz:VIX": "18"}}
+
+    def okx_api(self, candles=None):
+        def fetch(body):
+            path = body.get("okx")
+            if path == "/api/v5/public/instruments":
+                return self.INSTS
+            if path == "/api/v5/market/tickers":
+                return [{"instId": k, "last": str(v)} for k, v in self.LAST.items()]
+            if body.get("type") == "allMids":
+                return self.MIDS.get(body["dex"], {})
+            if path == "/api/v5/market/history-candles" and candles:
+                return candles(body["params"])
+            return []
+        return fetch
+
+    def test_candidates(self):
+        self.assertEqual(bt.okx_candidate("kPEPE"), ("PEPE", 1000.0))
+        self.assertEqual(bt.okx_candidate("xyz:GOLD"), ("XAU", 1.0))
+        self.assertEqual(bt.okx_candidate("xyz:TSLA"), ("TSLA", 1.0))
+        self.assertEqual(bt.okx_candidate("BTC"), ("BTC", 1.0))
+        self.assertEqual(bt.okx_candidate("xyz:kAPPA"), ("kAPPA", 1.0))  # у акций «k» — часть имени
+
+    def test_map_checks_price_not_just_name(self):
+        md = bt.MarketData(self.cache, False, self.okx_api(), 0, NOW)
+        m = bt.okx_map(md, ["BTC", "kPEPE", "xyz:GOLD", "xyz:TSLA", "xyz:STX", "xyz:VIX", "xyz:NEW"])
+        self.assertEqual({k: v["status"] for k, v in m.items()},
+                         {"BTC": "ok", "kPEPE": "ok", "xyz:GOLD": "ok", "xyz:TSLA": "ok", "xyz:STX": "mismatch",
+                          "xyz:VIX": "missing", "xyz:NEW": "missing"})
+        self.assertEqual((m["xyz:GOLD"]["inst"], m["kPEPE"]["scale"]), ("XAU-USDT-SWAP", 1000.0))
+        # Сутки — из кеша, без сети; offline — тоже из кеша.
+        n = md.requests
+        self.assertEqual(bt.okx_map(md, ["BTC"])["BTC"]["status"], "ok")
+        self.assertEqual(md.requests, n)
+        off = bt.MarketData(self.cache, True, None, 0, NOW)
+        self.assertEqual(bt.okx_map(off, ["xyz:STX", "ZZZ"]), {"xyz:STX": m["xyz:STX"], "ZZZ": {"status": "unverified"}})
+
+    def test_backtest_on_okx_uses_okx_prices_and_drops_the_rest(self):
+        f = Fills()
+        ts = NOW - 2 * 86_400_000
+        f.add("a", "kPEPE", bt.OPEN_SHORT, ts, notional=30_000, oid=1)
+        f.add("b", "xyz:STX", bt.OPEN_LONG, ts + MIN, notional=30_000, oid=2)  # другой актив на OKX
+        f.add("c", "xyz:VIX", bt.OPEN_LONG, ts + 2 * MIN, notional=30_000, oid=3)  # нет на OKX
+        f.write(self.db)
+        con = sqlite3.connect(self.db)
+        con.execute("UPDATE hl_fills SET sz = '3000000' WHERE oid=1")  # 30 000 $ / 3 000 000 kPEPE = 0,01
+        con.commit()
+        con.close()
+        asked = []
+
+        def candles(params):
+            asked.append(params["instId"])
+            after = int(params["after"])
+            step = bt.OKX_BAR_SEC * 1000
+            return [[str(t), "0.00001", "0.0000102", "0.0000099", "0.00001"]
+                    for t in range((after - 1) // step * step, after - 100 * step, -step) if t >= NOW - 5 * 86_400_000]
+
+        r = bt.run(args(self.db, self.out, self.cache, "--venue", "okx", "--min-train-trades", "0",
+                        "--delays", "5", "--chase", "0.5", "--cluster", "1", "--max-hold", "60", "--tp", "1",
+                        "--pnl30", "0"),
+                   fetch=self.okx_api(candles), now_ms=NOW)
+        self.assertEqual(set(asked), {"PEPE-USDT-SWAP"})
+        self.assertEqual(r["signals"], 1)
+        self.assertIn("Торговля — на OKX", r["text"])
+        self.assertIn("другой актив с тем же именем (цена не сходится): xyz:STX", r["text"])
+        self.assertIn("нет на OKX: xyz:VIX", r["text"])
+        self.assertIn("Комиссия тейкера 0.05 %", r["text"])
+        self.assertEqual(r["summary"]["okx"]["map"]["kPEPE"]["inst"], "PEPE-USDT-SWAP")
+        # Шорт кита по 0,01 за kPEPE = 0,00001 за PEPE; на OKX — 0,00001: вход
+        # не хуже китов. Без пересчёта масштаба цена казалась бы на 99,9 %
+        # «ниже китов» — и шорт пропускался бы как поздний.
+        self.assertEqual(r["summary"]["full"]["trades"], 1)
 
 
 class ClusterTest(Base):

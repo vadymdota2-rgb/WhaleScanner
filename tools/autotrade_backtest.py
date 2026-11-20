@@ -54,6 +54,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from array import array
 from collections import defaultdict
@@ -62,6 +63,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
+OKX_API = "https://www.okx.com"
+# Имена на OKX, которые отличаются от Hyperliquid (сверено по цене в ноябре
+# 2026). Совпадение имени ничего не доказывает: xyz:STX — акции Seagate, а
+# STX на OKX — токен Stacks; xyz:CVX — Chevron, а CVX на OKX — токен Convex.
+# Поэтому любая пара проходит ещё и сверку цены (okx_map).
+OKX_ALIASES = {"GOLD": "XAU", "SILVER": "XAG", "COPPER": "XCU", "PLATINUM": "XPT", "PALLADIUM": "XPD",
+               "NATGAS": "NG", "BRENTOIL": "BZ", "SP500": "US500", "XYZ100": "US100", "ANTH": "ANTHROPIC",
+               "OAI": "OPENAI", "SMSN": "SAMSUNG", "SKHX": "SKHYNIX", "TCNT": "TENCENT"}
+OKX_PRICE_TOL = 0.02   # цены одной бумаги на двух биржах расходятся меньше чем на 2 %
+OKX_BAR, OKX_BAR_SEC = "5m", 300
 STOCK_DEXES = ("xyz", "io", "para")
 # Интервалы от мелкого к крупному; Hyperliquid хранит 5000 последних каждого.
 INTERVALS: tuple[tuple[str, int], ...] = (("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600))
@@ -217,6 +228,15 @@ def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
 # ── свечи и фандинг (сеть — только здесь) ────────────────────────────────────
 
 def http_fetch(body: dict) -> object:
+    """Запрос к публичному API: Hyperliquid — POST info; {"okx": путь,
+    "params": {…}} — GET публичного API OKX (ключ не нужен), ответ — data."""
+    if "okx" in body:
+        url = OKX_API + str(body["okx"]) + "?" + urllib.parse.urlencode(body.get("params") or {})
+        # Без своего User-Agent OKX отвечает 403 стандартному urllib.
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; backtest)"})  # noqa: S310 — адрес постоянный, https
+        with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 — адрес постоянный, https
+            got = json.loads(r.read(16 << 20))
+        return got.get("data") if isinstance(got, dict) and str(got.get("code")) == "0" else None
     req = urllib.request.Request(HL_INFO, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 — адрес постоянный, https
         return json.loads(r.read(4 << 20))
@@ -253,9 +273,75 @@ class MarketData:
         try:
             got = self.fetch(body)
         except Exception as e:  # noqa: BLE001 — сеть: любой сбой — пропуск, а не падение
-            self.errors.append(f"{body.get('type')} {body.get('req', body).get('coin', '')}: {type(e).__name__}")
+            what = body.get("okx") or f"{body.get('type')} {body.get('req', body).get('coin', '')}"
+            self.errors.append(f"{what}: {type(e).__name__}")
             return []
         return got if isinstance(got, list) else []
+
+    def _call_any(self, body: dict) -> object:
+        """Как _call, но ответ — любой JSON (allMids — словарь)."""
+        if self.offline:
+            return None
+        if self.requests and self.pause:
+            time.sleep(self.pause)
+        self.requests += 1
+        try:
+            return self.fetch(body)
+        except Exception as e:  # noqa: BLE001 — сеть: любой сбой — пропуск, а не падение
+            self.errors.append(f"{body.get('type') or body.get('okx')}: {type(e).__name__}")
+            return None
+
+    def okx_candles(self, inst: str, start_ms: int, end_ms: int) -> Market:
+        """5-минутные свечи OKX (история — на годы назад, по 100 за запрос,
+        от новых к старым), с кешем как у Hyperliquid."""
+        step = OKX_BAR_SEC * 1000
+        name = f"okx_candles_{safe_name(inst)}_{OKX_BAR}.json"
+        have = {int(k): v for k, v in self._load(name).items()}
+        end_ms = min(end_ms, self.now_ms)
+        covered = have and min(have) <= start_ms and max(have) + step >= end_ms - step
+        if not covered and not self.offline:
+            after = end_ms + step
+            for _ in range(2000):
+                rows = self._call({"okx": "/api/v5/market/history-candles",
+                                   "params": {"instId": inst, "bar": OKX_BAR, "after": after, "limit": 100}})
+                got = 0
+                for r in rows:
+                    try:
+                        t = int(r[0])
+                        have[t] = [float(r[1]), float(r[2]), float(r[3]), float(r[4])]
+                        got += 1
+                        after = min(after, t)
+                    except (IndexError, TypeError, ValueError):
+                        continue
+                if not got or after <= start_ms:
+                    break
+            if have:
+                self._save(name, {str(k): v for k, v in have.items()})
+        return Market({OKX_BAR: sorted((t, *v) for t, v in have.items() if all(x > 0 for x in v))})
+
+    def okx_funding(self, inst: str, start_ms: int, end_ms: int) -> tuple[dict[int, float], str]:
+        """Фандинг OKX по факту (realizedRate) на моменты списания."""
+        name = f"okx_funding_{safe_name(inst)}.json"
+        have = {int(k): float(v) for k, v in self._load(name).items()}
+        if not self.offline and not (have and min(have) <= start_ms and max(have) >= end_ms - 8 * HOUR_MS):
+            after = min(end_ms, self.now_ms) + 1
+            for _ in range(200):
+                rows = self._call({"okx": "/api/v5/public/funding-rate-history",
+                                   "params": {"instId": inst, "after": after, "limit": 100}})
+                got = 0
+                for r in rows:
+                    try:
+                        t = int(r["fundingTime"])
+                        have[t] = float(r.get("realizedRate") or r["fundingRate"])
+                        got += 1
+                        after = min(after, t)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                if not got or after <= start_ms:
+                    break
+            if have:
+                self._save(name, {str(k): v for k, v in have.items()})
+        return have, ("OKX" if have else "нет данных — 0")
 
     def _load(self, name: str) -> dict:
         p = os.path.join(self.cache, name)
@@ -334,6 +420,62 @@ class MarketData:
             if have:
                 self._save(name, {str(k): v for k, v in have.items()})
         return have, ("API" if have else "нет данных — 0")
+
+
+def okx_candidate(coin: str) -> tuple[str, float]:
+    """Имя бумаги на OKX по имени на Hyperliquid и масштаб цены (сколько
+    единиц OKX в одной единице Hyperliquid): kPEPE — 1000 PEPE."""
+    base = coin.split(":", 1)[1] if ":" in coin else coin
+    if ":" not in coin and len(base) > 1 and base[0] == "k" and base[1:].isupper():
+        return base[1:], 1000.0
+    return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
+
+
+def okx_map(md: MarketData, coins: Sequence[str]) -> dict[str, dict]:
+    """Какие бумаги китов можно торговать на OKX. Имя (с заменами) — только
+    кандидат; пара принимается, если цены сейчас сходятся (±2 % с учётом
+    масштаба). Иначе — «нет на OKX» или «другой актив с тем же именем».
+    Результат — в кеш на сутки (offline — из кеша)."""
+    name = "okx_map.json"
+    cached = md._load(name)
+    if cached.get("day") == md.now_ms // DAY_MS or md.offline:
+        got = cached.get("map") or {}
+        if all(c in got for c in coins) or md.offline:
+            return {c: got.get(c, {"status": "unverified"}) for c in coins}
+    insts = {r.get("instId") for r in md._call({"okx": "/api/v5/public/instruments", "params": {"instType": "SWAP"}})
+             if isinstance(r, dict) and r.get("state") == "live"}
+    last: dict[str, float] = {}
+    for r in md._call({"okx": "/api/v5/market/tickers", "params": {"instType": "SWAP"}}):
+        try:
+            last[str(r["instId"])] = float(r["last"])
+        except (KeyError, TypeError, ValueError):
+            continue
+    mids: dict[str, float] = {}
+    for dex in sorted({c.split(":", 1)[0] if ":" in c else "" for c in coins}):
+        got = md._call_any({"type": "allMids", "dex": dex})
+        if isinstance(got, dict):
+            for k, v in got.items():
+                try:
+                    mids[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    continue
+    out: dict[str, dict] = {}
+    for c in coins:
+        base, scale = okx_candidate(c)
+        inst = f"{base}-USDT-SWAP"
+        if not insts:  # каталог OKX не получен — неизвестно, а не «нет»
+            out[c] = {"status": "unverified", "inst": inst}
+        elif inst not in insts:
+            out[c] = {"status": "missing"}
+        elif not (mids.get(c, 0) > 0 and last.get(inst, 0) > 0):
+            out[c] = {"status": "unverified", "inst": inst}
+        else:
+            ratio = last[inst] * scale / mids[c]
+            ok = abs(ratio - 1) <= OKX_PRICE_TOL
+            out[c] = {"status": "ok" if ok else "mismatch", "inst": inst, "scale": scale, "ratio": round(ratio, 5)}
+    if insts and not md.offline:
+        md._save(name, {"day": md.now_ms // DAY_MS, "map": {**(cached.get("map") or {}), **out}})
+    return out
 
 
 def funding_from_db(con: sqlite3.Connection, coins: Sequence[str]) -> dict[str, dict[int, float]]:
@@ -709,6 +851,18 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     hold_ms = max([*holds, a.max_hold]) * 60_000
     db_funding = funding_from_db(con, sorted({s.coin for s in signals}))
     con.close()
+    if a.fee is None:
+        a.fee = 0.05 if a.venue == "okx" else 0.09
+    # Есть ли бумаги китов на OKX и под каким именем — считаем всегда (кроме
+    # --offline без кеша): это ответ на вопрос «можно ли торговать на OKX».
+    okx = okx_map(md, sorted({s.coin for s in signals})) if (a.venue == "okx" or not a.offline) else {}
+    if a.venue == "okx":
+        # Торгуем на OKX: только бумаги, сверенные по цене; цены китов — в
+        # единицах OKX (kPEPE → PEPE: делим на 1000).
+        signals = [s for s in signals if okx.get(s.coin, {}).get("status") == "ok"]
+        for s in signals:
+            scale = float(okx[s.coin]["scale"])
+            s.px, s.ref_px = s.px / scale, s.ref_px / scale
 
     by_coin: dict[str, list[int]] = defaultdict(list)
     for i, s in enumerate(signals):
@@ -719,8 +873,13 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     for coin, idxs in sorted(by_coin.items()):
         start = signals[idxs[0]].ts
         end = signals[idxs[-1]].ts + max(delays) * 1000 + hold_ms
-        market = md.candles(coin, start, end)
-        fund, funding_src[coin] = md.funding(coin, start, end, db_funding.get(coin, {}))
+        if a.venue == "okx":
+            inst = str(okx[coin]["inst"])
+            market = md.okx_candles(inst, start, end)
+            fund, funding_src[coin] = md.okx_funding(inst, start, end)
+        else:
+            market = md.candles(coin, start, end)
+            fund, funding_src[coin] = md.funding(coin, start, end, db_funding.get(coin, {}))
         for i in idxs:
             got = False
             for d in delays:
@@ -778,6 +937,18 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     fmt = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # noqa: E731
     w("Бэктест автокопирования китов — фьючерсы Hyperliquid (этап 1): "
       + ("все — крипта, акции, металлы" if a.markets == "all" else "акции (" + ", ".join(a.dexes) + ")"))
+    w(f"Торговля — на {'OKX' if a.venue == 'okx' else 'Hyperliquid'}; сигналы — сделки китов на Hyperliquid.")
+    if okx:
+        okx_ok = sorted(c for c, m in okx.items() if m.get("status") == "ok")
+        okx_bad = sorted(c for c, m in okx.items() if m.get("status") == "mismatch")
+        okx_no = sorted(c for c, m in okx.items() if m.get("status") in ("missing", "unverified"))
+        w(f"OKX: есть {len(okx_ok)} из {len(okx)} бумаг китов"
+          + (f"; другой актив с тем же именем (цена не сходится): {', '.join(okx_bad)}" if okx_bad else "")
+          + (f"; нет на OKX: {', '.join(okx_no[:40])}{' …' if len(okx_no) > 40 else ''}" if okx_no else ""))
+        renamed = sorted(f"{c}→{m['inst'].removesuffix('-USDT-SWAP')}" for c, m in okx.items()
+                         if m.get("status") == "ok" and m["inst"].removesuffix("-USDT-SWAP") != c.split(":")[-1])
+        if renamed:
+            w("На OKX под другим именем: " + ", ".join(renamed))
     w(f"Период сигналов: {fmt(t_lo)} — {fmt(t_hi)}; подбор — до {fmt(cut)}, отложенные — после.")
     w(f"Сигналов (ордеров китов): {len(signals)}; без свечей на весь срок удержания: {no_data}.")
     res = defaultdict(int)
@@ -872,6 +1043,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         f.write(text)
     summary = build_summary(a, sizing, signals, cut, res, funding_src, md, checked, verdict,
                             on(list(range(len(signals))), best[0]) if best else [], passes)
+    summary["okx"] = {"venue": a.venue, "map": okx}
     with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False)
     os.replace(os.path.join(a.out, "summary.json.tmp"), os.path.join(a.out, "summary.json"))
@@ -954,8 +1126,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-hold", type=int, default=4320,
                     help="предел удержания, мин: дальше позиция считается закрытой по рынку (не дождались)")
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание, %% на каждую сторону")
-    ap.add_argument("--fee", type=float, default=0.09,
-                    help="комиссия тейкера, %% на каждую сторону (базовая 0,045 %%; у HIP-3 до двойной)")
+    ap.add_argument("--venue", choices=("hl", "okx"), default="hl",
+                    help="где торговать: hl — Hyperliquid; okx — OKX (только бумаги, сверенные по цене; свечи и фандинг OKX)")
+    ap.add_argument("--fee", type=float, default=None,
+                    help="комиссия тейкера, %% на каждую сторону (по умолчанию: Hyperliquid 0,09 — HIP-3 до двойной "
+                         "базовой 0,045; OKX 0,05)")
     ap.add_argument("--deposit", type=float, default=10000, help="условный депозит, $")
     ap.add_argument("--margin-pct", type=float, default=10, help="маржа на сделку, %% депозита")
     ap.add_argument("--leverage", type=float, default=10, help="плечо")
