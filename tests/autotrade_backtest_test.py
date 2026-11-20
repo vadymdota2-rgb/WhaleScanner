@@ -318,6 +318,7 @@ class OwnerRulesTest(Base):
         self.assertEqual((a.tp, a.sl, a.hold, a.whale_exit, a.min_whale, a.margin, a.markets),
                          ("1", "0", "0", "0", 1000, "cross", "all"))
         self.assertTrue(all(k >= 2 for k in bt.int_list(a.cluster)))
+        self.assertEqual((a.cluster_hours, a.chase), (2, "0.2,0.3,0.5"))  # 2 часа; предел догона 0,2–0,5 %
         self.assertEqual((a.leverage, a.margin_pct, a.max_open), (10, 10, 1))
 
 
@@ -518,7 +519,7 @@ class VerdictTest(Base):
 
     def test_real_edge_passes_and_none_fails(self):
         extra = ["--delays", "5,30", "--tp", "0,2", "--sl", "0,1", "--hold", "0,60", "--max-hold", "120",
-                 "--min-notional", "20000", "--pnl30", "0", "--cooldown", "0", "--fee", "0.045"]
+                 "--min-notional", "20000", "--pnl30", "0", "--cooldown", "0", "--fee", "0.045", "--cluster", "1"]
         r = bt.run(args(self.db, self.out, self.cache, *extra), fetch=self.scenario(0.02), now_ms=NOW)
         self.assertTrue(r["verdict"], r["text"])
         self.assertIn("МОЖНО ДАЛЬШЕ", r["text"])
@@ -535,6 +536,8 @@ class VerdictTest(Base):
         self.assertIsNotNone(sm["fade"])
         self.assertLess(sm["fade"]["net"], sm["top"][0]["holdout"]["net"])
         self.assertIn("за китами лучше", r["text"])
+        self.assertIn("По пределу догона", r["text"])
+        self.assertTrue(sm["by_chase"] and {"chase", "train", "holdout"} <= set(sm["by_chase"][0]))
         self.assertLessEqual(len(sm["equity"]), 501)
         # Без преимущества — комиссии съедают всё.
         os.remove(self.db)

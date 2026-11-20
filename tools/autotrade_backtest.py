@@ -949,6 +949,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
                 ps[k] = p
         return simulate(flipped, ps, prm, slip, fee, sizing)
 
+    by_chase: list[dict] = []
     checked = [(prm, st, stats(on(hold_out, prm))) for prm, st in top]
     best = checked[0] if checked else None
     fade = stats(against(hold_out, best[0])) if best else Stats()
@@ -1037,6 +1038,17 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         breakdown("По времени суток:", lambda t: "рынок США открыт" if us_open(t.entry_t) else "рынок США закрыт")
         breakdown("По причине выхода:", lambda t: t.why)
         w("")
+        w("По пределу догона (лучший набор подбора для каждого предела; подбор → отложенные):")
+        for chase in pct_list(a.chase):
+            cand = [g for g in ranked if g[0].filters.max_chase == chase]
+            if not cand:
+                w(f"  {chase * 100:g} %: нет набора с {a.min_train_trades}+ сделками")
+                continue
+            ho = stats(on(hold_out, cand[0][0]))
+            w(f"  {chase * 100:g} %: подбор {cand[0][1].net:.2f} $ ({cand[0][1].trades} сделок), "
+              f"отложенные {ho.net:.2f} $ ({ho.trades} сделок, PF {ho.row()['profit_factor']})")
+            by_chase.append({"chase": round(chase * 100, 3), "train": stats_json(cand[0][1]), "holdout": stats_json(ho)})
+        w("")
         w("По задержке D (лучший набор подбора для каждой D; на всём периоде и только на минутных свечах):")
         for d in delays:
             cand = [g for g in ranked if g[0].delay == d]
@@ -1077,6 +1089,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     summary = build_summary(a, sizing, signals, cut, res, funding_src, md, checked, verdict,
                             on(list(range(len(signals))), best[0]) if best else [], passes, fade if best else None)
     summary["okx"] = {"venue": a.venue, "map": okx}
+    summary["by_chase"] = by_chase
     with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False)
     os.replace(os.path.join(a.out, "summary.json.tmp"), os.path.join(a.out, "summary.json"))
@@ -1148,8 +1161,12 @@ def parser() -> argparse.ArgumentParser:
                     help="китов в одну сторону за окно, от (сетка; правило владельца — минимум 2)")
     ap.add_argument("--min-whale", type=float, default=1000,
                     help="кит считается, если его позиция в эту сторону за окно — от X $ (правило владельца — 1000)")
-    ap.add_argument("--cluster-hours", type=float, default=24, help="окно сговора, ч")
-    ap.add_argument("--chase", default="0.1,0.3,1",
+    ap.add_argument("--cluster-hours", type=float, default=2, help="окно сговора, ч (правило владельца — 2)")
+    # Предел догона: тейк — 1 % от нашего входа; цена, уже ушедшая от средней
+    # китов на треть цели (0,3 %), — вход «по хаям». 0,1 % режет почти всё
+    # (за D секунд цена почти всегда чуть сдвигается), 0,5 % — уже догонялки.
+    # Сетка — чтобы выбрать по данным (отчёт: «По пределу догона»).
+    ap.add_argument("--chase", default="0.2,0.3,0.5",
                     help="на сколько %% цена входа может быть хуже средней цены китов (сетка; 0 — без предела)")
     ap.add_argument("--margin", choices=("cross", "isolated"), default="cross", help="кросс- или изолированная маржа")
     ap.add_argument("--since-days", type=int, default=0, help="только последние N дней (0 — все)")
