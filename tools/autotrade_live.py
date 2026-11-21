@@ -431,6 +431,20 @@ class Signals:
                 pnl[wl] = pnl.get(wl, 0) + int(p or 0)
         return [(wl, p / NANOS) for wl, p in sorted(pnl.items()) if p < 0]
 
+    def wallets_at(self, coin: str, side: int, ts: int) -> dict[str, int]:
+        """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
+        за 2 часа до сигнала, и их первая сделка в окне. Для позиции, открытой
+        до того, как бот стал запоминать китов."""
+        con = self._con()
+        try:
+            rows = con.execute(
+                "SELECT wallet, MIN(ts), SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND dir_code = ? "
+                "AND ts >= ? AND ts <= ? GROUP BY wallet",
+                (coin, bt.OPEN_LONG if side > 0 else bt.OPEN_SHORT, ts - WINDOW_MS, ts)).fetchall()
+        finally:
+            con.close()
+        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit[0]}
+
     def sweep(self, now: int) -> int:
         """Очистка: окна бумаг, по которым давно не было сделок, сами не
         пустеют (выбрасывают старое только на новой сделке) — вычистить
@@ -916,6 +930,11 @@ class Trader:
         рыночным ордером только на закрытие. Не вышло (сбой, отказ) — запись
         «выходим» остаётся, тейк заново не ставится, попытка — раз в минуту."""
         op = self.st.get("open")
+        if op and "wallets" not in op and num(op.get("signal_ts")) > 0:
+            # Позиция открыта прежней версией (без китов в записи) — найти их по базе.
+            op["wallets"] = self.sig.wallets_at(op["coin"], op["side"], int(num(op["signal_ts"])))
+            self.event(f"{op['inst']}: киты сигнала восстановлены по базе — {len(op['wallets'])}; "
+                       "выход вслед за ними в убытке включён")
         if not op or not isinstance(op.get("wallets"), dict) or not op["wallets"]:
             return
         now = self.clock()

@@ -85,6 +85,10 @@ MUTS = [
      "принятая позиция помнит китов"),
     ("                    and str(o.get(\"ordId\") or \"\") not in self.st[\"closed_ids\"]]", "]",
      "закрытая сделка — её вход не повод принять позицию"),
+    ("        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit[0]}",
+     "        return {str(w): int(t) for w, t, n in rows}", "восстановленные киты — только от 1000 $"),
+    ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
+     "позиция прежней версии — киты по базе"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),

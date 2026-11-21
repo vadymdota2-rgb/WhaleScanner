@@ -626,6 +626,26 @@ class WhaleExitTest(Base):
         self.assertIsNone(self.state()["open"])
         self.assertEqual(len(self.trades()), 1)
 
+    def test_position_from_old_version_recovers_whales_from_db(self) -> None:
+        """Позиция открыта прежней версией: китов в записи нет — бот находит
+        их по базе (кто открывал за 2 часа до сигнала от 1000 $) и следит."""
+        tr = self.enter()
+        del tr.st["open"]["wallets"]
+        con = sqlite3.connect(self.db)   # мелкий (100 $) в том же окне — не кит сигнала
+        con.execute(INS, fill(49, "0xsmall", "BTC", 1, self.now - 7 * MIN, 100, 100_000))
+        con.commit()
+        con.close()
+        tr.save()
+        self.now += 20 * MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(sorted(self.state()["open"]["wallets"]), ["0xa", "0xb"])
+        close_fill(self.db, 50, "0xb", "BTC", 3, self.now - MIN, -30.0)
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNone(self.state()["open"])
+        self.assertTrue(any("восстановлены по базе" in e for e in self.state()["events"]))
+
     def test_stop_button_still_follows_whale_out(self) -> None:
         tr = self.enter()
         self.on(False)
