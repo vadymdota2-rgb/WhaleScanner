@@ -757,6 +757,12 @@ def main(argv: list[str] | None = None) -> int:
         base = okx.detect(os.environ.get("OKX_API_BASE", "") or str(tr.st.get("base") or ""))
         tr.st["base"] = base
         tr.event(f"ключ OKX принят: {base}")
+        cfg = okx.config()
+        lv_ = str(cfg.get("acctLv") or "?")
+        modes = {"1": "Простой (Spot) — фьючерсы по API недоступны", "2": "Спот и фьючерсы",
+                 "3": "Мультивалютная маржа", "4": "Портфельная маржа"}
+        tr.event(f"счёт OKX: режим {lv_} — {modes.get(lv_, 'неизвестный')}; позиции: {cfg.get('posMode')}; "
+                 f"уровень доступа: {cfg.get('level') or '?'}; права ключа: {cfg.get('perm') or '?'}")
     except (OkxError, OSError) as e:
         tr.st["error"] = str(e)[:300]
         tr.event(f"ключ OKX не принят: {e}")
