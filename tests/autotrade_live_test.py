@@ -79,7 +79,21 @@ class FakeOkx:
         if p == "/api/v5/trade/order" and method == "POST":
             self.n += 1
             o = {**b, "ordId": str(self.n), "state": "live", "cTime": str(T0)}
-            if b["ordType"] == "market":
+            closing = b.get("reduceOnly") or (b.get("posSide") == "long" and b["side"] == "sell") \
+                or (b.get("posSide") == "short" and b["side"] == "buy")
+            if b["ordType"] == "market" and closing:
+                # Закрытие: уменьшить свою позицию (не открыть встречную).
+                px = self.last[b["instId"]]
+                o.update(state="filled", avgPx=str(px), accFillSz=b["sz"], fillTime=str(T0))
+                for p in self.pos:
+                    if p["instId"] == b["instId"] and p.get("posSide", "net") == b.get("posSide", "net"):
+                        left = abs(float(p["pos"])) - float(b["sz"])
+                        sign = 1 if float(p["pos"]) > 0 else -1
+                        o["pnl"] = str(round(float(b["sz"]) * (px - float(p["avgPx"])) * (1 if b["side"] == "sell" else -1)
+                                             * float(self.instr[b["instId"]]["ctVal"]), 6))
+                        p["pos"] = str(sign * left)
+                self.pos = [p for p in self.pos if abs(float(p["pos"])) > 1e-12]
+            elif b["ordType"] == "market":
                 o.update(state="filled", avgPx=str(self.last[b["instId"]]), accFillSz=b["sz"])
                 sign = 1 if b["side"] == "buy" else -1
                 self.pos.append({"instId": b["instId"], "pos": str(sign * float(b["sz"]) if self.pos_mode == "net_mode"
@@ -113,8 +127,20 @@ class FakeOkx:
 def make_db(path: str, fills: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, "
-                "ts INTEGER, notional_nanos INTEGER, sz TEXT)")
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?)", fills)
+                "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0)")
+    con.executemany(INS, fills)
+    con.commit()
+    con.close()
+
+
+INS = "INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz) VALUES (?,?,?,?,?,?,?)"
+
+
+def close_fill(path: str, tid: int, wallet: str, coin: str, code: int, ts: int, pnl_usd: float) -> None:
+    """Кит закрыл (3/4 — закрытие лонга/шорта, 5 — разворот, 6/7 — ликвидация) с итогом pnl_usd."""
+    con = sqlite3.connect(path)
+    con.execute("INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos) "
+                "VALUES (?,?,?,?,?,?,?,?)", (tid, wallet, coin, code, ts, 5000 * 10**9, "0.05", int(pnl_usd * 1e9)))
     con.commit()
     con.close()
 
@@ -416,8 +442,9 @@ class SignalsTest(Base):
 
 class OrderTypeTest(Base):
     def test_entry_always_market_exit_always_limit_at_tp(self) -> None:
-        """Правило владельца: вход — всегда рыночным ордером, выход — всегда
-        лимитным по цене тейка; бот никогда не закрывает позицию по рынку."""
+        """Правило владельца: вход — всегда рыночным ордером, выход — лимитным
+        по цене тейка; по рынку бот закрывает только вслед за китом, вышедшим
+        в убыток (WhaleExitTest) — без этого рыночного закрытия нет."""
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             self.ex = FakeOkx(mode)
             tr = self.trader(self.whales(side=side))
@@ -433,6 +460,200 @@ class OrderTypeTest(Base):
             self.assertFalse(any(c[1] in ("/api/v5/trade/close-position", "/api/v5/trade/order-algo") for c in self.ex.calls))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+
+
+class WhaleExitTest(Base):
+    """Правило владельца: кто-то из китов сигнала закрыл свою сделку по этой
+    бумаге в убытке (стоп, ликвидация, «ситуация изменилась») — бот снимает
+    тейк и закрывает свою позицию рыночным ордером только на закрытие. Кит
+    закрыл в плюс или это не кит сигнала — сидим до тейка."""
+
+    def enter(self, mode: str = "net_mode", side: int = 1) -> lv.Trader:
+        self.ex = FakeOkx(mode)
+        tr = self.trader(self.whales(side=side))
+        self.on()
+        tr.step()
+        self.assertEqual(sorted(tr.st["open"]["wallets"]), ["0xa", "0xb"])
+        return tr
+
+    def trades(self) -> list[dict]:
+        path = os.path.join(self.dir, "live", "trades.jsonl")
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(x) for x in f]
+
+    def test_whale_closes_at_loss_bot_closes_by_market(self) -> None:
+        for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
+            tr = self.enter(mode, side)
+            self.ex.last["BTC-USDT-SWAP"] = 100_000 * (1 - side * 0.004)   # цена пошла против
+            self.now += 20 * MIN
+            close_fill(self.db, 50, "0xa", "BTC", 3 if side > 0 else 4, self.now - MIN, -120.0)
+            tr.last_sync = 0
+            tr.step()
+            exits = [o for o in self.ex.orders if o["ordType"] == "market" and o["side"] == ("sell" if side > 0 else "buy")]
+            self.assertEqual(len(exits), 1, mode)
+            ex = exits[0]
+            self.assertEqual(ex["sz"], "10", "закрываем ровно свой объём")
+            if mode == "net_mode":
+                self.assertTrue(ex["reduceOnly"], "только закрытие — не перевернуть позицию")
+            else:
+                self.assertEqual(ex["posSide"], "short")
+            self.assertEqual(self.ex.pos, [], "позиции нет")
+            self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [],
+                             "тейк снят")
+            [t] = self.trades()
+            self.assertEqual(t["why"], "кит вышел в убыток")
+            self.assertLess(t["pnl"], 0)
+            self.assertIsNone(self.state()["open"])
+            self.assertTrue(any("закрыл в убыток" in e for e in self.state()["events"]))
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+            os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
+
+    def test_whale_profit_or_other_whale_or_other_coin_keeps_position(self) -> None:
+        tr = self.enter()
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, +300.0)     # кит сигнала — в плюс
+        close_fill(self.db, 51, "0xzz", "BTC", 3, self.now - MIN, -900.0)    # не кит сигнала
+        close_fill(self.db, 52, "0xb", "ETH", 3, self.now - MIN, -900.0)     # другая бумага
+        close_fill(self.db, 53, "0xb", "BTC", 4, self.now - MIN, -900.0)     # закрытие шорта — не наша сторона
+        for _ in range(3):
+            tr.last_sync = 0
+            self.now += MIN
+            tr.step()
+        self.assertEqual(len(self.market_orders()), 1, "только вход")
+        self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP")
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]), 1)
+
+    def test_partial_profits_then_loss_sum_decides(self) -> None:
+        """Кит закрывал частями: итог закрытий в минусе — выходим; в плюсе — нет."""
+        tr = self.enter()
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xb", "BTC", 3, self.now - 3 * MIN, +50.0)
+        close_fill(self.db, 51, "0xb", "BTC", 3, self.now - 2 * MIN, -20.0)
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNotNone(self.state()["open"], "итог +30 — сидим")
+        close_fill(self.db, 52, "0xb", "BTC", 3, self.now - MIN, -40.0)
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNone(self.state()["open"], "итог −10 — выходим")
+
+    def test_liquidation_and_flip_count_as_loss_close(self) -> None:
+        for code in (6, 5):
+            tr = self.enter()
+            self.now += 20 * MIN
+            close_fill(self.db, 50, "0xa", "BTC", code, self.now - MIN, -500.0)
+            tr.last_sync = 0
+            tr.step()
+            self.assertIsNone(self.state()["open"], code)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_old_loss_before_whale_entered_does_not_count(self) -> None:
+        """Убыток кита по прошлой сделке (до его входа в окне сигнала) — не повод:
+        у каждого кита — от его первой сделки (0xa вошёл в −6 мин, 0xb — в −5)."""
+        tr = self.enter()
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - 60 * MIN, -500.0)
+        close_fill(self.db, 51, "0xb", "BTC", 3, self.now - 5 * MIN - 30_000, -500.0)  # раньше входа 0xb
+        self.now += 20 * MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNotNone(self.state()["open"])
+
+    def test_whale_already_lost_before_entry_no_entry(self) -> None:
+        fills = self.whales()
+        make_db(self.db, fills)
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -80.0)
+        okx = lv.Okx("K", "S", "P", False, self.ex)
+        tr = lv.Trader(okx, lv.Signals(self.db), self.dir, clock=lambda: self.now, log=self.logs.append)
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        st = self.state()
+        self.assertEqual(st["last_skip"]["code"], "whale_exit")
+        self.assertIn("уже закрыл позицию в убыток", st["last_skip"]["why"])
+
+    def test_failed_close_keeps_trying_and_never_replaces_tp(self) -> None:
+        tr = self.enter()
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -120.0)
+        real = tr.okx.order
+        tries = []
+
+        def order(body):
+            if body["ordType"] == "market":
+                tries.append(body)
+                raise lv.OkxError("50001", "сервис занят")
+            return real(body)
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.last_sync = 0
+        tr.step()
+        self.assertIn("exit", self.state()["open"])
+        self.assertTrue(any("не вышло" in e for e in self.state()["events"]))
+        for _ in range(3):      # 15-секундные сверки: тейк не ставится заново, ордер — не чаще раза в минуту
+            self.now += 15_000
+            tr.last_sync = 0
+            tr.step()
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [])
+        self.assertEqual(len(tries), 1, "повтор — не чаще раза в минуту")
+        tr.okx.order = real  # type: ignore[method-assign]
+        self.now += 60_000
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNone(self.state()["open"])
+        self.assertEqual(self.trades()[-1]["why"], "кит вышел в убыток")
+
+    def test_close_only_bots_share_when_owner_added(self) -> None:
+        """Владелец докупил руками на той же бумаге (позиция 25, у бота 10):
+        вслед за китом закрываются только 10 бота."""
+        tr = self.enter()
+        self.ex.pos[0]["pos"] = "25"
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -50.0)
+        tr.last_sync = 0
+        tr.step()
+        [ex] = [o for o in self.ex.orders if o["ordType"] == "market" and o["side"] == "sell"]
+        self.assertEqual(ex["sz"], "10")
+        self.assertEqual(self.ex.pos[0]["pos"], "15.0", "ручная часть осталась")
+        for _ in range(2):  # ручную часть бот своей не принимает (вход этой сделки уже закрыт)
+            self.now += 2 * MIN
+            tr.last_sync = 0
+            tr._checked.clear()
+            tr.step()
+        self.assertIsNone(self.state()["open"])
+        self.assertEqual(len(self.trades()), 1)
+
+    def test_stop_button_still_follows_whale_out(self) -> None:
+        tr = self.enter()
+        self.on(False)
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xb", "BTC", 3, self.now - MIN, -10.0)
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNone(self.state()["open"])
+
+    def test_adopted_after_crash_keeps_whales(self) -> None:
+        """Служба упала между входом и записью: принятая позиция помнит китов
+        сигнала (из записи «входим») и тоже выходит вслед за ними."""
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.get_order
+        tr.okx.get_order = mock.Mock(side_effect=OSError("обрыв"))  # type: ignore[method-assign]
+        with self.assertRaises(OSError):
+            tr.step()
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                       clock=lambda: self.now, log=self.logs.append)
+        del real
+        tr.recover()
+        self.assertEqual(sorted(self.state()["open"]["wallets"]), ["0xa", "0xb"])
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -10.0)
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNone(self.state()["open"])
 
 
 class EeaTest(Base):
@@ -604,7 +825,7 @@ class RejectTest(Base):
         self.on()
         tr.step()
         con = sqlite3.connect(self.db)
-        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?)",
+        con.executemany(INS,
                         [fill(20 + i, f"0x{i}", "BTC", 1, self.now + i * 1000, 5000, 100_000) for i in range(3)])
         con.commit()
         con.close()
@@ -718,7 +939,7 @@ class ReviewTest(Base):
 
     def add_fills(self, rows: list[tuple]) -> None:
         con = sqlite3.connect(self.db)
-        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?)", rows)
+        con.executemany(INS, rows)
         con.commit()
         con.close()
 
