@@ -226,6 +226,10 @@ class Okx:
     def cancel(self, inst: str, ord_id: str) -> None:
         self.call("POST", "/api/v5/trade/cancel-order", body={"instId": inst, "ordId": ord_id})
 
+    def history(self, inst: str) -> list[dict]:
+        """Последние ордера по бумаге (за 7 дней) — чтобы узнать свои по метке clOrdId."""
+        return self.call("GET", "/api/v5/trade/orders-history", {"instType": inst_type(inst), "instId": inst, "limit": "50"})
+
     def closed(self, inst: str) -> list[dict]:
         return self.call("GET", "/api/v5/account/positions-history", {"instType": inst_type(inst), "instId": inst})
 
@@ -618,6 +622,7 @@ class Trader:
         self.positions = self.okx.positions()
         self.equity = self.okx.equity()
         self.last_sync = time.time()
+        self.find_own()
         self._track_open()
 
     def _track_open(self) -> None:
@@ -730,7 +735,8 @@ class Trader:
                 self.lever_set.add(inst)
             # Сначала — запись «входим» (если служба упадёт посреди, при старте
             # ордер найдётся по clOrdId, а не будет повторён).
-            self.st["entering"] = {"inst": inst, "cl": cl, "at": now}
+            self.st["entering"] = {"inst": inst, "cl": cl, "at": now, "coin": s["coin"], "side": s["side"],
+                                   "whales": s["whales"], "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"]}
             self.save()
             ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                                      "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
@@ -765,8 +771,74 @@ class Trader:
         self.save()
         return ""
 
+    def _side_of(self, p: dict) -> int:
+        ps = str(p.get("posSide") or "net")
+        if ps in ("long", "short"):
+            return 1 if ps == "long" else -1
+        return 1 if float(p.get("pos") or 0) > 0 else -1
+
+    def adopt(self, p: dict, order: dict, info: dict | None = None) -> None:
+        """Позиция открыта нашим ордером, но не записана (служба упала между
+        ордером и записью): принять как свою и поставить тейк."""
+        inst = str(p["instId"])
+        side = self._side_of(p)
+        ins = self.instruments().get(inst, {})
+        px = float(p.get("avgPx") or order.get("avgPx") or 0)
+        size = abs(float(p.get("pos") or 0))
+        tp = round_step(px * (1 + side * TP), ins.get("tickSz", "0.0001"), ROUND_CEILING if side > 0 else ROUND_FLOOR)
+        in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
+        ct = float(ins.get("ctVal") or 0) * float(ins.get("ctMult") or 1)
+        info = info or {}
+        opened = int(order.get("fillTime") or order.get("cTime") or info.get("at") or self.clock())
+        coin = info.get("coin") or inst.split("-", 1)[0]
+        op = {"coin": coin, "inst": inst, "side": side, "opened": opened, "px": px, "size": size,
+              "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
+              "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
+              "in_id": str(order.get("ordId") or ""), "adopted": True}
+        self.st["open"] = op
+        self.st["entered"][coin] = opened
+        self.event(f"найдена своя позиция без записи: {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(Decimal(str(size)))} "
+                   f"по {px} — принята, тейк {op['tp_s']}")
+        pend = [o for o in self.okx.pending(inst) if str(o.get("clOrdId", "")).startswith(TAG)]
+        if pend:  # тейк уже стоит (упали после него) — не дублировать
+            op["tp_id"] = str(pend[0].get("ordId"))
+        else:
+            self._place_tp(op, size)
+        self.save()
+
+    def find_own(self) -> None:
+        """Позиции на счёте, которые бот не ведёт: открыты нашим рыночным
+        ордером (метка clOrdId «wtin…» за последние 7 дней) — свои,
+        принять. Нет такой метки — чужие (владельца): не трогать. Каждую
+        бумагу — не чаще раза в час."""
+        if self.st.get("open"):
+            return
+        checked = self.__dict__.setdefault("_checked", {})
+        for p in self.positions:
+            inst = str(p.get("instId") or "")
+            if not inst or time.time() - checked.get(inst, 0) < 3600:
+                continue
+            checked[inst] = time.time()
+            side = self._side_of(p)
+            try:
+                hist = self.okx.history(inst)
+            except OkxError as e:
+                self.event(f"{inst}: история ордеров недоступна — {e}")
+                continue
+            mine = [o for o in hist
+                    if str(o.get("clOrdId", "")).startswith(f"{TAG}in") and o.get("state") in ("filled", "partially_filled")
+                    and (1 if o.get("side") == "buy" else -1) == side
+                    and self.clock() - int(o.get("cTime") or 0) < 7 * 86_400_000]
+            if mine:
+                info = self.st.get("entering") if (self.st.get("entering") or {}).get("inst") == inst else None
+                self.adopt(p, mine[0], info)
+                self.st.pop("entering", None)
+                return
+
     def recover(self) -> None:
-        """После перезапуска: вход был начат, но не записан — найти ордер."""
+        """После перезапуска: вход был начат, но не записан. Ордер исполнен и
+        позиция есть — принять её как свою и поставить тейк; ордера нет —
+        входа не было."""
         e = self.st.get("entering")
         if not e:
             return
@@ -774,9 +846,14 @@ class Trader:
             o = self.okx.get_order(e["inst"], cl_id=e["cl"])
         except OkxError:
             o = {}
-        if o:
-            self.event(f"после перезапуска найден ордер входа {e['inst']} ({o.get('state')}) — сверка по позиции")
+        self.sync()
+        live = [p for p in self.positions if p.get("instId") == e["inst"]]
+        if o and o.get("state") in ("filled", "partially_filled") and live and not self.st.get("open"):
+            self.adopt(live[0], o, e)
+        elif o:
+            self.event(f"после перезапуска: ордер входа {e['inst']} — {o.get('state')}, позиции нет")
         self.st.pop("entering", None)
+        self.save()
 
     def step(self) -> None:
         sigs = self.sig.poll(self.clock())
@@ -833,7 +910,10 @@ def main(argv: list[str] | None = None) -> int:
     me = [os.path.abspath(__file__), bt.__file__]
     stamp = [os.path.getmtime(p) for p in me]
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
-    tr.recover()
+    try:
+        tr.recover()
+    except (OkxError, OSError) as e:  # не вышло сейчас — find_own в сверке счёта догонит
+        tr.event(f"сверка после перезапуска: {e}")
     bts = Backtests(a.dir, a.db)
     jan = Janitor(a.dir)
     fails = 0

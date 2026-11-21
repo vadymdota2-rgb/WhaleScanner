@@ -78,7 +78,7 @@ class FakeOkx:
                                                       "permission for the market"}]}
         if p == "/api/v5/trade/order" and method == "POST":
             self.n += 1
-            o = {**b, "ordId": str(self.n), "state": "live"}
+            o = {**b, "ordId": str(self.n), "state": "live", "cTime": str(T0)}
             if b["ordType"] == "market":
                 o.update(state="filled", avgPx=str(self.last[b["instId"]]), accFillSz=b["sz"])
                 sign = 1 if b["side"] == "buy" else -1
@@ -96,6 +96,8 @@ class FakeOkx:
             kind = self.instr.get(q["instId"], {}).get("instType", "SWAP")
             if q.get("instType", kind) != kind:
                 return ok([])
+        if p == "/api/v5/trade/orders-history":
+            return ok([o for o in reversed(self.orders) if o["instId"] == q["instId"] and o["state"] != "live"])
         if p == "/api/v5/trade/orders-pending":
             return ok([o for o in self.orders if o["state"] == "live" and o["instId"] == q["instId"]])
         if p == "/api/v5/trade/cancel-order":
@@ -478,6 +480,71 @@ class RejectTest(Base):
         self.now += 16 * MIN
         del self.ex.reject["BTC-USDT-SWAP"]
         self.assertEqual(tr.try_enter({"coin": "BTC", "side": 1, "ts": self.now, "whales": 2, "ref_px": 100_000}), "")
+
+
+class RecoverTest(Base):
+    """Служба упала между рыночным ордером и записью сделки: позиция есть,
+    бот её «не знает». После перезапуска — узнаёт свою по метке ордера и
+    ставит тейк; ручную позицию владельца своей не считает."""
+
+    def crash_after_order(self) -> lv.Trader:
+        tr = self.trader(self.whales())
+        self.on()
+        real_order = tr.okx.order
+
+        def order_then_crash(body):
+            real_order(body)
+            if body["ordType"] == "market":
+                raise SystemExit("упала")
+            return ""
+
+        tr.okx.order = order_then_crash  # type: ignore[method-assign]
+        with self.assertRaises(SystemExit):
+            tr.step()
+        return tr
+
+    def test_restart_adopts_own_position_and_places_tp(self) -> None:
+        self.crash_after_order()
+        self.assertEqual(len(self.ex.pos), 1)
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка нет")
+        st = self.state()
+        self.assertIsNone(st["open"])
+        self.assertEqual(st["entering"]["inst"], "BTC-USDT-SWAP")
+        # Перезапуск службы: новый трейдер с тем же каталогом.
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                       clock=lambda: self.now, log=self.logs.append)
+        tr.recover()
+        st = self.state()
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 101000.0, 2))
+        self.assertNotIn("entering", st)
+        [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
+        self.assertEqual((tp["side"], tp["px"]), ("sell", "101000"))
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк не дублируется")
+        self.assertEqual(len(self.market_orders()), 1, "повторного входа нет")
+
+    def test_lost_record_found_by_order_tag(self) -> None:
+        self.crash_after_order()
+        os.remove(os.path.join(self.dir, "live", "state.json"))  # и запись «входим» потерялась
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                       clock=lambda: self.now, log=self.logs.append)
+        tr.recover()
+        tr.step()
+        self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP")
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
+
+    def test_manual_position_is_not_adopted(self) -> None:
+        self.ex.pos = [{"instId": "ETH-USDT-SWAP", "pos": "-3", "posSide": "net", "avgPx": "3000"}]
+        self.ex.orders.append({"instId": "ETH-USDT-SWAP", "ordId": "99", "clOrdId": "", "side": "sell",
+                               "ordType": "market", "state": "filled", "cTime": str(T0)})  # руками — без нашей метки
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        st = self.state()
+        self.assertIsNone(st["open"])
+        self.assertEqual(self.market_orders()[1:], [])
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [])
 
 
 class JanitorTest(Base):
