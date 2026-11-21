@@ -264,7 +264,16 @@ class Window:
         self.total += dn
 
     def add(self, ts: int, wallet: str, nanos: int, units: float) -> None:
-        self.orders.append((ts, wallet, nanos, units))
+        item = (ts, wallet, nanos, units)
+        if self.orders and ts < self.orders[-1][0]:
+            # Опоздавшая сделка (бот записал её позже) — на своё место по
+            # времени: выброс старше окна идёт слева и требует порядка.
+            i = len(self.orders)
+            while i > 0 and self.orders[i - 1][0] > ts:
+                i -= 1
+            self.orders.insert(i, item)
+        else:
+            self.orders.append(item)
         self._change(wallet, nanos, units, 1, int(units > 0))
 
     def expire(self, before: int) -> None:

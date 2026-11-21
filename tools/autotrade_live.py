@@ -353,12 +353,17 @@ class Signals:
         self.limit = [MIN_WHALE_USD * NANOS]
 
     def _con(self) -> sqlite3.Connection:
+        if not os.path.isfile(self.db):  # open_ro бросил бы SystemExit — мимо обработчика шага
+            raise OSError(f"нет базы бота: {self.db}")
         return bt.open_ro(self.db)
 
     def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
         китов от 1000 $ за 2 часа, и строка, на которой это случилось."""
-        since = max(self.last_ts - 10 * 60_000, now - WINDOW_MS) if self.last_ts else now - WINDOW_MS
+        # Всё окно 2 часа каждый раз: бот записывает сделки китов с опозданием
+        # (опрос кошельков), и опоздавшая сделка должна попасть в окно, а не
+        # потеряться. Повторы отсекает seen (tid).
+        since = now - WINDOW_MS
         con = self._con()
         try:
             rows = con.execute(
@@ -374,10 +379,13 @@ class Signals:
             self.last_ts = max(self.last_ts, ts)
             side = 1 if code == bt.OPEN_LONG else -1
             w = self.windows.setdefault((coin, side), bt.Window(self.limit))
-            w.expire(ts - WINDOW_MS)
             w.add(ts, wallet, int(nanos or 0), float(units or 0.0))
+            # Окно — 2 часа до самой свежей сделки (опоздавшая старше окна
+            # тут же выходит); момент сигнала — самая свежая сделка окна.
+            newest = w.orders[-1][0]
+            w.expire(newest - WINDOW_MS)
             if w.count[0] >= MIN_WHALES and w.big_u > 0:
-                out.append({"coin": coin, "side": side, "ts": ts, "whales": w.count[0],
+                out.append({"coin": coin, "side": side, "ts": newest, "whales": w.count[0],
                             "ref_px": (w.big_n / NANOS) / w.big_u})
         cut = now - WINDOW_MS - 20 * 60_000
         self.seen = {t: s for t, s in self.seen.items() if s >= cut}
@@ -418,7 +426,10 @@ def cgroup_limit_mb() -> float:
             raw = f.read().strip()
     except (OSError, StopIteration):
         return math.inf
-    return math.inf if raw == "max" else int(raw) / 2**20
+    try:
+        return math.inf if raw == "max" else int(raw) / 2**20
+    except ValueError:
+        return math.inf
 
 
 class Backtests:
@@ -438,8 +449,11 @@ class Backtests:
         self.log: TextIO | None = None
         self.st = self._read()
         self.st.update(running=False)
-        if not self.st.get("next"):
-            self.st["next"] = next_run(time.time())
+        # Файл мог быть испорчен руками или обрывом записи: поля — числа и строка.
+        self.st["next"] = int(num(self.st.get("next"))) or next_run(time.time())
+        for k in ("started", "finished"):
+            self.st[k] = int(num(self.st.get(k)))
+        self.st["error"] = self.st["error"] if isinstance(self.st.get("error"), str) else ""
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -460,13 +474,13 @@ class Backtests:
         req = os.path.join(self.dir, "run.request")
         if self.proc is not None:
             rc = self.proc.poll()
-            if not on:
-                self.proc.terminate()
-                self.proc.wait(timeout=30)
+            if not on and rc is None:
+                self._stop(self.proc, terminate=True)
                 self._done(None, "остановлено кнопкой «Стоп»")
-            elif rc is None and now - self.st.get("started", now) > BT_TIMEOUT_SEC:
-                self.proc.kill()
-                self.proc.wait(timeout=30)
+            elif not on:
+                self._done(rc, "")
+            elif rc is None and now - num(self.st.get("started"), now) > BT_TIMEOUT_SEC:
+                self._stop(self.proc, terminate=False)
                 self._done(None, "бэктест шёл дольше 6 часов — остановлен")
             elif rc is not None:
                 self._done(rc, "")
@@ -494,6 +508,19 @@ class Backtests:
             stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(19))  # noqa: PLW1509 — однопоточная служба
         self.st.update(running=True, started=int(now), error="")
         self._write()
+
+    @staticmethod
+    def _stop(proc: subprocess.Popen[bytes], terminate: bool) -> None:
+        """Остановить пересчёт: вежливо (terminate), не вышел за 30 с — kill."""
+        if terminate:
+            proc.terminate()
+            try:
+                proc.wait(timeout=30)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        proc.kill()
+        proc.wait(timeout=30)
 
     def _done(self, rc: int | None, why: str) -> None:
         self.proc = None
@@ -554,7 +581,14 @@ class Janitor:
         self.last = now
         dropped = tr.sig.sweep(int(now * 1000))
         cut = int(now * 1000) - COIN_PAUSE_MS
-        tr.st["entered"] = {c: t for c, t in tr.st.get("entered", {}).items() if int(t) >= cut}
+        entered = tr.st.get("entered")
+        tr.st["entered"] = {c: t for c, t in entered.items() if num(t) >= cut} if isinstance(entered, dict) else {}
+        # Истёкшие запреты бумаг (15 минут — сбой, неделя — OKX не даёт) — убрать.
+        blocked = tr.st.get("blocked")
+        ms = int(now * 1000)
+        tr.st["blocked"] = {i: b for i, b in blocked.items() if isinstance(b, dict)
+                            and ms - num(b.get("at")) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS)} \
+            if isinstance(blocked, dict) else {}
         self.rotate(os.path.join(tr.dir, "live.log"))
         busy = bts is not None and bts.proc is not None   # идёт пересчёт — его лог и кеш не трогаем
         freed = 0
@@ -609,6 +643,9 @@ class Janitor:
 
 # ── трейдер ──────────────────────────────────────────────────────────────────
 
+OPEN_KEYS = ("coin", "inst", "side", "opened", "px", "size", "tp", "tp_s", "notional")  # поля записи своей позиции
+
+
 class Trader:
     def __init__(self, okx: Okx, signals: Signals, data_dir: str, clock: Callable[[], int] = now_ms,
                  log: Callable[[str], None] | None = None) -> None:
@@ -625,17 +662,36 @@ class Trader:
         self.positions: list[dict[str, Any]] = []
         self.equity = 0.0
         self.last_sync = 0.0
+        self.unverified: set[str] = set()   # позиции, которые не удалось проверить по истории ордеров
+        self._checked: dict[str, float] = {}
 
     # состояние
     def _load(self) -> dict[str, Any]:
+        st: dict[str, Any] = {}
         try:
             with open(os.path.join(self.dir, "state.json"), encoding="utf-8") as f:
-                st = json.load(f)
-                if isinstance(st, dict):
-                    return st
+                got = json.load(f)
+                st = got if isinstance(got, dict) else {}
         except (OSError, ValueError):
             pass
-        return {"open": None, "entered": {}, "error": "", "events": []}
+        # Файл пишет сама служба, но правка руками или порча не должны ронять
+        # каждый шаг: поля — своих типов, иначе пустые.
+        for k, kind in (("entered", dict), ("events", list), ("blocked", dict), ("own_unknown", dict)):
+            if not isinstance(st.get(k), kind):
+                st[k] = kind()
+        st["events"] = [e for e in st["events"] if isinstance(e, str)]
+        op = st.get("open")
+        if op is not None and not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)
+                                   and op["side"] in (1, -1) and isinstance(op["inst"], str)
+                                   and num(op["px"]) > 0 and num(op["tp"]) > 0 and num(op["size"]) > 0):
+            # Запись позиции испорчена: забыть её — find_own узнает свою позицию по метке ордера.
+            self._log(f"[AUTO-LIVE] запись позиции в state.json испорчена — сверка по счёту: {str(op)[:200]}")
+            op = None
+        st["open"] = op
+        if not isinstance(st.get("entering"), dict):
+            st.pop("entering", None)
+        st["error"] = st["error"] if isinstance(st.get("error"), str) else ""
+        return st
 
     def save(self) -> None:
         self.st.update(heartbeat=self.clock(), simulated=self.okx.simulated, equity=self.equity,
@@ -711,8 +767,34 @@ class Trader:
         held = {str(p.get("instId")) for p in self.positions}
         if self.st.get("own_unknown"):
             self.st["own_unknown"] = {k: v for k, v in self.st["own_unknown"].items() if k in held}
+        self.resolve_entering()
         self.find_own()
         self._track_open()
+
+    def resolve_entering(self) -> None:
+        """Вход начат (ордер, возможно, ушёл), но не записан: сбой между
+        рыночным ордером и записью сделки. Пока не ясно, исполнился ли он, —
+        новых входов нет (иначе второй рыночный ордер). Ордер найден по метке
+        и исполнен, позиция есть — она своя: принять и поставить тейк; ордер
+        отменён или за 10 минут не подтвердился позицией — входа не было."""
+        e = self.st.get("entering")
+        if not isinstance(e, dict) or self.st.get("open"):
+            self.st.pop("entering", None)
+            return
+        try:
+            o = self.okx.get_order(str(e.get("inst")), cl_id=str(e.get("cl")))
+        except OkxError:
+            o = {}
+        side = int(num(e.get("side"), 1)) or 1
+        live = [p for p in self.positions if p.get("instId") == e.get("inst") and self._side_of(p) == side]
+        if o.get("state") in ("filled", "partially_filled") and live:
+            self.adopt(live[0], o, e)
+            self.st.pop("entering", None)
+        elif o.get("state") in ("canceled", "mmp_canceled") or self.clock() - num(e.get("at")) > 600_000:
+            # 10 минут ордер не подтвердился позицией: снять запись. Если позиция
+            # всё же наша — find_own узнает её по метке ордера.
+            self.event(f"вход {e.get('inst')} не состоялся ({o.get('state') or 'ордера нет'}) — запись снята")
+            self.st.pop("entering", None)
 
     def _track_open(self) -> None:
         """Наша позиция: есть — тейк на месте? нет — закрылась (тейк или руками):
@@ -720,34 +802,53 @@ class Trader:
         op = self.st.get("open")
         if not op:
             return
-        live = [p for p in self.positions if p.get("instId") == op["inst"]]
+        # Своя позиция — та же бумага и та же сторона (в режиме long/short на
+        # бумаге может быть и встречная ручная позиция владельца).
+        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
         if live:
             p = live[0]
             op.update(mark=num(p.get("markPx")), upl=num(p.get("upl")))
-            if not any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
-                # Не больше своего объёма: позиция на бумаге могла вырасти ручной докупкой.
-                self._place_tp(op, min(size_of(p.get("pos")), size_of(op.get("size"))))
+            if any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
+                return
+            # Тейка в ожидающих нет: исполнен — сделка закрыта, хотя позиция на
+            # бумаге осталась (её докупили руками) — новый тейк закрыл бы часть
+            # ручной; снят — поставить заново, не больше своего объёма.
+            tp = self.okx.get_order(op["inst"], str(op.get("tp_id") or "")) if op.get("tp_id") else {}
+            if tp.get("state") == "filled":
+                self._record_close(op, {"uTime": tp.get("fillTime") or tp.get("uTime"), "closeAvgPx": tp.get("avgPx"),
+                                        "realizedPnl": tp.get("pnl"), "fee": tp.get("fee")})
+                return
+            self._place_tp(op, min(size_of(p.get("pos")), size_of(op.get("size"))))
             return
-        if self.clock() - op["opened"] < 60_000:
+        if self.clock() - num(op.get("opened")) < 60_000:
             return  # биржа ещё не показала только что открытую позицию
-        hist = [h for h in self.okx.closed(op["inst"]) if int(h.get("uTime") or 0) >= op["opened"]]
-        if not hist and self.clock() - op.get("gone_at", self.clock()) < 300_000:
+        hist = [h for h in self.okx.closed(op["inst"]) if num(h.get("uTime")) >= num(op.get("opened"))]
+        if not hist and self.clock() - num(op.get("gone_at"), self.clock()) < 300_000:
             op.setdefault("gone_at", self.clock())  # позиции нет, а истории ещё нет — подождать до 5 минут
             return
-        h = hist[0] if hist else {}
+        self._record_close(op, hist[0] if hist else {})
+
+    def _record_close(self, op: dict[str, Any], h: dict[str, Any]) -> None:
+        """Сделка закрыта: запись — один раз (сначала «позиции нет» в состоянии,
+        потом снятие остатка тейка: сбой снятия не повторит запись)."""
         pnl = num(h.get("realizedPnl"), num(h.get("pnl")))
+        out_px = num(h.get("closeAvgPx"))
         trade = {"coin": op["coin"], "inst": op["inst"], "side": op["side"], "opened": op["opened"],
-                 "closed": int(num(h.get("uTime"), self.clock())), "px_in": op["px"], "px_out": num(h.get("closeAvgPx")),
+                 "closed": int(num(h.get("uTime"), self.clock())) or self.clock(), "px_in": op["px"], "px_out": out_px,
                  "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": num(h.get("fee")),
                  "funding": num(h.get("fundingFee")), "notional": op["notional"],
-                 "why": "тейк" if num(h.get("closeAvgPx")) > 0 and abs(num(h.get("closeAvgPx")) / op["tp"] - 1) < 0.002 else "закрыта"}
+                 "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.002 else "закрыта"}
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
-        for o in self.okx.pending(op["inst"]):  # оставшийся тейк — снять
-            if str(o.get("clOrdId", "")).startswith(TAG):
-                self.okx.cancel(op["inst"], str(o.get("ordId")))
         self.st["open"] = None
         self.event(f"закрыта {op['inst']} {'лонг' if op['side'] > 0 else 'шорт'}: {trade['why']}, PnL {pnl:+.2f} $")
+        self.save()
+        try:
+            for o in self.okx.pending(op["inst"]):  # оставшийся тейк бота — снять
+                if str(o.get("clOrdId", "")).startswith(TAG):
+                    self.okx.cancel(op["inst"], str(o.get("ordId")))
+        except OkxError as e:
+            self.event(f"{op['inst']}: остаток тейка не снят — {e}; проверьте ордера в OKX")
 
     # вход
     def _ps(self, side: int) -> dict[str, Any]:
@@ -787,18 +888,22 @@ class Trader:
         now = self.clock()
         if self.st.get("open"):
             return f"у бота уже есть своя позиция ({(self.st.get('open') or {}).get('inst')})"
+        if self.st.get("entering"):
+            return "прошлый вход ещё не подтверждён биржей — сверка"
+        if self.unverified:
+            return f"не удалось проверить позиции ({', '.join(sorted(self.unverified))}) — свои они или ваши"
         unknown = [str(p.get("instId")) for p in self.positions if str(p.get("instId")) in self.st.get("own_unknown", {})]
         if unknown:
             return f"своя позиция без записи ({', '.join(unknown)}) — проверьте её в OKX; пока она есть, бот не входит"
         # Остальные позиции на счёте — владельца (руками): бот входит, но 5 %.
         foreign = [str(p.get("instId")) for p in self.positions]
-        if now - int(self.st["entered"].get(s["coin"], 0)) < COIN_PAUSE_MS:
+        if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
             return "в эту бумагу входили меньше 3 часов назад"
         base, scale = bt.okx_candidate(s["coin"])
         inst = self.inst_for(base)
         blocked = self.st.setdefault("blocked", {})
         b = blocked.get(inst)
-        if b and now - int(b.get("at", 0)) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
+        if isinstance(b, dict) and now - num(b.get("at")) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
             return f"{inst}: OKX не даёт торговать ({b.get('why', '')})"
         if inst in foreign:
             # Своя сделка бота на той же бумаге смешалась бы с ручной (в режиме
@@ -852,8 +957,15 @@ class Trader:
             ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                                      "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
         except OkxError as e:
-            # Ордер не принят — позиции нет. Бумагу — в исключённые (по самой
-            # бумаге — на неделю, иначе — на 15 минут), сигналы — дальше.
+            if self.st.get("entering") and not (e.code.isdigit() and len(e.code) == 5):
+                # Ответ не от биржи (ошибка шлюза, обрыв, порча ответа): ордер
+                # мог уйти. Запись «входим» остаётся — сверка счёта примет
+                # позицию или снимет запись; до тех пор новых входов нет.
+                self.event(f"{inst}: ответ на ордер не получен — {e}; сверка по счёту")
+                self.save()
+                return f"{inst}: ответ на ордер не получен — сверка"
+            # Ордер не принят биржей — позиции нет. Бумагу — в исключённые (по
+            # самой бумаге — на неделю, иначе — на 15 минут), сигналы — дальше.
             self.st.pop("entering", None)
             permanent = e.code in BLOCK_CODES
             blocked[inst] = {"at": now, "why": str(e).split(" [")[0][:200], "permanent": permanent}
@@ -866,13 +978,24 @@ class Trader:
             if o.get("state") == "filled":
                 break
             time.sleep(0.5)
+        got_sz = size_of(o.get("accFillSz"))
+        if o.get("state") in ("canceled", "mmp_canceled") and got_sz <= 0:
+            self.st.pop("entering", None)
+            blocked[inst] = {"at": now, "why": f"рыночный ордер отменён биржей ({o.get('state')})", "permanent": False}
+            self.event(f"{inst}: рыночный ордер отменён биржей без исполнения — входа нет")
+            return f"{inst}: ордер отменён биржей"
+        if o.get("state") not in ("filled", "partially_filled") or got_sz <= 0:
+            # Не ясно, исполнился ли: запись «входим» остаётся, сверка счёта
+            # (resolve_entering) примет позицию по метке или снимет запись.
+            self.event(f"{inst}: исполнение ордера не подтверждено ({o.get('state') or 'нет ответа'}) — сверка по счёту")
+            self.save()
+            return f"{inst}: исполнение не подтверждено — сверка"
         # Цена и объём исполнения — с биржи; мусор или ноль — цена тикера и наш объём.
         avg = num(o.get("avgPx"))
         # Цена исполнения рыночного ордера — рядом с тикером (±5 %); дальше —
         # порча ответа: от неё тейк встал бы «в рынок». Тогда — цена тикера.
         fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last
-        got_sz = size_of(o.get("accFillSz"))
-        filled_d = got_sz if 0 < got_sz <= sz else sz
+        filled_d = got_sz if got_sz <= sz else sz
         filled = float(filled_d)
         tp = round_step(fill_px * (1 + s["side"] * TP), fmt_dec(tick), ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
@@ -916,7 +1039,7 @@ class Trader:
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
         ct = num(ins.get("ctVal")) * num(ins.get("ctMult"), 1.0)
         info = info or {}
-        opened = int(order.get("fillTime") or order.get("cTime") or info.get("at") or self.clock())
+        opened = int(num(order.get("fillTime")) or num(order.get("cTime")) or num(info.get("at")) or self.clock())
         coin = info.get("coin") or inst.split("-", 1)[0]
         op = {"coin": coin, "inst": inst, "side": side, "opened": opened, "px": px, "size": size,
               "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
@@ -941,22 +1064,28 @@ class Trader:
         бумагу — не чаще раза в час."""
         if self.st.get("open"):
             return
-        checked = self.__dict__.setdefault("_checked", {})
+        checked = self._checked
+        held = {str(p.get("instId") or "") for p in self.positions}
+        self.unverified &= held
         for p in self.positions:
             inst = str(p.get("instId") or "")
             if not inst or time.time() - checked.get(inst, 0) < 3600:
                 continue
-            checked[inst] = time.time()
             side = self._side_of(p)
             try:
                 hist = self.okx.history(inst)
             except OkxError as e:
+                # Не проверено — не «ручная»: пока не проверим, новых входов нет
+                # (иначе своя непринятая позиция стала бы второй позицией бота).
+                self.unverified.add(inst)
                 self.event(f"{inst}: история ордеров недоступна — {e}")
                 continue
+            checked[inst] = time.time()
+            self.unverified.discard(inst)
             mine = [o for o in hist
                     if str(o.get("clOrdId", "")).startswith(f"{TAG}in") and o.get("state") in ("filled", "partially_filled")
                     and (1 if o.get("side") == "buy" else -1) == side
-                    and self.clock() - int(o.get("cTime") or 0) < 7 * 86_400_000]
+                    and self.clock() - num(o.get("cTime")) < 7 * 86_400_000]
             if mine:
                 info = self.st.get("entering") if (self.st.get("entering") or {}).get("inst") == inst else None
                 self.adopt(p, mine[0], info)
@@ -967,20 +1096,9 @@ class Trader:
         """После перезапуска: вход был начат, но не записан. Ордер исполнен и
         позиция есть — принять её как свою и поставить тейк; ордера нет —
         входа не было."""
-        e = self.st.get("entering")
-        if not e:
+        if not self.st.get("entering"):
             return
-        try:
-            o = self.okx.get_order(e["inst"], cl_id=e["cl"])
-        except OkxError:
-            o = {}
-        self.sync()
-        live = [p for p in self.positions if p.get("instId") == e["inst"]]
-        if o and o.get("state") in ("filled", "partially_filled") and live and not self.st.get("open"):
-            self.adopt(live[0], o, e)
-        elif o:
-            self.event(f"после перезапуска: ордер входа {e['inst']} — {o.get('state')}, позиции нет")
-        self.st.pop("entering", None)
+        self.sync()  # в нём resolve_entering: своя позиция — принять, нет — снять запись
         self.save()
 
     def step(self) -> None:
@@ -1060,11 +1178,11 @@ def main(argv: list[str] | None = None) -> int:
                     tr.event(f"служба заняла {tr.st['janitor']['rss_mb']:.0f} МБ (больше {RSS_MAX_MB}) — перезапуск")
                     tr.save()
                     return 0
-            except OSError as e:
+            except Exception as e:  # noqa: BLE001 — очистка не должна ронять торговлю
                 tr.event(f"очистка: {e}")
         try:
             bts.tick(tr.is_on())
-        except (OSError, subprocess.SubprocessError) as e:
+        except Exception as e:  # noqa: BLE001 — сбой бэктеста не должен ронять торговлю
             tr.event(f"бэктест: {e}")
         try:
             tr.step()

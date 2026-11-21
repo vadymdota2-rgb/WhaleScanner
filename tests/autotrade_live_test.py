@@ -633,6 +633,262 @@ class RecoverTest(Base):
                              for o in self.ex.orders))
 
 
+class ReviewTest(Base):
+    """Ошибки, найденные построчной ревизией, — каждая закрыта проверкой."""
+
+    def add_fills(self, rows: list[tuple]) -> None:
+        con = sqlite3.connect(self.db)
+        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?)", rows)
+        con.commit()
+        con.close()
+
+    def stx(self, tid: int = 10, ago: int = 2) -> list[tuple]:
+        return [fill(tid, "0xc", "STX", 1, self.now - ago * MIN - MIN, 5000, 0.5),
+                fill(tid + 1, "0xd", "STX", 1, self.now - ago * MIN, 5000, 0.5)]
+
+    def test_network_failure_after_market_order_never_sends_second(self) -> None:
+        """Рыночный ордер ушёл, а проверка исполнения упала обрывом сети: на
+        следующем шаге новый сигнал по другой бумаге — второго рыночного
+        ордера нет; своя позиция принята по метке, тейк поставлен."""
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.get_order
+        tr.okx.get_order = mock.Mock(side_effect=OSError("обрыв"))  # type: ignore[method-assign]
+        with self.assertRaises(OSError):
+            tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual(self.state()["entering"]["inst"], "BTC-USDT-SWAP")
+        tr.okx.get_order = real  # type: ignore[method-assign]
+        # Биржа ещё не показывает позицию в списке — а сигнал по другой бумаге уже есть.
+        shown, self.ex.pos = self.ex.pos, []
+        self.now += MIN
+        self.add_fills(self.stx())
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1, "второго рыночного ордера нет")
+        self.ex.pos = shown
+        tr.last_sync = 0
+        tr.step()
+        st = self.state()
+        self.assertEqual(st["open"]["inst"], "BTC-USDT-SWAP")
+        self.assertNotIn("entering", st)
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
+
+    def test_gateway_error_on_order_is_not_a_refusal(self) -> None:
+        """Шлюз ответил 502 (не JSON), а ордер на бирже исполнился: это не
+        отказ — бумага не исключается, следующий сигнал в том же шаге не
+        входит, позиция принимается сверкой."""
+        tr = self.trader(self.whales() + self.stx())
+        self.on()
+        real = tr.okx.order
+
+        def order(body):
+            got = real(body)
+            if body["ordType"] == "market":
+                raise lv.OkxError("502", "HTTP")
+            return got
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1, "второй сигнал не вошёл")
+        st = self.state()
+        self.assertIn("entering", st)
+        self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
+        self.assertIn("не подтверждён", st["last_skip"]["why"])
+        tr.okx.order = real  # type: ignore[method-assign]
+        tr.last_sync = 0
+        tr.step()
+        self.assertIn(self.state()["open"]["inst"], ("BTC-USDT-SWAP", "STX-USDT-SWAP"))
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_canceled_market_order_is_not_a_position(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.order
+
+        def order(body):
+            got = real(body)
+            if body["ordType"] == "market":
+                self.ex.orders[-1].update(state="canceled", accFillSz="0")
+                self.ex.pos.clear()
+            return got
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.step()
+        st = self.state()
+        self.assertIsNone(st["open"])
+        self.assertNotIn("entering", st)
+        self.assertFalse(st["blocked"]["BTC-USDT-SWAP"]["permanent"])
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
+
+    def test_unconfirmed_fill_is_not_recorded_as_position(self) -> None:
+        """Биржа приняла рыночный ордер, но исполнение не подтверждает (state
+        live, исполнено 0): позицию не записывать — ждать сверки."""
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.order
+
+        def order(body):
+            got = real(body)
+            if body["ordType"] == "market":
+                self.ex.orders[-1].update(state="live", accFillSz="0")
+                self.ex.pos.clear()
+            return got
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.step()
+        st = self.state()
+        self.assertIsNone(st["open"])
+        self.assertEqual(st["entering"]["inst"], "BTC-USDT-SWAP")
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [])
+
+    def test_unconfirmed_entry_expires_after_10_minutes(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        tr.st["entering"] = {"inst": "BTC-USDT-SWAP", "cl": "wtin404", "at": self.now, "coin": "BTC", "side": 1}
+        tr.sync()
+        self.assertIn("entering", tr.st, "ещё ждём")
+        self.now += 11 * MIN
+        tr.sync()
+        self.assertNotIn("entering", tr.st)
+
+    def test_tp_filled_while_owner_added_to_position(self) -> None:
+        """Режим net: бот в лонге 10, владелец докупил 15 руками; тейк бота
+        исполнился — позиция 15 (ручная). Сделка записана, нового тейка на
+        ручную часть нет."""
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
+        tp.update(state="filled", avgPx="101000", accFillSz="10", pnl="100", fee="-5", fillTime=str(self.now + 5 * MIN))
+        self.ex.pos[0]["pos"] = "15"
+        self.now += 10 * MIN
+        tr.last_sync = 0
+        tr.step()
+        with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+            [t] = [json.loads(x) for x in f]
+        self.assertEqual((t["why"], t["pnl"], t["px_out"]), ("тейк", 100.0, 101000.0))
+        self.assertIsNone(self.state()["open"])
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [])
+
+    def test_long_short_owner_opposite_position_is_not_bots(self) -> None:
+        """Режим long/short: бот в лонге BTC, владелец открыл шорт BTC руками.
+        Лонг бота закрыт (тейком или руками, тейк снят) — бот видит закрытие,
+        а не принимает шорт владельца за свой и не ставит на него тейк."""
+        for tp_state, why in (("filled", "тейк"), ("canceled", "закрыта")):
+            self.ex = FakeOkx("long_short_mode")
+            tr = self.trader(self.whales())
+            self.on()
+            tr.step()
+            next(o for o in self.ex.orders if o["ordType"] == "limit")["state"] = tp_state
+            self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "4", "posSide": "short", "avgPx": "100500",
+                            "markPx": "100500"}]
+            self.now += 10 * MIN
+            px = "101000" if tp_state == "filled" else "100200"
+            self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "9", "closeAvgPx": px}]
+            tr.last_sync = 0
+            tr.step()
+            self.assertIsNone(self.state()["open"], tp_state)
+            self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [], tp_state)
+            with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+                self.assertEqual(json.loads(f.readlines()[-1])["why"], why)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_cancel_failure_after_close_records_trade_once(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.ex.pos = []
+        self.now += 10 * MIN
+        self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "-3", "closeAvgPx": "99990"}]
+        tr.okx.cancel = mock.Mock(side_effect=lv.OkxError("50001", "сервис занят"))  # type: ignore[method-assign]
+        for _ in range(3):
+            tr.last_sync = 0
+            tr.step()
+        with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+            self.assertEqual(len(f.readlines()), 1, "закрытие записано один раз")
+        self.assertTrue(any("остаток тейка не снят" in x for x in self.logs))
+
+    def test_history_failure_blocks_entries_until_checked(self) -> None:
+        """Позиция на счёте, история ордеров недоступна: своя она или ручная —
+        неизвестно; новых входов нет, пока не проверено."""
+        self.ex.pos = [{"instId": "ETH-USDT-SWAP", "pos": "-3", "posSide": "net", "avgPx": "3000"}]
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.history
+        tr.okx.history = mock.Mock(side_effect=lv.OkxError("50013", "занято"))  # type: ignore[method-assign]
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        self.assertIn("не удалось проверить", self.state()["last_skip"]["why"])
+        tr.okx.history = real  # type: ignore[method-assign]
+        self.now += MIN
+        self.add_fills(self.stx(20))
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual(self.state()["open"]["margin_pct"], 5.0)
+
+    def test_late_whale_fill_is_counted(self) -> None:
+        """Сделка кита пришла в базу позже следующей (бот записал её с
+        задержкой): она всё равно считается в окне 2 часов."""
+        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)])
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        # Время — на 12 минут раньше уже прочитанной: опоздала дольше любого «нахлёста».
+        self.add_fills([fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000)])
+        self.now += MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_window_keeps_time_order_for_late_items(self) -> None:
+        import autotrade_backtest as bt
+        w = bt.Window([1000 * 10**9])
+        w.add(T0, "0xa", 5000 * 10**9, 0.05)
+        w.add(T0 - 90 * MIN, "0xb", 5000 * 10**9, 0.05)  # опоздавшая — старше
+        self.assertEqual(w.count[0], 2)
+        w.expire(T0 - 60 * MIN)                          # уходит именно она, а не новая
+        self.assertEqual(w.count[0], 1)
+        w.expire(T0 + MIN)
+        self.assertEqual(w.count[0], 0)
+
+    def test_missing_db_is_an_error_not_exit(self) -> None:
+        with self.assertRaises(OSError):
+            lv.Signals(os.path.join(self.tmp.name, "нет.db")).poll(self.now)
+
+    def test_corrupted_state_file_does_not_stop_trading(self) -> None:
+        """state.json испорчен (правка руками, обрыв): служба не падает на
+        каждом шаге; испорченная запись позиции забыта — своя позиция
+        находится по метке ордера."""
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        good = self.state()
+        for bad in ({"entered": [], "events": "x", "blocked": 5, "open": {"inst": 1}},
+                    {"open": {**good["open"], "side": 0}}, {"open": "мусор", "entering": "x", "error": None}, []):
+            with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+                json.dump(bad, f)
+            tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                           clock=lambda: self.now, log=self.logs.append)
+            tr.last_sync = 0
+            tr.step()
+            self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP", str(bad))
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_janitor_survives_garbage_state_and_drops_expired_blocks(self) -> None:
+        tr = self.trader(self.whales())
+        now_ms = self.now
+        tr.st["entered"] = {"BTC": "мусор", "ETH": now_ms}
+        tr.st["blocked"] = {"A": {"at": now_ms - 20 * MIN, "permanent": False},
+                            "B": {"at": now_ms - 20 * MIN, "permanent": True},
+                            "C": {"at": now_ms - 8 * 86_400_000, "permanent": True}, "D": "мусор"}
+        lv.Janitor(self.dir, rss=lambda: 10.0).run(tr, None, now_ms / 1000)
+        self.assertEqual(tr.st["entered"], {"ETH": now_ms})
+        self.assertEqual(sorted(tr.st["blocked"]), ["B"])
+
+
 class JanitorTest(Base):
     def test_cleans_windows_lists_logs_cache_and_asks_restart_when_fat(self) -> None:
         tr = self.trader(self.whales())
@@ -799,6 +1055,41 @@ class BacktestServiceTest(unittest.TestCase):
         small.tick(True)
         self.assertIsNone(small.proc)
         self.assertIn("переустановите", self.status()["error"])
+
+    def test_corrupted_status_file_is_sanitized(self) -> None:
+        with open(os.path.join(self.dir, "backtest_status.json"), "w") as f:
+            json.dump({"next": "завтра", "started": [1], "finished": None, "error": 5}, f)
+        b = lv.Backtests(self.dir, "/db/hyperliquid.db", self.script, limit_mb=lambda: 4096)
+        self.assertIsInstance(b.st["next"], int)
+        self.assertGreater(b.st["next"], 0)
+        self.assertEqual((b.st["started"], b.st["finished"], b.st["error"]), (0, 0, ""))
+        b.tick(True, now=1000.0)  # не падает на сравнении строки с числом
+
+    def test_stubborn_process_is_killed(self) -> None:
+        """Пересчёт не вышел по terminate за 30 с — kill, а не исключение из службы."""
+        calls = []
+
+        class P:
+            def terminate(self) -> None:
+                calls.append("term")
+
+            def kill(self) -> None:
+                calls.append("kill")
+
+            def wait(self, timeout: float) -> int:
+                calls.append("wait")
+                if calls.count("wait") == 1:
+                    raise lv.subprocess.TimeoutExpired("bt", timeout)
+                return -9
+
+        lv.Backtests._stop(P(), terminate=True)  # type: ignore[arg-type]
+        self.assertEqual(calls, ["term", "wait", "kill", "wait"])
+
+    def test_cgroup_garbage_is_no_limit(self) -> None:
+        import io
+        files = [io.StringIO("0::/system.slice/x\n"), io.StringIO("мусор\n")]
+        with mock.patch("builtins.open", side_effect=lambda *a, **k: files.pop(0)):
+            self.assertEqual(lv.cgroup_limit_mb(), float("inf"))
 
     def test_next_run_nightly_utc(self) -> None:
         day = 1_800_000_000 // 86400 * 86400

@@ -14,6 +14,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(ROOT, "tools", "autotrade_live.py")
+BT_PATH = os.path.join(ROOT, "tools", "autotrade_backtest.py")  # окно китов — общее с бэктестом
 TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py"]
 ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "PYTHONDONTWRITEBYTECODE": "1"}
 EQUIV: set[str] = set()
@@ -48,6 +49,22 @@ MUTS = [
      "тейк на шаге — не ближе +1 %"),
     ("in_usd = str(ins.get(\"ctValCcy\", \"\")).upper() in (\"USD\", \"USDC\", \"USDT\")\n        qty",
      "in_usd = False\n        qty", "контракт в долларах"),
+    # Ревизия: ни второго рыночного ордера, ни чужой позиции за свою
+    ("        if self.st.get(\"entering\"):\n            return \"прошлый вход", "        if False:\n            return \"прошлый вход",
+     "вход не подтверждён — новых нет"),
+    ("if self.st.get(\"entering\") and not (e.code.isdigit() and len(e.code) == 5):", "if False:",
+     "ошибка шлюза на ордер — не отказ, а сверка"),
+    ("if o.get(\"state\") not in (\"filled\", \"partially_filled\") or got_sz <= 0:", "if False:",
+     "исполнение не подтверждено — позиции не записываем"),
+    ("if o.get(\"state\") in (\"canceled\", \"mmp_canceled\") and got_sz <= 0:", "if False:",
+     "рыночный отменён без исполнения — входа нет"),
+    ("or self.clock() - num(e.get(\"at\")) > 600_000:", ":", "неподтверждённый вход снимается через 10 минут"),
+    ("        if self.unverified:\n", "        if False:\n", "позиции не проверены — входов нет"),
+    ("                self.unverified.add(inst)\n", "", "сбой истории — позиция не проверена"),
+    ("op[\"inst\"] and self._side_of(p) == op[\"side\"]]", "op[\"inst\"]]", "своя позиция — та же сторона (long/short)"),
+    ("            if tp.get(\"state\") == \"filled\":", "            if False:", "тейк исполнен — сделка закрыта"),
+    ("        if op is not None and not (isinstance(op, dict)", "        if False and not (isinstance(op, dict)", "испорченная запись позиции — забыть"),
+    ("        if not os.path.isfile(self.db):", "        if False:", "нет базы — ошибка шага, не выход"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
@@ -65,7 +82,8 @@ MUTS = [
      "в ответе — только объекты"),
     ("abs(px / mark - 1) <= ADOPT_TOL", "True", "подхват — цена входа по рынку"),
     ("BLOCK_CODES = {\"50124\",", "BLOCK_CODES = {\"50000\",", "50124 — бумага исключается"),
-    ("now - int(b.get(\"at\", 0)) < (BLOCK_MS if b.get(\"permanent\") else FAIL_PAUSE_MS)", "now - int(b.get(\"at\", 0)) < FAIL_PAUSE_MS",
+    ("isinstance(b, dict) and now - num(b.get(\"at\")) < (BLOCK_MS if b.get(\"permanent\") else FAIL_PAUSE_MS)",
+     "isinstance(b, dict) and now - num(b.get(\"at\")) < FAIL_PAUSE_MS",
      "исключение бумаги — на неделю"),
     ("                if e.code == \"50119\":\n                    continue\n", "", "ключ ищется на всех адресах"),
     ("    return \"SWAP\" if inst.endswith(\"-SWAP\") else \"FUTURES\"", "    return \"SWAP\"", "европейский бессрочный — FUTURES"),
@@ -74,33 +92,50 @@ MUTS = [
     ("                    and (1 if o.get(\"side\") == \"buy\" else -1) == side", "                    and True", "своя позиция — та же сторона"),
     ("                \"WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid\", (since, now)",
      "                \"WHERE dir_code IN (1, 2) AND ts >= ? ORDER BY ts, tid\", (since,)", "сделки китов — только до «сейчас»"),
-    ("            w.expire(ts - WINDOW_MS)\n            w.add(", "            w.add(", "окно — без старше 2 часов"),
+    ("            w.expire(newest - WINDOW_MS)\n", "", "окно — без старше 2 часов"),
     ("        if self.limit_mb() < BT_NEED_MB:", "        if False:", "бэктест — только при достаточной памяти службы"),
-    ("                self.proc.terminate()\n", "", "«Стоп» прерывает пересчёт"),
+    ("            proc.terminate()\n", "", "«Стоп» прерывает пересчёт"),
+    ("            except subprocess.TimeoutExpired:\n                pass\n        proc.kill()", "            except subprocess.TimeoutExpired:\n                pass\n            return\n        proc.kill()",
+     "не вышел по «Стоп» — kill"),
     ("        cut = int(now * 1000) - COIN_PAUSE_MS", "        cut = int(now * 1000)", "очистка входов — только старше 3 часов"),
+    ("and ms - num(b.get(\"at\")) < (BLOCK_MS", "and ms - num(b.get(\"at\")) < 10**15 + (BLOCK_MS", "очистка: истёкшие запреты бумаг"),
     ("            if os.path.getsize(path) > LOG_MAX_BYTES:", "            if False:", "ротация журнала"),
     ("            if now - mtime > CACHE_MAX_DAYS * 86400:", "            if False:", "кеш старше 30 дней — удаляется"),
 ]
 
+BT_MUTS = [
+    ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
+]
+
 
 def main() -> int:
-    with open(PATH, encoding="utf-8") as f:
-        src = f.read()
-    alive: list[str] = []
     # MUTATE_ONLY="часть имени|другая" — только эти (перепроверить выживших).
     only = [x for x in os.environ.get("MUTATE_ONLY", "").split("|") if x]
-    muts = [m for m in MUTS if not only or any(o in m[2] for o in only)]
+    pick = lambda ms: [m for m in ms if not only or any(o in m[2] for o in only)]  # noqa: E731
     # Контроль: на чистом коде тесты обязаны проходить — иначе каждая мутация
     # «убита» падением, которое было и без неё.
     for t in TESTS:
         if subprocess.run([sys.executable, t], cwd=ROOT, env=ENV, capture_output=True, timeout=300, check=False).returncode:
             print(f"тесты падают и без мутаций: {t} — проверка недействительна")
             return 2
+    alive: list[str] = []
+    total = 0
+    for path, muts in ((PATH, pick(MUTS)), (BT_PATH, pick(BT_MUTS))):
+        alive += run(path, muts)
+        total += len(muts) - len(EQUIV & {m[2] for m in muts})
+    print(f"ИТОГ: убито {total - len(alive)} из {total}; выжили: {alive}")
+    return 1 if alive else 0
+
+
+def run(path: str, muts: list[tuple[str, str, str]]) -> list[str]:
+    with open(path, encoding="utf-8") as f:
+        src = f.read()
+    alive: list[str] = []
     try:
         for a, b, name in muts:
             if src.count(a) != 1:
                 sys.exit(f"мутация «{name}»: текст найден {src.count(a)} раз — обновите список")
-            with open(PATH, "w", encoding="utf-8") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(src.replace(a, b))
             killed = False
             for t in TESTS:
@@ -117,11 +152,9 @@ def main() -> int:
             if not killed and name not in EQUIV:
                 alive.append(name)
     finally:
-        with open(PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(src)
-    total = len(muts) - len(EQUIV & {m[2] for m in muts})
-    print(f"ИТОГ: убито {total - len(alive)} из {total}; выжили: {alive}")
-    return 1 if alive else 0
+    return alive
 
 
 if __name__ == "__main__":
