@@ -497,10 +497,10 @@ class EeaTest(Base):
 
 class RejectTest(Base):
     def test_refused_instrument_is_excluded_and_next_signal_trades(self) -> None:
-        """OKX EEA не даёт торговать бумагой (50124 на ордер): позиции нет,
-        бумага исключена на неделю, бот не долбит её ордерами и входит по
-        следующему сигналу в другую бумагу."""
-        self.ex.reject["STX-USDT-SWAP"] = "50124"
+        """OKX не даёт торговать самой бумагой (51155 — ограничение по стране):
+        позиции нет, бумага исключена на неделю, бот не долбит её ордерами и
+        входит по следующему сигналу в другую бумагу."""
+        self.ex.reject["STX-USDT-SWAP"] = "51155"
         fills = [fill(1, "0xa", "STX", 1, self.now - 4 * MIN, 5000, 0.5),
                  fill(2, "0xb", "STX", 1, self.now - 3 * MIN, 5000, 0.5),
                  fill(3, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000),
@@ -530,7 +530,7 @@ class RejectTest(Base):
                               and c[2].get("instId") == "STX-USDT-SWAP"]), 1)
 
     def test_refused_instrument_stays_excluded_for_a_week(self) -> None:
-        self.ex.reject["BTC-USDT-SWAP"] = "50124"
+        self.ex.reject["BTC-USDT-SWAP"] = "51001"
         tr = self.trader(self.whales())
         self.on()
         tr.step()
@@ -540,6 +540,86 @@ class RejectTest(Base):
         self.assertIn("OKX не даёт торговать", tr.try_enter({**sig, "ts": self.now}))
         self.now += 7 * 86_400_000  # неделя прошла — снова пробуем
         self.assertEqual(tr.try_enter({**sig, "ts": self.now}), "")
+
+    def test_key_closed_market_pauses_market_not_instruments(self) -> None:
+        """Как было на сервере владельца: OKX отклоняет каждый ордер 50124
+        («ключу не разрешена торговля на рынке»). Это про ключ, не про бумагу:
+        ни одна бумага не исключается; рынок — пауза 30 минут (одна проверка
+        ордером, а не по ордеру на каждый сигнал); ключ исправили — следующий
+        сигнал входит, в том числе по BTC."""
+        self.ex.reject["BTC-USDT-SWAP"] = self.ex.reject["STX-USDT-SWAP"] = "50124"
+        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 5000, 0.5), fill(11, "0xd", "STX", 1, self.now - 2 * MIN, 5000, 0.5)]
+        tr = self.trader(self.whales() + stx)
+        self.on()
+        tr.step()
+        st = self.state()
+        tries = [c for c in self.ex.calls if c[1] == "/api/v5/trade/order"]
+        self.assertEqual(len(tries), 1, "второй сигнал — без ордера: рынок на паузе")
+        self.assertEqual(st["blocked"], {}, "бумаги не исключены")
+        self.assertIn("SWAP", st["market_block"])
+        self.assertIn("ключу OKX закрыт рынок", st["last_skip"]["why"])
+        self.assertEqual(st["last_skip"]["code"], "market")
+        self.assertTrue(any("Бумаги не исключаются" in e for e in st["events"]))
+        self.assertIn("50124", st["key_problem"]["why"])
+        # Ключ исправили; через 31 минуту — снова пробуем, и BTC входит.
+        del self.ex.reject["BTC-USDT-SWAP"]
+        self.now += 31 * MIN
+        sig = {"coin": "BTC", "side": 1, "ts": self.now, "whales": 2, "ref_px": 100_000}
+        self.assertEqual(tr.try_enter(sig), "")
+        self.assertEqual(tr.st["open"]["inst"], "BTC-USDT-SWAP")
+        self.assertNotIn("key_problem", tr.st, "ордер прошёл — проблемы ключа нет")
+
+    def test_closed_swap_market_does_not_stop_xperp(self) -> None:
+        """Закрыт один рынок (USDT-SWAP на европейском счёте) — европейские
+        бессрочные (FUTURES) торгуются дальше."""
+        x = "BTC-USD_UM_XPERP-310815"
+        self.ex.instr[x] = {"instId": x, "instType": "FUTURES", "state": "live", "ctVal": "0.0001", "ctMult": "1",
+                            "ctValCcy": "BTC", "lotSz": "1", "minSz": "1", "tickSz": "0.1"}
+        self.ex.last[x] = 100_000.0
+        self.ex.reject["STX-USDT-SWAP"] = "50124"
+        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 5000, 0.5), fill(11, "0xd", "STX", 1, self.now - MIN // 2, 5000, 0.5)]
+        tr = self.trader(self.whales() + stx)
+        self.on()
+        tr.step()
+        self.assertEqual(self.state()["open"]["inst"], x)
+        self.assertIn("SWAP", self.state()["market_block"])
+
+    def test_old_week_exclusions_for_50124_are_lifted(self) -> None:
+        """Прежняя версия исключила BTC, ETH и др. на неделю за 50124 — при
+        старте новой эти исключения снимаются; исключения по бумаге остаются."""
+        os.makedirs(os.path.join(self.dir, "live"))
+        with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+            json.dump({"blocked": {
+                "BTC-USD_UM_XPERP-310404": {"at": self.now, "why": "OKX 50124: This API Key does not have trading permission",
+                                            "permanent": True},
+                "STX-USDT-SWAP": {"at": self.now, "why": "OKX 51155: compliance", "permanent": True}}}, f)
+        tr = self.trader(self.whales())
+        self.assertEqual(list(tr.st["blocked"]), ["STX-USDT-SWAP"])
+
+    def test_skip_counter_by_reason_per_hour_for_a_day(self) -> None:
+        """Счётчик пропусков: по причинам, один сигнал с одной причиной за
+        час — один раз; старше суток — не считается."""
+        self.ex.last["BTC-USDT-SWAP"] = 100_500  # цена ушла дальше 0,3 %
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        con = sqlite3.connect(self.db)
+        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?)",
+                        [fill(20 + i, f"0x{i}", "BTC", 1, self.now + i * 1000, 5000, 100_000) for i in range(3)])
+        con.commit()
+        con.close()
+        self.now += 5000
+        tr.step()   # новые сделки китов по той же бумаге — тот же сигнал, счёт не растёт
+        total = lambda: sum(sum(v.values()) for v in self.state()["skips"].values())  # noqa: E731
+        self.assertEqual(total(), 1)
+        self.assertEqual(next(iter(self.state()["skips"].values())), {"chase": 1})
+        tr.count_skip({"coin": "ETH", "side": -1}, "no_inst")
+        tr.save()
+        self.assertEqual(total(), 2)
+        self.now += 25 * 3_600_000
+        tr.count_skip({"coin": "SOL", "side": 1}, "no_inst")
+        tr.save()
+        self.assertEqual(list(self.state()["skips"].values()), [{"no_inst": 1}], "старше суток — убрано")
 
     def test_other_order_error_pauses_coin_15_min(self) -> None:
         self.ex.reject["BTC-USDT-SWAP"] = "51008"  # мало маржи — не про бумагу

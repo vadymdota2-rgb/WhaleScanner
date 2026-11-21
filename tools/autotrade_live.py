@@ -71,8 +71,8 @@ OKX_HINTS = {
     "50105": "неверный Passphrase", "50110": "IP сервера не разрешён в настройках ключа OKX",
     "50101": "ключ от другого режима: демо-ключ на реальном счёте или наоборот (OKX_SIMULATED)",
     "50120": "у ключа нет права «Торговля»", "51008": "не хватает маржи на счёте",
-    "50124": "ключу или счёту закрыт рынок бессрочных фьючерсов: у ключа включите право «Торговля», "
-             "а на счёте OKX — доступ к Perpetual (фьючерсам)",
+    "50124": "ключу API закрыт этот рынок (фьючерсы): в OKX → API откройте ключ и разрешите торговлю "
+             "фьючерсами; если такой настройки нет — создайте новый ключ (права «Торговля», без вывода)",
 }
 NANOS = bt.NANOS
 
@@ -100,10 +100,17 @@ INSTR_TTL = 3600           # каталог OKX — раз в час
 TAG = "wt"                 # приставка clOrdId наших ордеров
 # Отказы OKX по самой бумаге (не по счёту): этой бумагой торговать нельзя —
 # исключить её на неделю и искать следующие сигналы, а не долбить ордерами.
-# 50124 — рынок закрыт для ключа/страны (у OKX EEA — часть контрактов),
 # 51001 — бумаги нет, 51155/51156 — ограничения по стране (compliance),
 # 51010 — режим счёта не позволяет эту бумагу.
-BLOCK_CODES = {"50124", "51001", "51155", "51156", "51010"}
+BLOCK_CODES = {"51001", "51155", "51156", "51010"}
+# Отказы по КЛЮЧУ, а не по бумаге: 50124 — «ключу не разрешена торговля на
+# этом рынке». На сервере владельца так OKX отклонил подряд AAPL, BTC, MSFT,
+# NVDA, HYPE, ETH, PUMP — исключать бумаги на неделю было неверно (после
+# исправления ключа BTC и ETH ещё неделю пропускались бы). Теперь — пауза
+# всего рынка (SWAP или FUTURES) на 30 минут: одна проверка ордером раз в
+# полчаса, бумаги не исключаются; ключ исправлен — следующий сигнал входит.
+MARKET_CODES = {"50124"}
+MARKET_PAUSE_MS = 30 * 60_000
 BLOCK_MS = 7 * 86_400_000
 FAIL_PAUSE_MS = 15 * 60_000  # другой отказ ордера — эту бумагу не трогать 15 минут
 
@@ -589,6 +596,9 @@ class Janitor:
         tr.st["blocked"] = {i: b for i, b in blocked.items() if isinstance(b, dict)
                             and ms - num(b.get("at")) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS)} \
             if isinstance(blocked, dict) else {}
+        mb = tr.st.get("market_block")
+        tr.st["market_block"] = {k: v for k, v in mb.items() if isinstance(v, dict) and ms - num(v.get("at")) < MARKET_PAUSE_MS} \
+            if isinstance(mb, dict) else {}
         self.rotate(os.path.join(tr.dir, "live.log"))
         busy = bts is not None and bts.proc is not None   # идёт пересчёт — его лог и кеш не трогаем
         freed = 0
@@ -664,6 +674,8 @@ class Trader:
         self.last_sync = 0.0
         self.unverified: set[str] = set()   # позиции, которые не удалось проверить по истории ордеров
         self._checked: dict[str, float] = {}
+        self.skip_code = "other"
+        self._skip_seen: set[tuple[str, int, str, int]] = set()
 
     # состояние
     def _load(self) -> dict[str, Any]:
@@ -676,9 +688,14 @@ class Trader:
             pass
         # Файл пишет сама служба, но правка руками или порча не должны ронять
         # каждый шаг: поля — своих типов, иначе пустые.
-        for k, kind in (("entered", dict), ("events", list), ("blocked", dict), ("own_unknown", dict)):
+        for k, kind in (("entered", dict), ("events", list), ("blocked", dict), ("own_unknown", dict),
+                        ("market_block", dict), ("skips", dict)):
             if not isinstance(st.get(k), kind):
                 st[k] = kind()
+        # Прежняя версия исключала бумаги на неделю за 50124 (а это запрет ключу,
+        # не бумаге): такие исключения снять — BTC, ETH и др. снова доступны.
+        st["blocked"] = {i: b for i, b in st["blocked"].items()
+                         if not (isinstance(b, dict) and "50124" in str(b.get("why", "")))}
         st["events"] = [e for e in st["events"] if isinstance(e, str)]
         op = st.get("open")
         if op is not None and not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)
@@ -883,45 +900,69 @@ class Trader:
             out.append(s)
         return out
 
+    def _skip(self, code: str, why: str) -> str:
+        """Причина пропуска: текст — вкладке, код — в счётчик за сутки."""
+        self.skip_code = code
+        return why
+
+    def count_skip(self, s: dict[str, Any], code: str) -> None:
+        """Счётчик пропусков по причинам — по часам, 24 часа. Один сигнал
+        (бумага и сторона) с одной причиной за час — один раз: новые сделки
+        китов по той же бумаге не раздувают счёт."""
+        hour = self.clock() // 3_600_000 * 3_600_000
+        key = (s["coin"], s["side"], code, hour)
+        if key in self._skip_seen:
+            return
+        self._skip_seen = {k for k in self._skip_seen if k[3] == hour} | {key}
+        skips = {h: v for h, v in self.st["skips"].items() if isinstance(v, dict) and num(h) > hour - 24 * 3_600_000}
+        bucket = skips.setdefault(str(hour), {})
+        bucket[code] = int(num(bucket.get(code))) + 1
+        self.st["skips"] = skips
+
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
         if self.st.get("open"):
-            return f"у бота уже есть своя позиция ({(self.st.get('open') or {}).get('inst')})"
+            return self._skip("own_open", f"у бота уже есть своя позиция ({(self.st.get('open') or {}).get('inst')})")
         if self.st.get("entering"):
-            return "прошлый вход ещё не подтверждён биржей — сверка"
+            return self._skip("entering", "прошлый вход ещё не подтверждён биржей — сверка")
         if self.unverified:
-            return f"не удалось проверить позиции ({', '.join(sorted(self.unverified))}) — свои они или ваши"
+            return self._skip("unverified", f"не удалось проверить позиции ({', '.join(sorted(self.unverified))}) — свои они или ваши")
         unknown = [str(p.get("instId")) for p in self.positions if str(p.get("instId")) in self.st.get("own_unknown", {})]
         if unknown:
-            return f"своя позиция без записи ({', '.join(unknown)}) — проверьте её в OKX; пока она есть, бот не входит"
+            return self._skip("own_unknown", f"своя позиция без записи ({', '.join(unknown)}) — проверьте её в OKX; пока она есть, бот не входит")
         # Остальные позиции на счёте — владельца (руками): бот входит, но 5 %.
         foreign = [str(p.get("instId")) for p in self.positions]
         if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
-            return "в эту бумагу входили меньше 3 часов назад"
+            return self._skip("coin_pause", "в эту бумагу входили меньше 3 часов назад")
         base, scale = bt.okx_candidate(s["coin"])
         inst = self.inst_for(base)
         blocked = self.st.setdefault("blocked", {})
         b = blocked.get(inst)
         if isinstance(b, dict) and now - num(b.get("at")) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
-            return f"{inst}: OKX не даёт торговать ({b.get('why', '')})"
+            return self._skip("blocked", f"{inst}: OKX не даёт торговать ({b.get('why', '')})")
+        mb = self.st["market_block"].get(inst_type(inst))
+        if isinstance(mb, dict) and now - num(mb.get("at")) < MARKET_PAUSE_MS:
+            left = int((MARKET_PAUSE_MS - (now - num(mb.get("at")))) // 60_000) + 1
+            return self._skip("market", f"ключу OKX закрыт рынок {inst_type(inst)} — проверка снова через {left} мин "
+                                        f"({mb.get('why', '')})")
         if inst in foreign:
             # Своя сделка бота на той же бумаге смешалась бы с ручной (в режиме
             # net — вычлась бы из неё), а тейк бота закрыл бы часть ручной.
-            return f"на {inst} уже ваша позиция — бот на эту бумагу не входит"
+            return self._skip("manual_same", f"на {inst} уже ваша позиция — бот на эту бумагу не входит")
         ins = self.instruments().get(inst)
         if not ins:
-            return f"{inst} нет на OKX"
+            return self._skip("no_inst", f"{inst} нет на OKX")
         last = self.okx.ticker(inst)
         if last <= 0:
-            return "нет цены OKX"
+            return self._skip("no_price", "нет цены OKX")
         hl_px = last * scale
         if abs(hl_px / s["ref_px"] - 1) > MATCH_TOL:
-            return f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})"
+            return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE:
-            return f"цена ушла от китов дальше {CHASE * 100:g} %"
+            return self._skip("chase", f"цена ушла от китов дальше {CHASE * 100:g} %")
         if self.equity <= 0:
-            return "капитал счёта 0"
+            return self._skip("no_equity", "капитал счёта 0")
         frac = MARGIN_FRAC_SHARED if foreign else MARGIN_FRAC
         notional = self.equity * frac * LEVERAGE
         # Параметры бумаги из каталога — только конечные положительные: мусор
@@ -929,7 +970,7 @@ class Trader:
         ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
         step, min_sz, tick = dec(ins.get("lotSz")), dec(ins.get("minSz")), dec(ins.get("tickSz"))
         if ct_val is None or ct_mult is None or step is None or min_sz is None or tick is None:
-            return f"{inst}: неверные параметры бумаги в каталоге OKX"
+            return self._skip("bad_params", f"{inst}: неверные параметры бумаги в каталоге OKX")
         ct_d = ct_val * ct_mult
         ct = float(ct_d)
         # Десятичными, не двоичными дробями: 10 000 / (10 000 000 × 0,00001) — ровно 100, а не 99,999…
@@ -941,9 +982,9 @@ class Trader:
         # слишком крупный для этой цены — тейк невозможен, без выхода не входим.
         tp_try = round_step(last * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= TP + TP_SLACK:
-            return f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +1 % при цене {last}"
+            return self._skip("tick", f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +1 % при цене {last}")
         if sz < min_sz:
-            return f"позиция {notional:.0f} $ меньше минимальной на OKX"
+            return self._skip("min_size", f"позиция {notional:.0f} $ меньше минимальной на OKX")
         cl = f"{TAG}in{now % 10**12}"
         try:
             if inst not in self.lever_set:
@@ -963,15 +1004,26 @@ class Trader:
                 # позицию или снимет запись; до тех пор новых входов нет.
                 self.event(f"{inst}: ответ на ордер не получен — {e}; сверка по счёту")
                 self.save()
-                return f"{inst}: ответ на ордер не получен — сверка"
-            # Ордер не принят биржей — позиции нет. Бумагу — в исключённые (по
-            # самой бумаге — на неделю, иначе — на 15 минут), сигналы — дальше.
+                return self._skip("unconfirmed", f"{inst}: ответ на ордер не получен — сверка")
+            # Ордер не принят биржей — позиции нет.
             self.st.pop("entering", None)
+            why = str(e).split(" [")[0][:400]
+            if e.code in MARKET_CODES:
+                # Закрыто ключу, а не бумаге: пауза всего рынка, бумаги не исключаются.
+                self.st["market_block"][inst_type(inst)] = {"at": now, "why": why}
+                # Во вкладку — пока ордер на этом рынке не пройдёт (пауза рынка короче).
+                self.st["key_problem"] = {"at": now, "why": why, "market": inst_type(inst)}
+                self.event(f"{inst}: ордер не принят — {why}. Бумаги не исключаются: бот проверит рынок снова "
+                           f"через {MARKET_PAUSE_MS // 60_000} минут")
+                return self._skip("market", f"{inst}: ключу OKX закрыт рынок ({e.code})")
+            # По самой бумаге — в исключённые на неделю, иначе — на 15 минут; сигналы — дальше.
             permanent = e.code in BLOCK_CODES
-            blocked[inst] = {"at": now, "why": str(e).split(" [")[0][:200], "permanent": permanent}
+            blocked[inst] = {"at": now, "why": why, "permanent": permanent}
             self.event(f"{inst}: ордер не принят — {e}; "
                        + ("бумага исключена на 7 дней" if permanent else "пауза по бумаге 15 минут"))
-            return f"{inst}: ордер не принят ({e.code})"
+            return self._skip("rejected", f"{inst}: ордер не принят ({e.code})")
+        if (self.st.get("key_problem") or {}).get("market") == inst_type(inst):
+            self.st.pop("key_problem", None)  # ордер на этом рынке принят — ключ в порядке
         o: dict[str, Any] = {}
         for _ in range(10):
             o = self.okx.get_order(inst, ord_id)
@@ -983,13 +1035,13 @@ class Trader:
             self.st.pop("entering", None)
             blocked[inst] = {"at": now, "why": f"рыночный ордер отменён биржей ({o.get('state')})", "permanent": False}
             self.event(f"{inst}: рыночный ордер отменён биржей без исполнения — входа нет")
-            return f"{inst}: ордер отменён биржей"
+            return self._skip("canceled", f"{inst}: ордер отменён биржей")
         if o.get("state") not in ("filled", "partially_filled") or got_sz <= 0:
             # Не ясно, исполнился ли: запись «входим» остаётся, сверка счёта
             # (resolve_entering) примет позицию по метке или снимет запись.
             self.event(f"{inst}: исполнение ордера не подтверждено ({o.get('state') or 'нет ответа'}) — сверка по счёту")
             self.save()
-            return f"{inst}: исполнение не подтверждено — сверка"
+            return self._skip("unconfirmed", f"{inst}: исполнение не подтверждено — сверка")
         # Цена и объём исполнения — с биржи; мусор или ноль — цена тикера и наш объём.
         avg = num(o.get("avgPx"))
         # Цена исполнения рыночного ордера — рядом с тикером (±5 %); дальше —
@@ -1109,10 +1161,13 @@ class Trader:
             self.save()
             return
         for s in self.candidates(sigs):
+            self.skip_code = "other"
             why = self.try_enter(s)
             if not why:
                 break
-            self.st["last_skip"] = {"coin": s["coin"], "side": s["side"], "why": why, "at": self.clock()}
+            self.st["last_skip"] = {"coin": s["coin"], "side": s["side"], "why": why, "at": self.clock(),
+                                    "code": self.skip_code}
+            self.count_skip(s, self.skip_code)
         self.save()
 
 
