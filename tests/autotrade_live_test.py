@@ -167,6 +167,33 @@ class SignTest(Base):
         self.assertEqual(seen["headers"]["OK-ACCESS-SIGN"],
                          base64.b64encode(hmac.new(b"S", msg.encode(), hashlib.sha256).digest()).decode())
 
+    def test_detect_finds_eea_address_for_european_key(self) -> None:
+        """Ключ европейского аккаунта (OKX EEA): www отвечает 50119 «ключа нет»
+        — бот пробует eea.okx.com и остаётся там; подпись — без адреса."""
+        hosts = []
+
+        def t(method, url, headers, body):
+            hosts.append(urllib.parse.urlparse(url).netloc)
+            if "eea." in url:
+                return {"code": "0", "data": [{"posMode": "net_mode"}]}
+            return {"code": "50119", "msg": "API key doesn't exist", "data": []}
+
+        okx = lv.Okx("K", "S", "P", False, t)
+        self.assertEqual(okx.detect(), "https://eea.okx.com")
+        self.assertEqual(hosts, ["www.okx.com", "eea.okx.com"])
+        hosts.clear()
+        okx.detect("https://eea.okx.com")  # запомненный — первым, без лишних запросов
+        self.assertEqual(hosts, ["eea.okx.com"])
+        # Нигде нет — понятная причина; другая ошибка (IP) — сразу, без перебора.
+        none = lv.Okx("K", "S", "P", False, lambda *_: {"code": "50119", "msg": "x", "data": []})
+        with self.assertRaisesRegex(lv.OkxError, "не найден ни на одном адресе"):
+            none.detect()
+        calls = []
+        ip = lv.Okx("K", "S", "P", False, lambda *a: calls.append(a) or {"code": "50110", "msg": "ip", "data": []})
+        with self.assertRaisesRegex(lv.OkxError, "IP сервера"):
+            ip.detect()
+        self.assertEqual(len(calls), 1)
+
     def test_error_is_raised_with_reason(self) -> None:
         okx = lv.Okx("K", "S", "P", False, lambda *_: {"code": "1", "msg": "", "data": [{"sCode": "51008", "sMsg": "мало маржи"}]})
         with self.assertRaisesRegex(lv.OkxError, "51008: мало маржи"):

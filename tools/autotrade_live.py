@@ -53,6 +53,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autotrade_backtest as bt  # noqa: E402 — общий код: окно китов, имена OKX, открытие базы на чтение
 
 OKX = "https://www.okx.com"
+# Ключ живёт на одном адресе: глобальный OKX, европейский (OKX EEA, вход
+# через my.okx.com — API на eea.okx.com) или американский. Чужой адрес
+# отвечает 50119 «ключа нет» — бот пробует по очереди и запоминает рабочий.
+# OKX_API_BASE в /etc/whale-autotrade.env — проверяется первым.
+OKX_BASES = ("https://www.okx.com", "https://eea.okx.com", "https://us.okx.com")
+# Понятные причины частых отказов OKX (код → текст во вкладку).
+OKX_HINTS = {
+    "50119": "ключ не найден ни на одном адресе OKX (www, eea, us) — удалён или введён с ошибкой",
+    "50111": "неверный API key", "50113": "неверная подпись — проверьте Secret key",
+    "50105": "неверный Passphrase", "50110": "IP сервера не разрешён в настройках ключа OKX",
+    "50101": "ключ от другого режима: демо-ключ на реальном счёте или наоборот (OKX_SIMULATED)",
+    "50120": "у ключа нет права «Торговля»", "51008": "не хватает маржи на счёте",
+}
 NANOS = bt.NANOS
 
 # Правила владельца.
@@ -81,7 +94,8 @@ def now_ms() -> int:
 
 class OkxError(Exception):
     def __init__(self, code: str, msg: str) -> None:
-        super().__init__(f"OKX {code}: {msg}")
+        hint = OKX_HINTS.get(code)
+        super().__init__(f"OKX {code}: {msg}" + (f" — {hint}" if hint else ""))
         self.code = code
 
 
@@ -104,10 +118,28 @@ class Okx:
     """Подписанный REST OKX v5. Секреты — только в памяти этого объекта."""
 
     def __init__(self, key: str, secret: str, passphrase: str, simulated: bool,
-                 transport: Transport | None = None) -> None:
+                 transport: Transport | None = None, base: str = OKX) -> None:
         self._key, self._secret, self._pass = key, secret, passphrase
         self.simulated = simulated
         self._t = transport or http_transport
+        self.base = base.rstrip("/")
+
+    def detect(self, first: str = "") -> str:
+        """Найти адрес, на котором живёт ключ: «ключа нет» (50119) — следующий.
+        Другая ошибка (подпись, IP, Passphrase) — сразу наружу: адрес верный,
+        неверен ключ."""
+        order = [b.rstrip("/") for b in (first, *OKX_BASES) if b]
+        for b in dict.fromkeys(order):
+            self.base = b
+            try:
+                self.call("GET", "/api/v5/account/config")
+            except OkxError as e:
+                if e.code == "50119":
+                    continue
+                raise
+            return b
+        self.base = order[0]
+        raise OkxError("50119", "API key doesn't exist")
 
     def _sign(self, ts: str, method: str, path: str, body: str) -> str:
         mac = hmac.new(self._secret.encode(), (ts + method + path + body).encode(), hashlib.sha256)
@@ -126,7 +158,7 @@ class Okx:
                             "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": self._pass})
         if self.simulated:
             headers["x-simulated-trading"] = "1"
-        got = self._t(method, OKX + path, headers, raw.encode() if body is not None else None)
+        got = self._t(method, self.base + path, headers, raw.encode() if body is not None else None)
         if not isinstance(got, dict):
             raise OkxError("?", "ответ не JSON-объект")
         if str(got.get("code")) != "0":
@@ -490,6 +522,16 @@ def main(argv: list[str] | None = None) -> int:
     okx = Okx(key, secret, pw, os.environ.get("OKX_SIMULATED") == "1")
     del key, secret, pw
     tr = Trader(okx, Signals(a.db), a.dir)
+    try:
+        base = okx.detect(os.environ.get("OKX_API_BASE", "") or str(tr.st.get("base") or ""))
+        tr.st["base"] = base
+        tr.event(f"ключ OKX принят: {base}")
+    except (OkxError, OSError) as e:
+        tr.st["error"] = str(e)[:300]
+        tr.event(f"ключ OKX не принят: {e}")
+        tr.save()
+        time.sleep(300)  # служба перезапустится и попробует снова
+        return 1
     me = [os.path.abspath(__file__), bt.__file__]
     stamp = [os.path.getmtime(p) for p in me]
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
