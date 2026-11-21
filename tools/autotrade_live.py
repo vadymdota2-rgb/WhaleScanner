@@ -201,7 +201,10 @@ class Okx:
         return float(d[0].get("totalEq") or 0) if d else 0.0
 
     def positions(self) -> list[dict]:
-        return [p for p in self.call("GET", "/api/v5/account/positions", {"instType": "SWAP"})
+        """ВСЕ позиции счёта — бессрочные, срочные фьючерсы, маржа, опционы:
+        правило «одна позиция за раз» считает и ручные сделки владельца любого
+        вида (раньше — только бессрочные: срочный фьючерс владельца бот не видел)."""
+        return [p for p in self.call("GET", "/api/v5/account/positions")
                 if float(p.get("pos") or 0) != 0]
 
     def set_leverage(self, inst: str, lever: int) -> None:
@@ -654,7 +657,8 @@ class Trader:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
         if self.st.get("open") or self.positions:
-            return "на счёте уже есть позиция"
+            names = ", ".join(str(p.get("instId")) for p in self.positions) or str((self.st.get("open") or {}).get("inst"))
+            return f"на счёте уже есть позиция ({names})"
         if now - int(self.st["entered"].get(s["coin"], 0)) < COIN_PAUSE_MS:
             return "в эту бумагу входили меньше 3 часов назад"
         base, scale = bt.okx_candidate(s["coin"])
@@ -785,6 +789,9 @@ def main(argv: list[str] | None = None) -> int:
                  "3": "Мультивалютная маржа", "4": "Портфельная маржа"}
         tr.event(f"счёт OKX: режим {lv_} — {modes.get(lv_, 'неизвестный')}; позиции: {cfg.get('posMode')}; "
                  f"уровень доступа: {cfg.get('level') or '?'}; права ключа: {cfg.get('perm') or '?'}")
+        held = okx.positions()
+        tr.event("открытые позиции на счёте: " + (", ".join(f"{p.get('instId')} ({p.get('instType', '?')})"
+                                                            for p in held) or "нет"))
     except (OkxError, OSError) as e:
         tr.st["error"] = str(e)[:300]
         tr.event(f"ключ OKX не принят: {e}")

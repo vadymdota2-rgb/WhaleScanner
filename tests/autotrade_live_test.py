@@ -242,12 +242,17 @@ class TradeTest(Base):
         self.assertFalse(self.state()["on"])
 
     def test_any_position_blocks_even_manual(self) -> None:
-        self.ex.pos = [{"instId": "ETH-USDT-SWAP", "pos": "-3", "posSide": "net", "avgPx": "3000"}]  # руками владельца
+        # Руками владельца — срочный фьючерс (не бессрочный): тоже позиция.
+        self.ex.pos = [{"instId": "ETH-USDT-250328", "instType": "FUTURES", "pos": "-3", "posSide": "net", "avgPx": "3000"}]
         tr = self.trader(self.whales())
         self.on()
         tr.step()
         self.assertEqual(self.market_orders(), [])
-        self.assertEqual(self.state()["last_skip"]["why"], "на счёте уже есть позиция")
+        self.assertIn("на счёте уже есть позиция", self.state()["last_skip"]["why"])
+        self.assertIn("ETH-USDT-250328", self.state()["last_skip"]["why"])
+        # Запрос позиций — без фильтра по виду (все позиции счёта).
+        q = [c[2] for c in self.ex.calls if c[1] == "/api/v5/account/positions"]
+        self.assertTrue(q and all("instType" not in x for x in q))
 
     def test_chase_and_other_asset_and_stale(self) -> None:
         cases = [(100_400, "цена ушла от китов"), (110_000, "другой актив"), (99_000, "")]
