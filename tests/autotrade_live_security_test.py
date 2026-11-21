@@ -151,6 +151,14 @@ class GarbageTradeTest(Base):
         self.assertEqual(self.ex.orders, [])
         self.assertIsNone(tr.st.get("open"))
         self.assertTrue(any("не сходится с рынком" in e for e in self.logs))
+        # Своя, но не принятая позиция — бот её не считает ручной: новых входов
+        # нет, пока она есть (иначе у бота было бы две позиции).
+        tr.positions = [p]
+        self.assertIn("своя позиция без записи", tr.try_enter({"coin": "SOL", "side": 1, "ts": self.now,
+                                                               "whales": 2, "ref_px": 100.0}))
+        self.ex.pos = []
+        tr.sync()
+        self.assertEqual(tr.st.get("own_unknown"), {})  # позиция закрыта — запрет снят
 
     def test_tp_never_at_zero_or_into_market(self) -> None:
         tr = self.trader(self.whales())

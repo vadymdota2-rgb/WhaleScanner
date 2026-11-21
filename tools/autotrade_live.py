@@ -15,9 +15,10 @@
 - только фьючерсы (крипта, акции, металлы), бумага должна быть на OKX и цена
   сходиться с ценой китов (±2 %) — иначе это другой актив;
 - не догоняем: цена OKX хуже средней цены китов больше чем на 0,3 % — пропуск;
-- маржа — 10 % капитала счёта, плечо 10×, кросс;
-- всегда одна открытая позиция: пока на счёте есть ЛЮБАЯ позиция (и
-  открытая владельцем руками) — новую не открываем;
+- маржа — 10 % капитала счёта, плечо 10×, кросс; на счёте открыта сделка
+  владельца (руками, любого вида) — бот всё равно входит, но маржой 5 %;
+  на ту же бумагу, где ручная позиция, — не входит;
+- у бота своя позиция — всегда одна: пока её не закрыли, вторую не открываем;
 - выход — только тейк +1 % движения цены (лимитный ордер на бирже), без
   стопа и срока: пересиживаем; бот позицию сам никогда не закрывает;
 - в одну и ту же бумагу — не чаще раза в 3 часа.
@@ -82,6 +83,9 @@ WINDOW_MS = 2 * 3_600_000
 CHASE = 0.003
 MATCH_TOL = 0.02
 MARGIN_FRAC = 0.10
+# На счёте открыта сделка владельца (руками) — бот всё равно входит, но маржой
+# 5 % капитала, а не 10 % (правило владельца). Своя позиция у бота — одна.
+MARGIN_FRAC_SHARED = 0.05
 LEVERAGE = 10
 TP = 0.01
 COIN_PAUSE_MS = 3 * 3_600_000
@@ -274,8 +278,8 @@ class Okx:
 
     def positions(self) -> list[dict[str, Any]]:
         """ВСЕ позиции счёта — бессрочные, срочные фьючерсы, маржа, опционы:
-        правило «одна позиция за раз» считает и ручные сделки владельца любого
-        вида (раньше — только бессрочные: срочный фьючерс владельца бот не видел)."""
+        ручная сделка владельца любого вида видна боту (маржа 5 % вместо 10 %,
+        её бумага — не для бота); раньше бот видел только бессрочные."""
         return [p for p in self.call("GET", "/api/v5/account/positions")
                 if isinstance(p, dict) and num(p.get("pos")) != 0]
 
@@ -639,6 +643,7 @@ class Trader:
                                                          "mgnMode", "cTime")} for p in self.positions],
                        on=self.is_on(), rules={"whales": MIN_WHALES, "whale_usd": MIN_WHALE_USD, "window_h": 2,
                                                "chase_pct": CHASE * 100, "margin_pct": MARGIN_FRAC * 100,
+                                               "margin_shared_pct": MARGIN_FRAC_SHARED * 100,
                                                "leverage": LEVERAGE, "tp_pct": TP * 100, "coin_pause_h": 3})
         tmp = os.path.join(self.dir, "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
@@ -703,6 +708,9 @@ class Trader:
         self.positions = self.okx.positions()
         self.equity = self.okx.equity()
         self.last_sync = time.time()
+        held = {str(p.get("instId")) for p in self.positions}
+        if self.st.get("own_unknown"):
+            self.st["own_unknown"] = {k: v for k, v in self.st["own_unknown"].items() if k in held}
         self.find_own()
         self._track_open()
 
@@ -717,7 +725,8 @@ class Trader:
             p = live[0]
             op.update(mark=num(p.get("markPx")), upl=num(p.get("upl")))
             if not any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
-                self._place_tp(op, size_of(p.get("pos")))
+                # Не больше своего объёма: позиция на бумаге могла вырасти ручной докупкой.
+                self._place_tp(op, min(size_of(p.get("pos")), size_of(op.get("size"))))
             return
         if self.clock() - op["opened"] < 60_000:
             return  # биржа ещё не показала только что открытую позицию
@@ -776,9 +785,13 @@ class Trader:
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
-        if self.st.get("open") or self.positions:
-            names = ", ".join(str(p.get("instId")) for p in self.positions) or str((self.st.get("open") or {}).get("inst"))
-            return f"на счёте уже есть позиция ({names})"
+        if self.st.get("open"):
+            return f"у бота уже есть своя позиция ({(self.st.get('open') or {}).get('inst')})"
+        unknown = [str(p.get("instId")) for p in self.positions if str(p.get("instId")) in self.st.get("own_unknown", {})]
+        if unknown:
+            return f"своя позиция без записи ({', '.join(unknown)}) — проверьте её в OKX; пока она есть, бот не входит"
+        # Остальные позиции на счёте — владельца (руками): бот входит, но 5 %.
+        foreign = [str(p.get("instId")) for p in self.positions]
         if now - int(self.st["entered"].get(s["coin"], 0)) < COIN_PAUSE_MS:
             return "в эту бумагу входили меньше 3 часов назад"
         base, scale = bt.okx_candidate(s["coin"])
@@ -787,6 +800,10 @@ class Trader:
         b = blocked.get(inst)
         if b and now - int(b.get("at", 0)) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
             return f"{inst}: OKX не даёт торговать ({b.get('why', '')})"
+        if inst in foreign:
+            # Своя сделка бота на той же бумаге смешалась бы с ручной (в режиме
+            # net — вычлась бы из неё), а тейк бота закрыл бы часть ручной.
+            return f"на {inst} уже ваша позиция — бот на эту бумагу не входит"
         ins = self.instruments().get(inst)
         if not ins:
             return f"{inst} нет на OKX"
@@ -800,7 +817,8 @@ class Trader:
             return f"цена ушла от китов дальше {CHASE * 100:g} %"
         if self.equity <= 0:
             return "капитал счёта 0"
-        notional = self.equity * MARGIN_FRAC * LEVERAGE
+        frac = MARGIN_FRAC_SHARED if foreign else MARGIN_FRAC
+        notional = self.equity * frac * LEVERAGE
         # Параметры бумаги из каталога — только конечные положительные: мусор
         # в каталоге не должен дать ордер неверного размера.
         ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
@@ -859,12 +877,14 @@ class Trader:
         tp = round_step(fill_px * (1 + s["side"] * TP), fmt_dec(tick), ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
-              "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id}
+              "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id,
+              "margin_pct": round(frac * 100, 2)}
         self.st["open"] = op
         self.st["entered"][s["coin"]] = now
         self.st.pop("entering", None)
         self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} {fmt_dec(sz)} по {fill_px} "
-                   f"(≈{op['notional']:.0f} $, китов {s['whales']}), тейк {op['tp_s']}")
+                   f"(≈{op['notional']:.0f} $, маржа {frac * 100:g} %"
+                   f"{' — на счёте ваша позиция' if foreign else ''}, китов {s['whales']}), тейк {op['tp_s']}")
         self._place_tp(op, filled_d)
         self.save()
         return ""
@@ -875,7 +895,7 @@ class Trader:
             return 1 if ps == "long" else -1
         return 1 if num(p.get("pos")) > 0 else -1
 
-    def adopt(self, p: dict[str, Any], order: dict[str, Any], info: dict[str, Any] | None = None) -> None:
+    def adopt(self, p: dict[str, Any], order: dict[str, Any], info: dict[str, Any] | None = None) -> bool:
         """Позиция открыта нашим ордером, но не записана (служба упала между
         ордером и записью): принять как свою и поставить тейк."""
         inst = str(p["instId"])
@@ -886,7 +906,10 @@ class Trader:
         if not (px > 0 and mark > 0 and abs(px / mark - 1) <= ADOPT_TOL):
             self.event(f"{inst}: своя позиция без записи, но цена входа {px} не сходится с рынком {mark} — "
                        "тейк не ставлю, проверьте позицию в OKX")
-            return
+            # Своя, но не принята: пока она есть — новых входов нет (иначе у бота
+            # было бы две позиции, а эту он считал бы ручной).
+            self.st.setdefault("own_unknown", {})[inst] = self.clock()
+            return False
         size_d = size_of(p.get("pos"))
         size = float(size_d)
         tp = round_step(px * (1 + side * TP), ins.get("tickSz", "0.0001"), ROUND_CEILING if side > 0 else ROUND_FLOOR)
@@ -909,6 +932,7 @@ class Trader:
         else:
             self._place_tp(op, size_d)
         self.save()
+        return True
 
     def find_own(self) -> None:
         """Позиции на счёте, которые бот не ведёт: открыты нашим рыночным

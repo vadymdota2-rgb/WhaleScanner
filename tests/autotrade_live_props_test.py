@@ -4,12 +4,13 @@
 фиксировано: нарушение воспроизводится по номеру случая).
 
 Свойства (рынок честный, параметры случайные; PROPS случаев):
-  1. Вход — тогда и только тогда, когда: модуль включён, на счёте нет ни
-     одной позиции, сигнал свежий, в бумагу не входили 3 часа, цена OKX
+  1. Вход — тогда и только тогда, когда: модуль включён, у бота нет своей
+     позиции, ручной позиции владельца на этой же бумаге нет, сигнал свежий, в бумагу не входили 3 часа, цена OKX
      сходится с ценой китов (±2 %) и не хуже её больше чем на 0,3 %,
      размер не меньше минимума бумаги.
-  2. Размер — ровно floor(10 % капитала × 10 / (контракт × цена) / шаг) × шаг
-     (контракт в долларах — без цены); номинал не больше 10 % × 10 капитала.
+  2. Размер — ровно floor(маржа × капитал × 10 / (контракт × цена) / шаг) × шаг,
+     маржа 10 %, а при ручной позиции владельца на счёте — 5 % (контракт в
+     долларах — без цены); номинал не больше маржа × 10 капитала.
   3. Вход — рыночный; выход — один лимитный ордер на весь объём; цена тейка
      — на шаге цены, по ту сторону от входа, не ближе +1 % и не дальше
      +1 % + шаг.
@@ -49,7 +50,7 @@ def rnd_garbage(r: random.Random):
 class PropsTest(Base):
     def test_entry_size_and_tp_properties(self) -> None:
         r = random.Random(20261121)
-        entered = 0
+        entered = shared = 0
         for case in range(PROPS):
             self.ex = FakeOkx(r.choice(["net_mode", "long_short_mode"]))
             price = 10 ** r.uniform(-5, 5)
@@ -67,8 +68,11 @@ class PropsTest(Base):
             ref = price * (1 + (r.uniform(-0.004, 0.004) if r.random() < 0.7 else r.uniform(-0.03, 0.03)))
             self.ex.last = {inst: price}
             self.ex.eq = r.choice([0.0, 50.0, 1000.0, 10_000.0, 1e6 * r.random()])
-            if r.random() < 0.2:
-                self.ex.pos = [{"instId": "ETH-USD_UM_XPERP-310815", "instType": "FUTURES", "pos": "1", "posSide": "net"}]
+            # Ручная позиция владельца: нет / на другой бумаге (вход — 5 %) / на той же (не входим).
+            manual = r.choice([None] * 7 + ["other", "other", "same"])
+            if manual:
+                self.ex.pos = [{"instId": "ETH-USD_UM_XPERP-310815" if manual == "other" else inst,
+                                "instType": "FUTURES", "pos": "1", "posSide": "net", "avgPx": str(price)}]
             on = r.random() < 0.85
             age = r.choice([1, 5, 14, 16, 60])
             paused = r.random() < 0.15
@@ -85,23 +89,23 @@ class PropsTest(Base):
             self.on(on)
             tr.step()
             markets = [o for o in self.ex.orders if o["ordType"] == "market"]
-            notional = Decimal(repr(round(self.ex.eq * 0.1 * 10, 6)))
+            frac = lv.MARGIN_FRAC_SHARED if manual else lv.MARGIN_FRAC
+            notional = Decimal(repr(round(self.ex.eq * frac * lv.LEVERAGE, 6)))
             qty = notional / (ct_val if ct_usd else ct_val * Decimal(repr(price)))
             want_sz = (qty / lot).to_integral_value(rounding=ROUND_DOWN) * lot
             hl = price
-            should = (on and not self.ex.pos[:1 if not markets else 0] and age <= 15 and not paused
+            should = (on and manual != "same" and age <= 15 and not paused
                       and self.ex.eq > 0 and abs(hl / ref - 1) <= lv.MATCH_TOL and side * (hl / ref - 1) <= lv.CHASE
                       and want_sz >= min_sz)
-            had_pos = any(p["instId"] != inst for p in self.ex.pos)
-            should = should and not had_pos
             tp_try = lv.round_step(price * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
             should = should and tp_try > 0 and lv.TP * 0.999 <= side * (float(tp_try) / price - 1) <= lv.TP + lv.TP_SLACK
             ctx = f"случай {case}: side {side} price {price} ref {ref} eq {self.ex.eq} ct {ct_val} usd {ct_usd} " \
-                  f"lot {lot} min {min_sz} on {on} age {age} paused {paused} pos {had_pos}"
+                  f"lot {lot} min {min_sz} on {on} age {age} paused {paused} ручная {manual}"
             self.assertEqual(len(markets), int(should), ctx)
             if not markets:
                 continue
             entered += 1
+            shared += manual == "other"
             m = markets[0]
             self.assertEqual(Decimal(m["sz"]), want_sz, ctx)
             self.assertLessEqual(Decimal(m["sz"]) * (ct_val if ct_usd else ct_val * Decimal(repr(price))),
@@ -117,7 +121,8 @@ class PropsTest(Base):
             self.assertGreaterEqual(move, lv.TP * 0.999999, ctx)
             self.assertLessEqual(move, min(lv.TP + float(tick) / price + 1e-9, lv.TP + lv.TP_SLACK), ctx)
         # Проверка не пустая: заметная доля случаев дошла до входа.
-        self.assertGreater(entered, PROPS // 10)
+        self.assertGreater(entered, PROPS // 20)
+        self.assertGreater(shared, 0, "ни одного входа при ручной позиции (5 %) — генератор не проверяет правило")
 
 
 class FuzzTest(Base):
@@ -164,7 +169,7 @@ class FuzzTest(Base):
             self.on()
             entries: list[tuple[dict, bool]] = []
             for _step in range(r.randint(1, 4)):
-                known = bool(tr.positions) or bool(tr.st.get("open"))
+                known = bool(tr.st.get("open"))  # своя позиция бота (ручные — разрешены, 5 %)
                 before = len(self.ex.orders)
                 try:
                     tr.step()
@@ -191,7 +196,7 @@ class FuzzTest(Base):
                         self.assertGreaterEqual(s * (float(o["px"]) / fill_px - 1), lv.TP * 0.999, ctx)
             self.assertLessEqual(len(entries), 1, f"случай {case}: больше одного входа")
             for _o, known in entries:
-                self.assertFalse(known, f"случай {case}: вход при известной позиции")
+                self.assertFalse(known, f"случай {case}: второй вход при своей открытой позиции")
             for name in os.listdir(os.path.join(self.dir, "live")):
                 with open(os.path.join(self.dir, "live", name), encoding="utf-8") as f:
                     text = f.read()

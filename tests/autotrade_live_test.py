@@ -249,19 +249,61 @@ class TradeTest(Base):
         self.assertEqual(self.market_orders(), [])
         self.assertFalse(self.state()["on"])
 
-    def test_any_position_blocks_even_manual(self) -> None:
-        # Руками владельца — срочный фьючерс (не бессрочный): тоже позиция.
+    def test_manual_position_halves_margin_to_5_percent(self) -> None:
+        """Правило владельца: на счёте его ручная сделка (любого вида — здесь
+        срочный фьючерс) — бот всё равно входит, но маржой 5 % капитала, а не
+        10 %: 10 000 $ × 5 % × 10 = 5 000 $ → 5 контрактов по 1 000 $."""
         self.ex.pos = [{"instId": "ETH-USDT-250328", "instType": "FUTURES", "pos": "-3", "posSide": "net", "avgPx": "3000"}]
         tr = self.trader(self.whales())
         self.on()
         tr.step()
-        self.assertEqual(self.market_orders(), [])
-        self.assertIn("на счёте уже есть позиция", self.state()["last_skip"]["why"])
-        self.assertIn("ETH-USDT-250328", self.state()["last_skip"]["why"])
+        [m] = self.market_orders()
+        self.assertEqual((m["instId"], m["sz"]), ("BTC-USDT-SWAP", "5"))
+        [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
+        self.assertEqual(tp["sz"], "5")
+        self.assertEqual(self.state()["open"]["margin_pct"], 5.0)
+        self.assertTrue(any("маржа 5 % — на счёте ваша позиция" in e for e in self.state()["events"]))
         # Запрос позиций — без фильтра по виду (все позиции счёта).
         q = [c[2] for c in self.ex.calls if c[1] == "/api/v5/account/positions"]
         self.assertTrue(q and all("instType" not in x for x in q))
+        # Своя позиция у бота — одна: пока она открыта, второй нет (и при ручной).
+        self.now += 2 * MIN
+        tr.last_sync = 0
+        self.assertIn("у бота уже есть своя позиция", tr.try_enter({"coin": "SOL", "side": 1, "ts": self.now,
+                                                                    "whales": 2, "ref_px": 100.0}))
 
+    def test_no_manual_position_full_10_percent(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders()[0]["sz"], "10")
+        self.assertEqual(self.state()["open"]["margin_pct"], 10.0)
+
+    def test_same_instrument_as_manual_is_skipped(self) -> None:
+        """Ручная позиция на той же бумаге: сделка бота смешалась бы с ней
+        (в режиме net — вычлась бы), а тейк бота закрыл бы часть ручной."""
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "2", "posSide": "net", "avgPx": "90000", "markPx": "100000"}]
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        self.assertIn("уже ваша позиция", self.state()["last_skip"]["why"])
+
+    def test_retaken_tp_is_only_bots_share(self) -> None:
+        """Тейк сняли, а позиция на бумаге выросла (докупили руками): новый тейк
+        — только на объём бота, не на всю позицию."""
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        for o in self.ex.orders:
+            if o["ordType"] == "limit":
+                o["state"] = "canceled"
+        self.ex.pos[0]["pos"] = "25"
+        self.now += 2 * MIN
+        tr.last_sync = 0
+        tr.step()
+        live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
+        self.assertEqual([o["sz"] for o in live], ["10"])
     def test_chase_and_other_asset_and_stale(self) -> None:
         cases = [(100_400, "цена ушла от китов"), (110_000, "другой актив"), (99_000, "")]
         for okx_px, why in cases:
@@ -583,10 +625,12 @@ class RecoverTest(Base):
         tr = self.trader(self.whales())
         self.on()
         tr.step()
-        st = self.state()
-        self.assertIsNone(st["open"])
-        self.assertEqual(self.market_orders()[1:], [])
-        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [])
+        # Ручная — не своя: не принята, тейк на неё не ставится; бот входит
+        # своей сделкой (5 %), и тейк — только на неё.
+        self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP")
+        self.assertEqual([o["instId"] for o in self.ex.orders if o["ordType"] == "limit"], ["BTC-USDT-SWAP"])
+        self.assertFalse(any(o.get("instId") == "ETH-USDT-SWAP" and o.get("clOrdId", "").startswith("wt")
+                             for o in self.ex.orders))
 
 
 class JanitorTest(Base):

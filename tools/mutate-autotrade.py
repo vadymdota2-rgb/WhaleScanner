@@ -30,7 +30,13 @@ MUTS = [
     ("TP = 0.01\n", "TP = 0.005\n", "тейк +1 %"),
     ("COIN_PAUSE_MS = 3 * 3_600_000", "COIN_PAUSE_MS = 3_600_000", "в бумагу — раз в 3 часа"),
     ("if key in seen or now - s[\"ts\"] > FRESH_MS:", "if key in seen:", "сигнал старше 15 минут — не входим"),
-    ("        if self.st.get(\"open\") or self.positions:", "        if self.st.get(\"open\"):", "одна позиция — и ручная тоже"),
+    ("        if self.st.get(\"open\"):\n            return f\"у бота уже есть своя позиция", "        if False:\n            return f\"у бота уже есть своя позиция",
+     "своя позиция у бота — одна"),
+    ("MARGIN_FRAC_SHARED = 0.05", "MARGIN_FRAC_SHARED = 0.10", "при ручной позиции — маржа 5 %"),
+    ("        frac = MARGIN_FRAC_SHARED if foreign else MARGIN_FRAC", "        frac = MARGIN_FRAC", "5 % — только когда есть ручная"),
+    ("        if inst in foreign:", "        if False:", "на бумагу с ручной позицией — не входим"),
+    ("        if unknown:\n", "        if False:\n", "своя непринятая позиция — новых входов нет"),
+    ("min(size_of(p.get(\"pos\")), size_of(op.get(\"size\")))", "size_of(p.get(\"pos\"))", "тейк заново — только на объём бота"),
     ("\"ordType\": \"market\", \"sz\": fmt_dec(sz)", "\"ordType\": \"limit\", \"sz\": fmt_dec(sz)", "вход — рыночный"),
     ("\"ordType\": \"limit\", \"px\": op[\"tp_s\"]", "\"ordType\": \"market\", \"px\": op[\"tp_s\"]", "выход — лимитный"),
     ("            body[\"reduceOnly\"] = True\n", "", "тейк в режиме net — только на закрытие"),
@@ -84,6 +90,12 @@ def main() -> int:
     # MUTATE_ONLY="часть имени|другая" — только эти (перепроверить выживших).
     only = [x for x in os.environ.get("MUTATE_ONLY", "").split("|") if x]
     muts = [m for m in MUTS if not only or any(o in m[2] for o in only)]
+    # Контроль: на чистом коде тесты обязаны проходить — иначе каждая мутация
+    # «убита» падением, которое было и без неё.
+    for t in TESTS:
+        if subprocess.run([sys.executable, t], cwd=ROOT, env=ENV, capture_output=True, timeout=300, check=False).returncode:
+            print(f"тесты падают и без мутаций: {t} — проверка недействительна")
+            return 2
     try:
         for a, b, name in muts:
             if src.count(a) != 1:
