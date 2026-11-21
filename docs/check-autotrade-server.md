@@ -74,9 +74,15 @@ systemctl show whale-autotrade -p ActiveState -p MemoryMax -p MemoryCurrent -p N
 ```bash
 mkdir -p "$T/ws/tools" "$T/ws/tests"
 cp ~/WhaleScanner/tools/autotrade_backtest.py "$T/ws/tools/"
-cp ~/WhaleScanner/tests/autotrade_backtest_test.py ~/WhaleScanner/tests/autotrade_scale_test.py "$T/ws/tests/"
+cp ~/WhaleScanner/tools/autotrade_live.py "$T/ws/tools/"
+cp ~/WhaleScanner/tests/autotrade_backtest_test.py ~/WhaleScanner/tests/autotrade_scale_test.py \
+   ~/WhaleScanner/tests/autotrade_live_test.py ~/WhaleScanner/tests/autotrade_live_security_test.py \
+   ~/WhaleScanner/tests/autotrade_live_props_test.py "$T/ws/tests/"
 (cd "$T/ws" && python3 tests/autotrade_backtest_test.py)              # «36 проверок без сети и без записи в базу»
 (cd "$T/ws" && nice -n 19 python3 tests/autotrade_scale_test.py)      # 300 000 ордеров, пик < 700 МБ; ~20–60 с; с пределом 150 МБ — код 3
+(cd "$T/ws" && python3 tests/autotrade_live_test.py)                  # «34 проверок на поддельной OKX — без сети, ключей и денег»
+(cd "$T/ws" && python3 tests/autotrade_live_security_test.py)         # «12 атак и порч — закрыты»
+(cd "$T/ws" && nice -n 19 python3 tests/autotrade_live_props_test.py) # «1500 случаев свойств и 1500 — фаззинга»
 ```
 
 Модуль API (без сети, без настоящих баз и ключей — всё подменено в тесте):
