@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import gc
 import hashlib
 import hmac
@@ -116,16 +117,71 @@ class OkxError(Exception):
 Transport = Callable[[str, str, dict[str, str], bytes | None], Any]
 
 
-def http_transport(method: str, url: str, headers: dict[str, str], body: bytes | None) -> Any:
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)  # noqa: S310 — адрес постоянный, https
+MAX_REPLY = 8 << 20  # ответ OKX больше — не ответ (каталог бумаг — ~0,6 МБ)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Перенаправление — отказ: иначе подписанные заголовки (ключ и
+    Passphrase) ушли бы на адрес, который назвал чужой ответ."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]  # noqa: ANN001, PLR0913
+        raise OkxError(str(code), f"перенаправление на {urllib.parse.urlsplit(newurl).netloc} — отказ")
+
+
+# Без прокси из окружения (ключ — только напрямую на OKX) и без перенаправлений.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+
+
+def _read_json(r: Any, limit: int) -> Any:
+    raw = r.read(limit + 1)
+    if len(raw) > limit:
+        raise OkxError("size", f"ответ больше {limit >> 20} МБ — не ответ")
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:  # noqa: S310
-            return json.loads(r.read(8 << 20))
+        return json.loads(raw)
+    except ValueError:
+        raise OkxError("json", "ответ не JSON") from None
+
+
+def http_transport(method: str, url: str, headers: dict[str, str], body: bytes | None) -> Any:
+    if not url.startswith(tuple(f"{b}/" for b in OKX_BASES)):
+        raise OkxError("host", "адрес не из списка OKX — запрос не отправлен")
+    req = urllib.request.Request(url, data=body, method=method,  # noqa: S310 — адрес проверен выше, https
+                                 headers={**headers, "Accept-Encoding": "identity"})
+    try:
+        with _OPENER.open(req, timeout=15) as r:
+            return _read_json(r, MAX_REPLY)
     except urllib.error.HTTPError as e:
         try:
-            return json.loads(e.read(1 << 20))
-        except ValueError:
+            return _read_json(e, 1 << 20)
+        except OkxError:
             raise OkxError(str(e.code), "HTTP") from None
+
+
+def num(v: Any, default: float = 0.0) -> float:
+    """Число из ответа OKX (строка или число): мусор, NaN, бесконечность,
+    булево — default. Ответ биржи не должен ронять службу или попасть в ордер."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return default
+    try:
+        x = float(v)
+    except (ValueError, OverflowError):
+        return default
+    return x if math.isfinite(x) else default
+
+
+DEC_MAX = Decimal("1e15")  # параметр бумаги больше — не параметр, а порча
+
+
+def dec(v: Any) -> Decimal | None:
+    """Параметр бумаги (размер контракта, шаг, минимум) — конечное
+    положительное десятичное; иначе None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        d = Decimal(str(v))
+    except ArithmeticError:
+        return None
+    return d if d.is_finite() and 0 < d <= DEC_MAX else None
 
 
 class Okx:
@@ -190,34 +246,34 @@ class Okx:
 
     def ticker(self, inst: str) -> float:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
-        return float(d[0]["last"]) if d else 0.0
+        return max(0.0, num(d[0].get("last"))) if d and isinstance(d[0], dict) else 0.0
 
     def config(self) -> dict:
         d = self.call("GET", "/api/v5/account/config")
-        return d[0] if d else {}
+        return d[0] if d and isinstance(d[0], dict) else {}
 
     def equity(self) -> float:
         d = self.call("GET", "/api/v5/account/balance")
-        return float(d[0].get("totalEq") or 0) if d else 0.0
+        return max(0.0, num(d[0].get("totalEq"))) if d and isinstance(d[0], dict) else 0.0
 
     def positions(self) -> list[dict]:
         """ВСЕ позиции счёта — бессрочные, срочные фьючерсы, маржа, опционы:
         правило «одна позиция за раз» считает и ручные сделки владельца любого
         вида (раньше — только бессрочные: срочный фьючерс владельца бот не видел)."""
         return [p for p in self.call("GET", "/api/v5/account/positions")
-                if float(p.get("pos") or 0) != 0]
+                if isinstance(p, dict) and num(p.get("pos")) != 0]
 
     def set_leverage(self, inst: str, lever: int) -> None:
         self.call("POST", "/api/v5/account/set-leverage", body={"instId": inst, "lever": str(lever), "mgnMode": "cross"})
 
     def order(self, body: dict) -> str:
         d = self.call("POST", "/api/v5/trade/order", body=body)
-        return str(d[0].get("ordId")) if d else ""
+        return str(d[0].get("ordId") or "") if d and isinstance(d[0], dict) else ""
 
     def get_order(self, inst: str, ord_id: str = "", cl_id: str = "") -> dict:
         p = {"instId": inst, **({"ordId": ord_id} if ord_id else {"clOrdId": cl_id})}
         d = self.call("GET", "/api/v5/trade/order", p)
-        return d[0] if d else {}
+        return d[0] if d and isinstance(d[0], dict) else {}
 
     def pending(self, inst: str) -> list[dict]:
         # Вид контракта — по имени: европейский бессрочный (…_XPERP-…) у OKX — FUTURES.
@@ -247,8 +303,12 @@ def fmt_dec(x: Decimal) -> str:
     return s if s not in ("-0", "") else "0"
 
 
-def round_step(value: float, step: str, mode: str) -> Decimal:
-    st = Decimal(step)
+def round_step(value: float, step: Any, mode: str) -> Decimal:
+    """Округлить до шага бумаги. Шаг или значение — мусор (не конечное
+    положительное) — 0: вызывающий такое не отправляет."""
+    st = step if isinstance(step, Decimal) and step.is_finite() and step > 0 else dec(step)
+    if st is None or not math.isfinite(value) or value <= 0:
+        return Decimal(0)
     # 12 значащих цифр: хвост двоичной дроби (101000.00000000001) не должен
     # сдвигать цену тейка на шаг вверх.
     return (Decimal(f"{value:.12g}") / st).to_integral_value(rounding=mode) * st
@@ -634,9 +694,9 @@ class Trader:
         live = [p for p in self.positions if p.get("instId") == op["inst"]]
         if live:
             p = live[0]
-            op.update(mark=float(p.get("markPx") or 0), upl=float(p.get("upl") or 0))
+            op.update(mark=num(p.get("markPx")), upl=num(p.get("upl")))
             if not any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
-                self._place_tp(op, abs(float(p.get("pos") or 0)))
+                self._place_tp(op, abs(num(p.get("pos"))))
             return
         if self.clock() - op["opened"] < 60_000:
             return  # биржа ещё не показала только что открытую позицию
@@ -645,12 +705,12 @@ class Trader:
             op.setdefault("gone_at", self.clock())  # позиции нет, а истории ещё нет — подождать до 5 минут
             return
         h = hist[0] if hist else {}
-        pnl = float(h.get("realizedPnl") or h.get("pnl") or 0)
+        pnl = num(h.get("realizedPnl"), num(h.get("pnl")))
         trade = {"coin": op["coin"], "inst": op["inst"], "side": op["side"], "opened": op["opened"],
-                 "closed": int(h.get("uTime") or self.clock()), "px_in": op["px"], "px_out": float(h.get("closeAvgPx") or 0),
-                 "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": float(h.get("fee") or 0),
-                 "funding": float(h.get("fundingFee") or 0), "notional": op["notional"],
-                 "why": "тейк" if h.get("closeAvgPx") and abs(float(h["closeAvgPx"]) / op["tp"] - 1) < 0.002 else "закрыта"}
+                 "closed": int(num(h.get("uTime"), self.clock())), "px_in": op["px"], "px_out": num(h.get("closeAvgPx")),
+                 "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": num(h.get("fee")),
+                 "funding": num(h.get("fundingFee")), "notional": op["notional"],
+                 "why": "тейк" if num(h.get("closeAvgPx")) > 0 and abs(num(h.get("closeAvgPx")) / op["tp"] - 1) < 0.002 else "закрыта"}
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
         for o in self.okx.pending(op["inst"]):  # оставшийся тейк — снять
@@ -666,7 +726,11 @@ class Trader:
     def _place_tp(self, op: dict, size: float) -> None:
         ins = self.instruments().get(op["inst"], {})
         sz = round_step(size, ins.get("lotSz", "1"), ROUND_DOWN)
-        if sz <= 0:
+        # Тейк — только по ту сторону от входа, не ближе +1 % (ни нулевой цены,
+        # ни цены «в рынок»: такой лимит исполнился бы сразу с убытком).
+        if sz <= 0 or not (op.get("px", 0) > 0 and op.get("tp", 0) > 0
+                           and op["side"] * (op["tp"] / op["px"] - 1) >= TP * 0.999):
+            self.event(f"тейк {op.get('inst')} не поставлен: цена {op.get('tp')} или объём {fmt_dec(sz)} неверны")
             return
         body = {"instId": op["inst"], "tdMode": "cross", "side": "sell" if op["side"] > 0 else "buy",
                 "ordType": "limit", "px": op["tp_s"], "sz": fmt_dec(sz),
@@ -716,17 +780,20 @@ class Trader:
         if self.equity <= 0:
             return "капитал счёта 0"
         notional = self.equity * MARGIN_FRAC * LEVERAGE
-        ct = float(ins.get("ctVal") or 0) * float(ins.get("ctMult") or 1)
-        if ct <= 0:
-            return "у бумаги нет размера контракта"
+        # Параметры бумаги из каталога — только конечные положительные: мусор
+        # в каталоге не должен дать ордер неверного размера.
+        ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
+        step, min_sz, tick = dec(ins.get("lotSz")), dec(ins.get("minSz")), dec(ins.get("tickSz"))
+        if ct_val is None or ct_mult is None or step is None or min_sz is None or tick is None:
+            return f"{inst}: неверные параметры бумаги в каталоге OKX"
+        ct_d = ct_val * ct_mult
+        ct = float(ct_d)
         # Десятичными, не двоичными дробями: 10 000 / (10 000 000 × 0,00001) — ровно 100, а не 99,999…
         # Размер контракта — в монете (ctValCcy = BTC) или уже в долларах (USD/USDC/USDT).
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-        ct_d = Decimal(ins.get("ctVal") or "0") * Decimal(ins.get("ctMult") or "1")
         qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(last)))
-        step = Decimal(ins.get("lotSz", "1"))
         sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-        if sz < Decimal(ins.get("minSz", "1")):
+        if sz < min_sz:
             return f"позиция {notional:.0f} $ меньше минимальной на OKX"
         cl = f"{TAG}in{now % 10**12}"
         try:
@@ -755,10 +822,10 @@ class Trader:
             if o.get("state") == "filled":
                 break
             time.sleep(0.5)
-        fill_px = float(o.get("avgPx") or last)
-        filled = float(o.get("accFillSz") or sz)
-        tick = ins.get("tickSz", "0.0001")
-        tp = round_step(fill_px * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
+        # Цена и объём исполнения — с биржи; мусор или ноль — цена тикера и наш объём.
+        fill_px = num(o.get("avgPx")) if num(o.get("avgPx")) > 0 else last
+        filled = num(o.get("accFillSz")) if 0 < num(o.get("accFillSz")) <= float(sz) else float(sz)
+        tp = round_step(fill_px * (1 + s["side"] * TP), fmt_dec(tick), ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id}
@@ -775,7 +842,7 @@ class Trader:
         ps = str(p.get("posSide") or "net")
         if ps in ("long", "short"):
             return 1 if ps == "long" else -1
-        return 1 if float(p.get("pos") or 0) > 0 else -1
+        return 1 if num(p.get("pos")) > 0 else -1
 
     def adopt(self, p: dict, order: dict, info: dict | None = None) -> None:
         """Позиция открыта нашим ордером, но не записана (служба упала между
@@ -783,11 +850,11 @@ class Trader:
         inst = str(p["instId"])
         side = self._side_of(p)
         ins = self.instruments().get(inst, {})
-        px = float(p.get("avgPx") or order.get("avgPx") or 0)
-        size = abs(float(p.get("pos") or 0))
+        px = num(p.get("avgPx")) or num(order.get("avgPx"))
+        size = abs(num(p.get("pos")))
         tp = round_step(px * (1 + side * TP), ins.get("tickSz", "0.0001"), ROUND_CEILING if side > 0 else ROUND_FLOOR)
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-        ct = float(ins.get("ctVal") or 0) * float(ins.get("ctMult") or 1)
+        ct = num(ins.get("ctVal")) * num(ins.get("ctMult"), 1.0)
         info = info or {}
         opened = int(order.get("fillTime") or order.get("cTime") or info.get("at") or self.clock())
         coin = info.get("coin") or inst.split("-", 1)[0]
@@ -876,12 +943,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dir", default=os.environ.get("WT_AUTOTRADE_DIR")
                     or os.path.expanduser("~/WalletTracker/autotrade_data"), help="каталог модуля")
     a = ap.parse_args(argv)
+    os.umask(0o077)  # состояние и журнал — только владельцу службы (позиции, капитал)
+    live_dir = os.path.join(a.dir, "live")
+    with contextlib.suppress(OSError):  # файлы прежних версий — тоже только владельцу
+        for e in os.scandir(live_dir):
+            if e.is_file(follow_symlinks=False):
+                os.chmod(e.path, 0o600)
     key, secret, pw = (os.environ.get(k, "") for k in ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE"))
     os.makedirs(os.path.join(a.dir, "live"), exist_ok=True)
     if not (key and secret and pw):
         msg = "нет ключа OKX (OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE в /etc/whale-autotrade.env)"
-        with open(os.path.join(a.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+        tmp = os.path.join(a.dir, "live", "state.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"error": msg, "heartbeat": now_ms(), "open": None, "entered": {}, "events": []}, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(a.dir, "live", "state.json"))
         print(f"[AUTO-LIVE] {msg}", flush=True)
         time.sleep(300)  # служба перезапустится — проверит снова
         return 1
@@ -934,7 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
             tr.step()
             tr.st["error"] = ""
             fails = 0
-        except (OkxError, OSError, sqlite3.Error, ValueError, KeyError) as e:
+        except Exception as e:  # noqa: BLE001 — шаг не должен ронять службу: сбой — в журнал и пауза
             fails += 1
             tr.st["error"] = str(e)[:300]
             tr.event(f"сбой: {e}")
