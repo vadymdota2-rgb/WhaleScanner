@@ -89,8 +89,8 @@ class FakeOkx:
             self.orders.append(o)
             return ok([{"ordId": o["ordId"], "clOrdId": b.get("clOrdId", ""), "sCode": "0"}])
         if p == "/api/v5/trade/order":
-            o = next(o for o in self.orders if o["ordId"] == q.get("ordId") or o.get("clOrdId") == q.get("clOrdId"))
-            return ok([o])
+            o = next((o for o in self.orders if o["ordId"] == q.get("ordId") or o.get("clOrdId") == q.get("clOrdId")), None)
+            return ok([o] if o else [])
         if p in ("/api/v5/trade/orders-pending", "/api/v5/account/positions-history"):
             # Как OKX: вид контракта должен совпадать с бумагой (XPERP — FUTURES).
             kind = self.instr.get(q["instId"], {}).get("instType", "SWAP")

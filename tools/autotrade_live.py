@@ -85,6 +85,9 @@ MARGIN_FRAC = 0.10
 LEVERAGE = 10
 TP = 0.01
 COIN_PAUSE_MS = 3 * 3_600_000
+FILL_TOL = 0.05            # цена исполнения рыночного входа — не дальше 5 % от тикера
+ADOPT_TOL = 0.5            # подхват позиции: средняя цена — не дальше 50 % от рынка
+TP_SLACK = 0.005           # тейк на шаге цены — не дальше +1,5 % (иначе шаг цены слишком крупный)
 
 FRESH_MS = 15 * 60_000     # сигнал старше — не входим (бот мог отстать, момент ушёл)
 POLL_SEC = 5               # опрос базы
@@ -172,6 +175,18 @@ def num(v: Any, default: float = 0.0) -> float:
 DEC_MAX = Decimal("1e15")  # параметр бумаги больше — не параметр, а порча
 
 
+def size_of(v: Any) -> Decimal:
+    """Объём позиции из ответа OKX (со знаком в режиме net) — по модулю,
+    точно; мусор — 0."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return Decimal(0)
+    try:
+        d = Decimal(str(v))
+    except ArithmeticError:
+        return Decimal(0)
+    return abs(d) if d.is_finite() and abs(d) <= DEC_MAX else Decimal(0)
+
+
 def dec(v: Any) -> Decimal | None:
     """Параметр бумаги (размер контракта, шаг, минимум) — конечное
     положительное десятичное; иначе None."""
@@ -238,7 +253,8 @@ class Okx:
             err.args = (f"{err.args[0]} [{method} {path.split('?')[0]}]",)  # какой запрос — для разбора
             raise err
         data = got.get("data")
-        return data if isinstance(data, list) else []
+        # Только объекты: строка или число в списке ответа — порча, не запись.
+        return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
 
     # Обёртки — только то, что нужно трейдеру.
     def instruments(self, inst_type: str = "SWAP") -> list[dict]:
@@ -303,10 +319,15 @@ def fmt_dec(x: Decimal) -> str:
     return s if s not in ("-0", "") else "0"
 
 
-def round_step(value: float, step: Any, mode: str) -> Decimal:
+def round_step(value: float | Decimal, step: Any, mode: str) -> Decimal:
     """Округлить до шага бумаги. Шаг или значение — мусор (не конечное
-    положительное) — 0: вызывающий такое не отправляет."""
+    положительное) — 0: вызывающий такое не отправляет. Decimal (размер
+    позиции) — без потери точности; float (цена) — до 12 значащих цифр."""
     st = step if isinstance(step, Decimal) and step.is_finite() and step > 0 else dec(step)
+    if isinstance(value, Decimal):
+        if st is None or not value.is_finite() or value <= 0:
+            return Decimal(0)
+        return (value / st).to_integral_value(rounding=mode) * st
     if st is None or not math.isfinite(value) or value <= 0:
         return Decimal(0)
     # 12 значащих цифр: хвост двоичной дроби (101000.00000000001) не должен
@@ -696,7 +717,7 @@ class Trader:
             p = live[0]
             op.update(mark=num(p.get("markPx")), upl=num(p.get("upl")))
             if not any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
-                self._place_tp(op, abs(num(p.get("pos"))))
+                self._place_tp(op, size_of(p.get("pos")))
             return
         if self.clock() - op["opened"] < 60_000:
             return  # биржа ещё не показала только что открытую позицию
@@ -723,7 +744,7 @@ class Trader:
     def _ps(self, side: int) -> dict:
         return {"posSide": "long" if side > 0 else "short"} if self.pos_mode == "long_short_mode" else {}
 
-    def _place_tp(self, op: dict, size: float) -> None:
+    def _place_tp(self, op: dict, size: Decimal) -> None:
         ins = self.instruments().get(op["inst"], {})
         sz = round_step(size, ins.get("lotSz", "1"), ROUND_DOWN)
         # Тейк — только по ту сторону от входа, не ближе +1 % (ни нулевой цены,
@@ -793,6 +814,11 @@ class Trader:
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
         qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(last)))
         sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+        # Тейк должен встать на шаг цены не ближе +1 % и не дальше +1,5 %: шаг
+        # слишком крупный для этой цены — тейк невозможен, без выхода не входим.
+        tp_try = round_step(last * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
+        if tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= TP + TP_SLACK:
+            return f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +1 % при цене {last}"
         if sz < min_sz:
             return f"позиция {notional:.0f} $ меньше минимальной на OKX"
         cl = f"{TAG}in{now % 10**12}"
@@ -823,8 +849,13 @@ class Trader:
                 break
             time.sleep(0.5)
         # Цена и объём исполнения — с биржи; мусор или ноль — цена тикера и наш объём.
-        fill_px = num(o.get("avgPx")) if num(o.get("avgPx")) > 0 else last
-        filled = num(o.get("accFillSz")) if 0 < num(o.get("accFillSz")) <= float(sz) else float(sz)
+        avg = num(o.get("avgPx"))
+        # Цена исполнения рыночного ордера — рядом с тикером (±5 %); дальше —
+        # порча ответа: от неё тейк встал бы «в рынок». Тогда — цена тикера.
+        fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last
+        got_sz = size_of(o.get("accFillSz"))
+        filled_d = got_sz if 0 < got_sz <= sz else sz
+        filled = float(filled_d)
         tp = round_step(fill_px * (1 + s["side"] * TP), fmt_dec(tick), ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
@@ -834,7 +865,7 @@ class Trader:
         self.st.pop("entering", None)
         self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} {fmt_dec(sz)} по {fill_px} "
                    f"(≈{op['notional']:.0f} $, китов {s['whales']}), тейк {op['tp_s']}")
-        self._place_tp(op, filled)
+        self._place_tp(op, filled_d)
         self.save()
         return ""
 
@@ -851,7 +882,13 @@ class Trader:
         side = self._side_of(p)
         ins = self.instruments().get(inst, {})
         px = num(p.get("avgPx")) or num(order.get("avgPx"))
-        size = abs(num(p.get("pos")))
+        mark = num(p.get("markPx")) or self.okx.ticker(inst)
+        if not (px > 0 and mark > 0 and abs(px / mark - 1) <= ADOPT_TOL):
+            self.event(f"{inst}: своя позиция без записи, но цена входа {px} не сходится с рынком {mark} — "
+                       "тейк не ставлю, проверьте позицию в OKX")
+            return
+        size_d = size_of(p.get("pos"))
+        size = float(size_d)
         tp = round_step(px * (1 + side * TP), ins.get("tickSz", "0.0001"), ROUND_CEILING if side > 0 else ROUND_FLOOR)
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
         ct = num(ins.get("ctVal")) * num(ins.get("ctMult"), 1.0)
@@ -870,7 +907,7 @@ class Trader:
         if pend:  # тейк уже стоит (упали после него) — не дублировать
             op["tp_id"] = str(pend[0].get("ordId"))
         else:
-            self._place_tp(op, size)
+            self._place_tp(op, size_d)
         self.save()
 
     def find_own(self) -> None:

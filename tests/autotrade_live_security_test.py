@@ -125,6 +125,33 @@ class GarbageTradeTest(Base):
         op = self.state()["open"]
         self.assertEqual((op["px"], op["size"], op["tp"]), (100_000.0, 10.0, 101_000.0))
 
+    def test_absurd_fill_price_never_puts_tp_into_market(self) -> None:
+        """Шорт, биржа вернула цену исполнения 10^20: тейк (покупка) встал бы
+        выше рынка и исполнился сразу. Цена дальше 5 % от тикера — порча:
+        берётся тикер."""
+        tr = self.trader(self.whales(side=-1))
+        self.on()
+        real = self.ex.__call__
+
+        def spoil(method, url, headers, body):
+            got = real(method, url, headers, body)
+            if url.split("?")[0].endswith("/api/v5/trade/order") and method == "GET":
+                got["data"][0] = {**got["data"][0], "avgPx": str(10**20)}
+            return got
+
+        tr.okx._t = spoil
+        tr.step()
+        [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
+        self.assertEqual((tp["side"], tp["px"]), ("buy", "99000"))
+
+    def test_adopt_with_absurd_entry_price_places_nothing(self) -> None:
+        tr = self.trader(self.whales())
+        p = {"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "1e20", "markPx": "100000"}
+        tr.adopt(p, {"ordId": "1", "avgPx": "1e20"})
+        self.assertEqual(self.ex.orders, [])
+        self.assertIsNone(tr.st.get("open"))
+        self.assertTrue(any("не сходится с рынком" in e for e in self.logs))
+
     def test_tp_never_at_zero_or_into_market(self) -> None:
         tr = self.trader(self.whales())
         for px, tp, side in ((0, 0, 1), (100.0, 0.0, 1), (100.0, 100.5, 1), (100.0, 99.0, 1), (100.0, 101.0, -1)):

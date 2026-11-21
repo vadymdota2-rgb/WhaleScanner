@@ -56,6 +56,7 @@ python3 tests/safe_http_test.py
 python3 tests/autotrade_backtest_test.py
 python3 tests/autotrade_live_test.py
 python3 tests/autotrade_live_security_test.py
+python3 tests/autotrade_live_props_test.py
 
 [ -n "${FULL:-}" ] || exit 0
 
