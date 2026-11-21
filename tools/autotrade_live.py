@@ -24,7 +24,10 @@
   (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
   тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
   закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
-- в одну и ту же бумагу — не чаще раза в 3 часа.
+- в одну и ту же бумагу — не чаще раза в 3 часа;
+- входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
+  крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
+  крупных от 2 — входим в их сторону.
 
 Кнопки «Старт»/«Стоп» во вкладке пишут switch.json: «Стоп» — новых входов
 нет; открытая позиция и её тейк остаются, выход вслед за китом — тоже.
@@ -394,19 +397,51 @@ class Signals:
             # тут же выходит); момент сигнала — самая свежая сделка окна.
             newest = w.orders[-1][0]
             w.expire(newest - WINDOW_MS)
+            # Встречная сторона той же бумаги за те же 2 часа: киты против.
+            opp = self.windows.get((coin, -side))
+            if opp is not None:
+                opp.expire(newest - WINDOW_MS)
             if w.count[0] >= MIN_WHALES and w.big_u > 0:
-                # Киты сигнала (от 1000 $) и их первая сделка в окне: от неё
-                # смотрим, не закрыли ли они позицию в убыток.
-                big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit[0]}
-                first: dict[str, int] = {}
-                for t, wl, _n, _u in w.orders:
-                    if wl in big and wl not in first:
-                        first[wl] = t
-                out.append({"coin": coin, "side": side, "ts": newest, "whales": w.count[0], "wallets": first,
-                            "ref_px": (w.big_n / NANOS) / w.big_u})
+                out.append(self._signal(coin, side, w, opp, newest))
+            # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
+            # сигнал и в их сторону: входим с крупными (правило владельца).
+            if opp is not None and opp.count[0] >= MIN_WHALES and opp.big_u > 0 \
+                    and self.whale_usd(opp) > self.whale_usd(w):
+                out.append(self._signal(coin, -side, opp, w, newest))
         cut = now - WINDOW_MS - 20 * 60_000
         self.seen = {t: s for t, s in self.seen.items() if s >= cut}
         return out
+
+    def whale_usd(self, w: bt.Window | None) -> float:
+        """Объём китов окна (кошельки от 1000 $), $."""
+        if w is None:
+            return 0.0
+        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit[0])) / NANOS
+
+    def balance(self, coin: str, side: int, now: int) -> tuple[float, float]:
+        """Объём китов за сигнал и против — на момент решения (окна за 2 часа
+        до «сейчас»), а не на момент строки сигнала: за время опроса могли
+        прийти киты в другую сторону."""
+        out = []
+        for sd in (side, -side):
+            w = self.windows.get((coin, sd))
+            if w is not None:
+                w.expire(now - WINDOW_MS)
+            out.append(self.whale_usd(w))
+        return out[0], out[1]
+
+    def _signal(self, coin: str, side: int, w: bt.Window, opp: bt.Window | None, ts: int) -> dict[str, Any]:
+        """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
+        (от неё смотрим, не закрыли ли они в убыток), средняя цена китов,
+        объём китов сигнала и китов против (та же бумага, те же 2 часа)."""
+        big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit[0]}
+        first: dict[str, int] = {}
+        for t, wl, _n, _u in w.orders:
+            if wl in big and wl not in first:
+                first[wl] = t
+        return {"coin": coin, "side": side, "ts": ts, "whales": w.count[0], "wallets": first,
+                "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_usd(w), 2),
+                "usd_against": round(self.whale_usd(opp), 2)}
 
     def whale_loss(self, coin: str, side: int, wallets: dict[str, Any], now: int) -> list[tuple[str, float]]:
         """Киты сигнала, закрывшие позицию по этой бумаге и стороне в убыток:
@@ -767,7 +802,7 @@ class Trader:
                                                "chase_pct": CHASE * 100, "margin_pct": MARGIN_FRAC * 100,
                                                "margin_shared_pct": MARGIN_FRAC_SHARED * 100,
                                                "leverage": LEVERAGE, "tp_pct": TP * 100, "coin_pause_h": 3,
-                                               "exit_on_whale_loss": True})
+                                               "exit_on_whale_loss": True, "follow_bigger_side": True})
         tmp = os.path.join(self.dir, "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.st, f, ensure_ascii=False)
@@ -1048,6 +1083,13 @@ class Trader:
         foreign = [str(p.get("instId")) for p in self.positions]
         if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
             return self._skip("coin_pause", "в эту бумагу входили меньше 3 часов назад")
+        usd, against = self.sig.balance(s["coin"], s["side"], now)
+        s = {**s, "usd": round(usd, 2), "usd_against": round(against, 2)}
+        if against > 0 and against >= usd:
+            # Против сигнала — киты крупнее: в их сторону не идём (их сигнал,
+            # если их от 2, — отдельный кандидат, он и войдёт).
+            return self._skip("bigger_against", f"против сигнала киты крупнее: {'шорты' if s['side'] > 0 else 'лонги'} "
+                                                f"{against:,.0f} $ против {usd:,.0f} $ — входим только с крупными".replace(",", " "))
         lost = self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now)
         if lost:
             return self._skip("whale_exit", f"кит сигнала уже закрыл позицию в убыток ({lost[0][0][:10]}…, "
@@ -1111,7 +1153,7 @@ class Trader:
             # ордер найдётся по clOrdId, а не будет повторён).
             self.st["entering"] = {"inst": inst, "cl": cl, "at": now, "coin": s["coin"], "side": s["side"],
                                    "whales": s["whales"], "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"],
-                                   "wallets": s.get("wallets") or {}}
+                                   "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against")}
             self.save()
             ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                                      "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
@@ -1171,7 +1213,8 @@ class Trader:
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id,
-              "margin_pct": round(frac * 100, 2), "wallets": s.get("wallets") or {}}
+              "margin_pct": round(frac * 100, 2), "wallets": s.get("wallets") or {},
+              "usd": s.get("usd"), "usd_against": s.get("usd_against")}
         self.st["open"] = op
         self.st["entered"][s["coin"]] = now
         self.st.pop("entering", None)

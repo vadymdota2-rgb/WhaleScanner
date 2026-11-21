@@ -676,6 +676,85 @@ class WhaleExitTest(Base):
         self.assertIsNone(self.state()["open"])
 
 
+class BiggerSideTest(Base):
+    """Правило владельца «входим с крупными»: лонг BTC запустили мелкие киты
+    (~42 тыс. $), а за те же 2 часа против них открыли шорты на 1,41 млн $ —
+    бот вошёл в лонг. Теперь: против сигнала киты крупнее — в слабую сторону
+    не входим; крупных от 2 — входим с ними."""
+
+    def shorts(self, n: int = 2, usd: float = 700_000, ago: int = 40) -> list[tuple]:
+        return [fill(100 + i, f"0xbig{i}", "BTC", -1, self.now - (ago + i) * MIN, usd, 100_000) for i in range(n)]
+
+    def test_small_longs_against_big_shorts_bot_goes_short(self) -> None:
+        tr = self.trader(self.shorts() + self.whales())
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "sell", "вошли с крупными — в шорт")
+        op = self.state()["open"]
+        self.assertEqual((op["side"], sorted(op["wallets"])), (-1, ["0xbig0", "0xbig1"]))
+        self.assertEqual((op["usd"], op["usd_against"]), (1_400_000.0, 10_000.0))
+
+    def test_one_big_short_blocks_long_but_is_no_signal(self) -> None:
+        tr = self.trader(self.shorts(n=1) + self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        sk = self.state()["last_skip"]
+        self.assertEqual(sk["code"], "bigger_against")
+        self.assertIn("шорты 700 000 $ против 10 000 $", sk["why"])
+
+    def test_smaller_against_does_not_block(self) -> None:
+        tr = self.trader(self.shorts(n=2, usd=2000) + self.whales())
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "buy")
+        self.assertEqual(self.state()["open"]["usd_against"], 4000.0)
+
+    def test_equal_sides_no_entry(self) -> None:
+        """Поровну — непонятно, кто сильнее: не входим ни в одну сторону."""
+        tr = self.trader(self.shorts(n=2, usd=5000) + self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+
+    def test_against_older_than_two_hours_ignored(self) -> None:
+        """Против — за 2 часа до «сейчас»: шорты, прочитанные прошлым опросом,
+        через 25 минут (им уже 125 минут) не в счёт, хотя от строки сигнала
+        (10 минут назад) они ещё в пределах 2 часов."""
+        tr = self.trader(self.shorts(ago=100))
+        self.on()
+        tr.step()                      # шорты в окне; их сигнал давний — не входим
+        self.assertEqual(self.market_orders(), [])
+        self.now += 25 * MIN
+        con = sqlite3.connect(self.db)
+        con.executemany(INS, self.whales(ago=10))
+        con.commit()
+        con.close()
+        tr.last_sync = 0
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "buy")
+        os.remove(self.db)
+        os.remove(os.path.join(self.dir, "live", "state.json"))
+        self.ex = FakeOkx()
+        tr = self.trader(self.shorts(ago=130) + self.whales())
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "buy")
+
+    def test_small_against_wallets_under_1000_do_not_count(self) -> None:
+        """Против — только киты (кошелёк от 1000 $): мелочь против не мешает."""
+        crumbs = [fill(200 + i, f"0xc{i}", "BTC", -1, self.now - 30 * MIN + i, 900, 100_000) for i in range(50)]
+        tr = self.trader(crumbs + self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual(self.state()["open"]["usd_against"], 0.0)
+
+
 class EeaTest(Base):
     def test_european_account_trades_xperp_not_usdt_swap(self) -> None:
         """OKX EEA: бессрочные — FUTURES «BTC-USD_UM_XPERP-310815», а

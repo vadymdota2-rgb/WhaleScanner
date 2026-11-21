@@ -17,7 +17,10 @@ PATH = os.path.join(ROOT, "tools", "autotrade_live.py")
 BT_PATH = os.path.join(ROOT, "tools", "autotrade_backtest.py")  # окно китов — общее с бэктестом
 TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py"]
 ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "PYTHONDONTWRITEBYTECODE": "1"}
-EQUIV: set[str] = set()
+# Выброс встречного окна в опросе — для снимка в сигнале; решение всё равно
+# перепроверяет перевес на окнах за 2 часа до «сейчас» (balance) — наблюдаемо
+# то же самое.
+EQUIV: set[str] = {"киты против — те же 2 часа"}
 
 MUTS = [
     # Правила владельца
@@ -89,6 +92,17 @@ MUTS = [
      "        return {str(w): int(t) for w, t, n in rows}", "восстановленные киты — только от 1000 $"),
     ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
      "позиция прежней версии — киты по базе"),
+    # Входим с крупными
+    ("        if against > 0 and against >= usd:", "        if False:", "против сигнала киты крупнее — не входим"),
+    ("        if against > 0 and against >= usd:", "        if against > 0 and against > usd:", "поровну — не входим"),
+    ("                out.append(self._signal(coin, -side, opp, w, newest))", "                pass", "крупных от 2 — входим с ними"),
+    ("                opp.expire(newest - WINDOW_MS)", "                pass", "киты против — те же 2 часа"),
+    ("            if w is not None:\n                w.expire(now - WINDOW_MS)", "            if False:\n                w.expire(now - WINDOW_MS)",
+     "решение — по китам за 2 часа до «сейчас»"),
+    ("        usd, against = self.sig.balance(s[\"coin\"], s[\"side\"], now)",
+     "        usd, against = num(s.get(\"usd\")), num(s.get(\"usd_against\"))", "решение — по текущему перевесу, а не по строке сигнала"),
+    ("        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit[0])) / NANOS",
+     "        return float(sum(v[0] for v in w.per.values() if v[2] > 0)) / NANOS", "против — только кошельки от 1000 $"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
