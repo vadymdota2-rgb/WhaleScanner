@@ -90,6 +90,14 @@ POLL_SEC = 5               # опрос базы
 SYNC_SEC = 15              # сверка счёта
 INSTR_TTL = 3600           # каталог OKX — раз в час
 TAG = "wt"                 # приставка clOrdId наших ордеров
+# Отказы OKX по самой бумаге (не по счёту): этой бумагой торговать нельзя —
+# исключить её на неделю и искать следующие сигналы, а не долбить ордерами.
+# 50124 — рынок закрыт для ключа/страны (у OKX EEA — часть контрактов),
+# 51001 — бумаги нет, 51155/51156 — ограничения по стране (compliance),
+# 51010 — режим счёта не позволяет эту бумагу.
+BLOCK_CODES = {"50124", "51001", "51155", "51156", "51010"}
+BLOCK_MS = 7 * 86_400_000
+FAIL_PAUSE_MS = 15 * 60_000  # другой отказ ордера — эту бумагу не трогать 15 минут
 
 
 def now_ms() -> int:
@@ -651,6 +659,10 @@ class Trader:
             return "в эту бумагу входили меньше 3 часов назад"
         base, scale = bt.okx_candidate(s["coin"])
         inst = f"{base}-USDT-SWAP"
+        blocked = self.st.setdefault("blocked", {})
+        b = blocked.get(inst)
+        if b and now - int(b.get("at", 0)) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
+            return f"{inst}: OKX не даёт торговать ({b.get('why', '')})"
         ins = self.instruments().get(inst)
         if not ins:
             return f"{inst} нет на OKX"
@@ -675,16 +687,26 @@ class Trader:
         sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
         if sz < Decimal(ins.get("minSz", "1")):
             return f"позиция {notional:.0f} $ меньше минимальной на OKX"
-        if inst not in self.lever_set:
-            self.okx.set_leverage(inst, LEVERAGE)
-            self.lever_set.add(inst)
         cl = f"{TAG}in{now % 10**12}"
-        # Сначала — запись «входим» (если служба упадёт посреди, при старте
-        # ордер найдётся по clOrdId, а не будет повторён).
-        self.st["entering"] = {"inst": inst, "cl": cl, "at": now}
-        self.save()
-        ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
-                                 "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
+        try:
+            if inst not in self.lever_set:
+                self.okx.set_leverage(inst, LEVERAGE)
+                self.lever_set.add(inst)
+            # Сначала — запись «входим» (если служба упадёт посреди, при старте
+            # ордер найдётся по clOrdId, а не будет повторён).
+            self.st["entering"] = {"inst": inst, "cl": cl, "at": now}
+            self.save()
+            ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
+                                     "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
+        except OkxError as e:
+            # Ордер не принят — позиции нет. Бумагу — в исключённые (по самой
+            # бумаге — на неделю, иначе — на 15 минут), сигналы — дальше.
+            self.st.pop("entering", None)
+            permanent = e.code in BLOCK_CODES
+            blocked[inst] = {"at": now, "why": str(e).split(" [")[0][:200], "permanent": permanent}
+            self.event(f"{inst}: ордер не принят — {e}; "
+                       + ("бумага исключена на 7 дней" if permanent else "пауза по бумаге 15 минут"))
+            return f"{inst}: ордер не принят ({e.code})"
         o: dict = {}
         for _ in range(10):
             o = self.okx.get_order(inst, ord_id)

@@ -50,6 +50,7 @@ class FakeOkx:
         self.calls: list[tuple[str, str, dict]] = []
         self.pos_mode = pos_mode
         self.n = 0
+        self.reject: dict[str, str] = {}   # бумага → код отказа OKX на ордер
 
     def __call__(self, method: str, url: str, headers: dict, body: bytes | None):
         u = urllib.parse.urlparse(url)
@@ -70,6 +71,10 @@ class FakeOkx:
             return ok(self.pos)
         if p == "/api/v5/account/set-leverage":
             return ok([{"lever": b["lever"]}])
+        if p == "/api/v5/trade/order" and method == "POST" and b["instId"] in self.reject:
+            code = self.reject[b["instId"]]
+            return {"code": "1", "msg": "", "data": [{"sCode": code, "sMsg": "This API Key does not have trading "
+                                                      "permission for the market"}]}
         if p == "/api/v5/trade/order" and method == "POST":
             self.n += 1
             o = {**b, "ordId": str(self.n), "state": "live"}
@@ -355,6 +360,53 @@ class OrderTypeTest(Base):
             self.assertFalse(any(c[1] in ("/api/v5/trade/close-position", "/api/v5/trade/order-algo") for c in self.ex.calls))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+
+
+class RejectTest(Base):
+    def test_refused_instrument_is_excluded_and_next_signal_trades(self) -> None:
+        """OKX EEA не даёт торговать бумагой (50124 на ордер): позиции нет,
+        бумага исключена на неделю, бот не долбит её ордерами и входит по
+        следующему сигналу в другую бумагу."""
+        self.ex.reject["STX-USDT-SWAP"] = "50124"
+        fills = [fill(1, "0xa", "STX", 1, self.now - 4 * MIN, 5000, 0.5),
+                 fill(2, "0xb", "STX", 1, self.now - 3 * MIN, 5000, 0.5),
+                 fill(3, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000),
+                 fill(4, "0xb", "BTC", 1, self.now - 1 * MIN, 5000, 100_000)]
+        # BTC — раньше в списке «свежих первыми» нельзя: сначала пробуем STX.
+        fills = [fills[2], fills[3], fills[0], fills[1]]
+        fills = [(i + 1, *f[1:]) for i, f in enumerate(fills)]
+        fills[2] = (3, "0xa", "STX", 1, self.now - MIN // 2, int(5000e9), str(5000 / 0.5))
+        fills[3] = (4, "0xb", "STX", 1, self.now - MIN // 3, int(5000e9), str(5000 / 0.5))
+        tr = self.trader(fills)
+        self.on()
+        tr.step()
+        st = self.state()
+        self.assertTrue(st["blocked"]["STX-USDT-SWAP"]["permanent"])
+        self.assertNotIn("entering", st)
+        self.assertEqual(st["open"]["inst"], "BTC-USDT-SWAP", "после отказа — следующий сигнал")
+        tries = [c for c in self.ex.calls if c[1] == "/api/v5/trade/order" and c[2].get("instId") == "STX-USDT-SWAP"]
+        self.assertEqual(len(tries), 1)
+        self.assertTrue(any("исключена на 7 дней" in e for e in st["events"]))
+        # Позицию закрыли — новые киты по STX: не пробуем (неделя), причина — в пропуске.
+        self.ex.pos = []
+        tr.st["open"] = None
+        tr.positions = []
+        self.assertIn("OKX не даёт торговать", tr.try_enter({"coin": "STX", "side": 1, "ts": self.now,
+                                                             "whales": 2, "ref_px": 0.5}))
+        self.assertEqual(len([c for c in self.ex.calls if c[1] == "/api/v5/trade/order"
+                              and c[2].get("instId") == "STX-USDT-SWAP"]), 1)
+
+    def test_other_order_error_pauses_coin_15_min(self) -> None:
+        self.ex.reject["BTC-USDT-SWAP"] = "51008"  # мало маржи — не про бумагу
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        b = self.state()["blocked"]["BTC-USDT-SWAP"]
+        self.assertFalse(b["permanent"])
+        self.assertIn("маржи", b["why"])
+        self.now += 16 * MIN
+        del self.ex.reject["BTC-USDT-SWAP"]
+        self.assertEqual(tr.try_enter({"coin": "BTC", "side": 1, "ts": self.now, "whales": 2, "ref_px": 100_000}), "")
 
 
 class JanitorTest(Base):
