@@ -127,7 +127,8 @@ class FakeOkx:
 def make_db(path: str, fills: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, "
-                "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0)")
+                "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, "
+                "dir TEXT NOT NULL DEFAULT '')")
     con.executemany(INS, fills)
     con.commit()
     con.close()
@@ -136,11 +137,11 @@ def make_db(path: str, fills: list[tuple]) -> None:
 INS = "INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz) VALUES (?,?,?,?,?,?,?)"
 
 
-def close_fill(path: str, tid: int, wallet: str, coin: str, code: int, ts: int, pnl_usd: float) -> None:
+def close_fill(path: str, tid: int, wallet: str, coin: str, code: int, ts: int, pnl_usd: float, d: str = "") -> None:
     """Кит закрыл (3/4 — закрытие лонга/шорта, 5 — разворот, 6/7 — ликвидация) с итогом pnl_usd."""
     con = sqlite3.connect(path)
-    con.execute("INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos) "
-                "VALUES (?,?,?,?,?,?,?,?)", (tid, wallet, coin, code, ts, 5000 * 10**9, "0.05", int(pnl_usd * 1e9)))
+    con.execute("INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos, dir) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", (tid, wallet, coin, code, ts, 5000 * 10**9, "0.05", int(pnl_usd * 1e9), d))
     con.commit()
     con.close()
 
@@ -541,10 +542,10 @@ class WhaleExitTest(Base):
         self.assertIsNone(self.state()["open"], "итог −10 — выходим")
 
     def test_liquidation_and_flip_count_as_loss_close(self) -> None:
-        for code in (6, 5):
+        for code, d in ((6, "Liquidated Isolated Long"), (5, "Long > Short")):
             tr = self.enter()
             self.now += 20 * MIN
-            close_fill(self.db, 50, "0xa", "BTC", code, self.now - MIN, -500.0)
+            close_fill(self.db, 50, "0xa", "BTC", code, self.now - MIN, -500.0, d)
             tr.last_sync = 0
             tr.step()
             self.assertIsNone(self.state()["open"], code)
@@ -646,6 +647,47 @@ class WhaleExitTest(Base):
         self.assertIsNone(self.state()["open"])
         self.assertTrue(any("восстановлены по базе" in e for e in self.state()["events"]))
 
+    def test_flip_into_our_side_is_not_an_exit(self) -> None:
+        """Ревизия: разворот кита «Short > Long» — он закрыл встречный шорт в
+        минус и перешёл в лонг вместе с нами. Раньше бот закрывал свой лонг."""
+        tr = self.enter()
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 5, self.now - MIN, -300.0, "Short > Long")
+        tr.last_sync = 0
+        tr.step()
+        self.assertIsNotNone(self.state()["open"])
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_lost_reply_on_exit_does_not_close_owner_part(self) -> None:
+        """Ревизия: ордер выхода исполнился, а ответ не дошёл (ошибка шлюза);
+        владелец докупил руками (25, у бота 10). Повтор через минуту находит
+        ордер по метке и не закрывает ещё 10 — из ручной части."""
+        tr = self.enter()
+        self.ex.pos[0]["pos"] = "25"
+        self.now += 20 * MIN
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -50.0)
+        real = tr.okx.order
+
+        def order(body):
+            got = real(body)
+            if body["clOrdId"].startswith("wtex"):
+                raise lv.OkxError("502", "HTTP")
+            return got
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.ex.pos[0]["pos"], "15.0")
+        for _ in range(3):
+            self.now += 61_000
+            tr.last_sync = 0
+            tr.step()
+        exits = [o for o in self.ex.orders if o["ordType"] == "market" and o["side"] == "sell"]
+        self.assertEqual(len(exits), 1, "второго ордера выхода нет")
+        self.assertEqual(self.ex.pos[0]["pos"], "15.0", "ручная часть цела")
+        self.assertIsNone(self.state()["open"])
+        self.assertEqual(self.trades()[-1]["why"], "кит вышел в убыток")
+
     def test_stop_button_still_follows_whale_out(self) -> None:
         tr = self.enter()
         self.on(False)
@@ -674,6 +716,36 @@ class WhaleExitTest(Base):
         tr.last_sync = 0
         tr.step()
         self.assertIsNone(self.state()["open"])
+
+
+class SignalMomentTest(Base):
+    """Ревизия: момент сигнала — сделка кита, и на момент входа китов от 2."""
+
+    def test_small_trade_does_not_refresh_old_whales(self) -> None:
+        """Киты вошли час назад (сигнал давний), сейчас кто-то купил на 50 $ —
+        это не свежий сигнал. Раньше бот входил по такой сделке."""
+        fills = [*self.whales(ago=60), fill(9, "0xdust", "BTC", 1, self.now - MIN, 50, 100_000)]
+        tr = self.trader(fills)
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+
+    def test_whale_count_rechecked_at_decision(self) -> None:
+        """Кит A вошёл 125 минут назад (прочитан прошлым опросом), кит B — 14
+        минут назад: от строки B оба в окне, но на момент решения A старше 2
+        часов — китов 1, не входим. Раньше бот входил."""
+        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 100 * MIN, 5000, 100_000)])
+        self.on()
+        tr.step()
+        self.now += 25 * MIN
+        con = sqlite3.connect(self.db)
+        con.execute(INS, fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000))
+        con.commit()
+        con.close()
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        self.assertEqual(self.state()["last_skip"]["code"], "stale")
 
 
 class BiggerSideTest(Base):
@@ -856,6 +928,7 @@ class RejectTest(Base):
         tr.step()
         del self.ex.reject["BTC-USDT-SWAP"]
         sig = {"coin": "BTC", "side": 1, "ts": self.now, "whales": 2, "ref_px": 100_000}
+        tr.sig.windows.clear()  # сигналы ниже — новые (без окна прошлого опроса)
         self.now += 86_400_000  # сутки — ещё исключена
         self.assertIn("OKX не даёт торговать", tr.try_enter({**sig, "ts": self.now}))
         self.now += 7 * 86_400_000  # неделя прошла — снова пробуем

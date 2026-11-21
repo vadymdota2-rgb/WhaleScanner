@@ -401,6 +401,12 @@ class Signals:
             opp = self.windows.get((coin, -side))
             if opp is not None:
                 opp.expire(newest - WINDOW_MS)
+            # Момент сигнала — сделка КИТА (кошелёк от 1000 $ в окне). Мелкая
+            # сделка (не кит) сигнал не «освежает»: иначе вход через полтора
+            # часа после китов по чьей-то сделке на 50 $ выглядел бы свежим.
+            v = w.per.get(wallet)
+            if v is None or v[0] < self.limit[0]:
+                continue
             if w.count[0] >= MIN_WHALES and w.big_u > 0:
                 out.append(self._signal(coin, side, w, opp, newest))
             # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
@@ -418,17 +424,18 @@ class Signals:
             return 0.0
         return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit[0])) / NANOS
 
-    def balance(self, coin: str, side: int, now: int) -> tuple[float, float]:
-        """Объём китов за сигнал и против — на момент решения (окна за 2 часа
-        до «сейчас»), а не на момент строки сигнала: за время опроса могли
-        прийти киты в другую сторону."""
+    def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:
+        """На момент решения (окна за 2 часа до «сейчас»), а не на момент строки
+        сигнала: объём китов за и против и сколько китов за (за время опроса
+        могли прийти киты в другую сторону, а старые — выйти из окна)."""
         out = []
         for sd in (side, -side):
             w = self.windows.get((coin, sd))
             if w is not None:
                 w.expire(now - WINDOW_MS)
             out.append(self.whale_usd(w))
-        return out[0], out[1]
+        w = self.windows.get((coin, side))
+        return out[0], out[1], (w.count[0] if w is not None else 0)
 
     def _signal(self, coin: str, side: int, w: bt.Window, opp: bt.Window | None, ts: int) -> dict[str, Any]:
         """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
@@ -452,12 +459,17 @@ class Signals:
         if not since:
             return []
         codes = bt.CLOSES_FOR[1 if side > 0 else -1]
+        # Разворот (код 5) — в обе стороны одним кодом: «Long > Short» закрывает
+        # лонг, «Short > Long» — шорт. Разворот В нашу сторону (кит закрыл
+        # встречный шорт в минус и перешёл в лонг вместе с нами) — не выход.
+        flip = "%Long > Short%" if side > 0 else "%Short > Long%"
         con = self._con()
         try:
             rows = con.execute(
                 f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
-                f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ?",
-                (coin, *since, *codes, min(since.values()), now)).fetchall()
+                f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
+                f"AND (dir_code != {bt.FLIP} OR dir LIKE ?)",
+                (coin, *since, *codes, min(since.values()), now, flip)).fetchall()
         finally:
             con.close()
         pnl: dict[str, int] = {}
@@ -984,36 +996,69 @@ class Trader:
             return
         op["exit"]["tried"] = now
         self.save()
-        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
-        if not live:
-            return  # позиции уже нет — закрытие запишет _track_open по истории
         try:
-            for po in self.okx.pending(op["inst"]):  # сначала снять свой тейк
+            # Сначала — сколько уже закрыто прежними ордерами выхода (ответ мог
+            # не дойти, исполнение — частичным): повтор закрывает только
+            # остаток своего объёма, а не ручную докупку владельца.
+            got = self._exit_fills(op)
+            if got is None:
+                return  # прежний ордер выхода ещё исполняется
+            remaining = size_of(op.get("size")) - got[0]
+            if remaining <= 0:
+                self._record_close(op, got[1])
+                return
+            live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
+            if not live:
+                return  # позиции уже нет — закрытие запишет _track_open по истории
+            for po in self.okx.pending(op["inst"]):  # снять свой тейк
                 if str(po.get("clOrdId", "")).startswith(TAG):
                     self.okx.cancel(op["inst"], str(po.get("ordId")))
             ins = self.instruments().get(op["inst"], {})
-            sz = round_step(min(size_of(live[0].get("pos")), size_of(op.get("size"))), ins.get("lotSz", "1"), ROUND_DOWN)
+            sz = round_step(min(size_of(live[0].get("pos")), remaining), ins.get("lotSz", "1"), ROUND_DOWN)
             if sz <= 0:
                 return
+            cl = f"{TAG}ex{now % 10**12}"
             body = {"instId": op["inst"], "tdMode": "cross", "side": "sell" if op["side"] > 0 else "buy",
-                    "ordType": "market", "sz": fmt_dec(sz), "clOrdId": f"{TAG}ex{now % 10**12}", **self._ps(op["side"])}
+                    "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(op["side"])}
             if self.pos_mode != "long_short_mode":
                 body["reduceOnly"] = True  # только закрытие: не перевернуть позицию
-            ex_id = self.okx.order(body)
-            op["exit_id"] = ex_id
+            # Метка ордера — в запись ДО отправки: ответ не дошёл — ордер всё
+            # равно найдётся по метке, и повтор не закроет лишнего.
+            op["exit"].setdefault("ids", []).append(cl)
             self.save()
-            o: dict[str, Any] = {}
+            self.okx.order(body)
             for _ in range(10):
-                o = self.okx.get_order(op["inst"], ex_id)
-                if o.get("state") == "filled":
+                if self.okx.get_order(op["inst"], cl_id=cl).get("state") in ("filled", "canceled", "mmp_canceled"):
                     break
                 time.sleep(0.5)
+            got = self._exit_fills(op)
         except OkxError as e:
             self.event(f"{op['inst']}: закрыть вслед за китом не вышло — {e}; повтор через минуту")
             return
-        if o.get("state") == "filled" and size_of(o.get("accFillSz")) >= sz:
-            self._record_close(op, {"uTime": o.get("fillTime") or o.get("uTime"), "closeAvgPx": o.get("avgPx"),
-                                    "realizedPnl": o.get("pnl"), "fee": o.get("fee")})
+        if got is not None and got[0] >= size_of(op.get("size")):
+            self._record_close(op, got[1])
+
+    def _exit_fills(self, op: dict[str, Any]) -> tuple[Decimal, dict[str, Any]] | None:
+        """Ордера выхода вслед за китом: сколько исполнено и итог для записи
+        (средняя цена, PnL и комиссии — суммой). Какой-то ещё исполняется — None."""
+        done, val, pnl, fee, last = Decimal(0), 0.0, 0.0, 0.0, 0.0
+        for cl in op["exit"].get("ids", []):
+            try:
+                o = self.okx.get_order(op["inst"], cl_id=str(cl))
+            except OkxError as e:
+                if e.code != "51603":
+                    raise
+                o = {}  # 51603 «ордера нет» — до биржи не дошёл, исполнения нет
+            if o.get("state") in ("live", "partially_filled"):
+                return None
+            q = size_of(o.get("accFillSz"))
+            done += q
+            val += float(q) * num(o.get("avgPx"))
+            pnl += num(o.get("pnl"))
+            fee += num(o.get("fee"))
+            last = max(last, num(o.get("fillTime")) or num(o.get("uTime")))
+        return done, {"uTime": last or None, "closeAvgPx": val / float(done) if done > 0 else 0.0,
+                      "realizedPnl": pnl, "fee": fee}
 
     # вход
     def _ps(self, side: int) -> dict[str, Any]:
@@ -1083,8 +1128,10 @@ class Trader:
         foreign = [str(p.get("instId")) for p in self.positions]
         if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
             return self._skip("coin_pause", "в эту бумагу входили меньше 3 часов назад")
-        usd, against = self.sig.balance(s["coin"], s["side"], now)
+        usd, against, count = self.sig.balance(s["coin"], s["side"], now)
         s = {**s, "usd": round(usd, 2), "usd_against": round(against, 2)}
+        if (s["coin"], s["side"]) in self.sig.windows and count < MIN_WHALES:
+            return self._skip("stale", f"китов за 2 часа до «сейчас» осталось {count} — сигнал устарел")
         if against > 0 and against >= usd:
             # Против сигнала — киты крупнее: в их сторону не идём (их сигнал,
             # если их от 2, — отдельный кандидат, он и войдёт).
