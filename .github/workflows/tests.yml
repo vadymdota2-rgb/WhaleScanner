@@ -63,3 +63,92 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -yq libcurl4-openssl-dev libsqlite3-dev libboost-dev
       - name: Мутационная проверка оплаты (все порчи кода убиты)
         run: python3 tools/mutate.py
+
+  # Автокопирование (tools/autotrade_*.py) — на уровне карточки халвинга
+  # (Wallet-Tracker): анализатор с тем же набором правил, строгие типы,
+  # Python 3.10–3.13, Debian 13 как на сервере, мутации — отдельным заданием.
+  # Сложность (PLR09xx) не проверяется: правила входа — линейный список
+  # проверок владельца, дробить его — прятать порядок проверок.
+  autotrade-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Анализатор Python (торговля, бэктест и их тесты)
+        run: >-
+          pipx run ruff==0.15.8 check --target-version py310
+          --select E,F,W,B,UP,SIM,PL,RUF,S,BLE,I
+          --ignore E501,PLR2004,RUF001,RUF002,RUF003,S310,S603,S607,PLR0911,PLR0912,PLR0913,PLR0915,PLR0917
+          --per-file-ignores 'tests/*:PLC0415' --per-file-ignores 'tests/*:S311'
+          tools/autotrade_live.py tools/autotrade_backtest.py tools/mutate-autotrade.py
+          tests/autotrade_live_test.py tests/autotrade_live_security_test.py tests/autotrade_live_props_test.py
+          tests/autotrade_backtest_test.py tests/autotrade_scale_test.py
+      - name: Строгие типы (mypy --strict)
+        working-directory: tools
+        run: pipx run mypy==1.11.2 --strict --python-version 3.10 autotrade_live.py autotrade_backtest.py
+
+  autotrade-python:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Python без устаревших конструкций
+        run: python -W error::SyntaxWarning -W error::DeprecationWarning -m py_compile tools/autotrade_live.py tools/autotrade_backtest.py
+      - name: Торговля — правила, атаки, инварианты и фаззинг; бэктест
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python tests/autotrade_live_test.py
+          python tests/autotrade_live_security_test.py
+          python tests/autotrade_live_props_test.py
+          python tests/autotrade_backtest_test.py
+
+  # Боевой сервер — Debian 13 со своим Python и SQLite.
+  autotrade-debian:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: debian:trixie@sha256:8c4733a92aacd0bcff3779eadc35a4a5147f36cb20a5fcb56504cbc740212259
+    steps:
+      - name: Python и git из Debian — как на сервере
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends python3 git ca-certificates
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Тесты торговли и бэктеста на Debian 13 (вкл. предел памяти SQLite — код 3)
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 tests/autotrade_live_test.py
+          python3 tests/autotrade_live_security_test.py
+          python3 tests/autotrade_live_props_test.py
+          python3 tests/autotrade_backtest_test.py
+          python3 tests/autotrade_scale_test.py
+
+  autotrade-mutation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.11"
+      - name: Мутационная проверка торговли (все порчи кода убиты)
+        run: python tools/mutate-autotrade.py

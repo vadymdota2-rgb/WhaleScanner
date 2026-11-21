@@ -33,7 +33,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 import autotrade_live as lv  # noqa: E402
-from autotrade_live_test import MIN, Base, FakeOkx, fill, make_db  # noqa: E402
+from autotrade_live_test import MIN, Base, FakeOkx, fill  # noqa: E402
 
 PROPS = int(os.environ.get("AUTOTRADE_PROPS", "1500"))
 FUZZ = int(os.environ.get("AUTOTRADE_FUZZ", "1500"))

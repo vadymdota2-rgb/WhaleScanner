@@ -354,6 +354,24 @@ class TradeTest(Base):
         self.assertIn("нет ключа OKX", self.state()["error"])
 
 
+class SignalsTest(Base):
+    def test_future_fills_ignored_until_their_time(self) -> None:
+        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now + 10 * MIN, 5000, 100_000),
+                          fill(2, "0xb", "BTC", 1, self.now + 11 * MIN, 5000, 100_000)])
+        sig = lv.Signals(self.db)
+        self.assertEqual(sig.poll(self.now), [])
+        self.assertEqual(len(sig.poll(self.now + 12 * MIN)), 1)
+
+    def test_window_drops_whales_older_than_two_hours(self) -> None:
+        """Кит A — давно (3 часа назад от второго опроса), кит B — сейчас: двух
+        китов за 2 часа нет — сигнала нет."""
+        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now - MIN, 5000, 100_000),
+                          fill(2, "0xb", "BTC", 1, self.now + 3 * 60 * MIN, 5000, 100_000)])
+        sig = lv.Signals(self.db)
+        self.assertEqual(sig.poll(self.now), [])
+        self.assertEqual(sig.poll(self.now + 3 * 60 * MIN + MIN), [])
+
+
 class OrderTypeTest(Base):
     def test_entry_always_market_exit_always_limit_at_tp(self) -> None:
         """Правило владельца: вход — всегда рыночным ордером, выход — всегда
@@ -414,7 +432,7 @@ class EeaTest(Base):
         tr = self.trader(self.whales())
         self.on()
         tr.step()
-        for k in range(3):
+        for _ in range(3):
             self.now += 2 * MIN
             tr.last_sync = 0
             tr.step()
@@ -468,6 +486,18 @@ class RejectTest(Base):
                                                              "whales": 2, "ref_px": 0.5}))
         self.assertEqual(len([c for c in self.ex.calls if c[1] == "/api/v5/trade/order"
                               and c[2].get("instId") == "STX-USDT-SWAP"]), 1)
+
+    def test_refused_instrument_stays_excluded_for_a_week(self) -> None:
+        self.ex.reject["BTC-USDT-SWAP"] = "50124"
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        del self.ex.reject["BTC-USDT-SWAP"]
+        sig = {"coin": "BTC", "side": 1, "ts": self.now, "whales": 2, "ref_px": 100_000}
+        self.now += 86_400_000  # сутки — ещё исключена
+        self.assertIn("OKX не даёт торговать", tr.try_enter({**sig, "ts": self.now}))
+        self.now += 7 * 86_400_000  # неделя прошла — снова пробуем
+        self.assertEqual(tr.try_enter({**sig, "ts": self.now}), "")
 
     def test_other_order_error_pauses_coin_15_min(self) -> None:
         self.ex.reject["BTC-USDT-SWAP"] = "51008"  # мало маржи — не про бумагу
@@ -534,6 +564,18 @@ class RecoverTest(Base):
         self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP")
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
 
+    def test_our_order_in_other_direction_is_not_adoption(self) -> None:
+        """На счёте — лонг владельца; в истории — наш прошлый вход в шорт по той
+        же бумаге (давно закрыт): чужую позицию своей не считать."""
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "3", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
+        self.ex.orders.append({"instId": "BTC-USDT-SWAP", "ordId": "77", "clOrdId": "wtin1", "side": "sell",
+                               "ordType": "market", "state": "filled", "cTime": str(T0)})
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.assertIsNone(self.state()["open"])
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [])
+
     def test_manual_position_is_not_adopted(self) -> None:
         self.ex.pos = [{"instId": "ETH-USDT-SWAP", "pos": "-3", "posSide": "net", "avgPx": "3000"}]
         self.ex.orders.append({"instId": "ETH-USDT-SWAP", "ordId": "99", "clOrdId": "", "side": "sell",
@@ -552,7 +594,8 @@ class JanitorTest(Base):
         tr = self.trader(self.whales())
         tr.sig.poll(self.now)
         self.assertTrue(tr.sig.windows)
-        tr.st["entered"] = {"OLD": self.now - 4 * 3_600_000, "NEW": self.now - 3_600_000}
+        tr.st["entered"] = {"OLD": self.now - 4 * 3_600_000, "NEW": self.now - 3_600_000,
+                            "FRESH": self.now + 2 * 3_600_000}  # за час до очистки — остаётся
         live_log = os.path.join(tr.dir, "live.log")
         with open(live_log, "wb") as f:
             f.write(b"x" * (lv.LOG_MAX_BYTES + 1))
@@ -569,7 +612,7 @@ class JanitorTest(Base):
         self.assertFalse(jan.run(tr, None, now))
         self.assertFalse(jan.due(now + 1))
         self.assertEqual(tr.sig.windows, {})
-        self.assertEqual(list(tr.st["entered"]), [])  # пауза 3 часа прошла у обеих
+        self.assertEqual(list(tr.st["entered"]), ["FRESH"])  # пауза 3 часа прошла — убраны; свежий вход — на месте
         self.assertTrue(os.path.exists(live_log + ".1"))
         self.assertFalse(os.path.exists(live_log))
         self.assertEqual(sorted(os.listdir(cache)), ["b.json"])  # старше 30 дней и сверх 500 МБ — убраны, старые первыми
@@ -586,6 +629,18 @@ class JanitorTest(Base):
         self.assertTrue(os.path.exists(os.path.join(cache, "b.json")), "кеш во время пересчёта не трогаем")
         tr.st["entering"] = {"inst": "X"}
         self.assertFalse(fat.run(tr, None, now))
+
+    def test_old_cache_removed_even_when_small(self) -> None:
+        cache = os.path.join(self.dir, "cache")
+        os.makedirs(cache)
+        now = self.now / 1000
+        for name, age in (("old.json", 31), ("new.json", 29)):
+            path = os.path.join(cache, name)
+            with open(path, "w") as f:
+                f.write("{}")
+            os.utime(path, (now - age * 86400, now - age * 86400))
+        self.assertEqual(lv.Janitor.clean_cache(cache, now), 2)
+        self.assertEqual(os.listdir(cache), ["new.json"])
 
     def test_rss_is_measured(self) -> None:
         self.assertGreater(lv.rss_mb(), 1)

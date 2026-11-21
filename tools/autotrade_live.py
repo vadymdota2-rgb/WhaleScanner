@@ -52,10 +52,10 @@ import urllib.request
 from collections.abc import Callable
 from datetime import datetime, timezone
 from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
-from typing import Any
+from typing import Any, TextIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import autotrade_backtest as bt  # noqa: E402 — общий код: окно китов, имена OKX, открытие базы на чтение
+import autotrade_backtest as bt
 
 OKX = "https://www.okx.com"
 # Ключ живёт на одном адресе: глобальный OKX, европейский (OKX EEA, вход
@@ -127,7 +127,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Перенаправление — отказ: иначе подписанные заголовки (ключ и
     Passphrase) ушли бы на адрес, который назвал чужой ответ."""
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]  # noqa: ANN001, PLR0913
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
         raise OkxError(str(code), f"перенаправление на {urllib.parse.urlsplit(newurl).netloc} — отказ")
 
 
@@ -148,7 +148,7 @@ def _read_json(r: Any, limit: int) -> Any:
 def http_transport(method: str, url: str, headers: dict[str, str], body: bytes | None) -> Any:
     if not url.startswith(tuple(f"{b}/" for b in OKX_BASES)):
         raise OkxError("host", "адрес не из списка OKX — запрос не отправлен")
-    req = urllib.request.Request(url, data=body, method=method,  # noqa: S310 — адрес проверен выше, https
+    req = urllib.request.Request(url, data=body, method=method,
                                  headers={**headers, "Accept-Encoding": "identity"})
     try:
         with _OPENER.open(req, timeout=15) as r:
@@ -230,8 +230,8 @@ class Okx:
         mac = hmac.new(self._secret.encode(), (ts + method + path + body).encode(), hashlib.sha256)
         return base64.b64encode(mac.digest()).decode()
 
-    def call(self, method: str, path: str, params: dict | None = None, body: dict | None = None,
-             private: bool = True) -> list:
+    def call(self, method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None,
+             private: bool = True) -> list[Any]:
         if params:
             path += "?" + urllib.parse.urlencode(params)
         raw = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -257,14 +257,14 @@ class Okx:
         return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
 
     # Обёртки — только то, что нужно трейдеру.
-    def instruments(self, inst_type: str = "SWAP") -> list[dict]:
+    def instruments(self, inst_type: str = "SWAP") -> list[dict[str, Any]]:
         return self.call("GET", "/api/v5/public/instruments", {"instType": inst_type}, private=False)
 
     def ticker(self, inst: str) -> float:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
         return max(0.0, num(d[0].get("last"))) if d and isinstance(d[0], dict) else 0.0
 
-    def config(self) -> dict:
+    def config(self) -> dict[str, Any]:
         d = self.call("GET", "/api/v5/account/config")
         return d[0] if d and isinstance(d[0], dict) else {}
 
@@ -272,7 +272,7 @@ class Okx:
         d = self.call("GET", "/api/v5/account/balance")
         return max(0.0, num(d[0].get("totalEq"))) if d and isinstance(d[0], dict) else 0.0
 
-    def positions(self) -> list[dict]:
+    def positions(self) -> list[dict[str, Any]]:
         """ВСЕ позиции счёта — бессрочные, срочные фьючерсы, маржа, опционы:
         правило «одна позиция за раз» считает и ручные сделки владельца любого
         вида (раньше — только бессрочные: срочный фьючерс владельца бот не видел)."""
@@ -282,27 +282,27 @@ class Okx:
     def set_leverage(self, inst: str, lever: int) -> None:
         self.call("POST", "/api/v5/account/set-leverage", body={"instId": inst, "lever": str(lever), "mgnMode": "cross"})
 
-    def order(self, body: dict) -> str:
+    def order(self, body: dict[str, Any]) -> str:
         d = self.call("POST", "/api/v5/trade/order", body=body)
         return str(d[0].get("ordId") or "") if d and isinstance(d[0], dict) else ""
 
-    def get_order(self, inst: str, ord_id: str = "", cl_id: str = "") -> dict:
+    def get_order(self, inst: str, ord_id: str = "", cl_id: str = "") -> dict[str, Any]:
         p = {"instId": inst, **({"ordId": ord_id} if ord_id else {"clOrdId": cl_id})}
         d = self.call("GET", "/api/v5/trade/order", p)
         return d[0] if d and isinstance(d[0], dict) else {}
 
-    def pending(self, inst: str) -> list[dict]:
+    def pending(self, inst: str) -> list[dict[str, Any]]:
         # Вид контракта — по имени: европейский бессрочный (…_XPERP-…) у OKX — FUTURES.
         return self.call("GET", "/api/v5/trade/orders-pending", {"instType": inst_type(inst), "instId": inst})
 
     def cancel(self, inst: str, ord_id: str) -> None:
         self.call("POST", "/api/v5/trade/cancel-order", body={"instId": inst, "ordId": ord_id})
 
-    def history(self, inst: str) -> list[dict]:
+    def history(self, inst: str) -> list[dict[str, Any]]:
         """Последние ордера по бумаге (за 7 дней) — чтобы узнать свои по метке clOrdId."""
         return self.call("GET", "/api/v5/trade/orders-history", {"instType": inst_type(inst), "instId": inst, "limit": "50"})
 
-    def closed(self, inst: str) -> list[dict]:
+    def closed(self, inst: str) -> list[dict[str, Any]]:
         return self.call("GET", "/api/v5/account/positions-history", {"instType": inst_type(inst), "instId": inst})
 
 
@@ -351,7 +351,7 @@ class Signals:
     def _con(self) -> sqlite3.Connection:
         return bt.open_ro(self.db)
 
-    def poll(self, now: int) -> list[dict]:
+    def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
         китов от 1000 $ за 2 часа, и строка, на которой это случилось."""
         since = max(self.last_ts - 10 * 60_000, now - WINDOW_MS) if self.last_ts else now - WINDOW_MS
@@ -362,7 +362,7 @@ class Signals:
                 "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now)).fetchall()
         finally:
             con.close()
-        out: list[dict] = []
+        out: list[dict[str, Any]] = []
         for tid, wallet, coin, code, ts, nanos, units in rows:
             if tid in self.seen or not bt.is_perp(coin):
                 continue
@@ -430,14 +430,14 @@ class Backtests:
         self.dir, self.db = data_dir, db
         self.script = script or os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotrade_backtest.py")
         self.limit_mb = limit_mb
-        self.proc: subprocess.Popen | None = None
-        self.log = None
+        self.proc: subprocess.Popen[bytes] | None = None
+        self.log: TextIO | None = None
         self.st = self._read()
         self.st.update(running=False)
         if not self.st.get("next"):
             self.st["next"] = next_run(time.time())
 
-    def _read(self) -> dict:
+    def _read(self) -> dict[str, Any]:
         try:
             with open(os.path.join(self.dir, "backtest_status.json"), encoding="utf-8") as f:
                 got = json.load(f)
@@ -614,16 +614,16 @@ class Trader:
         os.makedirs(self.dir, exist_ok=True)
         self._log = log or (lambda s: print(s, flush=True))
         self.st = self._load()
-        self.instr: dict[str, dict] = {}
+        self.instr: dict[str, dict[str, Any]] = {}
         self.instr_at = 0.0
         self.pos_mode = ""
         self.lever_set: set[str] = set()
-        self.positions: list[dict] = []
+        self.positions: list[dict[str, Any]] = []
         self.equity = 0.0
         self.last_sync = 0.0
 
     # состояние
-    def _load(self) -> dict:
+    def _load(self) -> dict[str, Any]:
         try:
             with open(os.path.join(self.dir, "state.json"), encoding="utf-8") as f:
                 st = json.load(f)
@@ -664,13 +664,13 @@ class Trader:
         return isinstance(got, dict) and got.get("on") is True
 
     # каталог и счёт
-    def instruments(self) -> dict[str, dict]:
+    def instruments(self) -> dict[str, dict[str, Any]]:
         """Каталог бессрочных контрактов. Глобальный OKX — «BTC-USDT-SWAP»;
         европейский OKX (EEA) торгует бессрочными как FUTURES вида
         «BTC-USD_UM_XPERP-310815», а SWAP в каталоге видны, но торговать ими
         нельзя (50124). Где есть XPERP — берём его."""
         if not self.instr or time.time() - self.instr_at > INSTR_TTL:
-            got: dict[str, dict] = {}
+            got: dict[str, dict[str, Any]] = {}
             for r in self.okx.instruments("SWAP"):
                 if r.get("state") == "live" and str(r.get("instId", "")).endswith("-USDT-SWAP"):
                     got[r["instId"]] = r
@@ -741,10 +741,10 @@ class Trader:
         self.event(f"закрыта {op['inst']} {'лонг' if op['side'] > 0 else 'шорт'}: {trade['why']}, PnL {pnl:+.2f} $")
 
     # вход
-    def _ps(self, side: int) -> dict:
+    def _ps(self, side: int) -> dict[str, Any]:
         return {"posSide": "long" if side > 0 else "short"} if self.pos_mode == "long_short_mode" else {}
 
-    def _place_tp(self, op: dict, size: Decimal) -> None:
+    def _place_tp(self, op: dict[str, Any], size: Decimal) -> None:
         ins = self.instruments().get(op["inst"], {})
         sz = round_step(size, ins.get("lotSz", "1"), ROUND_DOWN)
         # Тейк — только по ту сторону от входа, не ближе +1 % (ни нулевой цены,
@@ -761,7 +761,7 @@ class Trader:
         op["tp_id"] = self.okx.order(body)
         self.event(f"тейк {op['inst']} {op['tp_s']} × {fmt_dec(sz)}")
 
-    def candidates(self, sigs: list[dict]) -> list[dict]:
+    def candidates(self, sigs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         now = self.clock()
         seen: set[tuple[str, int]] = set()
         out = []
@@ -773,7 +773,7 @@ class Trader:
             out.append(s)
         return out
 
-    def try_enter(self, s: dict) -> str:
+    def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
         if self.st.get("open") or self.positions:
@@ -842,7 +842,7 @@ class Trader:
             self.event(f"{inst}: ордер не принят — {e}; "
                        + ("бумага исключена на 7 дней" if permanent else "пауза по бумаге 15 минут"))
             return f"{inst}: ордер не принят ({e.code})"
-        o: dict = {}
+        o: dict[str, Any] = {}
         for _ in range(10):
             o = self.okx.get_order(inst, ord_id)
             if o.get("state") == "filled":
@@ -869,13 +869,13 @@ class Trader:
         self.save()
         return ""
 
-    def _side_of(self, p: dict) -> int:
+    def _side_of(self, p: dict[str, Any]) -> int:
         ps = str(p.get("posSide") or "net")
         if ps in ("long", "short"):
             return 1 if ps == "long" else -1
         return 1 if num(p.get("pos")) > 0 else -1
 
-    def adopt(self, p: dict, order: dict, info: dict | None = None) -> None:
+    def adopt(self, p: dict[str, Any], order: dict[str, Any], info: dict[str, Any] | None = None) -> None:
         """Позиция открыта нашим ордером, но не записана (служба упала между
         ордером и записью): принять как свою и поставить тейк."""
         inst = str(p["instId"])
@@ -1050,10 +1050,8 @@ def main(argv: list[str] | None = None) -> int:
             fails += 1
             tr.st["error"] = str(e)[:300]
             tr.event(f"сбой: {e}")
-            try:
+            with contextlib.suppress(OSError):
                 tr.save()
-            except OSError:
-                pass
             time.sleep(min(300, 5 * 2 ** min(fails, 6)))
         # Код обновился (автодеплой) — выйти: systemd поднимет с новым. Идёт
         # пересчёт — дождаться его (иначе systemd убьёт его вместе со службой).

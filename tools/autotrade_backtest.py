@@ -68,6 +68,7 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 HL_INFO = "https://api.hyperliquid.xyz/info"
 OKX_API = "https://www.okx.com"
@@ -93,7 +94,7 @@ HOUR_MS = 3_600_000
 OPEN_LONG, OPEN_SHORT, CLOSE_LONG, CLOSE_SHORT, FLIP, LIQ_LONG, LIQ_SHORT = 1, 2, 3, 4, 5, 6, 7
 CLOSES_FOR = {1: (CLOSE_LONG, FLIP, LIQ_LONG), -1: (CLOSE_SHORT, FLIP, LIQ_SHORT)}
 
-Fetch = Callable[[dict], object]
+Fetch = Callable[[dict[str, Any]], object]
 
 
 # ── данные из базы бота (только чтение) ──────────────────────────────────────
@@ -121,8 +122,8 @@ class Signal:
     # обратную (киты «спорят»). Только прошлое.
     # Кортежи по порогам THRESHOLDS (не словари: на сотнях тысяч сигналов
     # это сотни мегабайт). whales_at(порог) / opp(порог) — чтение.
-    wallets_by: tuple = ()
-    opp_by: tuple = ()
+    wallets_by: tuple[Any, ...] = ()
+    opp_by: tuple[Any, ...] = ()
 
     @property
     def wallets_at(self) -> dict[float, int]:
@@ -174,7 +175,7 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
     with_history=False — без истории китов (PnL за 30 дней, закрытия):
     подсчёту сделок в день она не нужна."""
     thresholds = sorted({float(min_whale)} if isinstance(min_whale, (int, float)) else {float(x) for x in min_whale})
-    global THRESHOLDS  # пороги одни на прогон: по ним читаются кортежи сигналов
+    global THRESHOLDS  # noqa: PLW0603 — пороги одни на прогон: по ним читаются кортежи сигналов (память)
     THRESHOLDS = tuple(thresholds)
     cur = con.execute(
         "SELECT wallet, coin, dir_code, MIN(ts) AS t0, SUM(notional_nanos), SUM(ABS(CAST(sz AS REAL))), "
@@ -191,13 +192,13 @@ def load_signals(con: sqlite3.Connection, dexes: Sequence[str] | None, since_ms:
         return w
 
     out: list[Signal] = []
-    for wallet, coin, code, ts, notional, units, account, lev in cur:
+    for wallet, coin, code, ts, notional, raw_units, account, lev in cur:
         if not is_perp(coin) or (dexes is not None and not is_stock(coin, dexes)):
             continue
         side = 1 if code == OPEN_LONG else -1
         nanos = int(notional or 0)
         usd_n = nanos / NANOS
-        units = float(units or 0.0)
+        units = float(raw_units or 0.0)
         mine, other = window((coin, side)), window((coin, -side))
         mine.expire(ts - cluster_ms)
         other.expire(ts - cluster_ms)
@@ -230,7 +231,7 @@ class Window:
     def __init__(self, limits: Sequence[int]) -> None:
         self.limits = limits
         self.orders: deque[tuple[int, str, int, float]] = deque()
-        self.per: dict[str, list] = {}   # кит → [нано $, штук, ордеров, ордеров со штуками]
+        self.per: dict[str, list[Any]] = {}   # кит → [нано $, штук, ордеров, ордеров со штуками]
         self.count = [0] * len(limits)   # китов от каждого порога
         self.total = 0                   # нано $ всех ордеров окна
         self.big_n = 0                   # китов от наименьшего порога (со штуками): нано $
@@ -283,15 +284,15 @@ def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
     wallets = sorted(by_wallet)
     for chunk in (wallets[i:i + 200] for i in range(0, len(wallets), 200)):
         marks = ",".join("?" * len(chunk))
-        times: dict[str, array] = defaultdict(lambda: array("q"))
-        sums: dict[str, array] = defaultdict(lambda: array("d", [0.0]))
+        times: dict[str, array[int]] = defaultdict(lambda: array("q"))
+        sums: dict[str, array[float]] = defaultdict(lambda: array("d", [0.0]))
         for w, ts, p in con.execute(
                 f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE closed_pnl_nanos != 0 "  # noqa: S608 — только «?»
                 f"AND wallet IN ({marks}) ORDER BY ts", chunk):
             times[w].append(ts)
             sums[w].append(sums[w][-1] + p / NANOS)
         wanted = {(sig.wallet, sig.coin) for w in chunk for sig in by_wallet[w]}
-        closes: dict[tuple[str, str, int], array] = defaultdict(lambda: array("q"))
+        closes: dict[tuple[str, str, int], array[int]] = defaultdict(lambda: array("q"))
         for w, coin, ts, code in con.execute(
                 f"SELECT wallet, coin, ts, dir_code FROM hl_fills WHERE dir_code IN (3, 4, 5, 6, 7) "  # noqa: S608
                 f"AND wallet IN ({marks}) ORDER BY ts", chunk):
@@ -314,18 +315,18 @@ def attach_history(con: sqlite3.Connection, signals: list[Signal]) -> None:
 
 # ── свечи и фандинг (сеть — только здесь) ────────────────────────────────────
 
-def http_fetch(body: dict) -> object:
+def http_fetch(body: dict[str, Any]) -> object:
     """Запрос к публичному API: Hyperliquid — POST info; {"okx": путь,
     "params": {…}} — GET публичного API OKX (ключ не нужен), ответ — data."""
     if "okx" in body:
         url = OKX_API + str(body["okx"]) + "?" + urllib.parse.urlencode(body.get("params") or {})
         # Без своего User-Agent OKX отвечает 403 стандартному urllib.
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; backtest)"})  # noqa: S310 — адрес постоянный, https
-        with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 — адрес постоянный, https
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; backtest)"})
+        with urllib.request.urlopen(req, timeout=20) as r:
             got = json.loads(r.read(16 << 20))
         return got.get("data") if isinstance(got, dict) and str(got.get("code")) == "0" else None
     req = urllib.request.Request(HL_INFO, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as r:  # noqa: S310 — адрес постоянный, https
+    with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read(4 << 20))
 
 
@@ -337,7 +338,7 @@ def safe_name(coin: str) -> str:
 class Market:
     """Свечи одной бумаги по интервалам: время открытия (мс) и o, h, l, c —
     столбцами (array), а не кортежами: в несколько раз меньше памяти."""
-    by_interval: dict[str, Candles] = field(default_factory=dict)
+    by_interval: dict[str, Any] = field(default_factory=dict)  # интервал → Candles (или строки свечей — превращаются)
 
     def __post_init__(self) -> None:
         self.by_interval = {k: v if isinstance(v, Candles) else Candles(v) for k, v in self.by_interval.items()}
@@ -373,7 +374,7 @@ class MarketData:
         self.errors: list[str] = []
         os.makedirs(cache, exist_ok=True)
 
-    def _call(self, body: dict) -> list:
+    def _call(self, body: dict[str, Any]) -> list[Any]:
         if self.offline:
             return []
         if self.requests and self.pause:
@@ -387,7 +388,7 @@ class MarketData:
             return []
         return got if isinstance(got, list) else []
 
-    def _call_any(self, body: dict) -> object:
+    def _call_any(self, body: dict[str, Any]) -> object:
         """Как _call, но ответ — любой JSON (allMids — словарь)."""
         if self.offline:
             return None
@@ -452,7 +453,7 @@ class MarketData:
                 self._save(name, {str(k): v for k, v in have.items()})
         return have, ("OKX" if have else "нет данных — 0")
 
-    def _load(self, name: str) -> dict:
+    def _load(self, name: str) -> dict[str, Any]:
         p = os.path.join(self.cache, name)
         try:
             with open(p, encoding="utf-8") as f:
@@ -461,7 +462,7 @@ class MarketData:
         except (OSError, ValueError):
             return {}
 
-    def _save(self, name: str, data: dict) -> None:
+    def _save(self, name: str, data: dict[str, Any]) -> None:
         p = os.path.join(self.cache, name)
         with open(p + ".tmp", "w", encoding="utf-8") as f:
             json.dump(data, f)
@@ -540,7 +541,7 @@ def okx_candidate(coin: str) -> tuple[str, float]:
     return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
 
 
-def okx_map(md: MarketData, coins: Sequence[str]) -> dict[str, dict]:
+def okx_map(md: MarketData, coins: Sequence[str]) -> dict[str, dict[str, Any]]:
     """Какие бумаги китов можно торговать на OKX. Имя (с заменами) — только
     кандидат; пара принимается, если цены сейчас сходятся (±2 % с учётом
     масштаба). Иначе — «нет на OKX» или «другой актив с тем же именем».
@@ -568,7 +569,7 @@ def okx_map(md: MarketData, coins: Sequence[str]) -> dict[str, dict]:
                     mids[str(k)] = float(v)
                 except (TypeError, ValueError):
                     continue
-    out: dict[str, dict] = {}
+    out: dict[str, dict[str, Any]] = {}
     for c in coins:
         base, scale = okx_candidate(c)
         inst = f"{base}-USDT-SWAP"
@@ -606,9 +607,9 @@ class Path:
     sec: int
     entry_t: int
     entry_px: float
-    starts: array          # начало каждой свечи пути (мс); [0] — момент входа
-    cummax: array
-    negcummin: array       # −накопленный минимум: неубывающий
+    starts: array[int]     # начало каждой свечи пути (мс); [0] — момент входа
+    cummax: array[float]
+    negcummin: array[float]  # −накопленный минимум: неубывающий
     times_exit: dict[int, tuple[int, float]]  # выход по времени T мин → (момент, цена)
     whale_exit: tuple[int, float] | None
     end_t: int             # до какого момента путь известен
@@ -780,7 +781,7 @@ class Stats:
     max_open_at_once: int = 0  # больше всего позиций сразу
     max_overlap_mae: float = 0.0  # худшие провалы одновременно открытых вместе, $ (верхняя граница риска кросса)
 
-    def row(self) -> dict:
+    def row(self) -> dict[str, Any]:
         return {"сделок": self.trades, "прибыльных_%": round(100 * self.wins / self.trades, 1) if self.trades else 0,
                 "ср_прибыль_$": round(self.avg_win, 2), "ср_убыток_$": round(self.avg_loss, 2),
                 "profit_factor": round(self.pf, 2) if math.isfinite(self.pf) else "inf",
@@ -791,7 +792,7 @@ class Stats:
                 "позиций_сразу_макс": self.max_open_at_once, "провал_всех_сразу_$": round(self.max_overlap_mae, 2)}
 
 
-def stats_json(st: Stats) -> dict:
+def stats_json(st: Stats) -> dict[str, Any]:
     """Те же итоги для приложения: ключи латиницей, PF без бесконечности
     (убытков не было — null)."""
     return {"trades": st.trades, "win_pct": round(100 * st.wins / st.trades, 1) if st.trades else 0.0,
@@ -829,7 +830,7 @@ def stats(trades: Sequence[Trade]) -> Stats:
         s.max_open_at_once = max(s.max_open_at_once, len(active))
         s.max_overlap_mae = max(s.max_overlap_mae, sum(x.mae_usd for x in active))
     eq = peak = 0.0
-    run = run_usd = 0
+    run, run_usd = 0, 0.0
     for t in sorted(trades, key=lambda x: (x.exit_t, x.entry_t)):
         # Просадка счёта — и внутри сделки (пересиживаем: позиция могла уйти
         # против нас глубоко, прежде чем дошла до тейка), а не только по
@@ -844,7 +845,7 @@ def stats(trades: Sequence[Trade]) -> Stats:
             if run > s.worst_streak or (run == s.worst_streak and run_usd < s.worst_streak_usd):
                 s.worst_streak, s.worst_streak_usd = run, run_usd
         else:
-            run = run_usd = 0
+            run, run_usd = 0, 0.0
     return s
 
 
@@ -915,7 +916,7 @@ class Params:
     filters: Filters
     exits: Exits
 
-    def json(self) -> dict:
+    def json(self) -> dict[str, Any]:
         f, e = self.filters, self.exits
         return {"delay": self.delay, "min_notional": f.min_notional, "min_account": f.min_account,
                 "max_leverage": f.max_leverage, "pnl30": f.need_pnl30, "cooldown": f.cooldown_min,
@@ -924,7 +925,7 @@ class Params:
                 "no_conflict": f.no_conflict,
                 "tp": round(e.tp * 100, 3), "sl": round(e.sl * 100, 3), "hold": e.hold, "whale": e.whale}
 
-    def row(self) -> dict:
+    def row(self) -> dict[str, Any]:
         f, e = self.filters, self.exits
         return {"D_сек": self.delay, "китов_от": f.min_wallets, "кит_от_$": f.min_whale,
                 "без_споров": "да" if f.no_conflict else "нет", "объём_от_$": f.min_notional,
@@ -1094,7 +1095,7 @@ def inside(child: str, parent: str) -> bool:
     return os.path.commonpath([child, parent]) == parent
 
 
-def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None) -> dict:
+def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None) -> dict[str, Any]:
     bot_dir = os.path.dirname(os.path.realpath(a.db))
     for what, path in (("отчёт", a.out), ("кеш свечей", a.cache)):
         if inside(path, bot_dir):
@@ -1206,8 +1207,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         flip_book = PathBook(flipped, markets, hold_ms, holds, slip, cap=500)
         return simulate(flipped, flip_book.view(range(len(flipped)), prm.delay), prm, slip, fee, sizing)
 
-    by_chase: list[dict] = []
-    pace: list[dict] = []
+    by_chase: list[dict[str, Any]] = []
+    pace: list[dict[str, Any]] = []
     checked = [(prm, st, stats(on(hold_out, prm))) for prm, st in top]
     best = checked[0] if checked else None
     fade = stats(against(hold_out, best[0])) if best else Stats()
@@ -1217,7 +1218,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     # ── отчёт ──
     lines: list[str] = []
     w = lines.append
-    fmt = lambda ms: datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")  # noqa: E731
+    def fmt(ms: float) -> str:
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     w("Бэктест автокопирования китов — фьючерсы Hyperliquid (этап 1): "
       + ("все — крипта, акции, металлы" if a.markets == "all" else "акции (" + ", ".join(a.dexes) + ")"))
     w(f"Торговля — на {'OKX' if a.venue == 'okx' else 'Hyperliquid'}; сигналы — сделки китов на Hyperliquid.")
@@ -1235,7 +1237,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     w(f"Период сигналов: {fmt(t_lo)} — {fmt(t_hi)}; подбор — до {fmt(cut)}, отложенные — после.")
     w(f"Ордеров китов: {raw_signals}; из них проходят правило китов (от {k_min} в одну сторону): {len(signals)}; "
       f"без свечей: {no_data}.")
-    res = defaultdict(int)
+    res: defaultdict[str, int] = defaultdict(int)
     for i in range(len(signals)):
         res[book.interval(i, delays[0]) or "нет"] += 1
     w("Свечи (по сигналам, D=" + str(delays[0]) + "): " + ", ".join(f"{k} — {v}" for k, v in sorted(res.items())))
@@ -1353,8 +1355,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
             m1 = [t for t in tr if t.interval == "1m"]
             w(f"  D={d} с: итог {stats(tr).net:.2f} $ ({len(tr)} сделок); на минутных — {stats(m1).net:.2f} $ ({len(m1)})")
 
-        with open(os.path.join(a.out, "trades.csv"), "w", newline="", encoding="utf-8") as f:
-            wr = csv.writer(f)
+        with open(os.path.join(a.out, "trades.csv"), "w", newline="", encoding="utf-8") as fh:
+            wr = csv.writer(fh)
             wr.writerow(["бумага", "кит", "сторона", "сделка_кита_UTC", "вход_UTC", "выход_UTC", "объём_кита_$",
                          "счёт_кита_$", "плечо_кита", "PnL30_кита_$", "доход_%", "доход_$", "выход", "свечи",
                          "рынок_США", "отложенные"])
@@ -1364,30 +1366,30 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
                              round(s.notional, 2), round(s.account, 2), s.leverage, round(s.pnl30, 2),
                              round(t.pnl_pct * 100, 4), round(t.pnl_usd, 2), t.why, t.interval,
                              "открыт" if us_open(t.entry_t) else "закрыт", "да" if s.ts >= cut else "нет"])
-    with open(os.path.join(a.out, "grid.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "grid.csv"), "w", newline="", encoding="utf-8") as fh:
         rows = [{**prm.row(), **st.row()} for prm, st in grid]
         if rows:
-            wr2 = csv.DictWriter(f, fieldnames=list(rows[0]))
+            wr2 = csv.DictWriter(fh, fieldnames=list(rows[0]))
             wr2.writeheader()
             wr2.writerows(rows)
-    with open(os.path.join(a.out, "top10.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(a.out, "top10.csv"), "w", newline="", encoding="utf-8") as fh:
         rows = [{**prm.row(), **{f"подбор_{k}": v for k, v in st.row().items()},
                  **{f"отлож_{k}": v for k, v in ho.row().items()}} for prm, st, ho in checked]
         if rows:
-            wr3 = csv.DictWriter(f, fieldnames=list(rows[0]))
+            wr3 = csv.DictWriter(fh, fieldnames=list(rows[0]))
             wr3.writeheader()
             wr3.writerows(rows)
     text = "\n".join(lines) + "\n"
-    with open(os.path.join(a.out, "report.txt"), "w", encoding="utf-8") as f:
-        f.write(text)
+    with open(os.path.join(a.out, "report.txt"), "w", encoding="utf-8") as fh:
+        fh.write(text)
     summary = build_summary(a, sizing, signals, cut, res, funding_src, md, checked, verdict,
                             on(list(range(len(signals))), best[0]) if best else [], passes, fade if best else None)
     summary["okx"] = {"venue": a.venue, "map": okx}
     summary["by_chase"] = by_chase
     summary["pace"] = pace
     summary["entries_per_day"] = round(len(episodes(signals, a.cooldown)) / max(1.0, (t_hi - t_lo) / DAY_MS), 2)
-    with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False)
+    with open(os.path.join(a.out, "summary.json.tmp"), "w", encoding="utf-8") as fh:
+        json.dump(summary, fh, ensure_ascii=False)
     os.replace(os.path.join(a.out, "summary.json.tmp"), os.path.join(a.out, "summary.json"))
     return {"summary": summary, "text": text, "verdict": verdict, "signals": len(signals), "grid": grid, "top": checked,
             "requests": md.requests}
@@ -1442,15 +1444,15 @@ def count_report(signals: Sequence[Signal], raw: int, k_min: int, a: argparse.Na
     return "\n".join(lines) + "\n"
 
 
-def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signal], cut: int, res: dict,
-                  funding_src: dict[str, str], md: MarketData, checked: list, verdict: bool,
-                  trades: list[Trade], passes: Callable[[Stats], bool], fade_st: Stats | None = None) -> dict:
+def build_summary(a: argparse.Namespace, sizing: Sizing, signals: Sequence[Signal], cut: int, res: dict[str, Any],
+                  funding_src: dict[str, str], md: MarketData, checked: list[Any], verdict: bool,
+                  trades: list[Trade], passes: Callable[[Stats], bool], fade_st: Stats | None = None) -> dict[str, Any]:
     """Итог для закрытой вкладки приложения (API читает summary.json): то же,
     что в отчёте, машиночитаемо. Адреса китов — сокращённо."""
     def short(w: str) -> str:
         return w[:6] + "…" + w[-4:] if len(w) > 12 else w
 
-    def group(key: Callable[[Trade], str], limit: int = 0) -> list[dict]:
+    def group(key: Callable[[Trade], str], limit: int = 0) -> list[dict[str, Any]]:
         g: dict[str, list[Trade]] = defaultdict(list)
         for t in trades:
             g[key(t)].append(t)
@@ -1574,7 +1576,7 @@ def limit_memory(mb: int) -> None:
     понятный выход, а не съеденная память сервера, где живут бот и API."""
     if mb <= 0:
         return
-    import resource
+    import resource  # noqa: PLC0415 — только Unix; нужен лишь при пределе памяти
     cap = mb * 1024 * 1024
     _soft, hard = resource.getrlimit(resource.RLIMIT_AS)
     if hard != resource.RLIM_INFINITY:

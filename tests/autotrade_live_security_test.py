@@ -201,7 +201,7 @@ class GarbageTradeTest(Base):
         okx = lv.Okx("K", "S", "P", False, lambda m, u, h, b: seen.append((m, u, h, b)) or {"code": "0", "data": []},
                      base="https://eea.okx.com")
         okx.order({"instId": "BTC-USDT-SWAP", "sz": "1"})
-        m, u, h, b = seen[0]
+        _m, u, h, b = seen[0]
         self.assertTrue(u.startswith("https://eea.okx.com/api/v5/trade/order"))
         self.assertEqual(json.loads(b), {"instId": "BTC-USDT-SWAP", "sz": "1"})
         self.assertNotIn("eea.okx.com", h["OK-ACCESS-TIMESTAMP"] + "POST/api/v5/trade/order" + b.decode())
