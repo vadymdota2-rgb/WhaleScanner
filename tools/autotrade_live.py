@@ -220,13 +220,20 @@ class Okx:
         return d[0] if d else {}
 
     def pending(self, inst: str) -> list[dict]:
-        return self.call("GET", "/api/v5/trade/orders-pending", {"instType": "SWAP", "instId": inst})
+        # Вид контракта — по имени: европейский бессрочный (…_XPERP-…) у OKX — FUTURES.
+        return self.call("GET", "/api/v5/trade/orders-pending", {"instType": inst_type(inst), "instId": inst})
 
     def cancel(self, inst: str, ord_id: str) -> None:
         self.call("POST", "/api/v5/trade/cancel-order", body={"instId": inst, "ordId": ord_id})
 
     def closed(self, inst: str) -> list[dict]:
-        return self.call("GET", "/api/v5/account/positions-history", {"instType": "SWAP", "instId": inst})
+        return self.call("GET", "/api/v5/account/positions-history", {"instType": inst_type(inst), "instId": inst})
+
+
+def inst_type(inst: str) -> str:
+    """Вид контракта OKX по имени: «…-SWAP» — SWAP, остальное (в т. ч.
+    европейский бессрочный «BTC-USD_UM_XPERP-310815») — FUTURES."""
+    return "SWAP" if inst.endswith("-SWAP") else "FUTURES"
 
 
 # ── округление под правила бумаги ────────────────────────────────────────────

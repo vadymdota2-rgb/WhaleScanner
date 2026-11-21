@@ -91,6 +91,11 @@ class FakeOkx:
         if p == "/api/v5/trade/order":
             o = next(o for o in self.orders if o["ordId"] == q.get("ordId") or o.get("clOrdId") == q.get("clOrdId"))
             return ok([o])
+        if p in ("/api/v5/trade/orders-pending", "/api/v5/account/positions-history"):
+            # Как OKX: вид контракта должен совпадать с бумагой (XPERP — FUTURES).
+            kind = self.instr.get(q["instId"], {}).get("instType", "SWAP")
+            if q.get("instType", kind) != kind:
+                return ok([])
         if p == "/api/v5/trade/orders-pending":
             return ok([o for o in self.orders if o["state"] == "live" and o["instId"] == q["instId"]])
         if p == "/api/v5/trade/cancel-order":
@@ -395,6 +400,33 @@ class EeaTest(Base):
             self.assertFalse(any(c[2].get("instId") == "BTC-USDT-SWAP" for c in self.ex.calls if c[1] == "/api/v5/trade/order"))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_xperp_tp_is_seen_not_duplicated_and_close_recorded(self) -> None:
+        """Европейский контракт (FUTURES): бот видит свой тейк и не ставит его
+        заново каждые 15 секунд; после закрытия берёт PnL из истории FUTURES."""
+        x = "BTC-USD_UM_XPERP-310815"
+        self.ex = FakeOkx("long_short_mode")
+        self.ex.instr[x] = {"instId": x, "instType": "FUTURES", "state": "live", "ctVal": "0.0001", "ctMult": "1",
+                            "ctValCcy": "BTC", "lotSz": "1", "minSz": "1", "tickSz": "0.1"}
+        self.ex.last[x] = 100_000.0
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        for k in range(3):
+            self.now += 2 * MIN
+            tr.last_sync = 0
+            tr.step()
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк один, не дубли")
+        self.now += 10 * MIN
+        self.ex.pos = []
+        self.ex.history = [{"instId": x, "uTime": str(self.now), "realizedPnl": "77.0", "closeAvgPx": "101000"}]
+        tr.last_sync = 0
+        tr.step()
+        with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+            [t] = [json.loads(v) for v in f]
+        self.assertEqual((t["inst"], t["pnl"], t["why"]), (x, 77.0, "тейк"))
+        self.assertEqual(lv.inst_type(x), "FUTURES")
+        self.assertEqual(lv.inst_type("BTC-USDT-SWAP"), "SWAP")
 
     def test_global_account_without_xperp_keeps_usdt_swap(self) -> None:
         tr = self.trader(self.whales())
