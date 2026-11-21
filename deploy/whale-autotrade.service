@@ -38,7 +38,9 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 CapabilityBoundingSet=
 LockPersonality=yes
-MemoryMax=384M
+# Служба торгует (~100 МБ) и считает бэктест ночью (до 1200 МБ, сам себя
+# останавливает) — у неё свой предел, API это не задевает.
+MemoryMax=1792M
 
 [Install]
 WantedBy=multi-user.target

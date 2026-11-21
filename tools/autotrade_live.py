@@ -37,8 +37,11 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.error
@@ -267,6 +270,128 @@ class Signals:
         cut = now - WINDOW_MS - 20 * 60_000
         self.seen = {t: s for t, s in self.seen.items() if s >= cut}
         return out
+
+
+# ── бэктест: ночью и по кнопке, в этой службе (не в API) ─────────────────────
+
+BT_HOUR_UTC, BT_MINUTE = 3, 17
+BT_PAUSE_SEC = 15                 # между запросами к Hyperliquid
+BT_MEM_MB = 1200                  # предел памяти самого бэктеста (RLIMIT_AS)
+BT_NEED_MB = 1600                 # столько должна разрешать служба (MemoryMax) — иначе не запускаем
+BT_TIMEOUT_SEC = 6 * 3600
+
+
+def next_run(now: float) -> int:
+    day = int(now) // 86400 * 86400
+    at = day + BT_HOUR_UTC * 3600 + BT_MINUTE * 60
+    return at if at > now else at + 86400
+
+
+def cgroup_limit_mb() -> float:
+    """Предел памяти своей службы (cgroup v2 memory.max), МБ; нет — бесконечность."""
+    try:
+        with open("/proc/self/cgroup", encoding="utf-8") as f:
+            path = next((ln.split("::", 1)[1].strip() for ln in f if ln.startswith("0::")), "")
+        with open(f"/sys/fs/cgroup{path}/memory.max", encoding="utf-8") as f:
+            raw = f.read().strip()
+    except (OSError, StopIteration):
+        return math.inf
+    return math.inf if raw == "max" else int(raw) / 2**20
+
+
+class Backtests:
+    """Бэктест отдельным процессом с низким приоритетом: ночью в 03:17 UTC и
+    по запросу из вкладки (run.request от API), пока модуль включён. Удачный
+    итог — latest/ (прежний — prev/), неудачный прежний не портит. «Стоп» —
+    прерывает. Ход — в backtest_status.json (его показывает вкладка).
+    Раньше бэктест шёл внутри API и ронял её по памяти: здесь у службы свой
+    предел, и если он меньше BT_NEED_MB — не запускаем, а говорим почему."""
+
+    def __init__(self, data_dir: str, db: str, script: str | None = None,
+                 limit_mb: Callable[[], float] = cgroup_limit_mb) -> None:
+        self.dir, self.db = data_dir, db
+        self.script = script or os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotrade_backtest.py")
+        self.limit_mb = limit_mb
+        self.proc: subprocess.Popen | None = None
+        self.log = None
+        self.st = self._read()
+        self.st.update(running=False)
+        if not self.st.get("next"):
+            self.st["next"] = next_run(time.time())
+
+    def _read(self) -> dict:
+        try:
+            with open(os.path.join(self.dir, "backtest_status.json"), encoding="utf-8") as f:
+                got = json.load(f)
+                return got if isinstance(got, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write(self) -> None:
+        tmp = os.path.join(self.dir, "backtest_status.json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.st, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(self.dir, "backtest_status.json"))
+
+    def tick(self, on: bool, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        req = os.path.join(self.dir, "run.request")
+        if self.proc is not None:
+            rc = self.proc.poll()
+            if not on:
+                self.proc.terminate()
+                self.proc.wait(timeout=30)
+                self._done(None, "остановлено кнопкой «Стоп»")
+            elif rc is None and now - self.st.get("started", now) > BT_TIMEOUT_SEC:
+                self.proc.kill()
+                self.proc.wait(timeout=30)
+                self._done(None, "бэктест шёл дольше 6 часов — остановлен")
+            elif rc is not None:
+                self._done(rc, "")
+            return
+        wanted = os.path.exists(req) or now >= self.st["next"]
+        if not (on and wanted):
+            if not on and os.path.exists(req):
+                os.remove(req)
+            return
+        if os.path.exists(req):
+            os.remove(req)
+        self.st["next"] = next_run(now)
+        if self.limit_mb() < BT_NEED_MB:
+            self.st.update(error=f"службе whale-autotrade разрешено {self.limit_mb():.0f} МБ, бэктесту нужно "
+                                 f"{BT_NEED_MB} — переустановите: sudo bash ~/WhaleScanner/tools/autotrade-install.sh",
+                           finished=int(now))
+            self._write()
+            return
+        out = os.path.join(self.dir, "run")
+        shutil.rmtree(out, ignore_errors=True)
+        self.log = open(os.path.join(self.dir, "last_run.log"), "w", encoding="utf-8")  # noqa: SIM115 — закрывается в _done
+        self.proc = subprocess.Popen(  # свой скрипт, аргументы списком — без оболочки
+            [sys.executable, "-I", self.script, "--db", self.db, "--out", out, "--cache",
+             os.path.join(self.dir, "cache"), "--pause", str(BT_PAUSE_SEC), "--max-mem-mb", str(BT_MEM_MB)],
+            stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(19))  # noqa: PLW1509 — однопоточная служба
+        self.st.update(running=True, started=int(now), error="")
+        self._write()
+
+    def _done(self, rc: int | None, why: str) -> None:
+        self.proc = None
+        if self.log:
+            self.log.close()
+            self.log = None
+        out = os.path.join(self.dir, "run")
+        if not why:
+            if rc == 3:
+                why = f"бэктесту не хватило предела памяти {BT_MEM_MB} МБ — остановлен сам, сервер не тронут"
+            elif rc != 0 or not os.path.isfile(os.path.join(out, "summary.json")):
+                why = f"бэктест завершился с кодом {rc} (last_run.log)"
+        if not why:
+            prev, cur = os.path.join(self.dir, "prev"), os.path.join(self.dir, "latest")
+            shutil.rmtree(prev, ignore_errors=True)
+            if os.path.isdir(cur):
+                os.replace(cur, prev)
+            os.replace(out, cur)
+        self.st.update(running=False, finished=int(time.time()), error=why)
+        self._write()
 
 
 # ── трейдер ──────────────────────────────────────────────────────────────────
@@ -536,8 +661,13 @@ def main(argv: list[str] | None = None) -> int:
     stamp = [os.path.getmtime(p) for p in me]
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
     tr.recover()
+    bts = Backtests(a.dir, a.db)
     fails = 0
     while True:
+        try:
+            bts.tick(tr.is_on())
+        except (OSError, subprocess.SubprocessError) as e:
+            tr.event(f"бэктест: {e}")
         try:
             tr.step()
             tr.st["error"] = ""
@@ -551,8 +681,9 @@ def main(argv: list[str] | None = None) -> int:
             except OSError:
                 pass
             time.sleep(min(300, 5 * 2 ** min(fails, 6)))
-        # Код обновился (автодеплой) — выйти: systemd поднимет с новым.
-        if [os.path.getmtime(p) for p in me] != stamp:
+        # Код обновился (автодеплой) — выйти: systemd поднимет с новым. Идёт
+        # пересчёт — дождаться его (иначе systemd убьёт его вместе со службой).
+        if bts.proc is None and [os.path.getmtime(p) for p in me] != stamp:
             tr.event("код обновился — перезапуск")
             return 0
         time.sleep(POLL_SEC)

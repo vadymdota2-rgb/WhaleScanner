@@ -336,6 +336,129 @@ class TradeTest(Base):
         self.assertIn("нет ключа OKX", self.state()["error"])
 
 
+FAKE_BT = """
+import json, os, sys, time
+out = sys.argv[sys.argv.index("--out") + 1]
+mode = open(os.path.join(os.path.dirname(out), "mode")).read().strip()
+if mode == "sleep":
+    time.sleep(60)
+code = int(mode)
+if code == 0:
+    os.makedirs(out, exist_ok=True)
+    json.dump({"verdict": True, "args": sys.argv[1:]}, open(os.path.join(out, "summary.json"), "w"))
+sys.exit(code)
+"""
+
+
+class BacktestServiceTest(unittest.TestCase):
+    """Бэктест — в службе торговли, не в API: по запросу и ночью, пока
+    модуль включён; итог — latest/prev; «Стоп» прерывает; предел памяти
+    службы меньше нужного — не запускается и говорит, что делать."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.script = os.path.join(self.dir, "fake_bt.py")
+        with open(self.script, "w") as f:
+            f.write(FAKE_BT)
+
+    def bts(self, mode: str, limit: float = 4096) -> lv.Backtests:
+        with open(os.path.join(self.dir, "mode"), "w") as f:
+            f.write(mode)
+        b = lv.Backtests(self.dir, "/db/hyperliquid.db", self.script, limit_mb=lambda: limit)
+        b.st["next"] = 2**40  # ночь далеко — только по запросу
+        return b
+
+    def request(self) -> None:
+        with open(os.path.join(self.dir, "run.request"), "w") as f:
+            f.write("{}")
+
+    def status(self) -> dict:
+        with open(os.path.join(self.dir, "backtest_status.json")) as f:
+            return json.load(f)
+
+    def finish(self, b: lv.Backtests) -> None:
+        b.proc.wait(timeout=30)
+        b.tick(True)
+
+    def test_request_runs_and_success_becomes_latest(self) -> None:
+        b = self.bts("0")
+        b.tick(True)
+        self.assertIsNone(b.proc, "без запроса и не ночью — не запускается")
+        self.request()
+        b.tick(True)
+        self.assertIsNotNone(b.proc)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "run.request")))
+        self.assertTrue(self.status()["running"])
+        self.finish(b)
+        with open(os.path.join(self.dir, "latest", "summary.json")) as f:
+            args = json.load(f)["args"]
+        self.assertEqual(args[args.index("--pause") + 1], str(lv.BT_PAUSE_SEC))
+        self.assertEqual(args[args.index("--max-mem-mb") + 1], str(lv.BT_MEM_MB))
+        self.assertEqual((self.status()["running"], self.status()["error"]), (False, ""))
+        # Следующий — с ошибкой: прежний итог на месте; ещё удачный — прежний в prev.
+        with open(os.path.join(self.dir, "mode"), "w") as f:
+            f.write("2")
+        self.request()
+        b.tick(True)
+        self.finish(b)
+        self.assertIn("кодом 2", self.status()["error"])
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "latest", "summary.json")))
+        with open(os.path.join(self.dir, "mode"), "w") as f:
+            f.write("3")
+        self.request()
+        b.tick(True)
+        self.finish(b)
+        self.assertIn("предела памяти", self.status()["error"])
+        with open(os.path.join(self.dir, "mode"), "w") as f:
+            f.write("0")
+        self.request()
+        b.tick(True)
+        self.finish(b)
+        self.assertTrue(os.path.isfile(os.path.join(self.dir, "prev", "summary.json")))
+
+    def test_stop_interrupts_and_off_ignores_request(self) -> None:
+        b = self.bts("sleep")
+        self.request()
+        b.tick(True)
+        proc = b.proc
+        b.tick(False)  # «Стоп»
+        self.assertIsNone(b.proc)
+        self.assertIsNotNone(proc.poll())
+        self.assertIn("Стоп", self.status()["error"])
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "latest")))
+        self.request()
+        b.tick(False)
+        self.assertIsNone(b.proc)
+        self.assertFalse(os.path.exists(os.path.join(self.dir, "run.request")))
+
+    def test_nightly_and_memory_guard(self) -> None:
+        b = self.bts("0", limit=1792)
+        b.st["next"] = 1
+        b.tick(True, now=1000.0)
+        self.assertIsNotNone(b.proc, "ночь наступила — пересчёт")
+        self.assertEqual(b.st["next"], lv.next_run(1000.0))
+        self.finish(b)
+        small = self.bts("0", limit=384)  # старая служба: MemoryMax=384M
+        self.request()
+        small.tick(True)
+        self.assertIsNone(small.proc)
+        self.assertIn("переустановите", self.status()["error"])
+
+    def test_next_run_nightly_utc(self) -> None:
+        day = 1_800_000_000 // 86400 * 86400
+        at = day + 3 * 3600 + 17 * 60
+        self.assertEqual((lv.next_run(day), lv.next_run(at), lv.next_run(at - 1)), (at, at + 86400, at))
+
+    def test_unit_gives_room_for_backtest(self) -> None:
+        with open(os.path.join(ROOT, "deploy", "whale-autotrade.service"), encoding="utf-8") as f:
+            unit = f.read()
+        mem = int(next(ln for ln in unit.splitlines() if ln.startswith("MemoryMax=")).split("=")[1].rstrip("M"))
+        self.assertGreaterEqual(mem, lv.BT_NEED_MB)
+        self.assertGreater(lv.BT_NEED_MB, lv.BT_MEM_MB)
+
+
 if __name__ == "__main__":
     r = unittest.main(exit=False, verbosity=1).result
     if r.wasSuccessful():

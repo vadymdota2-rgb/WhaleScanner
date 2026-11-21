@@ -16,8 +16,11 @@
 
 Части модуля:
 - `~/WhaleScanner/tools/autotrade_backtest.py` — бэктест;
-- `~/WalletTracker/wt_autotrade.py` — ночной пересчёт и кнопки «Старт»,
-  «Стоп», «Пересчитать» (внутри API);
+- `~/WhaleScanner/tools/autotrade_live.py` — служба `whale-autotrade`:
+  реальная торговля на OKX и пересчёт бэктеста (ночью и по кнопке) — со
+  своим пределом памяти, не в API;
+- `~/WalletTracker/wt_autotrade.py` — в API только кнопки «Старт», «Стоп»,
+  «Пересчитать» (файлы-запросы) и показ состояния; процессов не запускает;
 - `~/WalletTracker/whale_api.py` — маршруты `/api/owner/autotrade…`;
 - вкладка «Автоторговля» в приложении (`~/WalletTracker/html/`).
 
@@ -52,13 +55,17 @@ git -C ~/WalletTracker log -1 --format=%ci
 
 ```bash
 systemctl show whale-api -p User -p ProtectHome -p ReadWritePaths -p MemoryMax -p MemoryCurrent
-grep -n '^MAX_MEM_MB\|autotrade_data' ~/WalletTracker/wt_autotrade.py
+grep -c 'subprocess\|threading' ~/WalletTracker/wt_autotrade.py   # ожидается 0 — API ничего не запускает
+systemctl show whale-autotrade -p ActiveState -p MemoryMax -p MemoryCurrent -p NRestarts
 ```
 
-Ожидается: `ProtectHome=read-only`; в `ReadWritePaths` есть
-`/home/<пользователь>/WalletTracker`; `MemoryMax` ≈ 1,5 ГБ. Модуль пишет в
-`~/WalletTracker/autotrade_data` (внутри разрешённого); предел памяти
-бэктеста в API — 1024 МБ (меньше `MemoryMax`).
+Ожидается: у `whale-api` — `ProtectHome=read-only`, в `ReadWritePaths` есть
+`/home/<пользователь>/WalletTracker`, `MemoryMax` ≈ 1,5 ГБ, и бэктест в ней
+больше не идёт. У `whale-autotrade` — `MemoryMax` ≈ 1,75 ГБ (1 879 048 192);
+если 384 МБ — служба поставлена старой установкой, бэктест в ней не
+запустится (вкладка скажет «переустановите»), владельцу —
+`sudo bash ~/WhaleScanner/tools/autotrade-install.sh` (ключ не спросит —
+он уже есть).
 
 ## 3. Тесты — во временной копии
 
@@ -128,7 +135,10 @@ D=~/WalletTracker/autotrade_data
 ls -la "$D" "$D/latest" 2>/dev/null
 cat "$D/switch.json" 2>/dev/null || echo "switch.json нет — модуль выключен («Старт» не нажимали)"
 tail -n 20 "$D/last_run.log" 2>/dev/null
+cat "$D/backtest_status.json" 2>/dev/null           # running, started, finished, error, next
 journalctl -u whale-api --since "-2 day" --no-pager | grep '\[AUTO\]' | tail -n 20
+journalctl -u whale-autotrade --since "-1 day" --no-pager | grep -v -iE 'key|secret|pass' | tail -n 30
+journalctl -k --since "-1 day" --no-pager | grep -iE 'oom|killed process' | tail -n 5   # ожидается пусто
 pgrep -af autotrade_backtest || echo "пересчёт сейчас не идёт"
 for p in $(pgrep -f autotrade_backtest); do ps -o pid,ni,rss,etime,cmd -p "$p"; done   # NI 19, RSS < 1 ГБ
 ```
