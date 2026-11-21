@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Установка реальной торговли автокопирования (один раз, владелец, с sudo):
 #
-#   sudo bash ~/WhaleScanner/tools/autotrade-install.sh
+#   sudo bash /home/vadymdota2/WhaleScanner/tools/autotrade-install.sh
 #
 # Что делает: кладёт службу whale-autotrade, создаёт /etc/whale-autotrade.env
 # (root, 600) с пустыми полями, если его нет, и каталог модуля. Ключи

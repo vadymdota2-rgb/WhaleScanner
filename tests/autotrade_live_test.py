@@ -336,6 +336,71 @@ class TradeTest(Base):
         self.assertIn("нет ключа OKX", self.state()["error"])
 
 
+class OrderTypeTest(Base):
+    def test_entry_always_market_exit_always_limit_at_tp(self) -> None:
+        """Правило владельца: вход — всегда рыночным ордером, выход — всегда
+        лимитным по цене тейка; бот никогда не закрывает позицию по рынку."""
+        for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
+            self.ex = FakeOkx(mode)
+            tr = self.trader(self.whales(side=side))
+            self.on()
+            tr.step()
+            opening = "buy" if side > 0 else "sell"
+            entries = [o for o in self.ex.orders if o["side"] == opening]
+            exits = [o for o in self.ex.orders if o["side"] != opening]
+            self.assertEqual([o["ordType"] for o in entries], ["market"], mode)
+            self.assertEqual([o["ordType"] for o in exits], ["limit"], mode)
+            self.assertEqual(float(exits[0]["px"]), tr.st["open"]["tp"])
+            self.assertAlmostEqual(tr.st["open"]["tp"] / tr.st["open"]["px"], 1 + side * lv.TP)
+            self.assertFalse(any(c[1] in ("/api/v5/trade/close-position", "/api/v5/trade/order-algo") for c in self.ex.calls))
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+
+class JanitorTest(Base):
+    def test_cleans_windows_lists_logs_cache_and_asks_restart_when_fat(self) -> None:
+        tr = self.trader(self.whales())
+        tr.sig.poll(self.now)
+        self.assertTrue(tr.sig.windows)
+        tr.st["entered"] = {"OLD": self.now - 4 * 3_600_000, "NEW": self.now - 3_600_000}
+        live_log = os.path.join(tr.dir, "live.log")
+        with open(live_log, "wb") as f:
+            f.write(b"x" * (lv.LOG_MAX_BYTES + 1))
+        cache = os.path.join(self.dir, "cache")
+        os.makedirs(cache)
+        now = self.now / 1000 + 3 * 3600  # через 3 часа — окна старше 2 часов пусты
+        for name, age_days, size in (("old.json", 40, 10), ("a.json", 3, 300 << 20), ("b.json", 1, 300 << 20)):
+            path = os.path.join(cache, name)
+            with open(path, "wb") as f:
+                f.truncate(size)
+            os.utime(path, (now - age_days * 86400, now - age_days * 86400))
+        jan = lv.Janitor(self.dir, rss=lambda: 120.0)
+        self.assertTrue(jan.due(now))
+        self.assertFalse(jan.run(tr, None, now))
+        self.assertFalse(jan.due(now + 1))
+        self.assertEqual(tr.sig.windows, {})
+        self.assertEqual(list(tr.st["entered"]), [])  # пауза 3 часа прошла у обеих
+        self.assertTrue(os.path.exists(live_log + ".1"))
+        self.assertFalse(os.path.exists(live_log))
+        self.assertEqual(sorted(os.listdir(cache)), ["b.json"])  # старше 30 дней и сверх 500 МБ — убраны, старые первыми
+        self.assertEqual(tr.st["janitor"]["rss_mb"], 120.0)
+        # Разрослась — просит перезапуск; но не посреди пересчёта и не посреди входа.
+        fat = lv.Janitor(self.dir, rss=lambda: lv.RSS_MAX_MB + 1)
+        self.assertTrue(fat.run(tr, None, now))
+
+        class Busy:
+            proc = object()
+
+        os.utime(os.path.join(cache, "b.json"), (now - 40 * 86400, now - 40 * 86400))
+        self.assertFalse(fat.run(tr, Busy(), now))
+        self.assertTrue(os.path.exists(os.path.join(cache, "b.json")), "кеш во время пересчёта не трогаем")
+        tr.st["entering"] = {"inst": "X"}
+        self.assertFalse(fat.run(tr, None, now))
+
+    def test_rss_is_measured(self) -> None:
+        self.assertGreater(lv.rss_mb(), 1)
+
+
 FAKE_BT = """
 import json, os, sys, time
 out = sys.argv[sys.argv.index("--out") + 1]

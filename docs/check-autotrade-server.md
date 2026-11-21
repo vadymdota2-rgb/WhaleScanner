@@ -64,7 +64,7 @@ systemctl show whale-autotrade -p ActiveState -p MemoryMax -p MemoryCurrent -p N
 больше не идёт. У `whale-autotrade` — `MemoryMax` ≈ 1,75 ГБ (1 879 048 192);
 если 384 МБ — служба поставлена старой установкой, бэктест в ней не
 запустится (вкладка скажет «переустановите»), владельцу —
-`sudo bash ~/WhaleScanner/tools/autotrade-install.sh` (ключ не спросит —
+`sudo bash /home/vadymdota2/WhaleScanner/tools/autotrade-install.sh` (ключ не спросит —
 он уже есть).
 
 ## 3. Тесты — во временной копии

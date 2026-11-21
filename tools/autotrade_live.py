@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import gc
 import hashlib
 import hmac
 import json
@@ -251,7 +252,7 @@ class Signals:
         try:
             rows = con.execute(
                 "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
-                "WHERE dir_code IN (1, 2) AND ts >= ? ORDER BY ts, tid", (since,)).fetchall()
+                "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now)).fetchall()
         finally:
             con.close()
         out: list[dict] = []
@@ -270,6 +271,16 @@ class Signals:
         cut = now - WINDOW_MS - 20 * 60_000
         self.seen = {t: s for t, s in self.seen.items() if s >= cut}
         return out
+
+    def sweep(self, now: int) -> int:
+        """Очистка: окна бумаг, по которым давно не было сделок, сами не
+        пустеют (выбрасывают старое только на новой сделке) — вычистить
+        старше 2 часов и убрать пустые. Сколько окон убрано."""
+        before = len(self.windows)
+        for w in self.windows.values():
+            w.expire(now - WINDOW_MS)
+        self.windows = {k: w for k, w in self.windows.items() if w.orders}
+        return before - len(self.windows)
 
 
 # ── бэктест: ночью и по кнопке, в этой службе (не в API) ─────────────────────
@@ -359,7 +370,7 @@ class Backtests:
         self.st["next"] = next_run(now)
         if self.limit_mb() < BT_NEED_MB:
             self.st.update(error=f"службе whale-autotrade разрешено {self.limit_mb():.0f} МБ, бэктесту нужно "
-                                 f"{BT_NEED_MB} — переустановите: sudo bash ~/WhaleScanner/tools/autotrade-install.sh",
+                                 f"{BT_NEED_MB} — переустановите: sudo bash /home/vadymdota2/WhaleScanner/tools/autotrade-install.sh",
                            finished=int(now))
             self._write()
             return
@@ -392,6 +403,97 @@ class Backtests:
             os.replace(out, cur)
         self.st.update(running=False, finished=int(time.time()), error=why)
         self._write()
+
+
+# ── автоочистка: память и диск не растут ─────────────────────────────────────
+
+CLEAN_SEC = 600                    # раз в 10 минут
+LOG_MAX_BYTES = 5 << 20            # live.log больше — в live.log.1 (одна старая копия)
+CACHE_MAX_DAYS = 30                # кеш свечей бэктеста — не старше
+CACHE_MAX_BYTES = 500 << 20        # и не больше 500 МБ (старые — первыми)
+RSS_MAX_MB = 400                   # служба (без бэктеста) больше — перезапуск через systemd
+
+
+def rss_mb() -> float:
+    """Сколько памяти занимает этот процесс (RSS), МБ; неизвестно — 0."""
+    try:
+        with open("/proc/self/statm", encoding="utf-8") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+class Janitor:
+    """Раз в 10 минут: окна китов и списки — только нужное; журнал — с
+    ротацией; кеш свечей бэктеста — не старше 30 дней и не больше 500 МБ
+    (не во время пересчёта); сборка мусора. Если служба всё равно разрослась
+    больше RSS_MAX_MB — выход: systemd поднимет её заново (позиция и тейк —
+    на бирже, состояние — в файле, ничего не теряется)."""
+
+    def __init__(self, data_dir: str, rss: Callable[[], float] = rss_mb) -> None:
+        self.dir = data_dir
+        self.rss = rss
+        self.last = 0.0
+
+    def due(self, now: float) -> bool:
+        return now - self.last >= CLEAN_SEC
+
+    def run(self, tr: Trader, bts: Backtests | None, now: float) -> bool:
+        """Очистка; True — пора перезапуститься (память не вернулась)."""
+        self.last = now
+        dropped = tr.sig.sweep(int(now * 1000))
+        cut = int(now * 1000) - COIN_PAUSE_MS
+        tr.st["entered"] = {c: t for c, t in tr.st.get("entered", {}).items() if int(t) >= cut}
+        self.rotate(os.path.join(tr.dir, "live.log"))
+        busy = bts is not None and bts.proc is not None   # идёт пересчёт — его лог и кеш не трогаем
+        freed = 0
+        if not busy:
+            self.rotate(os.path.join(self.dir, "last_run.log"))
+            freed = self.clean_cache(os.path.join(self.dir, "cache"), now)
+        gc.collect()
+        mb = self.rss()
+        tr.st["janitor"] = {"at": int(now * 1000), "rss_mb": round(mb, 1), "windows": len(tr.sig.windows),
+                            "dropped": dropped, "cache_freed_mb": round(freed / 2**20, 1)}
+        return mb > RSS_MAX_MB and not busy and "entering" not in tr.st
+
+    @staticmethod
+    def rotate(path: str) -> None:
+        try:
+            if os.path.getsize(path) > LOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+
+    @staticmethod
+    def clean_cache(cache: str, now: float) -> int:
+        """Кеш свечей и фандинга бэктеста: старше 30 дней — удалить; всё
+        равно больше 500 МБ — удалять самые старые. Сколько байт освобождено."""
+        try:
+            files = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(cache) if e.is_file()]
+        except OSError:
+            return 0
+        freed = 0
+        keep = []
+        for mtime, size, path in sorted(files):
+            if now - mtime > CACHE_MAX_DAYS * 86400:
+                try:
+                    os.remove(path)
+                    freed += size
+                except OSError:
+                    pass
+            else:
+                keep.append((mtime, size, path))
+        total = sum(size for _m, size, _p in keep)
+        for _mtime, size, path in keep:  # старые первыми
+            if total <= CACHE_MAX_BYTES:
+                break
+            try:
+                os.remove(path)
+                freed += size
+                total -= size
+            except OSError:
+                pass
+        return freed
 
 
 # ── трейдер ──────────────────────────────────────────────────────────────────
@@ -662,8 +764,17 @@ def main(argv: list[str] | None = None) -> int:
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
     tr.recover()
     bts = Backtests(a.dir, a.db)
+    jan = Janitor(a.dir)
     fails = 0
     while True:
+        if jan.due(time.time()):
+            try:
+                if jan.run(tr, bts, time.time()):
+                    tr.event(f"служба заняла {tr.st['janitor']['rss_mb']:.0f} МБ (больше {RSS_MAX_MB}) — перезапуск")
+                    tr.save()
+                    return 0
+            except OSError as e:
+                tr.event(f"очистка: {e}")
         try:
             bts.tick(tr.is_on())
         except (OSError, subprocess.SubprocessError) as e:
