@@ -69,6 +69,8 @@ OKX_HINTS = {
     "50105": "неверный Passphrase", "50110": "IP сервера не разрешён в настройках ключа OKX",
     "50101": "ключ от другого режима: демо-ключ на реальном счёте или наоборот (OKX_SIMULATED)",
     "50120": "у ключа нет права «Торговля»", "51008": "не хватает маржи на счёте",
+    "50124": "ключу или счёту закрыт рынок бессрочных фьючерсов: у ключа включите право «Торговля», "
+             "а на счёте OKX — доступ к Perpetual (фьючерсам)",
 }
 NANOS = bt.NANOS
 
@@ -168,7 +170,9 @@ class Okx:
         if str(got.get("code")) != "0":
             data = got.get("data") or [{}]
             d0 = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
-            raise OkxError(str(d0.get("sCode") or got.get("code")), str(d0.get("sMsg") or got.get("msg") or ""))
+            err = OkxError(str(d0.get("sCode") or got.get("code")), str(d0.get("sMsg") or got.get("msg") or ""))
+            err.args = (f"{err.args[0]} [{method} {path.split('?')[0]}]",)  # какой запрос — для разбора
+            raise err
         data = got.get("data")
         return data if isinstance(data, list) else []
 
