@@ -185,8 +185,8 @@ class Okx:
         return data if isinstance(data, list) else []
 
     # Обёртки — только то, что нужно трейдеру.
-    def instruments(self) -> list[dict]:
-        return self.call("GET", "/api/v5/public/instruments", {"instType": "SWAP"}, private=False)
+    def instruments(self, inst_type: str = "SWAP") -> list[dict]:
+        return self.call("GET", "/api/v5/public/instruments", {"instType": inst_type}, private=False)
 
     def ticker(self, inst: str) -> float:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
@@ -573,12 +573,35 @@ class Trader:
 
     # каталог и счёт
     def instruments(self) -> dict[str, dict]:
+        """Каталог бессрочных контрактов. Глобальный OKX — «BTC-USDT-SWAP»;
+        европейский OKX (EEA) торгует бессрочными как FUTURES вида
+        «BTC-USD_UM_XPERP-310815», а SWAP в каталоге видны, но торговать ими
+        нельзя (50124). Где есть XPERP — берём его."""
         if not self.instr or time.time() - self.instr_at > INSTR_TTL:
-            got = {r["instId"]: r for r in self.okx.instruments()
-                   if r.get("state") == "live" and str(r.get("instId", "")).endswith("-USDT-SWAP")}
+            got: dict[str, dict] = {}
+            for r in self.okx.instruments("SWAP"):
+                if r.get("state") == "live" and str(r.get("instId", "")).endswith("-USDT-SWAP"):
+                    got[r["instId"]] = r
+            try:
+                futs = self.okx.instruments("FUTURES")
+            except OkxError:
+                futs = []
+            for r in futs:
+                if r.get("state") == "live" and "_XPERP" in str(r.get("instId", "")):
+                    got[r["instId"]] = r
             if got:
                 self.instr, self.instr_at = got, time.time()
+                xperp: dict[str, str] = {}
+                for i in sorted(got, key=lambda x: ("_UM_XPERP" not in x, x)):  # USD-маржинальные — первыми
+                    if "_XPERP" in i:
+                        xperp.setdefault(i.split("-", 1)[0], i)
+                self.xperp = xperp
         return self.instr
+
+    def inst_for(self, base: str) -> str:
+        """Контракт для бумаги: европейский бессрочный (XPERP), если есть, иначе USDT-SWAP."""
+        self.instruments()
+        return getattr(self, "xperp", {}).get(base) or f"{base}-USDT-SWAP"
 
     def sync(self) -> None:
         if not self.pos_mode:
@@ -662,7 +685,7 @@ class Trader:
         if now - int(self.st["entered"].get(s["coin"], 0)) < COIN_PAUSE_MS:
             return "в эту бумагу входили меньше 3 часов назад"
         base, scale = bt.okx_candidate(s["coin"])
-        inst = f"{base}-USDT-SWAP"
+        inst = self.inst_for(base)
         blocked = self.st.setdefault("blocked", {})
         b = blocked.get(inst)
         if b and now - int(b.get("at", 0)) < (BLOCK_MS if b.get("permanent") else FAIL_PAUSE_MS):
@@ -685,8 +708,10 @@ class Trader:
         if ct <= 0:
             return "у бумаги нет размера контракта"
         # Десятичными, не двоичными дробями: 10 000 / (10 000 000 × 0,00001) — ровно 100, а не 99,999…
-        qty = Decimal(repr(round(notional, 6))) / (Decimal(ins.get("ctVal") or "0") * Decimal(ins.get("ctMult") or "1")
-                                                   * Decimal(repr(last)))
+        # Размер контракта — в монете (ctValCcy = BTC) или уже в долларах (USD/USDC/USDT).
+        in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
+        ct_d = Decimal(ins.get("ctVal") or "0") * Decimal(ins.get("ctMult") or "1")
+        qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(last)))
         step = Decimal(ins.get("lotSz", "1"))
         sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
         if sz < Decimal(ins.get("minSz", "1")):
@@ -722,7 +747,7 @@ class Trader:
         tick = ins.get("tickSz", "0.0001")
         tp = round_step(fill_px * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
-              "notional": round(filled * ct * fill_px, 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
+              "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id}
         self.st["open"] = op
         self.st["entered"][s["coin"]] = now

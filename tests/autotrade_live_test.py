@@ -60,7 +60,8 @@ class FakeOkx:
         ok = lambda data: {"code": "0", "msg": "", "data": data}  # noqa: E731
         p = u.path
         if p == "/api/v5/public/instruments":
-            return ok(list(self.instr.values()))
+            kind = q.get("instType", "SWAP")
+            return ok([r for r in self.instr.values() if r.get("instType", "SWAP") == kind])
         if p == "/api/v5/market/ticker":
             return ok([{"instId": q["instId"], "last": str(self.last[q["instId"]])}])
         if p == "/api/v5/account/config":
@@ -365,6 +366,39 @@ class OrderTypeTest(Base):
             self.assertFalse(any(c[1] in ("/api/v5/trade/close-position", "/api/v5/trade/order-algo") for c in self.ex.calls))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+
+
+class EeaTest(Base):
+    def test_european_account_trades_xperp_not_usdt_swap(self) -> None:
+        """OKX EEA: бессрочные — FUTURES «BTC-USD_UM_XPERP-310815», а
+        BTC-USDT-SWAP в каталоге есть, но торговать им нельзя (50124). Бот
+        берёт XPERP; размер контракта может быть в монете или в долларах."""
+        self.ex.reject["BTC-USDT-SWAP"] = "50124"
+        for ccy, ct_val in (("BTC", "0.0001"), ("USD", "100")):
+            self.ex = FakeOkx("long_short_mode")
+            self.ex.reject["BTC-USDT-SWAP"] = "50124"
+            x = "BTC-USD_UM_XPERP-310815"
+            self.ex.instr[x] = {"instId": x, "instType": "FUTURES", "state": "live", "ctVal": ct_val, "ctMult": "1",
+                                "ctValCcy": ccy, "lotSz": "1", "minSz": "1", "tickSz": "0.1"}
+            self.ex.instr["ETH-USD_UM_XPERP-310815"] = {**self.ex.instr[x], "instId": "ETH-USD_UM_XPERP-310815"}
+            self.ex.last[x] = 100_000.0
+            tr = self.trader(self.whales())
+            self.on()
+            tr.step()
+            [m] = self.market_orders()
+            # 10 000 $ позиции: контракт 0,0001 BTC × 100 000 = 10 $ → 1000; контракт 100 $ → 100.
+            ct_usd = float(ct_val) * (1 if ccy == "USD" else 100_000)
+            self.assertEqual((m["instId"], m["sz"]), (x, str(int(10_000 / ct_usd))), ccy)
+            self.assertAlmostEqual(tr.st["open"]["notional"], 10_000, delta=1)
+            [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
+            self.assertEqual((tp["instId"], tp["px"], tp["posSide"]), (x, "101000", "long"))
+            self.assertFalse(any(c[2].get("instId") == "BTC-USDT-SWAP" for c in self.ex.calls if c[1] == "/api/v5/trade/order"))
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_global_account_without_xperp_keeps_usdt_swap(self) -> None:
+        tr = self.trader(self.whales())
+        self.assertEqual(tr.inst_for("BTC"), "BTC-USDT-SWAP")
 
 
 class RejectTest(Base):
