@@ -30,7 +30,7 @@ HOUR_MS = 3_600_000
 
 # Киты — только топ кошельков по винрейту (правило владельца, 22.11.2026):
 # как доска «Топ трейдеров» приложения (whale_api.load_perp_rank, «win»).
-TOP_N = 1000
+TOP_N = 3000
 TOP_DAYS = 30
 TOP_MIN_TRADES = 5          # меньше — винрейт случайный (как HL_MIN_CLOSED в API)
 TOP_MAX_TRADES_30D = 200    # больше — бот (как HL_MAX_CLOSED_30D в API)

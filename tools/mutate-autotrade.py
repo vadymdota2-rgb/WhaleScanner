@@ -29,7 +29,7 @@ EQUIV: set[str] = {"киты против — те же 2 часа", "тейка
 
 MUTS = [
     # Правила владельца
-    ("MIN_WHALES = 1 ", "MIN_WHALES = 2 ", "сигнал — от 1 кита"),
+    ("MIN_WHALES = 2 ", "MIN_WHALES = 1 ", "сигнал — от 2 китов"),
     (" or (self.top is not None and wallet not in self.top):", ":", "киты — только топ по винрейту"),
     ("        self.refresh_top(now)\n", "", "список китов загружается до опроса"),
     ("        if now - self.top_at < ttl:", "        if self.top is not None:", "список китов — пересчёт раз в 15 минут"),

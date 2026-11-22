@@ -163,11 +163,11 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
             os.remove(self.db)
 
-    def test_one_big_against_goes_with_it(self) -> None:
-        # От 1 кита: один крупный шорт — сам сигнал; мелкие лонги против него — пропуск.
-        big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]
-        r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, -0.012)]))
-        self.assertEqual([(t.side, t.why) for t in r["trades"]], [(-1, "тейк")])
+    def test_one_big_against_blocks_small_side(self) -> None:
+        big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
+        r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
+        self.assertEqual(r["trades"], [])
+        self.assertGreater(r["skips"]["bigger_against"], 0)
 
     def test_bigger_against_goes_with_big(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000),
@@ -205,35 +205,23 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(len(self.market.calls), 0, "офлайн — ни одного запроса")
         self.assertEqual(r["trades"][0].why, "тейк")
 
-    def test_bigger_against_skips_weak_side(self) -> None:
-        # Крупный шорт (по 100 500) сам не входит — цена ушла от него дальше 0,3 %; лонг-кит
-        # (по 100 000) против него слабее — тоже пропуск: в слабую сторону не входим.
-        rows = [opn(100, "0xbig", "BTC", -1, T - 40 * MIN, 700_000, 100_500), opn(2, "0xb", "BTC", 1, T, 5000, 100_000)]
-        r = self.go(rows, lambda c, t: 100_000.0)
-        self.assertEqual(r["trades"], [])
-        self.assertGreater(r["skips"]["bigger_against"], 0)
-        self.assertGreater(r["skips"]["chase"], 0)
-
     def test_chase_whale_lost_and_stale_skipped(self) -> None:
         r = self.go(self.whales(), lambda c, t: 100_400.0)            # цена ушла на 0,4 % — не догоняем
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["chase"], 0)
         os.remove(self.db)
         self.cache += "2"  # свои свечи у каждого случая
-        # Кит сигнала уже вышел в убыток: 600 $ (не кит), закрыл в минус, ещё 600 $ — кит, но уже в убытке.
-        rows = [opn(1, "0xa", "BTC", 1, T - 2 * MIN, 600, 100_000), cls(10, "0xa", "BTC", 1, T - MIN, -50.0),
-                opn(2, "0xa", "BTC", 1, T, 600, 100_000)]
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T - MIN, -50.0)]   # кит сигнала уже вышел в убыток
+        rows[1] = opn(2, "0xb", "BTC", 1, T, 5000, 100_000)
         r = self.go(rows, lambda c, t: 100_000.0)
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["whale_exit"], 0)
         os.remove(self.db)
         self.cache += "3"
-        # Крупный шорт — за 2 часа минус 2 с до лонг-кита (его собственный вход — не по цене: догон):
-        # от строки лонга сигнал «с крупными» есть, но на момент решения (+5 с) шорту больше 2 часов —
-        # китов в шорт 0, сигнал устарел; входим в лонг.
-        rows = [opn(1, "0xbig", "BTC", -1, T - 120 * MIN + 2000, 700_000, 100_000), opn(2, "0xb", "BTC", 1, T, 5000, 100_000)]
-        r = self.go(rows, lambda c, t: 99_000.0 if t < T - 60 * MIN else 100_000.0)
-        self.assertEqual([t.side for t in r["trades"]], [1])
+        # Кит A — за 2 часа минус 2 секунды до кита B: на момент решения (+5 с) он старше 2 часов.
+        rows = [opn(1, "0xa", "BTC", 1, T - 120 * MIN + 2000, 5000, 100_000), opn(2, "0xb", "BTC", 1, T, 5000, 100_000)]
+        r = self.go(rows, lambda c, t: 100_000.0)
+        self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["stale"], 0)
 
     def test_network_failure_is_not_cached_forever(self) -> None:
@@ -290,12 +278,9 @@ class ReplayTest(unittest.TestCase):
 
     def test_with_whales_small_or_early_close_ignored(self) -> None:
         # Кит закрыл 500 $ после входа — мало; кит закрыл 5000 $ в плюс ДО нашего входа — не в счёт.
-        # 0xa: 600 $ в T − 2 мин (ещё не кит), закрыл в плюс 5000 $ в T − 1 мин, ещё 5000 $ в T — кит, вход.
-        rows = [opn(1, "0xa", "BTC", 1, T - 2 * MIN, 600, 100_000), cls(11, "0xa", "BTC", 1, T - MIN, +100.0),
-                opn(2, "0xa", "BTC", 1, T, 5000, 100_000),
-                (10, "0xa", "BTC", 3, T + 30 * MIN, int(500e9), "0.005", int(10e9), "")]
-        r = self.go(rows, step_price(100_000, [(T + 90 * MIN, 0.012)]))
-        self.assertGreaterEqual(r["books"]["with_whales"].trades[0].entry_t, T)
+        small = (10, "0xa", "BTC", 3, T + 30 * MIN, int(500e9), "0.005", int(10e9), "")
+        early = cls(11, "0xa", "BTC", 1, T - MIN, +100.0)   # 0xa открылся в T − 2 мин — закрытие в его окне
+        r = self.go([*self.whales(), small, early], step_price(100_000, [(T + 90 * MIN, 0.012)]))
         self.assertEqual(r["books"]["with_whales"].trades[0].why, "открыта", "тейка у варианта нет — держим")
         self.assertEqual(r["books"]["tp_or_whales"].trades[0].why, "тейк")
 
@@ -316,15 +301,17 @@ class ReplayTest(unittest.TestCase):
     def test_top_is_taken_at_trade_time(self) -> None:
         """Топ по винрейту — на момент сделки кита, без будущего: кошелёк,
         набравший 5 закрытий в плюс уже ПОСЛЕ своей сделки, тогда китом не был."""
-        make_db(self.db, [opn(1, "0xlate", "BTC", 1, T, 50_000, 100_000)], history=False)
+        make_db(self.db, [opn(1, "0xa", "BTC", 1, T - MIN, 5000, 100_000), opn(2, "0xlate", "BTC", 1, T, 50_000, 100_000)],
+                history=False)
         con = sqlite3.connect(self.db)
         con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)",
-                        [(50 + k, "0xlate", "ETH", 3, T + 60 * MIN + k, int(5000e9), "1", int(1e9), "") for k in range(5)])
+                        [(50 + k, "0xlate", "ETH", 3, T + 60 * MIN + k, int(5000e9), "1", int(1e9), "") for k in range(5)]
+                        + [(60 + k, "0xa", "ETH", 3, T - DAY + k, int(5000e9), "1", int(1e9), "") for k in range(5)])
         con.commit()
         con.close()
         r = rp.run(self.args(), fetch=FakeMarket(lambda c, t: 100_000.0), now_ms=NOW)
-        self.assertEqual(r["trades"], [])
-        self.assertEqual(sum(r["skips"].values()), 0, "не кит — нет и сигнала")
+        self.assertEqual(r["trades"], [], "кит на тот момент один (0xa) — мало")
+        self.assertEqual(sum(r["skips"].values()), 0, "нет и сигнала")
 
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот
