@@ -53,17 +53,11 @@ class FakeMarket:
         return list(reversed(rows))
 
 
-def make_db(path: str, rows: list[tuple], history: bool = True) -> None:
+def make_db(path: str, rows: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
                 "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '')")
     con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
-    # Киты — только топ по винрейту: у каждого кошелька — 5 закрытий в плюс
-    # по бумаге HIST до первой сделки (как у настоящего кита).
-    t0 = min((r[4] for r in rows), default=T) - DAY
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)",
-                    [(10**12 + i * 10 + k, w, "HIST", 3, t0 + k * 1000, int(5000e9), "0.05", int(1e9), "")
-                     for i, w in enumerate(sorted({r[1] for r in rows}) if history else []) for k in range(5)])
     # Как в базе бота (hyperliquid_core.cpp): без этих индексов запросы китов — полным перебором.
     con.execute("CREATE INDEX idx_hl_fills_code_ts ON hl_fills(dir_code, ts)")
     con.execute("CREATE INDEX idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)")
@@ -143,7 +137,7 @@ class ReplayTest(unittest.TestCase):
 
     def test_average_once_then_tp_from_new_average(self) -> None:
         # −1,5 % через 20 мин, кит добирает 2 000 $ в +40 мин, потом цена +0,3 % от входа.
-        rows = [*self.whales(), opn(20, "0xa", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
+        rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
         r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
         [t] = r["trades"]
         self.assertEqual(r["summary"]["averaged"], 1)
@@ -158,7 +152,7 @@ class ReplayTest(unittest.TestCase):
     def test_no_average_small_dip_or_small_add(self) -> None:
         for dip, add in ((-0.005, 2000), (-0.015, 500)):   # минус 0,5 % — мало; добор 500 $ — мало
             self.cache = os.path.join(self.tmp.name, f"cache{dip}")  # свои свечи у каждого случая
-            rows = [*self.whales(), opn(20, "0xa", "BTC", 1, T + 40 * MIN, add, 98_500)]
+            rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, add, 98_500)]
             r = self.go(rows, step_price(100_000, [(T + 20 * MIN, dip)]))
             self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
             os.remove(self.db)
@@ -291,27 +285,12 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(r["books"]["no_average"].trades[0].why, "кит вышел в убыток")
         os.remove(self.db)
         self.cache += "2"
-        rows = [*self.whales(), opn(20, "0xa", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
+        rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
         r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
         self.assertTrue(r["books"]["live"].trades[0].averaged)
         [t] = r["books"]["no_average"].trades
         self.assertEqual((t.averaged, t.why), (False, "открыта"))
         self.assertEqual({x["key"]: x["averaged"] for x in r["summary"]["variants"]}["no_average"], 0)
-
-    def test_top_is_taken_at_trade_time(self) -> None:
-        """Топ по винрейту — на момент сделки кита, без будущего: кошелёк,
-        набравший 5 закрытий в плюс уже ПОСЛЕ своей сделки, тогда китом не был."""
-        make_db(self.db, [opn(1, "0xa", "BTC", 1, T - MIN, 5000, 100_000), opn(2, "0xlate", "BTC", 1, T, 50_000, 100_000)],
-                history=False)
-        con = sqlite3.connect(self.db)
-        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)",
-                        [(50 + k, "0xlate", "ETH", 3, T + 60 * MIN + k, int(5000e9), "1", int(1e9), "") for k in range(5)]
-                        + [(60 + k, "0xa", "ETH", 3, T - DAY + k, int(5000e9), "1", int(1e9), "") for k in range(5)])
-        con.commit()
-        con.close()
-        r = rp.run(self.args(), fetch=FakeMarket(lambda c, t: 100_000.0), now_ms=NOW)
-        self.assertEqual(r["trades"], [], "кит на тот момент один (0xa) — мало")
-        self.assertEqual(sum(r["skips"].values()), 0, "нет и сигнала")
 
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот

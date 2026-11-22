@@ -10,9 +10,6 @@
     OKX_SIMULATED=1                                    — демо-счёт OKX (по умолчанию 0 — реальный)
 
 Правила владельца:
-- кит — только кошелёк из топ-3000 по винрейту за 30 дней (та же доска,
-  что «Топ трейдеров» в приложении: от 5 до 200 закрытий, без забаненных;
-  список — раз в 15 минут); сделки остальных не считаются ни за, ни против;
 - сигнал — от 2 разных китов Hyperliquid в одну сторону на одной бумаге за
   2 часа, у каждого от 1000 $ (сделки китов — из базы бота, только чтение);
 - только фьючерсы (крипта, акции, металлы), бумага должна быть на OKX и цена
@@ -90,8 +87,7 @@ OKX_HINTS = {
 NANOS = core.NANOS
 
 # Правила владельца.
-MIN_WHALES = 2              # от 2 китов (правило владельца; 22.11.2026 было 1 — вернули 2)
-TOP_TTL_MS = 15 * 60_000    # список китов (топ по винрейту) — пересчёт раз в 15 минут
+MIN_WHALES = 2
 MIN_WHALE_USD = 1000
 WINDOW_MS = 2 * 3_600_000
 CHASE = 0.003
@@ -375,36 +371,17 @@ class Signals:
         self.windows: dict[tuple[str, int], core.Window] = {}
         self.seen: dict[int, int] = {}   # tid → ts (против повторов при перекрытии опроса)
         self.limit = MIN_WHALE_USD * NANOS   # кит — кошелёк от 1000 $ в окне
-        # Киты — только топ-3000 по винрейту за 30 дней (как доска «Топ
-        # трейдеров»); None — список ещё не загружен (тогда фильтра нет).
-        self.top: set[str] | None = None
-        self.top_at = -10**15
-
-    def refresh_top(self, now: int, ttl: int = TOP_TTL_MS) -> None:
-        """Список китов на момент now — не чаще раза в ttl. Сбой базы —
-        исключение (ошибка шага), старый список остаётся, повтор — на
-        следующем опросе."""
-        if now - self.top_at < ttl:
-            return
-        con = self._con()
-        try:
-            self.top = core.top_winrate(con, now)
-        finally:
-            con.close()
-        self.top_at = now
 
     def _con(self) -> sqlite3.Connection:
         return core.open_ro(self.db)  # нет базы — OSError: ошибка шага, а не выход службы
 
     def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
-        китов (топ по винрейту) от 1000 $ за 2 часа, и строка, на которой это
-        случилось."""
+        китов от 1000 $ за 2 часа, и строка, на которой это случилось."""
         # Всё окно 2 часа каждый раз: бот записывает сделки китов с опозданием
         # (опрос кошельков), и опоздавшая сделка должна попасть в окно, а не
         # потеряться. Повторы отсекает seen (tid).
         since = now - WINDOW_MS
-        self.refresh_top(now)
         con = self._con()
         try:
             rows = con.execute(
@@ -423,9 +400,7 @@ class Signals:
         бэктеста-повтора (autotrade_replay.py): правила одни."""
         out: list[dict[str, Any]] = []
         for tid, wallet, coin, code, ts, nanos, units in rows:
-            # Не из топа по винрейту — не кит, его сделки не считаем вовсе
-            # (ни за, ни против). seen не ставим: попадёт в топ — учтём.
-            if tid in self.seen or not core.is_perp(coin) or (self.top is not None and wallet not in self.top):
+            if tid in self.seen or not core.is_perp(coin):
                 continue
             self.seen[tid] = ts
             side = 1 if code == core.OPEN_LONG else -1
@@ -542,8 +517,7 @@ class Signals:
                 (coin, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, ts - WINDOW_MS, ts)).fetchall()
         finally:
             con.close()
-        return {str(w): int(t) for w, t, n in rows
-                if int(n or 0) >= self.limit and (self.top is None or str(w) in self.top)}
+        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}
 
     def sweep(self, now: int) -> int:
         """Очистка: окна бумаг, по которым давно не было сделок, сами не
@@ -897,8 +871,7 @@ class Trader:
     def save(self) -> None:
         # Во вкладку (wt_autotrade.live) — только то, что она читает.
         self.st.update(heartbeat=self.clock(), simulated=self.okx.simulated, equity=self.equity,
-                       positions=[{k: p.get(k) for k in ("instId", "pos", "avgPx", "upl")} for p in self.positions],
-                       top_n=len(self.sig.top) if self.sig.top is not None else None)
+                       positions=[{k: p.get(k) for k in ("instId", "pos", "avgPx", "upl")} for p in self.positions])
         tmp = os.path.join(self.dir, "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.st, f, ensure_ascii=False)
@@ -1369,8 +1342,8 @@ class Trader:
         if (s["coin"], s["side"]) in self.sig.windows and count < MIN_WHALES:
             return self._skip("stale", f"китов за 2 часа до «сейчас» осталось {count} — сигнал устарел")
         if against > 0 and against >= usd:
-            # Против сигнала — киты крупнее: в эту сторону не идём (их сигнал —
-            # отдельный кандидат, он и войдёт).
+            # Против сигнала — киты крупнее: в их сторону не идём (их сигнал,
+            # если их от 2, — отдельный кандидат, он и войдёт).
             return self._skip("bigger_against", f"против сигнала киты крупнее: {'шорты' if s['side'] > 0 else 'лонги'} "
                                                 f"{against:,.0f} $ против {usd:,.0f} $ — входим только с крупными".replace(",", " "))
         lost = self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now)

@@ -29,12 +29,7 @@ EQUIV: set[str] = {"киты против — те же 2 часа", "тейка
 
 MUTS = [
     # Правила владельца
-    ("MIN_WHALES = 2 ", "MIN_WHALES = 1 ", "сигнал — от 2 китов"),
-    (" or (self.top is not None and wallet not in self.top):", ":", "киты — только топ по винрейту"),
-    ("        self.refresh_top(now)\n", "", "список китов загружается до опроса"),
-    ("        if now - self.top_at < ttl:", "        if self.top is not None:", "список китов — пересчёт раз в 15 минут"),
-    ("                if int(n or 0) >= self.limit and (self.top is None or str(w) in self.top)}",
-     "                if int(n or 0) >= self.limit}", "киты по базе — тоже только топ"),
+    ("MIN_WHALES = 2", "MIN_WHALES = 1", "сигнал — от 2 китов"),
     ("MIN_WHALE_USD = 1000", "MIN_WHALE_USD = 100", "кит — от 1000 $"),
     ("WINDOW_MS = 2 * 3_600_000", "WINDOW_MS = 4 * 3_600_000", "окно китов — 2 часа"),
     ("CHASE = 0.003", "CHASE = 0.03", "не догоняем дальше 0,3 %"),
@@ -97,8 +92,8 @@ MUTS = [
      "принятая позиция помнит китов"),
     ("                    and str(o.get(\"ordId\") or \"\") not in self.st[\"closed_ids\"]]", "]",
      "закрытая сделка — её вход не повод принять позицию"),
-    ("                if int(n or 0) >= self.limit and (self.top is None or str(w) in self.top)}",
-     "                if self.top is None or str(w) in self.top}", "восстановленные киты — только от 1000 $"),
+    ("        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}",
+     "        return {str(w): int(t) for w, t, n in rows}", "восстановленные киты — только от 1000 $"),
     ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
      "позиция прежней версии — киты по базе"),
     # Входим с крупными
@@ -207,9 +202,7 @@ RP_MUTS = [
     ("        if now < b.busy_until:", "        if False:", "повтор: позиция одна"),
     ("        if now - b.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
     ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
-    ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа кит есть"),
-    ("                    self.sig.refresh_top(int(row[4]), int(self.a.top_every_h * core.HOUR_MS))\n", "",
-     "повтор: киты — топ на момент сделки"),
+    ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
     ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),
     ("        if s[\"side\"] * (hl_px / s[\"ref_px\"] - 1) > lv.CHASE:", "        if False:", "повтор: не догоняем"),
     ("b.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "b.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
@@ -233,18 +226,6 @@ RP_MUTS = [
 ]
 
 CORE_MUTS = [
-    ("key=lambda x: (-x[0], -x[1], x[2])", "key=lambda x: (x[0], -x[1], x[2])", "топ — лучший винрейт"),
-    ("key=lambda x: (-x[0], -x[1], x[2])", "key=lambda x: (-x[0], x[1], x[2])", "топ — при равном больше закрытий"),
-    ("    return {a for _, _, a in ranked[:n]}", "    return {a for _, _, a in ranked}", "топ — не больше n"),
-    ("    ban = \"AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)\" if banned else \"\"",
-     "    ban = \"\"", "топ — без забаненных"),
-    ("        (now_ms - days * DAY_MS, now_ms, TOP_MIN_TRADES, max_tr)", "        (now_ms - days * DAY_MS, 10**18, TOP_MIN_TRADES, max_tr)",
-     "топ — без будущего"),
-    ("        (now_ms - days * DAY_MS, now_ms, TOP_MIN_TRADES, max_tr)", "        (0, now_ms, TOP_MIN_TRADES, max_tr)", "топ — за 30 дней"),
-    ("*([\"f.flat = 1\"] if \"flat\" in cols else [])", "*([])", "топ — flat тоже закрытие"),
-    ("    n = TOP_N if n is None else n", "    n = 1000 if n is None else n", "топ — предел TOP_N"),
-    ("TOP_MIN_TRADES = 5 ", "TOP_MIN_TRADES = 4 ", "топ — от 5 закрытий"),
-    ("TOP_MAX_TRADES_30D = 200 ", "TOP_MAX_TRADES_30D = 250 ", "топ — до 200 закрытий"),
     ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
     ("    if not os.path.isfile(path):\n        raise OSError", "    if False:\n        raise OSError", "нет базы — ошибка шага, не выход"),
     ("        self.count += (k1 > 0 and n1 >= self.limit) - (k0 > 0 and n0 >= self.limit)",

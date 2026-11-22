@@ -139,31 +139,11 @@ def make_db(path: str, fills: list[tuple]) -> None:
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, "
                 "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, "
                 "dir TEXT NOT NULL DEFAULT '')")
-    put(con, fills)
+    con.executemany(INS, fills)
     con.commit()
     con.close()
 
 
-def history(fills: list[tuple], wins: int = 5) -> list[tuple]:
-    """Киты — только топ по винрейту: каждому кошельку из сделок — 5 закрытий
-    в плюс по отдельной бумаге HIST за сутки до первой сделки (чтобы он был в
-    топе, как настоящий кит). tid — от адреса (с 10**12): повтор не дублирует."""
-    if not fills:
-        return []
-    t0 = min(int(f[4]) for f in fills) - 86_400_000
-    ws = sorted({str(f[1]) for f in fills})
-    return [(10**12 + int(hashlib.sha256(w.encode()).hexdigest()[:8], 16) * 10 + k, w, "HIST", 3, t0 + k * 1000,
-             5000 * 10**9, "0.05", 10**9) for w in ws for k in range(wins)]
-
-
-HIST = ("INSERT OR IGNORE INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos) "
-        "VALUES (?,?,?,?,?,?,?,?)")
-
-
-def put(con: sqlite3.Connection, fills: list[tuple]) -> None:
-    """Сделки китов в базу — вместе с их историей (чтобы они были в топе)."""
-    con.executemany(INS, fills)
-    con.executemany(HIST, history(fills))
 INS = "INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz) VALUES (?,?,?,?,?,?,?)"
 
 
@@ -303,51 +283,6 @@ class TradeTest(Base):
             tr.step()
             self.assertEqual(self.market_orders(), [], fills)
             os.remove(self.db)
-
-    def test_not_top_wallet_is_not_a_whale(self) -> None:
-        """Кошелёк не из топа по винрейту (нет 5 закрытий за 30 дней) — не кит:
-        с китом 0xa его сделку не считаем (китов 1 — мало); попал в топ
-        (пересчёт раз в 15 минут) — второй кит, вход."""
-        tr = self.trader([fill(9, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)])
-        con = sqlite3.connect(self.db)
-        con.execute(INS, fill(1, "0xnew", "BTC", 1, self.now - MIN, 50_000, 100_000))   # без истории закрытий
-        con.commit()
-        con.close()
-        self.on()
-        tr.step()
-        self.assertEqual(self.market_orders(), [])
-        self.assertEqual(tr.sig.top, {"0xa"})
-        self.now += 16 * MIN
-        con = sqlite3.connect(self.db)
-        put(con, [fill(2, "0xnew", "BTC", 1, self.now - MIN, 5000, 100_000),
-                  fill(3, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)])
-        con.commit()
-        con.close()
-        tr.last_sync = 0
-        tr.step()
-        self.assertEqual(len(self.market_orders()), 1)
-        self.assertEqual(self.state()["top_n"], 2)
-
-    def test_only_best_winrate_whales_count(self) -> None:
-        """Топ — по винрейту: при месте на двоих (TOP_N = 2) киты — у кого
-        винрейт выше; сделка третьего (5 в плюс и 3 в минус) не в счёт — с
-        одним китом 0xa сигнала нет."""
-        import autotrade_core as core
-        rows = [fill(1, "0xworse", "BTC", 1, self.now - MIN, 50_000, 100_000),
-                fill(2, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)]
-        with mock.patch.object(core, "TOP_N", 2):
-            tr = self.trader(rows)
-            for k in range(3):
-                close_fill(self.db, 900 + k, "0xworse", "HIST", 3, self.now - 2 * 86_400_000, -1.0)
-            close_fill(self.db, 990, "0xbest", "HIST", 3, self.now - 3 * 86_400_000, 1.0)
-            con = sqlite3.connect(self.db)
-            con.executemany(HIST, history([fill(0, "0xbest", "HIST", 1, self.now - 86_400_000, 1, 1)]))
-            con.commit()
-            con.close()
-            self.on()
-            tr.step()
-            self.assertEqual(tr.sig.top, {"0xbest", "0xa"})
-            self.assertEqual(self.market_orders(), [])
 
     def test_switch_off_no_entry(self) -> None:
         tr = self.trader(self.whales())
@@ -711,8 +646,7 @@ class WhaleExitTest(Base):
         tr = self.enter()
         del tr.st["open"]["wallets"]
         con = sqlite3.connect(self.db)   # мелкий (100 $) в том же окне — не кит сигнала
-        put(con, [fill(49, "0xsmall", "BTC", 1, self.now - 7 * MIN, 100, 100_000)])
-        con.execute(INS, fill(48, "0xnotop", "BTC", 1, self.now - 8 * MIN, 90_000, 100_000))  # не из топа — не кит
+        con.execute(INS, fill(49, "0xsmall", "BTC", 1, self.now - 7 * MIN, 100, 100_000))
         con.commit()
         con.close()
         tr.save()
@@ -818,7 +752,7 @@ class SignalMomentTest(Base):
         tr.step()
         self.now += 25 * MIN
         con = sqlite3.connect(self.db)
-        put(con, [fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000)])
+        con.execute(INS, fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000))
         con.commit()
         con.close()
         tr.last_sync = 0
@@ -855,13 +789,6 @@ class BiggerSideTest(Base):
         self.assertEqual(sk["code"], "bigger_against")
         self.assertIn("шорты 700 000 $ против 10 000 $", sk["why"])
 
-    def test_bigger_against_reason_named(self) -> None:
-        """Сигнал в слабую сторону (лонг) пропущен с понятной причиной."""
-        tr = self.trader(self.shorts(n=1) + self.whales())
-        tr.sig.poll(self.now)  # окна
-        why = tr.try_enter(tr.sig._signal("BTC", 1, tr.sig.windows[("BTC", 1)], tr.sig.windows[("BTC", -1)], self.now))
-        self.assertIn("шорты 700 000 $ против 10 000 $", why)
-
     def test_smaller_against_does_not_block(self) -> None:
         tr = self.trader(self.shorts(n=2, usd=2000) + self.whales())
         self.on()
@@ -887,7 +814,7 @@ class BiggerSideTest(Base):
         self.assertEqual(self.market_orders(), [])
         self.now += 25 * MIN
         con = sqlite3.connect(self.db)
-        put(con, self.whales(ago=10))
+        con.executemany(INS, self.whales(ago=10))
         con.commit()
         con.close()
         tr.last_sync = 0
@@ -1016,7 +943,7 @@ class AverageTest(Base):
 
     def whale_adds(self, wallet: str = "0xa", usd: float = 3000, side: int = 1, ago: int = 1, tid: int = 300) -> None:
         con = sqlite3.connect(self.db)
-        put(con, [fill(tid, wallet, "BTC", side, self.now - ago * MIN, usd, 100_000)])
+        con.execute(INS, fill(tid, wallet, "BTC", side, self.now - ago * MIN, usd, 100_000))
         con.commit()
         con.close()
 
@@ -1381,8 +1308,8 @@ class RejectTest(Base):
         self.on()
         tr.step()
         con = sqlite3.connect(self.db)
-        # Те же киты (уже в топе) докупают — тот же сигнал.
-        put(con, [fill(20 + i, ("0xa", "0xb")[i % 2], "BTC", 1, self.now + i * 1000, 5000, 100_000) for i in range(3)])
+        con.executemany(INS,
+                        [fill(20 + i, f"0x{i}", "BTC", 1, self.now + i * 1000, 5000, 100_000) for i in range(3)])
         con.commit()
         con.close()
         self.now += 5000
@@ -1495,7 +1422,7 @@ class ReviewTest(Base):
 
     def add_fills(self, rows: list[tuple]) -> None:
         con = sqlite3.connect(self.db)
-        put(con, rows)
+        con.executemany(INS, rows)
         con.commit()
         con.close()
 
@@ -1679,7 +1606,7 @@ class ReviewTest(Base):
         self.assertEqual(self.market_orders(), [])
         self.assertIn("не удалось проверить", self.state()["last_skip"]["why"])
         tr.okx.history = real  # type: ignore[method-assign]
-        self.now += 16 * MIN   # новые киты — в списке топа после пересчёта (раз в 15 минут)
+        self.now += MIN
         self.add_fills(self.stx(20))
         tr.last_sync = 0
         tr.step()
@@ -1688,15 +1615,13 @@ class ReviewTest(Base):
 
     def test_late_whale_fill_is_counted(self) -> None:
         """Сделка кита пришла в базу позже следующей (бот записал её с
-        задержкой): она всё равно считается в окне 2 часов — 600 $ + 600 $
-        одного кошелька — второй кит."""
-        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 600, 100_000),
-                          fill(3, "0xb", "BTC", 1, self.now - 3 * MIN, 5000, 100_000)])
+        задержкой): она всё равно считается в окне 2 часов."""
+        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)])
         self.on()
         tr.step()
         self.assertEqual(self.market_orders(), [])
         # Время — на 12 минут раньше уже прочитанной: опоздала дольше любого «нахлёста».
-        self.add_fills([fill(2, "0xa", "BTC", 1, self.now - 14 * MIN, 600, 100_000)])
+        self.add_fills([fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000)])
         self.now += MIN
         tr.last_sync = 0
         tr.step()

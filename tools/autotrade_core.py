@@ -28,13 +28,6 @@ NANOS = 1_000_000_000
 DAY_MS = 86_400_000
 HOUR_MS = 3_600_000
 
-# Киты — только топ кошельков по винрейту (правило владельца, 22.11.2026):
-# как доска «Топ трейдеров» приложения (whale_api.load_perp_rank, «win»).
-TOP_N = 3000
-TOP_DAYS = 30
-TOP_MIN_TRADES = 5          # меньше — винрейт случайный (как HL_MIN_CLOSED в API)
-TOP_MAX_TRADES_30D = 200    # больше — бот (как HL_MAX_CLOSED_30D в API)
-
 # dir_code в hl_fills (hyperliquid_core.cpp, dirCode).
 OPEN_LONG, OPEN_SHORT, CLOSE_LONG, CLOSE_SHORT, FLIP, LIQ_LONG, LIQ_SHORT = 1, 2, 3, 4, 5, 6, 7
 CLOSES_FOR = {1: (CLOSE_LONG, FLIP, LIQ_LONG), -1: (CLOSE_SHORT, FLIP, LIQ_SHORT)}
@@ -76,29 +69,6 @@ def okx_public(path: str, params: dict[str, Any]) -> object:
     with urllib.request.urlopen(req, timeout=20) as r:
         got = json.loads(r.read(16 << 20))
     return got.get("data") if isinstance(got, dict) and str(got.get("code")) == "0" else None
-
-
-def top_winrate(con: sqlite3.Connection, now_ms: int, n: int | None = None, days: int = TOP_DAYS) -> set[str]:
-    """Топ-n кошельков по винрейту на момент now_ms — та же доска, что «Топ
-    трейдеров» в приложении: закрытия за `days` дней до now_ms (closed_pnl ≠ 0,
-    flat = 1 или код ≥ 3 — одно условие с API), без забаненных, закрытий от 5
-    до 200 за 30 дней; винрейт — доля закрытий в плюс, округлённая до
-    процента; при равном — у кого больше закрытий. Будущее (после now_ms) не
-    берётся — бэктест не подглядывает."""
-    cols = {str(r[1]) for r in con.execute("PRAGMA table_info(hl_fills)")}
-    close = ["f.closed_pnl_nanos != 0", "f.dir_code >= 3", *(["f.flat = 1"] if "flat" in cols else [])]
-    banned = con.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'hl_banned'").fetchone()
-    ban = "AND NOT EXISTS (SELECT 1 FROM hl_banned b WHERE b.wallet = f.wallet)" if banned else ""
-    n = TOP_N if n is None else n
-    max_tr = max(TOP_MIN_TRADES, (TOP_MAX_TRADES_30D * days + 29) // 30)
-    rows = con.execute(
-        "SELECT f.wallet, COUNT(*), SUM(CASE WHEN f.closed_pnl_nanos > 0 THEN 1 ELSE 0 END) FROM hl_fills f "  # noqa: S608 — без ввода
-        f"WHERE f.ts >= ? AND f.ts <= ? AND ({' OR '.join(close)}) {ban} "
-        "GROUP BY f.wallet HAVING COUNT(*) >= ? AND COUNT(*) <= ?",
-        (now_ms - days * DAY_MS, now_ms, TOP_MIN_TRADES, max_tr)).fetchall()
-    ranked = sorted(((round(100.0 * int(w or 0) / int(t)), int(t), str(a)) for a, t, w in rows),
-                    key=lambda x: (-x[0], -x[1], x[2]))
-    return {a for _, _, a in ranked[:n]}
 
 
 class Window:
