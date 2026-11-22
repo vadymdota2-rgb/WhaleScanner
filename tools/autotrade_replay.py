@@ -58,6 +58,7 @@ import autotrade_live as lv
 BAR_MS = 300_000                  # 5-минутные свечи OKX
 BLOCK_MS = 100 * BAR_MS           # блок кеша — 100 свечей (один запрос)
 SYNC_MS = 15_000                  # живой бот сверяет счёт раз в 15 с
+LIMIT_WAIT_MS = 2 * 3_600_000     # вход лимитом: заявка ждёт исполнения не дольше 2 часов
 Fetch = Callable[[dict[str, Any]], object]
 
 
@@ -235,6 +236,7 @@ class Rules:
     tp: bool = True             # лимитный тейк +1 % от средней
     with_whales: bool = False   # выход, когда кит сигнала закрыл от 1000 $ (в плюс или в минус); иначе — только в убытке
     average: bool = True        # разовое усреднение
+    entry_limit: float | None = None  # вход лимитом: лонг — на столько ниже цены китов, шорт — выше (0.01 = 1 %)
 
 
 VARIANTS = (
@@ -243,6 +245,8 @@ VARIANTS = (
           tp=False, with_whales=True),
     Rules("tp_or_whales", "тейк +1 % или раньше — вместе с китом", with_whales=True),
     Rules("no_average", "как сейчас, без усреднения", average=False),
+    Rules("limit_entry", "вход лимитом: лонг на 1 % ниже цены китов, шорт на 1 % выше; заявка до 2 ч, "
+          "первая исполнившаяся", entry_limit=0.01),
 )
 
 
@@ -256,6 +260,10 @@ class Book:
         self.entered: dict[str, int] = {}
         self.busy_until = 0
         self.skips: defaultdict[str, int] = defaultdict(int)
+        # Вход лимитом: заявки ждут (несколько сразу, по бумаге — одна); первая
+        # исполнившаяся — позиция, остальные снимаются; не исполнилась — unfilled.
+        self.pending: list[dict[str, Any]] = []
+        self.unfilled = 0
 
 
 class Replay:
@@ -271,10 +279,15 @@ class Replay:
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, b: Book, s: dict[str, Any], now: int) -> str:
+        limit = b.rules.entry_limit
+        if limit is not None:
+            self.settle(b, now)
         if now < b.busy_until:
             return "own_open"
         if now - b.entered.get(s["coin"], -10**15) < lv.COIN_PAUSE_MS:
             return "coin_pause"
+        if limit is not None and any(p["s"]["coin"] == s["coin"] for p in b.pending):
+            return "pending_same"
         # Бумаги нет на OKX — сразу (живой бот проверяет это позже, итог тот же,
         # а повтор не тратит запрос к базе на каждый такой сигнал).
         base, scale = core.okx_candidate(s["coin"])
@@ -296,8 +309,8 @@ class Replay:
         hl_px = last * scale
         if abs(hl_px / s["ref_px"] - 1) > lv.MATCH_TOL:
             return "other_asset"
-        if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
-            return "chase"
+        if limit is None and s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
+            return "chase"  # у входа лимитом догона нет: заявка — ниже (выше) цены китов
         if b.equity <= 0:
             return "no_equity"
         sz = contracts(ins, b.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)
@@ -309,19 +322,65 @@ class Replay:
         tp_try = lv.round_step(last * (1 + s["side"] * lv.TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not lv.TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= lv.TP + lv.TP_SLACK:
             return "tick"
+        if limit is not None:
+            lim = float(lv.round_step(s["ref_px"] / scale * (1 - s["side"] * limit), tick,
+                                      ROUND_FLOOR if s["side"] > 0 else ROUND_CEILING))
+            if lim <= 0:
+                return "tick"
+            self.place(b, s, inst, ins, lim, now)
+            return ""
         self.open_trade(b, s, inst, ins, sz, last, now)
         return ""
 
+    def place(self, b: Book, s: dict[str, Any], inst: str, ins: dict[str, Any], lim: float, now: int) -> None:
+        """Заявка входа лимитом: когда исполнится (по свечам) — сразу, раз
+        цены известны; ждёт до 2 часов, снимается раньше, если кит сигнала
+        вышел в убыток. Цена уже за заявкой (на открытии свечи) — исполнение
+        сразу по ней (рыночно, тейкер); иначе — по цене заявки (мейкер)."""
+        side = s["side"]
+        end = now + LIMIT_WAIT_MS
+        lost = self.exit_time(s["coin"], side, s.get("wallets") or {}, now, False)
+        if lost is not None:
+            end = min(end, lost + SYNC_MS)
+        fill: tuple[int, float, bool] | None = None
+        first = True
+        for tf, o, h, lo, _cl in self.px.candles(inst, now, min(end, self.px.now_ms)):
+            t = int(tf)
+            if first and side * (o - lim) <= 0:
+                fill = (now, o, True)
+                break
+            first = False
+            if side * ((lo if side > 0 else h) - lim) <= 0:
+                fill = (max(t, now), lim, False)
+                break
+        b.pending.append({"s": s, "inst": inst, "ins": ins, "end": end, "fill": fill})
+
+    def settle(self, b: Book, now: int) -> None:
+        """Заявки к моменту now: первая исполнившаяся (по времени) — позиция,
+        остальные снимаются; истёкшие без исполнения — в unfilled."""
+        done = [p for p in b.pending if p["fill"] is not None and p["fill"][0] <= now]
+        if done:
+            p = min(done, key=lambda x: x["fill"][0])
+            b.pending = []
+            t, px, taker = p["fill"]
+            sz = contracts(p["ins"], b.equity * lv.MARGIN_FRAC * lv.LEVERAGE, px)
+            if sz is not None and b.equity > 0:
+                self.open_trade(b, p["s"], p["inst"], p["ins"], sz, px, t, limit=True, taker=taker)
+            return
+        left = [p for p in b.pending if p["fill"] is not None or p["end"] > now]
+        b.unfilled += len(b.pending) - len(left)
+        b.pending = left
+
     def open_trade(self, b: Book, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float,
-                   now: int) -> None:
+                   now: int, limit: bool = False, taker: bool = True) -> None:
         a, side, r = self.a, s["side"], b.rules
         slip = a.slippage / 100
         rnd = ROUND_CEILING if side > 0 else ROUND_FLOOR
-        entry = last * (1 + side * slip)
+        entry = last if limit else last * (1 + side * slip)   # лимитом — по цене исполнения, без проскальзывания
         tick = lv.dec(ins.get("tickSz")) or Decimal("0.0001")
         qty = float(sz) * coin_per_contract(ins, entry)      # монет в позиции
         avg_px = entry
-        fees = qty * entry * a.fee_taker / 100
+        fees = qty * entry * (a.fee_taker if taker else a.fee_maker) / 100
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
         wallets = s.get("wallets") or {}
         exit_at = self.exit_time(s["coin"], side, wallets, now, r.with_whales)
@@ -449,6 +508,9 @@ class Replay:
                     self.sig.sweep(int(rows[-1][4]))
         finally:
             con.close()
+        for b in self.books:  # заявки, исполнившиеся после последней сделки китов
+            if b.rules.entry_limit is not None:
+                self.settle(b, until)
         self.px.save()
         self.progress({"stage": "готово", "done": total, "total": total, "trades": len(self.books[0].trades),
                        "requests": self.px.requests})
@@ -524,7 +586,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         v_all, _v_first, v_last = split(b.trades, cut)
         variants.append({"key": b.rules.key, "name": b.rules.name, "deposit_end": round(b.equity, 2),
                          "verdict": passed(v_all, v_last, crit), "full": v_all, "last": v_last,
-                         "averaged": sum(t.averaged for t in b.trades)})
+                         "averaged": sum(t.averaged for t in b.trades), "unfilled": b.unfilled})
 
     def group(key: Callable[[Trade], str]) -> list[dict[str, Any]]:
         g: dict[str, list[Trade]] = defaultdict(list)

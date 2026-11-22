@@ -256,7 +256,7 @@ class ReplayTest(unittest.TestCase):
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]
         r = self.go(rows, step_price(100_000, [(T + 20 * MIN, 0.005), (T + 90 * MIN, 0.012)]))
         b = r["books"]
-        self.assertEqual(list(b), ["live", "with_whales", "tp_or_whales", "no_average"])
+        self.assertEqual(list(b), ["live", "with_whales", "tp_or_whales", "no_average", "limit_entry"])
         self.assertEqual(b["live"].trades[0].why, "тейк")
         for key in ("with_whales", "tp_or_whales"):
             [t] = b[key].trades
@@ -291,6 +291,67 @@ class ReplayTest(unittest.TestCase):
         [t] = r["books"]["no_average"].trades
         self.assertEqual((t.averaged, t.why), (False, "открыта"))
         self.assertEqual({x["key"]: x["averaged"] for x in r["summary"]["variants"]}["no_average"], 0)
+
+    def test_limit_entry_fills_on_dip(self) -> None:
+        """Вход лимитом: лонг — заявка на 1 % ниже цены китов (99 000);
+        откат на 1,2 % — исполнилась (мейкер), тейк +1 % от неё (99 990) —
+        цена вернулась к 100 000: тейк. Правила бота вошли по 100 000 и ждут."""
+        r = self.go(self.whales(), step_price(100_000, [(T + 30 * MIN, -0.012), (T + 90 * MIN, 0.0)]))
+        [t] = r["books"]["limit_entry"].trades
+        self.assertEqual((t.why, t.entry_px, t.tp), ("тейк", 99_000.0, 99_990.0))
+        self.assertEqual(t.entry_t, T + 30 * MIN)
+        self.assertAlmostEqual(t.notional, 9_900, delta=200, msg="5 % капитала × 10× — 0,1 BTC по 99 000")
+        self.assertGreater(t.pnl, 94, "≈ +1 % от 10 000 $ минус комиссии мейкера (не тейкера)")
+        self.assertEqual(r["books"]["live"].trades[0].why, "открыта")
+        v = {x["key"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(v["limit_entry"]["unfilled"], 0)
+
+    def test_limit_entry_short_and_immediate(self) -> None:
+        # Шорт: заявка на 1 % выше (101 000), рост на 1,2 % — исполнилась, назад к 99 800 — тейк (99 990).
+        r = self.go(self.whales(side=-1), step_price(100_000, [(T + 30 * MIN, 0.012), (T + 90 * MIN, -0.002)]))
+        [t] = r["books"]["limit_entry"].trades
+        self.assertEqual((t.side, t.why, t.entry_px), (-1, "тейк", 101_000.0))
+        os.remove(self.db)
+        self.cache += "2"
+        # Цена уже ниже заявки на момент решения (98 500 < 99 000) — исполнение сразу по ней.
+        r = self.go(self.whales(), lambda c, t: 98_500.0 if t >= T - 60 * MIN else 100_000.0)
+        [t] = r["books"]["limit_entry"].trades
+        self.assertEqual((t.entry_px, t.entry_t), (98_500.0, T + 5000))
+
+    def test_limit_entry_has_no_chase_rule(self) -> None:
+        # Цена ушла выше китов на 0,4 % — рыночный вход не догоняет; заявка лимитом (99 000) — ставится.
+        r = self.go(self.whales(), step_price(100_400, [(T + 30 * MIN, -0.016), (T + 90 * MIN, -0.004)]))
+        self.assertEqual(r["books"]["live"].trades, [])
+        self.assertEqual([t.entry_px for t in r["books"]["limit_entry"].trades], [99_000.0])
+
+    def test_limit_entry_expires_or_cancelled(self) -> None:
+        # Отката нет 2 часа (он — через 3 часа) — заявка снята, сделки нет; новый кит по той же
+        # бумаге, пока заявка ждёт, — вторую не ставим.
+        rows = [*self.whales(), opn(3, "0xc", "BTC", 1, T + 10 * MIN, 5000, 100_000)]
+        r = self.go(rows, step_price(100_000, [(T + 180 * MIN, -0.012)]))
+        self.assertEqual(r["books"]["limit_entry"].trades, [])
+        self.assertEqual({x["key"]: x for x in r["summary"]["variants"]}["limit_entry"]["unfilled"], 1)
+        os.remove(self.db)
+        self.cache += "2"
+        # Кит сигнала вышел в убыток до отката — заявка снята.
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 20 * MIN, -100.0)]
+        r = self.go(rows, step_price(100_000, [(T + 30 * MIN, -0.012)]))
+        self.assertEqual(r["books"]["limit_entry"].trades, [])
+        self.assertEqual({x["key"]: x for x in r["summary"]["variants"]}["limit_entry"]["unfilled"], 1)
+
+    def test_limit_entry_first_filled_wins(self) -> None:
+        """Заявки по BTC и ETH ждут вместе; ETH откатилась первой — позиция по
+        ETH, заявка BTC снята (её откат позже — уже не сделка)."""
+        rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 10 * MIN, base=10),
+                *self.whales(coin="NOPE", px=1, t=T + 300 * MIN, base=20), *self.whales(coin="NOPE", px=1, t=T + 400 * MIN, base=30)]
+
+        def price(c: str, t: int) -> float:
+            if c == "ETH":
+                return 3000 * (0.988 if T + 20 * MIN <= t < T + 40 * MIN else 1.0)
+            return 100_000 * (0.988 if t >= T + 60 * MIN else 1.0)
+
+        r = self.go(rows, price)
+        self.assertEqual([(t.coin, t.why) for t in r["books"]["limit_entry"].trades], [("ETH", "тейк")])
 
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот
