@@ -44,6 +44,50 @@ class CoreTest(unittest.TestCase):
         with self.assertRaises(OSError):  # не SystemExit: у службы это ошибка шага, а не выход
             core.open_ro(os.path.join(self.tmp.name, "нет.db"))
 
+    def test_top_winrate_like_app_board(self) -> None:
+        """Киты — топ по винрейту, как доска «Топ трейдеров» приложения:
+        закрытия за 30 дней до «сейчас» (closed_pnl ≠ 0, flat = 1 или код ≥ 3),
+        от 5 до 200, без забаненных; винрейт — доля закрытий в плюс
+        (округление до процента), при равном — больше закрытий; n — предел."""
+        db = os.path.join(self.tmp.name, "hl.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
+                    "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, flat INTEGER NOT NULL DEFAULT 0)")
+        con.execute("CREATE TABLE hl_banned (wallet TEXT)")
+        now, day = 1_800_000_000_000, core.DAY_MS
+        rows: list[tuple] = []
+
+        def closes(w: str, wins: int, losses: int, ts: int = now - day, code: int = 3) -> None:
+            for k in range(wins + losses):
+                rows.append((len(rows) + 1, w, "BTC", code, ts + k, 1, "1", 10**9 if k < wins else -(10**9), 0))
+
+        closes("0x100", 5, 0)              # 100 %, 5 закрытий
+        closes("0x100b", 9, 0)             # 100 %, 9 — выше при равном проценте
+        closes("0x80", 8, 2)               # 80 %
+        closes("0x4", 4, 0)                # 4 закрытия — меньше 5: не в доске
+        closes("0xbot", 201, 0)            # больше 200 — бот
+        closes("0xban", 9, 0)              # забанен
+        closes("0xold", 9, 0, ts=now - 31 * day)       # старше 30 дней — не в счёт
+        closes("0xfut", 9, 0, ts=now + 1)              # после «сейчас» — бэктест не подглядывает
+        closes("0xflat", 0, 0)
+        rows += [(len(rows) + 1 + k, "0xflat", "BTC", 1, now - day + k, 1, "1", 0, 1) for k in range(5)]  # flat = 1 — закрытие
+        rows += [(len(rows) + 10 + k, "0xopen", "BTC", 1, now - day + k, 1, "1", 0, 0) for k in range(9)]  # открытия — нет
+        con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
+        con.execute("INSERT INTO hl_banned VALUES ('0xban')")
+        con.commit()
+        con.close()
+        ro = core.open_ro(db)
+        try:
+            self.assertEqual(core.top_winrate(ro, now), {"0x100", "0x100b", "0x80", "0xflat"})
+            self.assertEqual(core.top_winrate(ro, now, 1), {"0x100b"})
+            self.assertEqual(core.top_winrate(ro, now, 2), {"0x100b", "0x100"})
+            self.assertEqual(core.top_winrate(ro, now, 3), {"0x100b", "0x100", "0x80"}, "0 % (flat без прибыли) — последний")
+            self.assertIn("0xfut", core.top_winrate(ro, now + 10_000))
+            with mock.patch.object(core, "TOP_N", 1):
+                self.assertEqual(core.top_winrate(ro, now), {"0x100b"}, "предел по умолчанию — TOP_N")
+        finally:
+            ro.close()
+
     def test_okx_names(self) -> None:
         self.assertEqual(core.okx_candidate("kPEPE"), ("PEPE", 1000.0))
         self.assertEqual(core.okx_candidate("xyz:GOLD"), ("XAU", 1.0))

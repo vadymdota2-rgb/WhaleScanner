@@ -6,9 +6,11 @@
 «входим с крупными», убыток и добор кита), и через те же правила входа и
 выхода:
 
-- от 2 китов в одну сторону за 2 часа, у каждого от 1000 $; на момент входа —
-  тоже от 2; против — киты крупнее или поровну — не входим, крупных от 2 —
-  входим с ними; кит сигнала уже вышел в убыток — не входим;
+- кит — только кошелёк из топ-1000 по винрейту за 30 дней (как доска «Топ
+  трейдеров»; на момент сделки, без будущего — пересчёт раз в 6 ч повтора);
+- от 1 кита в одну сторону за 2 часа, от 1000 $; на момент входа — тоже;
+  против — киты крупнее или поровну — не входим, крупнее — входим с ними;
+  кит сигнала уже вышел в убыток — не входим;
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
   средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; позиция —
   одна;
@@ -283,10 +285,10 @@ class Replay:
         if not ins:
             return "no_inst"
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
+        if count < lv.MIN_WHALES:  # порядок проверок — как у живого бота
+            return "stale"
         if against > 0 and against >= usd:
             return "bigger_against"
-        if count < lv.MIN_WHALES:
-            return "stale"
         if self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now):
             return "whale_exit"
         c = self.px.candle(inst, now)
@@ -433,6 +435,8 @@ class Replay:
             while rows := cur.fetchmany(5000):
                 for row in rows:
                     done += 1
+                    # Киты — топ по винрейту на момент сделки (без будущего), раз в top_every_h.
+                    self.sig.refresh_top(int(row[4]), int(self.a.top_every_h * core.HOUR_MS))
                     cands = list(reversed(self.sig.feed([row])))  # как candidates: встречный «крупный» — первым
                     for b in self.books:
                         for s in cands:
@@ -583,6 +587,7 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--since-days", type=int, default=30, help="сколько последних дней повторить")
     ap.add_argument("--deposit", type=float, default=1000, help="капитал на начало, $")
     ap.add_argument("--delay", type=int, default=5, help="задержка решения после сделки кита, с (опрос базы)")
+    ap.add_argument("--top-every-h", type=float, default=6, help="пересчёт топа китов по винрейту, ч времени повтора")
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание рыночного ордера, %%")
     ap.add_argument("--fee-taker", type=float, default=0.05, help="комиссия тейкера OKX, %%")
     ap.add_argument("--fee-maker", type=float, default=0.02, help="комиссия мейкера OKX (тейк лимитом), %%")
