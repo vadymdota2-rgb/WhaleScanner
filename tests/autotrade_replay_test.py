@@ -250,6 +250,48 @@ class ReplayTest(unittest.TestCase):
         r = self.go(self.whales(), price, offline=True)
         self.assertEqual([t.why for t in r["trades"]], ["тейк"])
 
+    def test_variants_with_whales_exit_on_profit_close(self) -> None:
+        """«Вместе с китами»: кит сигнала закрыл в плюс от 1000 $ — выходим с
+        ним; правила бота держат до тейка +1 %. Все варианты — на тех же сигналах."""
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, 0.005), (T + 90 * MIN, 0.012)]))
+        b = r["books"]
+        self.assertEqual(list(b), ["live", "with_whales", "tp_or_whales", "no_average"])
+        self.assertEqual(b["live"].trades[0].why, "тейк")
+        for key in ("with_whales", "tp_or_whales"):
+            [t] = b[key].trades
+            self.assertEqual(t.why, "вместе с китом", key)
+            self.assertLess(t.exit_t, T + 60 * MIN, key)
+            self.assertGreater(t.pnl, 0, key)
+            self.assertLess(t.pnl, b["live"].trades[0].pnl, key)
+        v = {x["key"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(v["live"]["full"], r["summary"]["full"], "первый вариант — сами правила бота")
+        self.assertEqual(v["with_whales"]["full"]["trades"], 1)
+        self.assertLess(v["with_whales"]["deposit_end"], v["live"]["deposit_end"])
+        self.assertIn("Варианты выхода", r["text"])
+
+    def test_with_whales_small_or_early_close_ignored(self) -> None:
+        # Кит закрыл 500 $ после входа — мало; кит закрыл 5000 $ в плюс ДО нашего входа — не в счёт.
+        small = (10, "0xa", "BTC", 3, T + 30 * MIN, int(500e9), "0.005", int(10e9), "")
+        early = cls(11, "0xa", "BTC", 1, T - MIN, +100.0)   # 0xa открылся в T − 2 мин — закрытие в его окне
+        r = self.go([*self.whales(), small, early], step_price(100_000, [(T + 90 * MIN, 0.012)]))
+        self.assertEqual(r["books"]["with_whales"].trades[0].why, "открыта", "тейка у варианта нет — держим")
+        self.assertEqual(r["books"]["tp_or_whales"].trades[0].why, "тейк")
+
+    def test_variants_loss_exit_and_no_average(self) -> None:
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, -100.0)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003)]))
+        self.assertEqual(r["books"]["with_whales"].trades[0].why, "вместе с китом", "в убытке — тоже выходим")
+        self.assertEqual(r["books"]["no_average"].trades[0].why, "кит вышел в убыток")
+        os.remove(self.db)
+        self.cache += "2"
+        rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
+        self.assertTrue(r["books"]["live"].trades[0].averaged)
+        [t] = r["books"]["no_average"].trades
+        self.assertEqual((t.averaged, t.why), (False, "открыта"))
+        self.assertEqual({x["key"]: x["averaged"] for x in r["summary"]["variants"]}["no_average"], 0)
+
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот
         же сигнал (общий код Signals)."""

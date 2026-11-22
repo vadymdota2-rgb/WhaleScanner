@@ -44,7 +44,9 @@ CI (`.github/workflows/tests.yml`) гоняет всё это на каждый 
 от 2 китов Hyperliquid в одну сторону за 2 часа (каждый от 1000 $), против —
 не крупнее; маржа 5 % × 10×, одна позиция; тейк +1 %, выход вслед за китом в
 убытке, разовое усреднение. Бэктест — повтор истории по тем же правилам:
-[`tools/autotrade_replay.py`](tools/autotrade_replay.py); общее —
+[`tools/autotrade_replay.py`](tools/autotrade_replay.py) — с вариантами выхода
+на тех же сигналах («вместе с китами», тейк или раньше с китом, без
+усреднения) для сравнения; общее —
 [`tools/autotrade_core.py`](tools/autotrade_core.py). База бота — только
 чтение. Устройство — [`docs/autotrade-how-it-works.md`](docs/autotrade-how-it-works.md),
 проверка на сервере — [`docs/check-autotrade-server.md`](docs/check-autotrade-server.md).
