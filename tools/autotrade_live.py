@@ -68,7 +68,6 @@ from typing import Any, TextIO
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autotrade_core as core
 
-OKX = "https://www.okx.com"
 # Ключ живёт на одном адресе: глобальный OKX, европейский (OKX EEA, вход
 # через my.okx.com — API на eea.okx.com) или американский. Чужой адрес
 # отвечает 50119 «ключа нет» — бот пробует по очереди и запоминает рабочий.
@@ -228,7 +227,7 @@ class Okx:
     """Подписанный REST OKX v5. Секреты — только в памяти этого объекта."""
 
     def __init__(self, key: str, secret: str, passphrase: str, simulated: bool,
-                 transport: Transport | None = None, base: str = OKX) -> None:
+                 transport: Transport | None = None, base: str = core.OKX_API) -> None:
         self._key, self._secret, self._pass = key, secret, passphrase
         self.simulated = simulated
         self._t = transport or http_transport
@@ -338,6 +337,22 @@ def inst_type(inst: str) -> str:
 
 
 # ── округление под правила бумаги ────────────────────────────────────────────
+
+def contract_size(ins: dict[str, Any], notional: float, px: float) -> Decimal:
+    """Объём в контрактах на notional $ по цене px — как ордер: десятичными
+    (10 000 / (10 000 000 × 0,00001) — ровно 100, а не 99,999…), вниз по шагу
+    бумаги; размер контракта — в монете или уже в долларах (ctValCcy).
+    Параметры бумаги — мусор, или меньше минимального ордера — 0."""
+    ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
+    step, min_sz = dec(ins.get("lotSz")), dec(ins.get("minSz"))
+    if ct_val is None or ct_mult is None or step is None or min_sz is None or not notional > 0 or not px > 0:
+        return Decimal(0)
+    ct_d = ct_val * ct_mult
+    in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
+    qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(px)))
+    sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+    return sz if sz >= min_sz else Decimal(0)
+
 
 def fmt_dec(x: Decimal) -> str:
     s = format(x.normalize(), "f")
@@ -519,15 +534,13 @@ class Signals:
             con.close()
         return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}
 
-    def sweep(self, now: int) -> int:
+    def sweep(self, now: int) -> None:
         """Очистка: окна бумаг, по которым давно не было сделок, сами не
         пустеют (выбрасывают старое только на новой сделке) — вычистить
-        старше 2 часов и убрать пустые. Сколько окон убрано."""
-        before = len(self.windows)
+        старше 2 часов и убрать пустые."""
         for w in self.windows.values():
             w.expire(now - WINDOW_MS)
         self.windows = {k: w for k, w in self.windows.items() if w.orders}
-        return before - len(self.windows)
 
 
 # ── бэктест: ночью и по кнопке, в этой службе (не в API) ─────────────────────
@@ -742,7 +755,7 @@ class Janitor:
     def run(self, tr: Trader, bts: Backtests | None, now: float) -> bool:
         """Очистка; True — пора перезапуститься (память не вернулась)."""
         self.last = now
-        dropped = tr.sig.sweep(int(now * 1000))
+        tr.sig.sweep(int(now * 1000))
         cut = int(now * 1000) - COIN_PAUSE_MS
         entered = tr.st.get("entered")
         tr.st["entered"] = {c: t for c, t in entered.items() if num(t) >= cut} if isinstance(entered, dict) else {}
@@ -757,14 +770,12 @@ class Janitor:
             if isinstance(mb, dict) else {}
         self.rotate(os.path.join(tr.dir, "live.log"))
         busy = bts is not None and bts.proc is not None   # идёт пересчёт — его лог и кеш не трогаем
-        freed = 0
         if not busy:
             self.rotate(os.path.join(self.dir, "last_run.log"))
-            freed = self.clean_cache(os.path.join(self.dir, "cache"), now)
+            self.clean_cache(os.path.join(self.dir, "cache"), now)
         gc.collect()
         mb = self.rss()
-        tr.st["janitor"] = {"at": int(now * 1000), "rss_mb": round(mb, 1), "windows": len(tr.sig.windows),
-                            "dropped": dropped, "cache_freed_mb": round(freed / 2**20, 1)}
+        tr.st["janitor"] = {"at": int(now * 1000), "rss_mb": round(mb, 1)}
         return mb > RSS_MAX_MB and not busy and "entering" not in tr.st
 
     @staticmethod
@@ -777,8 +788,8 @@ class Janitor:
 
     @staticmethod
     def clean_cache(cache: str, now: float) -> int:
-        """Кеш свечей и фандинга бэктеста: старше 30 дней — удалить; всё
-        равно больше 500 МБ — удалять самые старые. Сколько байт освобождено."""
+        """Кеш свечей бэктеста: старше 30 дней — удалить; всё равно больше
+        500 МБ — удалять самые старые. Сколько байт освобождено."""
         try:
             files = [(e.stat().st_mtime, e.stat().st_size, e.path) for e in os.scandir(cache) if e.is_file()]
         except OSError:
@@ -823,6 +834,7 @@ class Trader:
         self.st = self._load()
         self.instr: dict[str, dict[str, Any]] = {}
         self.instr_at = 0.0
+        self.xperp: dict[str, str] = {}   # бумага → европейский бессрочный (XPERP), где он есть
         self.pos_mode = ""
         self.lever_set: set[str] = set()
         self.positions: list[dict[str, Any]] = []
@@ -848,10 +860,6 @@ class Trader:
                         ("market_block", dict), ("skips", dict), ("closed_ids", list)):
             if not isinstance(st.get(k), kind):
                 st[k] = kind()
-        # Прежняя версия исключала бумаги на неделю за 50124 (а это запрет ключу,
-        # не бумаге): такие исключения снять — BTC, ETH и др. снова доступны.
-        st["blocked"] = {i: b for i, b in st["blocked"].items()
-                         if not (isinstance(b, dict) and "50124" in str(b.get("why", "")))}
         st["events"] = [e for e in st["events"] if isinstance(e, str)]
         op = st.get("open")
         if op is not None and not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)
@@ -871,7 +879,7 @@ class Trader:
     def save(self) -> None:
         # Во вкладку (wt_autotrade.live) — только то, что она читает.
         self.st.update(heartbeat=self.clock(), simulated=self.okx.simulated, equity=self.equity,
-                       positions=[{k: p.get(k) for k in ("instId", "pos", "avgPx", "upl")} for p in self.positions])
+                       positions=[{k: p.get(k) for k in ("instId", "upl")} for p in self.positions])
         tmp = os.path.join(self.dir, "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.st, f, ensure_ascii=False)
@@ -925,7 +933,7 @@ class Trader:
     def inst_for(self, base: str) -> str:
         """Контракт для бумаги: европейский бессрочный (XPERP), если есть, иначе USDT-SWAP."""
         self.instruments()
-        return getattr(self, "xperp", {}).get(base) or f"{base}-USDT-SWAP"
+        return self.xperp.get(base) or f"{base}-USDT-SWAP"
 
     def sync(self) -> None:
         if not self.pos_mode:
@@ -1184,17 +1192,7 @@ class Trader:
         if not adds:
             return
         why = f"кит {adds[0][0][:10]}… добрал {adds[0][1]:,.0f} $ при минусе {loss * 100:.2f} %".replace(",", " ")
-        ins = self.instruments().get(op["inst"], {})
-        ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
-        step, min_sz = dec(ins.get("lotSz")), dec(ins.get("minSz"))
-        sz = Decimal(0)
-        if ct_val is not None and ct_mult is not None and step is not None and min_sz is not None and self.equity > 0:
-            in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-            ct_d = ct_val * ct_mult
-            qty = Decimal(repr(round(self.equity * AVG_FRAC * LEVERAGE, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(mark)))
-            sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-            if sz < min_sz:
-                sz = Decimal(0)
+        sz = contract_size(self.instruments().get(op["inst"], {}), self.equity * AVG_FRAC * LEVERAGE, mark)
         if sz <= 0:
             op["avg"] = {"done": True, "at": now, "why": why, "skipped": "объём меньше минимального на OKX"}
             self.event(f"{op['inst']}: {why} — усреднение не сделано: объём 5 % меньше минимального на OKX")
@@ -1378,27 +1376,22 @@ class Trader:
             return self._skip("chase", f"цена ушла от китов дальше {CHASE * 100:g} %")
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
-        frac = MARGIN_FRAC
-        notional = self.equity * frac * LEVERAGE
+        notional = self.equity * MARGIN_FRAC * LEVERAGE
         # Параметры бумаги из каталога — только конечные положительные: мусор
         # в каталоге не должен дать ордер неверного размера.
-        ct_val, ct_mult = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1")
-        step, min_sz, tick = dec(ins.get("lotSz")), dec(ins.get("minSz")), dec(ins.get("tickSz"))
-        if ct_val is None or ct_mult is None or step is None or min_sz is None or tick is None:
+        ct_val, ct_mult, tick = dec(ins.get("ctVal")), dec(ins.get("ctMult") or "1"), dec(ins.get("tickSz"))
+        if ct_val is None or ct_mult is None or dec(ins.get("lotSz")) is None or dec(ins.get("minSz")) is None \
+                or tick is None:
             return self._skip("bad_params", f"{inst}: неверные параметры бумаги в каталоге OKX")
-        ct_d = ct_val * ct_mult
-        ct = float(ct_d)
-        # Десятичными, не двоичными дробями: 10 000 / (10 000 000 × 0,00001) — ровно 100, а не 99,999…
-        # Размер контракта — в монете (ctValCcy = BTC) или уже в долларах (USD/USDC/USDT).
+        ct = float(ct_val * ct_mult)
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-        qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(last)))
-        sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
+        sz = contract_size(ins, notional, last)
         # Тейк должен встать на шаг цены не ближе +1 % и не дальше +1,5 %: шаг
         # слишком крупный для этой цены — тейк невозможен, без выхода не входим.
         tp_try = round_step(last * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= TP + TP_SLACK:
             return self._skip("tick", f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +1 % при цене {last}")
-        if sz < min_sz:
+        if sz <= 0:
             return self._skip("min_size", f"позиция {notional:.0f} $ меньше минимальной на OKX")
         cl = f"{TAG}in{now % 10**12}"
         try:
@@ -1469,7 +1462,7 @@ class Trader:
         op = {"coin": s["coin"], "inst": inst, "side": s["side"], "opened": now, "px": fill_px, "size": filled,
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id,
-              "margin_pct": round(frac * 100, 2), "wallets": s.get("wallets") or {},
+              "margin_pct": round(MARGIN_FRAC * 100, 2), "wallets": s.get("wallets") or {},
               "usd": s.get("usd"), "usd_against": s.get("usd_against"),
               # Рыночный исполнен частично — может доисполниться: сверка
               # увеличит запись и тейк (_entry_fill).
@@ -1478,7 +1471,7 @@ class Trader:
         self.st["entered"][s["coin"]] = now
         self.st.pop("entering", None)
         self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} {fmt_dec(sz)} по {fill_px} "
-                   f"(≈{op['notional']:.0f} $, маржа {frac * 100:g} %, китов {s['whales']}), тейк {op['tp_s']}")
+                   f"(≈{op['notional']:.0f} $, маржа {MARGIN_FRAC * 100:g} %, китов {s['whales']}), тейк {op['tp_s']}")
         self._place_tp(op, filled_d)
         self.save()
         return ""
@@ -1565,15 +1558,6 @@ class Trader:
                 self.st.pop("entering", None)
                 return
 
-    def recover(self) -> None:
-        """После перезапуска: вход был начат, но не записан. Ордер исполнен и
-        позиция есть — принять её как свою и поставить тейк; ордера нет —
-        входа не было."""
-        if not self.st.get("entering"):
-            return
-        self.sync()  # в нём resolve_entering: своя позиция — принять, нет — снять запись
-        self.save()
-
     def step(self) -> None:
         sigs = self.sig.poll(self.clock())
         if time.time() - self.last_sync >= SYNC_SEC or sigs:
@@ -1594,7 +1578,7 @@ class Trader:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Автокопирование китов — реальная торговля на OKX")
-    ap.add_argument("--db", default=os.environ.get("WHALE_HL_DB", "hyperliquid.db"), help="база бота (только чтение)")
+    ap.add_argument("--db", default=os.environ.get("WHALE_HL_DB_FILE", "hyperliquid.db"), help="база бота (только чтение)")
     ap.add_argument("--dir", default=os.environ.get("WT_AUTOTRADE_DIR")
                     or os.path.expanduser("~/WalletTracker/autotrade_data"), help="каталог модуля")
     a = ap.parse_args(argv)
@@ -1639,11 +1623,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     me = [os.path.abspath(__file__), core.__file__]  # код обновился — перезапуск (бэктест — отдельным процессом)
     stamp = [os.path.getmtime(p) for p in me]
+    # Вход, начатый до перезапуска и не записанный, разберёт первая сверка шага
+    # (resolve_entering; своя позиция без записи — find_own по метке ордера).
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
-    try:
-        tr.recover()
-    except (OkxError, OSError) as e:  # не вышло сейчас — find_own в сверке счёта догонит
-        tr.event(f"сверка после перезапуска: {e}")
     bts = Backtests(a.dir, a.db)
     jan = Janitor(a.dir)
     fails = 0

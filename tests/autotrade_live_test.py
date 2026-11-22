@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 import urllib.parse
+from decimal import Decimal
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -266,7 +267,7 @@ class TradeTest(Base):
         self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 101000.0))
         tr.sync()
         tr.save()
-        self.assertEqual(set(self.state()["positions"][0]), {"instId", "pos", "avgPx", "upl"},
+        self.assertEqual(set(self.state()["positions"][0]), {"instId", "upl"},
                          "во вкладку — только то, что она читает")
 
     def test_one_whale_or_small_whale_no_trade(self) -> None:
@@ -722,7 +723,8 @@ class WhaleExitTest(Base):
         tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
                        clock=lambda: self.now, log=self.logs.append)
         del real
-        tr.recover()
+        tr.sync()  # первая сверка шага после перезапуска
+        tr.save()
         self.assertEqual(sorted(self.state()["open"]["wallets"]), ["0xa", "0xb"])
         self.now += 20 * MIN
         close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN, -10.0)
@@ -1288,18 +1290,6 @@ class RejectTest(Base):
         self.assertEqual(self.state()["open"]["inst"], x)
         self.assertIn("SWAP", self.state()["market_block"])
 
-    def test_old_week_exclusions_for_50124_are_lifted(self) -> None:
-        """Прежняя версия исключила BTC, ETH и др. на неделю за 50124 — при
-        старте новой эти исключения снимаются; исключения по бумаге остаются."""
-        os.makedirs(os.path.join(self.dir, "live"))
-        with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
-            json.dump({"blocked": {
-                "BTC-USD_UM_XPERP-310404": {"at": self.now, "why": "OKX 50124: This API Key does not have trading permission",
-                                            "permanent": True},
-                "STX-USDT-SWAP": {"at": self.now, "why": "OKX 51155: compliance", "permanent": True}}}, f)
-        tr = self.trader(self.whales())
-        self.assertEqual(list(tr.st["blocked"]), ["STX-USDT-SWAP"])
-
     def test_skip_counter_by_reason_per_hour_for_a_day(self) -> None:
         """Счётчик пропусков: по причинам, один сигнал с одной причиной за
         час — один раз; старше суток — не считается."""
@@ -1369,7 +1359,8 @@ class RecoverTest(Base):
         # Перезапуск службы: новый трейдер с тем же каталогом.
         tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
                        clock=lambda: self.now, log=self.logs.append)
-        tr.recover()
+        tr.sync()  # первая сверка шага после перезапуска
+        tr.save()
         st = self.state()
         self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 101000.0, 2))
         self.assertNotIn("entering", st)
@@ -1385,7 +1376,8 @@ class RecoverTest(Base):
         os.remove(os.path.join(self.dir, "live", "state.json"))  # и запись «входим» потерялась
         tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
                        clock=lambda: self.now, log=self.logs.append)
-        tr.recover()
+        tr.sync()  # первая сверка шага после перезапуска
+        tr.save()
         tr.step()
         self.assertEqual(self.state()["open"]["inst"], "BTC-USDT-SWAP")
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
@@ -1626,6 +1618,20 @@ class ReviewTest(Base):
         tr.last_sync = 0
         tr.step()
         self.assertEqual(len(self.market_orders()), 1)
+
+    def test_contract_size_one_rule_for_entry_average_and_backtest(self) -> None:
+        """Объём в контрактах — одна функция для входа, усреднения и бэктеста:
+        десятичными, вниз по шагу; контракт в монете или в долларах; меньше
+        минимума или мусор в параметрах — 0."""
+        btc = {"ctVal": "0.01", "ctMult": "1", "ctValCcy": "BTC", "lotSz": "0.01", "minSz": "0.01"}
+        self.assertEqual(lv.contract_size(btc, 10_000, 100_000), Decimal("10"))       # 0,1 BTC = 10 контрактов
+        self.assertEqual(lv.contract_size(btc, 10_050, 100_000), Decimal("10.05"))    # вниз по шагу 0,01
+        usd = {"ctVal": "0.00001", "ctMult": "10000000", "ctValCcy": "USD", "lotSz": "1", "minSz": "1"}
+        self.assertEqual(lv.contract_size(usd, 10_000, 3), Decimal("100"), "ровно 100, а не 99,999…")
+        self.assertEqual(lv.contract_size({**btc, "minSz": "1"}, 50, 100_000), Decimal(0), "0,05 — меньше минимального ордера 1")
+        for bad in ({**btc, "lotSz": "0"}, {**btc, "ctVal": "nan"}, {**btc, "minSz": None}):
+            self.assertEqual(lv.contract_size(bad, 10_000, 100_000), Decimal(0), bad)
+        self.assertEqual(lv.contract_size(btc, 10_000, 0), Decimal(0))
 
     def test_window_keeps_time_order_for_late_items(self) -> None:
         import autotrade_core as core

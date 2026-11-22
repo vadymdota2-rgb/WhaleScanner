@@ -42,7 +42,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -186,24 +186,12 @@ def coin_per_contract(ins: dict[str, Any], px: float) -> float:
     return ct / px if str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT") and px > 0 else ct
 
 
-def contracts(ins: dict[str, Any], notional: float, px: float) -> Decimal | None:
-    """Объём в контрактах как у живого бота: вниз по шагу; меньше минимума — None."""
-    ct_val, ct_mult = lv.dec(ins.get("ctVal")), lv.dec(ins.get("ctMult") or "1")
-    step, min_sz = lv.dec(ins.get("lotSz")), lv.dec(ins.get("minSz"))
-    if ct_val is None or ct_mult is None or step is None or min_sz is None or notional <= 0 or px <= 0:
-        return None
-    ct_d = ct_val * ct_mult
-    in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-    qty = Decimal(repr(round(notional, 6))) / (ct_d if in_usd else ct_d * Decimal(repr(px)))
-    sz = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-    return sz if sz >= min_sz and sz > 0 else None
 
 
 @dataclass
 class Trade:
     coin: str
     side: int
-    whales: int
     entry_t: int
     exit_t: int
     entry_px: float     # цена первого входа (с проскальзыванием)
@@ -265,8 +253,8 @@ class Replay:
             return "chase"
         if self.equity <= 0:
             return "no_equity"
-        sz = contracts(ins, self.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)
-        if sz is None:
+        sz = lv.contract_size(ins, self.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)  # как у живого бота
+        if sz <= 0:
             return "min_size"
         tick = lv.dec(ins.get("tickSz"))
         if tick is None:
@@ -309,9 +297,9 @@ class Replay:
                 edge = avg_px * (1 - side * lv.AVG_LOSS)
                 if side * (worst - edge) < 0:
                     fill = (o if side * (o - edge) < 0 else edge) * (1 + side * slip)
-                    add_sz = contracts(ins, max(0.0, self.equity) * lv.AVG_FRAC * lv.LEVERAGE, fill)
+                    add_sz = lv.contract_size(ins, self.equity * lv.AVG_FRAC * lv.LEVERAGE, fill)
                     averaged = True
-                    if add_sz is not None:
+                    if add_sz > 0:
                         add_q = float(add_sz) * coin_per_contract(ins, fill)
                         avg_px = (avg_px * qty + fill * add_q) / (qty + add_q)
                         qty += add_q
@@ -328,7 +316,7 @@ class Replay:
             self.equity += pnl
         self.entered[s["coin"]] = now
         self.busy_until = t_out if why != "открыта" else 10**18
-        self.trades.append(Trade(s["coin"], side, int(s.get("whales") or 0), now, t_out, entry, tp, px_out,
+        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out,
                                  qty * avg_px, pnl, why, mae, averaged))
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
@@ -459,7 +447,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
     cut = since + (now - since) * 3 // 4
     first, last = [t for t in trades if t.entry_t < cut], [t for t in trades if t.entry_t >= cut]
     st_all, st_last = stats(trades), stats(last)
-    crit = {"net_gt": 0, "pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2)}
+    crit = {"pf_ge": 1.3, "trades_ge": 100, "max_dd_le": round(0.15 * a.deposit, 2)}  # и итог > 0
     verdict = st_all["net"] > 0 and st_last["net"] > 0 and (st_last["pf"] is None or st_last["pf"] >= crit["pf_ge"]) \
         and st_last["trades"] >= crit["trades_ge"] and st_last["max_dd"] <= crit["max_dd_le"]
 
@@ -477,7 +465,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         curve = [*curve[::len(curve) // 500 + 1], curve[-1]]
 
     def row(t: Trade) -> dict[str, Any]:
-        return {"coin": t.coin, "side": t.side, "whales": t.whales, "entry": t.entry_t, "exit": t.exit_t,
+        return {"coin": t.coin, "side": t.side, "entry": t.entry_t, "exit": t.exit_t,
                 "px_in": t.entry_px, "px_out": t.exit_px, "tp": t.tp, "usd": round(t.pnl, 2),
                 "pct": round(t.pnl / t.notional * 100, 3) if t.notional else 0.0, "why": t.why,
                 "averaged": t.averaged, "mae": round(t.mae, 2),
@@ -487,7 +475,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         "generated_at": int(time.time()),
         "verdict": verdict,
         "criteria": crit,
-        "period": {"from": since, "to": now, "cut": cut},
+        "period": {"from": since, "to": now},
         "sizing": {"deposit": a.deposit, "deposit_end": round(rp.equity, 2), "margin_pct": lv.MARGIN_FRAC * 100,
                    "leverage": lv.LEVERAGE, "fee_taker_pct": a.fee_taker, "fee_maker_pct": a.fee_maker,
                    "slippage_pct": a.slippage},
