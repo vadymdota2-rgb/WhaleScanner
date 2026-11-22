@@ -56,8 +56,10 @@ class FakeMarket:
 def make_db(path: str, rows: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
-                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '')")
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
+                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '', "
+                "leverage INTEGER NOT NULL DEFAULT 0)")
+    # 10-й столбец (необязательный) — плечо; нет — 0 (неизвестно), как у бота без позиции.
+    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?,?)", [(*r, 0)[:10] if len(r) == 9 else r for r in rows])
     # Как в базе бота (hyperliquid_core.cpp): без этих индексов запросы китов — полным перебором.
     con.execute("CREATE INDEX idx_hl_fills_code_ts ON hl_fills(dir_code, ts)")
     con.execute("CREATE INDEX idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)")
@@ -176,6 +178,15 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, lambda c, t: 3000.0 if c == "ETH" else 100_000.0)
         self.assertEqual([t.coin for t in r["trades"]], ["BTC"], "позиция одна")
         self.assertGreater(r["skips"]["own_open"], 0)
+
+    def test_sides_compared_without_leverage(self) -> None:
+        # Шорты 2 × 700 000 $ при 100× — 14 000 $ без плеча (сами не входят: цена ушла от них на 0,4 %);
+        # лонги 2 × 15 000 $ при 1× (и каждый уже больше шортов без плеча): с плечом крупнее шорты,
+        # без плеча — лонги. Входим в лонг.
+        big = [(*opn(100 + i, f"0xbig{i}", "BTC", -1, T - (40 + i) * MIN, 700_000, 100_000), 100) for i in range(2)]
+        longs = [(*opn(1, "0xa", "BTC", 1, T - 2 * MIN, 15_000, 100_000), 1), (*opn(2, "0xb", "BTC", 1, T, 15_000, 100_000), 1)]
+        r = self.go(big + longs, step_price(100_000, [(T - 45 * MIN, -0.004), (T - 5 * MIN, 0.0), (T + 60 * MIN, 0.012)]))
+        self.assertEqual([(t.side, t.why) for t in r["trades"]], [(1, "тейк")])
 
     def test_coin_pause_three_hours(self) -> None:
         rows = [*self.whales(), *self.whales(t=T + 120 * MIN, base=10), *self.whales(t=T + 200 * MIN, base=20)]

@@ -426,7 +426,7 @@ class Replay:
             total = con.execute("SELECT COUNT(*) FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ?",
                                 (since, until)).fetchone()[0]
             cur = con.execute(
-                "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
+                f"SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)), {lv.MARGIN_SQL} FROM hl_fills "  # noqa: S608 — константа
                 "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, until))
             done = 0
             last_note = 0.0

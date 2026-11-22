@@ -78,23 +78,26 @@ class Window:
     разность точны, сравнение с порогом не «плывёт» от округления.
 
     count — кошельков от порога (китов); big_n / big_u — их нано $ и штуки
-    (у кого штуки известны) — для средней цены китов."""
+    (у кого штуки известны) — для средней цены китов. У кошелька — ещё и
+    объём без плеча (маржа: номинал ÷ плечо; плечо неизвестно — номинал):
+    по нему сравниваются стороны «за» и «против» (правило владельца)."""
     __slots__ = ("big_k", "big_n", "big_u", "count", "limit", "orders", "per")
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
-        self.orders: deque[tuple[int, str, int, float]] = deque()
-        self.per: dict[str, list[Any]] = {}   # кошелёк → [нано $, штук, сделок, сделок со штуками]
+        self.orders: deque[tuple[int, str, int, float, int]] = deque()
+        self.per: dict[str, list[Any]] = {}   # кошелёк → [нано $, штук, сделок, сделок со штуками, нано $ без плеча]
         self.count = 0
         self.big_n = 0
         self.big_u = 0.0
         self.big_k = 0
 
-    def _change(self, wallet: str, dn: int, du: float, dk: int, dku: int) -> None:
+    def _change(self, wallet: str, dn: int, du: float, dk: int, dku: int, dm: int) -> None:
         v = self.per.get(wallet)
-        n0, u0, k0, ku0 = v if v is not None else (0, 0.0, 0, 0)
+        n0, u0, k0, ku0, m0 = v if v is not None else (0, 0.0, 0, 0, 0)
         k1, ku1 = k0 + dk, ku0 + dku
         n1 = n0 + dn if k1 else 0
+        m1 = m0 + dm if k1 else 0
         u1 = u0 + du if ku1 else 0.0
         self.count += (k1 > 0 and n1 >= self.limit) - (k0 > 0 and n0 >= self.limit)
         if k0 and ku0 and n0 >= self.limit:
@@ -108,12 +111,13 @@ class Window:
         if not self.big_k:  # китов-со-штуками нет — сумма штук ровно 0 (без накопленной погрешности)
             self.big_n, self.big_u = 0, 0.0
         if k1:
-            self.per[wallet] = [n1, u1, k1, ku1]
+            self.per[wallet] = [n1, u1, k1, ku1, m1]
         else:
             self.per.pop(wallet, None)
 
-    def add(self, ts: int, wallet: str, nanos: int, units: float) -> None:
-        item = (ts, wallet, nanos, units)
+    def add(self, ts: int, wallet: str, nanos: int, units: float, margin: int | None = None) -> None:
+        m = nanos if margin is None else margin
+        item = (ts, wallet, nanos, units, m)
         if self.orders and ts < self.orders[-1][0]:
             # Опоздавшая сделка (бот записал её позже) — на своё место по
             # времени: выброс старше окна идёт слева и требует порядка.
@@ -123,12 +127,12 @@ class Window:
             self.orders.insert(i, item)
         else:
             self.orders.append(item)
-        self._change(wallet, nanos, units, 1, int(units > 0))
+        self._change(wallet, nanos, units, 1, int(units > 0), m)
 
     def expire(self, before: int) -> None:
         while self.orders and self.orders[0][0] < before:
-            _t, w, n, u = self.orders.popleft()
-            self._change(w, -n, -u, -1, -int(u > 0))
+            _t, w, n, u, m = self.orders.popleft()
+            self._change(w, -n, -u, -1, -int(u > 0), -m)
 
 
 def limit_memory(mb: int) -> None:

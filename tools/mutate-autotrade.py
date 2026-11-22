@@ -31,6 +31,11 @@ MUTS = [
     # Правила владельца
     ("MIN_WHALES = 2", "MIN_WHALES = 1", "сигнал — от 2 китов"),
     ("MIN_WHALE_USD = 1000", "MIN_WHALE_USD = 100", "кит — от 1000 $"),
+    ('MARGIN_SQL = "CASE WHEN leverage > 0 THEN notional_nanos / leverage ELSE notional_nanos END"',
+     'MARGIN_SQL = "notional_nanos"', "стороны — без плеча (номинал ÷ плечо)"),
+    ("sum(v[4] for v in w.per.values()", "sum(v[0] for v in w.per.values()", "сравнение сторон — по марже, не по номиналу"),
+    ("            margin = int(row[7] or 0) if len(row) > 7 and row[7] is not None else None",
+     "            margin = None", "маржа строки — в окно"),
     ("WINDOW_MS = 2 * 3_600_000", "WINDOW_MS = 4 * 3_600_000", "окно китов — 2 часа"),
     ("CHASE = 0.003", "CHASE = 0.03", "не догоняем дальше 0,3 %"),
     ("MATCH_TOL = 0.02", "MATCH_TOL = 0.2", "другой актив — расхождение цен больше 2 %"),
@@ -105,8 +110,8 @@ MUTS = [
      "решение — по китам за 2 часа до «сейчас»"),
     ("        usd, against, count = self.sig.balance(s[\"coin\"], s[\"side\"], now)",
      "        usd, against, count = num(s.get(\"usd\")), num(s.get(\"usd_against\")), 2", "решение — по текущему перевесу, а не по строке сигнала"),
-    ("        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS",
-     "        return float(sum(v[0] for v in w.per.values() if v[2] > 0)) / NANOS", "против — только кошельки от 1000 $"),
+    ("        return float(sum(v[4] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS",
+     "        return float(sum(v[4] for v in w.per.values() if v[2] > 0)) / NANOS", "против — только кошельки от 1000 $"),
     # Ревизия 2
     ("                f\"AND (dir_code != {core.FLIP} OR dir LIKE ?)\",", "                \"\",", "разворот в нашу сторону — не выход"),
     ("            if v is None or v[0] < self.limit:\n                continue\n", "", "мелкая сделка сигнал не освежает"),
@@ -203,6 +208,8 @@ RP_MUTS = [
     ("        if now - b.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
     ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
     ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
+    ("ABS(CAST(sz AS REAL)), {lv.MARGIN_SQL} FROM hl_fills", "ABS(CAST(sz AS REAL)), notional_nanos FROM hl_fills",
+     "повтор: стороны — без плеча"),
     ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),
     ("        if s[\"side\"] * (hl_px / s[\"ref_px\"] - 1) > lv.CHASE:", "        if False:", "повтор: не догоняем"),
     ("b.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "b.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
@@ -227,6 +234,9 @@ RP_MUTS = [
 
 CORE_MUTS = [
     ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
+    ("        m = nanos if margin is None else margin", "        m = nanos", "окно: маржа сделки, а не номинал"),
+    ("            self._change(w, -n, -u, -1, -int(u > 0), -m)", "            self._change(w, -n, -u, -1, -int(u > 0), 0)",
+     "окно: маржа уходит из окна вместе со сделкой"),
     ("    if not os.path.isfile(path):\n        raise OSError", "    if False:\n        raise OSError", "нет базы — ошибка шага, не выход"),
     ("        self.count += (k1 > 0 and n1 >= self.limit) - (k0 > 0 and n0 >= self.limit)",
      "        self.count += (k1 > 0 and n1 > self.limit) - (k0 > 0 and n0 > self.limit)", "кит — от порога включительно"),

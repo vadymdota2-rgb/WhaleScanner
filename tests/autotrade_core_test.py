@@ -55,25 +55,29 @@ class CoreTest(unittest.TestCase):
 
     def test_window_matches_brute_force(self) -> None:
         """Окно по ходу (прибавили — вычли) даёт ровно то же, что пересчёт с
-        нуля: китов от порога и средняя цена китов; опоздавшие сделки — тоже."""
+        нуля: китов от порога, средняя цена китов и объём без плеча по
+        кошелькам; опоздавшие сделки — тоже."""
         rnd = random.Random(7)
         for limit in (0, 1000 * core.NANOS):
             w = core.Window(limit)
-            orders: list[tuple[int, str, int, float]] = []
+            orders: list[tuple[int, str, int, float, int]] = []
             t = 10**9
             for _ in range(3000):
                 t += rnd.randrange(0, 600_000)
                 late = rnd.random() < 0.1
                 o = (t - rnd.randrange(0, 3_000_000) if late else t, f"w{rnd.randrange(30)}",
-                     rnd.choice([0, 300, 900, 1500, 25_000]) * core.NANOS, rnd.choice([0.0, 1.5, 10.0]))
+                     rnd.choice([0, 300, 900, 1500, 25_000]) * core.NANOS, rnd.choice([0.0, 1.5, 10.0]),
+                     rnd.choice([0, 30, 500, 9000]) * core.NANOS)
                 w.add(*o)
                 w.expire(t - 7_200_000)
                 orders = [x for x in [*orders, o] if x[0] >= t - 7_200_000]
                 per: dict[str, list] = {}
-                for _t, wl, n, u in orders:
-                    v = per.setdefault(wl, [0, 0.0])
+                for _t, wl, n, u, m in orders:
+                    v = per.setdefault(wl, [0, 0.0, 0])
                     v[0] += n
                     v[1] += u
+                    v[2] += m
+                self.assertEqual({k: v[4] for k, v in w.per.items()}, {k: v[2] for k, v in per.items()})
                 self.assertEqual(w.count, sum(1 for v in per.values() if v[0] >= limit))
                 big = [v for v in per.values() if v[0] >= limit and v[1] > 0]
                 self.assertEqual(w.big_n, sum(v[0] for v in big))
