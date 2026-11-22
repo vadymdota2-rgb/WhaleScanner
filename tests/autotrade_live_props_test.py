@@ -81,8 +81,9 @@ class PropsTest(Base):
             st_file = os.path.join(self.dir, "live", "state.json")
             if os.path.exists(st_file):
                 os.remove(st_file)
-            fills = [fill(1, "0xa", "BTC", side, self.now - age * MIN - MIN, 5000, ref),
-                     fill(2, "0xb", "BTC", side, self.now - age * MIN, 5000, ref)]
+            fills = [fill(1, "0xa", "BTC", side, self.now - age * MIN - 2 * MIN, 50_000, ref),
+                     fill(2, "0xb", "BTC", side, self.now - age * MIN - MIN, 50_000, ref),
+                     fill(3, "0xc", "BTC", side, self.now - age * MIN, 50_000, ref)]
             tr = self.trader(fills)
             if paused:
                 tr.st["entered"]["BTC"] = self.now - 2 * 3_600_000
@@ -163,8 +164,9 @@ class FuzzTest(Base):
                 if os.path.exists(p):
                     os.remove(p)
             side = r.choice([1, -1])
-            tr = self.trader([fill(1, "0xa", "BTC", side, self.now - 2 * MIN, 5000, 100_000),
-                              fill(2, "0xb", "BTC", side, self.now - MIN, 5000, 100_000)])
+            tr = self.trader([fill(1, "0xa", "BTC", side, self.now - 3 * MIN, 50_000, 100_000),
+                              fill(2, "0xb", "BTC", side, self.now - 2 * MIN, 50_000, 100_000),
+                              fill(3, "0xc", "BTC", side, self.now - MIN, 50_000, 100_000)])
             tr.okx._t = self.chaos(r, r.choice([0.1, 0.3, 0.7]))
             self.on()
             entries: list[tuple[dict, bool]] = []

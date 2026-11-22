@@ -105,7 +105,9 @@ class ReplayTest(unittest.TestCase):
         return rp.run(self.args(**kw), fetch=self.market, now_ms=NOW)
 
     def whales(self, side: int = 1, coin: str = "BTC", px: float = 100_000, t: int = T, base: int = 1) -> list[tuple]:
-        return [opn(base, "0xa", coin, side, t - 2 * MIN, 5000, px), opn(base + 1, "0xb", coin, side, t, 5000, px)]
+        """Сигнал: 3 кита от 10 000 $ в одну сторону, последний — в момент t."""
+        return [opn(base, "0xa", coin, side, t - 2 * MIN, 50_000, px), opn(base + 1, "0xb", coin, side, t - MIN, 50_000, px),
+                opn(base + 2, "0xc", coin, side, t, 50_000, px)]
 
     def test_take_profit(self) -> None:
         r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
@@ -158,14 +160,16 @@ class ReplayTest(unittest.TestCase):
             os.remove(self.db)
 
     def test_one_big_against_blocks_small_side(self) -> None:
-        big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
+        big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000),   # двое крупных — сигнала у них нет
+               opn(101, "0xbig2", "BTC", -1, T - 39 * MIN, 700_000, 100_000)]
         r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["bigger_against"], 0)
 
     def test_bigger_against_goes_with_big(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000),
-               opn(101, "0xbig2", "BTC", -1, T - 39 * MIN, 700_000, 100_000)]
+               opn(101, "0xbig2", "BTC", -1, T - 39 * MIN, 700_000, 100_000),
+               opn(102, "0xbig3", "BTC", -1, T - 38 * MIN, 700_000, 100_000)]
         r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, -0.012)]))
         [t] = r["trades"]
         self.assertEqual((t.side, t.why), (-1, "тейк"))
@@ -206,14 +210,15 @@ class ReplayTest(unittest.TestCase):
         os.remove(self.db)
         self.cache += "2"  # свои свечи у каждого случая
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T - MIN, -50.0)]   # кит сигнала уже вышел в убыток
-        rows[1] = opn(2, "0xb", "BTC", 1, T, 5000, 100_000)
+        rows[2] = opn(3, "0xc", "BTC", 1, T, 50_000, 100_000)
         r = self.go(rows, lambda c, t: 100_000.0)
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["whale_exit"], 0)
         os.remove(self.db)
         self.cache += "3"
-        # Кит A — за 2 часа минус 2 секунды до кита B: на момент решения (+5 с) он старше 2 часов.
-        rows = [opn(1, "0xa", "BTC", 1, T - 120 * MIN + 2000, 5000, 100_000), opn(2, "0xb", "BTC", 1, T, 5000, 100_000)]
+        # Кит A — за 2 часа минус 2 секунды до кита C: на момент решения (+5 с) он старше 2 часов.
+        rows = [opn(1, "0xa", "BTC", 1, T - 120 * MIN + 2000, 50_000, 100_000), opn(2, "0xb", "BTC", 1, T - MIN, 50_000, 100_000),
+                opn(3, "0xc", "BTC", 1, T, 50_000, 100_000)]
         r = self.go(rows, lambda c, t: 100_000.0)
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["stale"], 0)
