@@ -263,7 +263,11 @@ class TradeTest(Base):
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
         self.assertEqual((tp["side"], tp["px"], tp["sz"], tp["reduceOnly"]), ("sell", "101000", "10", True))
         st = self.state()
-        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["on"]), ("BTC-USDT-SWAP", 101000.0, True))
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 101000.0))
+        tr.sync()
+        tr.save()
+        self.assertEqual(set(self.state()["positions"][0]), {"instId", "pos", "avgPx", "upl"},
+                         "во вкладку — только то, что она читает")
 
     def test_one_whale_or_small_whale_no_trade(self) -> None:
         for fills in ([fill(1, "0xa", "BTC", 1, self.now - MIN, 5000, 100_000)],
@@ -284,7 +288,6 @@ class TradeTest(Base):
         tr = self.trader(self.whales())
         tr.step()
         self.assertEqual(self.market_orders(), [])
-        self.assertFalse(self.state()["on"])
 
     def test_manual_position_same_5_percent(self) -> None:
         """Правило владельца: маржа всегда 5 %; ручная сделка на счёте (любого
@@ -1625,15 +1628,15 @@ class ReviewTest(Base):
         self.assertEqual(len(self.market_orders()), 1)
 
     def test_window_keeps_time_order_for_late_items(self) -> None:
-        import autotrade_backtest as bt
-        w = bt.Window([1000 * 10**9])
+        import autotrade_core as core
+        w = core.Window(1000 * 10**9)
         w.add(T0, "0xa", 5000 * 10**9, 0.05)
         w.add(T0 - 90 * MIN, "0xb", 5000 * 10**9, 0.05)  # опоздавшая — старше
-        self.assertEqual(w.count[0], 2)
+        self.assertEqual(w.count, 2)
         w.expire(T0 - 60 * MIN)                          # уходит именно она, а не новая
-        self.assertEqual(w.count[0], 1)
+        self.assertEqual(w.count, 1)
         w.expire(T0 + MIN)
-        self.assertEqual(w.count[0], 0)
+        self.assertEqual(w.count, 0)
 
     def test_missing_db_is_an_error_not_exit(self) -> None:
         with self.assertRaises(OSError):

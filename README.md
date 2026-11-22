@@ -40,13 +40,14 @@ CI (`.github/workflows/tests.yml`) гоняет всё это на каждый 
 
 ## Автокопирование китов (закрытое, только для владельца)
 
-Этап 1 — бэктест: [`tools/autotrade_backtest.py`](tools/autotrade_backtest.py)
-считает, заработала бы копия открытий лонга и шорта китов на фьючерсах
-Hyperliquid (крипта, акции, металлы) после комиссий, фандинга и задержки:
-сговор нескольких китов, вход не дороже их средней цены, кросс-маржа, без
-стопа; с проверкой на отложенных данных. База бота — только чтение, бот не затрагивается. Проверка на
-сервере — [`docs/check-autotrade-server.md`](docs/check-autotrade-server.md).
-Бумажная и реальная торговля — только после «да» владельца по отчёту.
+Реальная торговля на OKX — служба [`tools/autotrade_live.py`](tools/autotrade_live.py):
+от 2 китов Hyperliquid в одну сторону за 2 часа (каждый от 1000 $), против —
+не крупнее; маржа 5 % × 10×, одна позиция; тейк +1 %, выход вслед за китом в
+убытке, разовое усреднение. Бэктест — повтор истории по тем же правилам:
+[`tools/autotrade_replay.py`](tools/autotrade_replay.py); общее —
+[`tools/autotrade_core.py`](tools/autotrade_core.py). База бота — только
+чтение. Устройство — [`docs/autotrade-how-it-works.md`](docs/autotrade-how-it-works.md),
+проверка на сервере — [`docs/check-autotrade-server.md`](docs/check-autotrade-server.md).
 
 ## Авторские права
 

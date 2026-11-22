@@ -110,13 +110,14 @@ class ReplayTest(unittest.TestCase):
     def test_take_profit(self) -> None:
         r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
         [t] = r["trades"]
-        self.assertEqual((t.why, t.sig.coin, t.sig.side), ("тейк", "BTC", 1))
-        self.assertGreater(t.pnl_usd, 0)
+        self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
+        self.assertGreater(t.pnl, 0)
         # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +1 % ≈ +100 $ минус комиссии.
-        self.assertAlmostEqual(t.pnl_usd, 100 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
+        self.assertAlmostEqual(t.pnl, 100 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
         s = r["summary"]
-        self.assertEqual((s["kind"], s["full"]["trades"], s["top"][0]["params"]["tp"]), ("replay", 1, 1.0))
-        self.assertEqual(s["sizing"]["margin_pct"], 5.0)
+        self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
+        self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])
+        self.assertEqual(s["by_exit"][0]["key"], "тейк")
         with open(os.path.join(self.out, "progress.json"), encoding="utf-8") as f:
             self.assertEqual(json.load(f)["stage"], "готово")
         self.assertTrue(os.path.isfile(os.path.join(self.out, "summary.json")))
@@ -126,7 +127,7 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003)]))
         [t] = r["trades"]
         self.assertEqual(t.why, "кит вышел в убыток")
-        self.assertLess(t.pnl_usd, 0)
+        self.assertLess(t.pnl, 0)
         self.assertGreaterEqual(t.exit_t, T + 30 * MIN)
 
     def test_whale_profit_close_keeps_position(self) -> None:
@@ -141,7 +142,7 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual(r["summary"]["averaged"], 1)
         self.assertEqual(t.why, "тейк", "после усреднения тейк ближе — +1 % от новой средней")
-        self.assertLess(t.tp_px, 100_000 * 1.01)
+        self.assertLess(t.tp, 100_000 * 1.01)
 
     def test_no_average_without_whale_add(self) -> None:
         r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
@@ -167,13 +168,13 @@ class ReplayTest(unittest.TestCase):
                opn(101, "0xbig2", "BTC", -1, T - 39 * MIN, 700_000, 100_000)]
         r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, -0.012)]))
         [t] = r["trades"]
-        self.assertEqual((t.sig.side, t.why), (-1, "тейк"))
+        self.assertEqual((t.side, t.why), (-1, "тейк"))
 
     def test_one_position_and_no_inst(self) -> None:
         rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 30 * MIN, base=10),
                 *self.whales(coin="NOPE", px=1, t=T + 31 * MIN, base=20)]
         r = self.go(rows, lambda c, t: 3000.0 if c == "ETH" else 100_000.0)
-        self.assertEqual([t.sig.coin for t in r["trades"]], ["BTC"], "позиция одна")
+        self.assertEqual([t.coin for t in r["trades"]], ["BTC"], "позиция одна")
         self.assertGreater(r["skips"]["own_open"], 0)
 
     def test_coin_pause_three_hours(self) -> None:
@@ -216,6 +217,38 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, lambda c, t: 100_000.0)
         self.assertEqual(r["trades"], [])
         self.assertGreater(r["skips"]["stale"], 0)
+
+    def test_network_failure_is_not_cached_forever(self) -> None:
+        """Ревизия: сбой сети на блоке свечей раньше ложился в кеш пустым
+        навсегда — следующие прогоны «не видели» цен этого блока."""
+        make_db(self.db, self.whales())
+        good = FakeMarket(step_price(100_000, [(T + 60 * MIN, 0.012)]))
+
+        def flaky(body: dict):
+            if body["okx"] == "/api/v5/market/history-candles":
+                raise OSError("сеть")
+            return good(body)
+
+        r = rp.run(self.args(), fetch=flaky, now_ms=NOW)
+        self.assertEqual(r["trades"], [])
+        self.assertGreater(r["summary"]["data"]["errors"], 0)
+        r = rp.run(self.args(), fetch=good, now_ms=NOW)
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"], "сеть вернулась — цены есть")
+
+    def test_corrupted_cache_is_cleaned(self) -> None:
+        price = step_price(100_000, [(T + 60 * MIN, 0.012)])
+        self.go(self.whales(), price)
+        path = os.path.join(self.cache, "replay_BTC-USDT-SWAP_5m.json")
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+        for k in raw:
+            raw[k] = [["мусор"], [1, 2, 3], [1, 2, 3, 4, float("nan")], *raw[k]]  # мусор — первым в блоке
+        raw["не число"] = [[1, 2, 3, 4, 5]]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(raw, f)
+        os.remove(self.db)
+        r = self.go(self.whales(), price, offline=True)
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
 
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот

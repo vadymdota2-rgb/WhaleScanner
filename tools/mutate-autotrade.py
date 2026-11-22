@@ -14,11 +14,12 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(ROOT, "tools", "autotrade_live.py")
-BT_PATH = os.path.join(ROOT, "tools", "autotrade_backtest.py")  # окно китов — общее с бэктестом
+CORE_PATH = os.path.join(ROOT, "tools", "autotrade_core.py")  # окно китов и база — общие с бэктестом-повтором
 RP_PATH = os.path.join(ROOT, "tools", "autotrade_replay.py")    # бэктест-повтор по правилам живого бота
 TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py",
-         "tests/autotrade_replay_test.py"]
-ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "PYTHONDONTWRITEBYTECODE": "1"}
+         "tests/autotrade_replay_test.py", "tests/autotrade_core_test.py"]
+ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "AUTOTRADE_SCALE_ROWS": "20000",
+       "PYTHONDONTWRITEBYTECODE": "1"}
 # Выброс встречного окна в опросе — для снимка в сигнале; решение всё равно
 # перепроверяет перевес на окнах за 2 часа до «сейчас» (balance) — наблюдаемо
 # то же самое.
@@ -72,11 +73,10 @@ MUTS = [
      "        live = [p for p in self.positions if p.get(\"instId\") == op[\"inst\"]]\n        if live:", "своя позиция — та же сторона (long/short)"),
     ("            if tp.get(\"state\") == \"filled\":", "            if False:", "тейк исполнен — сделка закрыта"),
     ("        if op is not None and not (isinstance(op, dict)", "        if False and not (isinstance(op, dict)", "испорченная запись позиции — забыть"),
-    ("        if not os.path.isfile(self.db):", "        if False:", "нет базы — ошибка шага, не выход"),
     # Выход вслед за китом в убытке
     (" for wl, p in sorted(pnl.items()) if p < 0]", " for wl, p in sorted(pnl.items()) if p != 0]", "выход — только когда кит закрыл в убыток"),
     ("            if ts >= since.get(wl, now + 1):", "            if True:", "убыток — только после входа кита в окно"),
-    ("        codes = bt.CLOSES_FOR[1 if side > 0 else -1]", "        codes = bt.CLOSES_FOR[-1 if side > 0 else 1]",
+    ("        codes = core.CLOSES_FOR[1 if side > 0 else -1]", "        codes = core.CLOSES_FOR[-1 if side > 0 else 1]",
      "закрытие кита — той же стороны"),
     ("        if lost:\n            return self._skip(\"whale_exit\"", "        if False:\n            return self._skip(\"whale_exit\"",
      "кит уже вышел в убыток — не входим"),
@@ -92,7 +92,7 @@ MUTS = [
      "принятая позиция помнит китов"),
     ("                    and str(o.get(\"ordId\") or \"\") not in self.st[\"closed_ids\"]]", "]",
      "закрытая сделка — её вход не повод принять позицию"),
-    ("        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit[0]}",
+    ("        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}",
      "        return {str(w): int(t) for w, t, n in rows}", "восстановленные киты — только от 1000 $"),
     ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
      "позиция прежней версии — киты по базе"),
@@ -105,11 +105,11 @@ MUTS = [
      "решение — по китам за 2 часа до «сейчас»"),
     ("        usd, against, count = self.sig.balance(s[\"coin\"], s[\"side\"], now)",
      "        usd, against, count = num(s.get(\"usd\")), num(s.get(\"usd_against\")), 2", "решение — по текущему перевесу, а не по строке сигнала"),
-    ("        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit[0])) / NANOS",
+    ("        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS",
      "        return float(sum(v[0] for v in w.per.values() if v[2] > 0)) / NANOS", "против — только кошельки от 1000 $"),
     # Ревизия 2
-    ("                f\"AND (dir_code != {bt.FLIP} OR dir LIKE ?)\",", "                \"\",", "разворот в нашу сторону — не выход"),
-    ("            if v is None or v[0] < self.limit[0]:\n                continue\n", "", "мелкая сделка сигнал не освежает"),
+    ("                f\"AND (dir_code != {core.FLIP} OR dir LIKE ?)\",", "                \"\",", "разворот в нашу сторону — не выход"),
+    ("            if v is None or v[0] < self.limit:\n                continue\n", "", "мелкая сделка сигнал не освежает"),
     ("        if (s[\"coin\"], s[\"side\"]) in self.sig.windows and count < MIN_WHALES:", "        if False:",
      "на момент входа китов от 2"),
     ("            remaining = size_of(op.get(\"size\")) - got[0]", "            remaining = size_of(op.get(\"size\"))",
@@ -211,11 +211,19 @@ RP_MUTS = [
     ("            if not averaged and add_at is not None and add_at < end:", "            if False:", "повтор: усреднение"),
     ("                edge = avg_px * (1 - side * lv.AVG_LOSS)", "                edge = avg_px", "повтор: усреднение — минус больше 1 %"),
     ("            if ts > since:\n                run[w] += n", "            if True:\n                run[w] += n", "повтор: добор — после нашего входа"),
-    ("                if run[w] >= lv.MIN_WHALE_USD * lv.NANOS:", "                if run[w] > 0:", "повтор: добор от 1000 $"),
+    ("                if run[w] >= lv.MIN_WHALE_USD * core.NANOS:", "                if run[w] > 0:", "повтор: добор от 1000 $"),
+    ("        if isinstance(rows, list) and end <= self.now_ms:", "        if end <= self.now_ms:", "повтор: сбой сети не ложится в кеш"),
+    ("                            got[int(k)] = [c for c in v if candle_ok(c)]", "                            got[int(k)] = v",
+     "повтор: испорченный кеш — без мусора"),
 ]
 
-BT_MUTS = [
+CORE_MUTS = [
     ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
+    ("    if not os.path.isfile(path):\n        raise OSError", "    if False:\n        raise OSError", "нет базы — ошибка шага, не выход"),
+    ("        self.count += (k1 > 0 and n1 >= self.limit) - (k0 > 0 and n0 >= self.limit)",
+     "        self.count += (k1 > 0 and n1 > self.limit) - (k0 > 0 and n0 > self.limit)", "кит — от порога включительно"),
+    ("    return bool(coin) and not coin.startswith(\"@\") and \"/\" not in coin", "    return bool(coin)", "спот — не сигнал"),
+    ("    con.execute(\"PRAGMA query_only=1\")\n", "", "база бота — только чтение"),
 ]
 
 
@@ -231,7 +239,7 @@ def main() -> int:
             return 2
     alive: list[str] = []
     total = 0
-    for path, muts in ((PATH, pick(MUTS)), (BT_PATH, pick(BT_MUTS)), (RP_PATH, pick(RP_MUTS))):
+    for path, muts in ((PATH, pick(MUTS)), (CORE_PATH, pick(CORE_MUTS)), (RP_PATH, pick(RP_MUTS))):
         alive += run(path, muts)
         total += len(muts) - len(EQUIV & {m[2] for m in muts})
     print(f"ИТОГ: убито {total - len(alive)} из {total}; выжили: {alive}")

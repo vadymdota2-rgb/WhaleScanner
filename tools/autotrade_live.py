@@ -66,7 +66,7 @@ from decimal import ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, Decimal
 from typing import Any, TextIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import autotrade_backtest as bt
+import autotrade_core as core
 
 OKX = "https://www.okx.com"
 # Ключ живёт на одном адресе: глобальный OKX, европейский (OKX EEA, вход
@@ -84,7 +84,7 @@ OKX_HINTS = {
     "50124": "ключу API закрыт этот рынок (фьючерсы): в OKX → API откройте ключ и разрешите торговлю "
              "фьючерсами; если такой настройки нет — создайте новый ключ (права «Торговля», без вывода)",
 }
-NANOS = bt.NANOS
+NANOS = core.NANOS
 
 # Правила владельца.
 MIN_WHALES = 2
@@ -368,15 +368,12 @@ class Signals:
 
     def __init__(self, db: str) -> None:
         self.db = db
-        self.windows: dict[tuple[str, int], bt.Window] = {}
-        self.last_ts = 0
+        self.windows: dict[tuple[str, int], core.Window] = {}
         self.seen: dict[int, int] = {}   # tid → ts (против повторов при перекрытии опроса)
-        self.limit = [MIN_WHALE_USD * NANOS]
+        self.limit = MIN_WHALE_USD * NANOS   # кит — кошелёк от 1000 $ в окне
 
     def _con(self) -> sqlite3.Connection:
-        if not os.path.isfile(self.db):  # open_ro бросил бы SystemExit — мимо обработчика шага
-            raise OSError(f"нет базы бота: {self.db}")
-        return bt.open_ro(self.db)
+        return core.open_ro(self.db)  # нет базы — OSError: ошибка шага, а не выход службы
 
     def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
@@ -403,12 +400,11 @@ class Signals:
         бэктеста-повтора (autotrade_replay.py): правила одни."""
         out: list[dict[str, Any]] = []
         for tid, wallet, coin, code, ts, nanos, units in rows:
-            if tid in self.seen or not bt.is_perp(coin):
+            if tid in self.seen or not core.is_perp(coin):
                 continue
             self.seen[tid] = ts
-            self.last_ts = max(self.last_ts, ts)
-            side = 1 if code == bt.OPEN_LONG else -1
-            w = self.windows.setdefault((coin, side), bt.Window(self.limit))
+            side = 1 if code == core.OPEN_LONG else -1
+            w = self.windows.setdefault((coin, side), core.Window(self.limit))
             w.add(ts, wallet, int(nanos or 0), float(units or 0.0))
             # Окно — 2 часа до самой свежей сделки (опоздавшая старше окна
             # тут же выходит); момент сигнала — самая свежая сделка окна.
@@ -422,22 +418,22 @@ class Signals:
             # сделка (не кит) сигнал не «освежает»: иначе вход через полтора
             # часа после китов по чьей-то сделке на 50 $ выглядел бы свежим.
             v = w.per.get(wallet)
-            if v is None or v[0] < self.limit[0]:
+            if v is None or v[0] < self.limit:
                 continue
-            if w.count[0] >= MIN_WHALES and w.big_u > 0:
+            if w.count >= MIN_WHALES and w.big_u > 0:
                 out.append(self._signal(coin, side, w, opp, newest))
             # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
             # сигнал и в их сторону: входим с крупными (правило владельца).
-            if opp is not None and opp.count[0] >= MIN_WHALES and opp.big_u > 0 \
+            if opp is not None and opp.count >= MIN_WHALES and opp.big_u > 0 \
                     and self.whale_usd(opp) > self.whale_usd(w):
                 out.append(self._signal(coin, -side, opp, w, newest))
         return out
 
-    def whale_usd(self, w: bt.Window | None) -> float:
+    def whale_usd(self, w: core.Window | None) -> float:
         """Объём китов окна (кошельки от 1000 $), $."""
         if w is None:
             return 0.0
-        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit[0])) / NANOS
+        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
 
     def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:
         """На момент решения (окна за 2 часа до «сейчас»), а не на момент строки
@@ -450,18 +446,18 @@ class Signals:
                 w.expire(now - WINDOW_MS)
             out.append(self.whale_usd(w))
         w = self.windows.get((coin, side))
-        return out[0], out[1], (w.count[0] if w is not None else 0)
+        return out[0], out[1], (w.count if w is not None else 0)
 
-    def _signal(self, coin: str, side: int, w: bt.Window, opp: bt.Window | None, ts: int) -> dict[str, Any]:
+    def _signal(self, coin: str, side: int, w: core.Window, opp: core.Window | None, ts: int) -> dict[str, Any]:
         """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
         (от неё смотрим, не закрыли ли они в убыток), средняя цена китов,
         объём китов сигнала и китов против (та же бумага, те же 2 часа)."""
-        big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit[0]}
+        big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit}
         first: dict[str, int] = {}
         for t, wl, _n, _u in w.orders:
             if wl in big and wl not in first:
                 first[wl] = t
-        return {"coin": coin, "side": side, "ts": ts, "whales": w.count[0], "wallets": first,
+        return {"coin": coin, "side": side, "ts": ts, "whales": w.count, "wallets": first,
                 "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_usd(w), 2),
                 "usd_against": round(self.whale_usd(opp), 2)}
 
@@ -473,7 +469,7 @@ class Signals:
         since = {str(k): int(num(v)) for k, v in wallets.items() if isinstance(k, str)}
         if not since:
             return []
-        codes = bt.CLOSES_FOR[1 if side > 0 else -1]
+        codes = core.CLOSES_FOR[1 if side > 0 else -1]
         # Разворот (код 5) — в обе стороны одним кодом: «Long > Short» закрывает
         # лонг, «Short > Long» — шорт. Разворот В нашу сторону (кит закрыл
         # встречный шорт в минус и перешёл в лонг вместе с нами) — не выход.
@@ -483,7 +479,7 @@ class Signals:
             rows = con.execute(
                 f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
                 f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
-                f"AND (dir_code != {bt.FLIP} OR dir LIKE ?)",
+                f"AND (dir_code != {core.FLIP} OR dir LIKE ?)",
                 (coin, *since, *codes, min(since.values()), now, flip)).fetchall()
         finally:
             con.close()
@@ -504,7 +500,7 @@ class Signals:
             rows = con.execute(
                 f"SELECT wallet, SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(ws))}) "  # noqa: S608 — только «?»
                 "AND dir_code = ? AND ts > ? AND ts <= ? GROUP BY wallet",
-                (coin, *ws, bt.OPEN_LONG if side > 0 else bt.OPEN_SHORT, since, now)).fetchall()
+                (coin, *ws, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, since, now)).fetchall()
         finally:
             con.close()
         return sorted(((str(w), int(n or 0) / NANOS) for w, n in rows), key=lambda x: -x[1])
@@ -518,10 +514,10 @@ class Signals:
             rows = con.execute(
                 "SELECT wallet, MIN(ts), SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND dir_code = ? "
                 "AND ts >= ? AND ts <= ? GROUP BY wallet",
-                (coin, bt.OPEN_LONG if side > 0 else bt.OPEN_SHORT, ts - WINDOW_MS, ts)).fetchall()
+                (coin, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, ts - WINDOW_MS, ts)).fetchall()
         finally:
             con.close()
-        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit[0]}
+        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}
 
     def sweep(self, now: int) -> int:
         """Очистка: окна бумаг, по которым давно не было сделок, сами не
@@ -873,14 +869,9 @@ class Trader:
         return st
 
     def save(self) -> None:
+        # Во вкладку (wt_autotrade.live) — только то, что она читает.
         self.st.update(heartbeat=self.clock(), simulated=self.okx.simulated, equity=self.equity,
-                       positions=[{k: p.get(k) for k in ("instId", "pos", "posSide", "avgPx", "markPx", "upl", "lever",
-                                                         "mgnMode", "cTime")} for p in self.positions],
-                       on=self.is_on(), rules={"whales": MIN_WHALES, "whale_usd": MIN_WHALE_USD, "window_h": 2,
-                                               "chase_pct": CHASE * 100, "margin_pct": MARGIN_FRAC * 100,
-                                               "avg_loss_pct": AVG_LOSS * 100, "avg_margin_pct": AVG_FRAC * 100,
-                                               "leverage": LEVERAGE, "tp_pct": TP * 100, "coin_pause_h": 3,
-                                               "exit_on_whale_loss": True, "follow_bigger_side": True})
+                       positions=[{k: p.get(k) for k in ("instId", "pos", "avgPx", "upl")} for p in self.positions])
         tmp = os.path.join(self.dir, "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(self.st, f, ensure_ascii=False)
@@ -940,7 +931,6 @@ class Trader:
         if not self.pos_mode:
             cfg = self.okx.config()
             self.pos_mode = str(cfg.get("posMode") or "net_mode")
-            self.st["account"] = {"posMode": self.pos_mode, "acctLv": cfg.get("acctLv")}
         self.positions = self.okx.positions()
         self.equity = self.okx.equity()
         self.last_sync = time.time()
@@ -1360,7 +1350,7 @@ class Trader:
         if lost:
             return self._skip("whale_exit", f"кит сигнала уже закрыл позицию в убыток ({lost[0][0][:10]}…, "
                                             f"{lost[0][1]:+.0f} $) — не входим")
-        base, scale = bt.okx_candidate(s["coin"])
+        base, scale = core.okx_candidate(s["coin"])
         inst = self.inst_for(base)
         blocked = self.st.setdefault("blocked", {})
         b = blocked.get(inst)
@@ -1647,7 +1637,7 @@ def main(argv: list[str] | None = None) -> int:
         tr.save()
         time.sleep(300)  # служба перезапустится и попробует снова
         return 1
-    me = [os.path.abspath(__file__), bt.__file__]
+    me = [os.path.abspath(__file__), core.__file__]  # код обновился — перезапуск (бэктест — отдельным процессом)
     stamp = [os.path.getmtime(p) for p in me]
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
     try:
