@@ -1,8 +1,7 @@
 # © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 """Общее для торговли (autotrade_live.py) и бэктеста-повтора
 (autotrade_replay.py): база бота только на чтение, коды сделок, окно китов,
-имя бумаги на OKX, публичный запрос к OKX, предел памяти, правило карты
-ликвидаций.
+имя бумаги на OKX, публичный запрос к OKX, предел памяти.
 
 Раньше это жило в бэктесте-сетке (autotrade_backtest.py) вместе с ~1500
 строками, которые служба больше не запускает; сетка удалена, общее — здесь.
@@ -56,42 +55,6 @@ def okx_candidate(coin: str) -> tuple[str, float]:
     if ":" not in coin and len(base) > 1 and base[0] == "k" and base[1:].isupper():
         return base[1:], 1000.0
     return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
-
-
-# Карта ликвидаций (правило владельца 22.11.2026): окно — позиции, открытые
-# за сутки; сравниваем ликвидации в LIQ_PCT % от цены. Шорт — только если
-# лонгов под ценой ликвидируется больше, чем шортов над ней (цену тянет к
-# ним), лонг — наоборот. Карты нет — входим, как без неё.
-LIQ_RANGE = "1d"
-LIQ_PCT = 2
-
-
-def liq_near(cum: object) -> tuple[float, float] | None:
-    """Ликвидации у цены по полю «cum» ответа карты ({2: {"L": $, "S": $}},
-    ключ — числом или строкой): (лонги под ценой, шорты над ней), $. None —
-    карты нет, она пуста или испорчена."""
-    if not isinstance(cum, dict):
-        return None
-    near = cum.get(LIQ_PCT, cum.get(str(LIQ_PCT)))
-    if not isinstance(near, dict):
-        return None
-    vals = []
-    for k in ("L", "S"):
-        v = near.get(k)
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v < float("inf"):
-            return None
-        vals.append(float(v))
-    return (vals[0], vals[1]) if vals[0] + vals[1] > 0 else None
-
-
-def liq_ok(cum: object, side: int) -> bool | None:
-    """Карта за сторону сделки? Шорт — лонгов под ценой больше, чем шортов над
-    ней; лонг — наоборот. None — карты нет (входим, как без неё)."""
-    near = liq_near(cum)
-    if near is None:
-        return None
-    longs, shorts = near
-    return longs > shorts if side < 0 else shorts > longs
 
 
 def safe_name(name: str) -> str:

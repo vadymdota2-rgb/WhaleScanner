@@ -2,8 +2,8 @@
 # © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 """Бэктест-повтор (tools/autotrade_replay.py) — на синтетической базе китов
 и поддельных свечах OKX: без сети. Проверяется, что повтор торгует по тем же
-правилам, что живой бот: вход от 2 китов, тейк +0,75 %, выход вслед за китом
-в убытке, без стопа, «входим с крупными», одна позиция, пауза на
+правилам, что живой бот: вход от 2 китов, тейк +1 %, выход вслед за китом в
+убытке, разовое усреднение, «входим с крупными», одна позиция, пауза на
 бумагу, нет на OKX — пропуск; ход — в progress.json; итог — summary.json
 для вкладки; второй прогон — из кеша, без сети.
 """
@@ -94,23 +94,15 @@ class ReplayTest(unittest.TestCase):
 
     def args(self, **kw) -> argparse.Namespace:
         a = rp.parser().parse_args(["--db", self.db, "--out", self.out, "--cache", self.cache, "--pause", "0",
-                                    "--deposit", "20000", "--max-mem-mb", "0",
-                                    "--wt-dir", os.path.join(self.tmp.name, "no-wallet-tracker")])
+                                    "--deposit", "20000", "--max-mem-mb", "0"])
         for k, v in kw.items():
             setattr(a, k, v)
         return a
 
-    def go(self, rows: list[tuple], price, liq: object = None, **kw) -> dict:
+    def go(self, rows: list[tuple], price, **kw) -> dict:
         make_db(self.db, rows)
         self.market = FakeMarket(price)
-        return rp.run(self.args(**kw), fetch=self.market, now_ms=NOW, liq_get=self.liq_get, liq_model=liq)
-
-    def liq_get(self, url: str) -> object:
-        """Биржи для карты: Binance и Bybit, 15-минутные ряды BTC у 100 000."""
-        from autotrade_liq_test import FakeEx
-        if not hasattr(self, "ex"):
-            self.ex = FakeEx(px=100_000, start=NOW - 40 * DAY, end=NOW)
-        return self.ex(url)
+        return rp.run(self.args(**kw), fetch=self.market, now_ms=NOW)
 
     def whales(self, side: int = 1, coin: str = "BTC", px: float = 100_000, t: int = T, base: int = 1) -> list[tuple]:
         return [opn(base, "0xa", coin, side, t - 2 * MIN, 5000, px), opn(base + 1, "0xb", coin, side, t, 5000, px)]
@@ -120,8 +112,8 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
         self.assertGreater(t.pnl, 0)
-        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +0,75 % ≈ +75 $ минус комиссии.
-        self.assertAlmostEqual(t.pnl, 75 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
+        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +1 % ≈ +100 $ минус комиссии.
+        self.assertAlmostEqual(t.pnl, 100 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
         s = r["summary"]
         self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
         self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])
@@ -143,39 +135,27 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, step_price(100_000, [(T + 90 * MIN, 0.012)]))
         self.assertEqual(r["trades"][0].why, "тейк")
 
-    def test_no_stop(self) -> None:
-        """Стопа нет: цена против входа на 30 % — держим; вернулась — тейк."""
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.3), (T + 90 * MIN, 0.009)]))
+    def test_average_once_then_tp_from_new_average(self) -> None:
+        # −1,5 % через 20 мин, кит добирает 2 000 $ в +40 мин, потом цена +0,3 % от входа.
+        rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
         [t] = r["trades"]
-        self.assertEqual(t.why, "тейк")
-        self.assertGreater(t.mae, 2_000, "провал внутри сделки виден")
+        self.assertEqual(r["summary"]["averaged"], 1)
+        self.assertEqual(t.why, "тейк", "после усреднения тейк ближе — +1 % от новой средней")
+        self.assertLess(t.tp, 100_000 * 1.01)
 
-    def test_liq_map_filter(self) -> None:
-        """Карта ликвидаций — как у живого бота: лонг — шортов над ценой больше;
-        против — пропуск «liq_against»; модели нет или карты нет — как без неё."""
-        from autotrade_liq_test import FakeModel
-        up = step_price(100_000, [(T + 60 * MIN, 0.012)])
-        r = self.go(self.whales(), up, liq=FakeModel(longs=10, shorts=5))
-        self.assertEqual(r["trades"], [])
-        self.assertEqual(r["skips"].get("liq_against"), 1)
-        d = r["summary"]["data"]
-        self.assertEqual((d["liq_model"], d["liq_maps"], d["liq_none"]), (True, 1, 0))
-        self.assertIn("решений с картой 1, без карты 0", r["text"])
-        os.remove(self.db)
-        self.cache += "2"
-        m = FakeModel(longs=5, shorts=10)
-        r = self.go(self.whales(), step_price(100_200, [(T + 60 * MIN, 0.012)]), liq=m)  # OKX на 0,2 % выше китов
-        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
-        sym, rng, got, _ref, at, px = m.calls[0]
-        self.assertEqual((sym, rng, at), ("BTC", "1d", (T + 5_000) // 1000))
-        self.assertAlmostEqual(px, 100_200, delta=1, msg="карта — по цене OKX на момент решения")
-        self.assertLessEqual(max(rows[-1][0] for rows in got.values()) * 1000 + 900_000, T + 5_000)
-        os.remove(self.db)
-        self.cache += "3"
-        r = self.go(self.whales(), up)          # модели нет — без карты
-        self.assertEqual(len(r["trades"]), 1)
-        self.assertEqual(r["summary"]["data"]["liq_model"], False)
-        self.assertIn("модели нет", r["text"])
+    def test_no_average_without_whale_add(self) -> None:
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
+        self.assertEqual(r["summary"]["averaged"], 0)
+        self.assertEqual(r["trades"][0].why, "открыта", "без усреднения тейк +1 % от 100 000 не достигнут")
+
+    def test_no_average_small_dip_or_small_add(self) -> None:
+        for dip, add in ((-0.005, 2000), (-0.015, 500)):   # минус 0,5 % — мало; добор 500 $ — мало
+            self.cache = os.path.join(self.tmp.name, f"cache{dip}")  # свои свечи у каждого случая
+            rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, add, 98_500)]
+            r = self.go(rows, step_price(100_000, [(T + 20 * MIN, dip)]))
+            self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
+            os.remove(self.db)
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
