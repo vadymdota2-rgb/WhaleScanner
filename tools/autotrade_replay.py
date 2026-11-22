@@ -311,25 +311,27 @@ class Replay:
         self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae))
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
-        """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
-        (как Signals.whale_loss, но по времени): сумма closed_pnl закрытий с
-        его первой сделки в окне < 0 — после нашего входа."""
+        """Когда кто-то из китов сигнала впервые полностью закрыл позицию в
+        убытке (как Signals.whale_loss, но по времени): сделка с flat = 1, а
+        сумма closed_pnl его закрытий с первой сделки в окне < 0 — после
+        нашего входа. Частичное закрытие — не выход."""
         run: dict[str, int] = defaultdict(int)
-        for w, ts, p in self.whale_rows(coin, side, wallets):
+        for w, ts, p, flat in self.whale_rows(coin, side, wallets):
             run[w] += p
-            if ts > since and run[w] < 0:
+            if ts > since and flat == 1 and run[w] < 0:
                 return ts
         return None
 
-    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int]]:
+    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int, int]]:
         """Закрытия китов сигнала по бумаге (закрытие, разворот против нас,
-        ликвидация) с их первой сделки в окне: (кошелёк, время, closed_pnl)."""
+        ликвидация) с их первой сделки в окне: (кошелёк, время, closed_pnl,
+        flat — позиция закрыта полностью)."""
         since = {str(k): int(lv.num(v)) for k, v in wallets.items()}
         if not since:
             return []
         marks = ",".join("?" * len(since))
         codes = core.CLOSES_FOR[1 if side > 0 else -1]
-        q = (f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
+        q = (f"SELECT wallet, ts, closed_pnl_nanos, flat FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
              f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? "
              f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid")
         args = (coin, *since, *codes, min(since.values()), "%Long > Short%" if side > 0 else "%Short > Long%")
@@ -338,7 +340,7 @@ class Replay:
             rows = con.execute(q, args).fetchall()
         finally:
             con.close()
-        return [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
+        return [(str(w), int(t), int(v or 0), int(f or 0)) for w, t, v, f in rows if int(t) >= since.get(str(w), 10**18)]
 
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)

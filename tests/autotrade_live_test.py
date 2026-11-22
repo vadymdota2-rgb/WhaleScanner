@@ -139,7 +139,7 @@ def make_db(path: str, fills: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, "
                 "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, "
-                "dir TEXT NOT NULL DEFAULT '')")
+                "dir TEXT NOT NULL DEFAULT '', flat INTEGER NOT NULL DEFAULT 0)")
     con.executemany(INS, fills)
     con.commit()
     con.close()
@@ -148,11 +148,14 @@ def make_db(path: str, fills: list[tuple]) -> None:
 INS = "INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz) VALUES (?,?,?,?,?,?,?)"
 
 
-def close_fill(path: str, tid: int, wallet: str, coin: str, code: int, ts: int, pnl_usd: float, d: str = "") -> None:
-    """Кит закрыл (3/4 — закрытие лонга/шорта, 5 — разворот, 6/7 — ликвидация) с итогом pnl_usd."""
+def close_fill(path: str, tid: int, wallet: str, coin: str, code: int, ts: int, pnl_usd: float, d: str = "",
+               full: bool = True) -> None:
+    """Кит закрыл (3/4 — закрытие лонга/шорта, 5 — разворот, 6/7 — ликвидация) с итогом pnl_usd;
+    full — позиция закрыта до нуля (flat = 1, как пишет бот), иначе — частично."""
     con = sqlite3.connect(path)
-    con.execute("INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos, dir) "
-                "VALUES (?,?,?,?,?,?,?,?,?)", (tid, wallet, coin, code, ts, 5000 * 10**9, "0.05", int(pnl_usd * 1e9), d))
+    con.execute("INSERT INTO hl_fills(tid, wallet, coin, dir_code, ts, notional_nanos, sz, closed_pnl_nanos, dir, flat) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (tid, wallet, coin, code, ts, 5000 * 10**9, "0.05", int(pnl_usd * 1e9), d, int(full)))
     con.commit()
     con.close()
 
@@ -525,6 +528,44 @@ class WhaleExitTest(Base):
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
             os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
+
+    def test_only_full_close_at_loss_is_an_exit(self) -> None:
+        """Правило владельца (22.11.2026): выходим, только когда кит сигнала
+        закрыл позицию ПОЛНОСТЬЮ и итог его закрытий в минусе. Частичное
+        закрытие в минус — сидим; полное потом — в итоге с частичным: −120 + 50
+        = −70 — выходим; −120 + 200 = +80 — сидим."""
+        for second, exits in ((+50.0, 1), (+200.0, 0)):
+            tr = self.enter()
+            self.now += 20 * MIN
+            close_fill(self.db, 50, "0xa", "BTC", 3, self.now - 2 * MIN, -120.0, full=False)
+            tr.last_sync = 0
+            tr.step()
+            self.assertEqual([o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")], [], "частично — сидим")
+            close_fill(self.db, 51, "0xa", "BTC", 3, self.now - MIN, second)
+            self.now += MIN
+            tr.last_sync = 0
+            tr.step()
+            got = [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
+            self.assertEqual(len(got), exits, second)
+            self.ex = FakeOkx()
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+            if os.path.exists(os.path.join(self.dir, "live", "trades.jsonl")):
+                os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
+
+    def test_entry_skipped_only_if_whale_fully_out_at_loss(self) -> None:
+        """До входа кит сигнала закрыл часть позиции в минус — он ещё в
+        позиции: входим; закрыл её полностью в минус — не входим."""
+        for full, enters in ((False, 1), (True, 0)):
+            self.ex = FakeOkx()
+            rows = self.whales()
+            tr = self.trader(rows)
+            close_fill(self.db, 50, "0xa", "BTC", 3, self.now - 2 * MIN, -50.0, full=full)
+            self.on()
+            tr.step()
+            self.assertEqual(len(self.market_orders()), enters, full)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
 
     def test_whale_profit_or_other_whale_or_other_coin_keeps_position(self) -> None:
         tr = self.enter()

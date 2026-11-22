@@ -56,8 +56,10 @@ class FakeMarket:
 def make_db(path: str, rows: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
-                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '')")
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
+                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '', "
+                "flat INTEGER NOT NULL DEFAULT 0)")
+    # 10-й столбец — flat (позиция закрыта до нуля, как пишет бот); у открытий — 0.
+    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?,?)", [r if len(r) == 10 else (*r, 0) for r in rows])
     # Как в базе бота (hyperliquid_core.cpp): без этих индексов запросы китов — полным перебором.
     con.execute("CREATE INDEX idx_hl_fills_code_ts ON hl_fills(dir_code, ts)")
     con.execute("CREATE INDEX idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)")
@@ -69,8 +71,9 @@ def opn(tid: int, wallet: str, coin: str, side: int, ts: int, usd: float, px: fl
     return (tid, wallet, coin, 1 if side > 0 else 2, ts, int(usd * 1e9), str(usd / px), 0, "")
 
 
-def cls(tid: int, wallet: str, coin: str, side: int, ts: int, pnl: float) -> tuple:
-    return (tid, wallet, coin, 3 if side > 0 else 4, ts, int(5000 * 1e9), "0.05", int(pnl * 1e9), "")
+def cls(tid: int, wallet: str, coin: str, side: int, ts: int, pnl: float, full: bool = True) -> tuple:
+    """Кит закрыл позицию (full — до нуля, flat = 1; иначе — частично)."""
+    return (tid, wallet, coin, 3 if side > 0 else 4, ts, int(5000 * 1e9), "0.05", int(pnl * 1e9), "", int(full))
 
 
 def step_price(base: float, moves: list[tuple[int, float]]):
@@ -129,6 +132,19 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(t.why, "кит вышел в убыток")
         self.assertLess(t.pnl, 0)
         self.assertGreaterEqual(t.exit_t, T + 30 * MIN)
+
+    def test_partial_whale_loss_is_not_an_exit(self) -> None:
+        # Кит закрыл часть позиции в минус — сидим до тейка; закрыл всё в минус — выход.
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, -100.0, full=False)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003), (T + 90 * MIN, 0.012)]))
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
+        os.remove(self.db)
+        self.cache += "2"
+        rows = [*rows, cls(11, "0xa", "BTC", 1, T + 60 * MIN, +20.0)]   # полностью: −100 + 20 — в минусе
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003), (T + 90 * MIN, 0.012)]))
+        [t] = r["trades"]
+        self.assertEqual(t.why, "кит вышел в убыток")
+        self.assertGreaterEqual(t.exit_t, T + 60 * MIN)
 
     def test_whale_profit_close_keeps_position(self) -> None:
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]

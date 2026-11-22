@@ -20,10 +20,11 @@
   на ту же бумагу, где ручная позиция, — не входит;
 - у бота своя позиция — всегда одна: пока её не закрыли, вторую не открываем;
 - выход — тейк +1 % движения цены (лимитный ордер на бирже); и второй
-  выход: кто-то из китов сигнала закрыл свою сделку по этой бумаге В УБЫТКЕ
-  (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
-  тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
-  закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
+  выход: кто-то из китов сигнала закрыл свою позицию по этой бумаге
+  ПОЛНОСТЬЮ (закрытие до нуля, разворот или ликвидация — flat в базе бота) и
+  итог его закрытий В УБЫТКЕ — бот снимает тейк и закрывает свою позицию
+  рыночным ордером (только на закрытие). Кит закрыл часть позиции (даже в
+  минус) или закрыл в плюс — сидим. Кит уже вышел так до входа — не входим;
 - стоп: цена против нашего входа на 4 % и больше (при 10× — около −40 %
   PnL) — снять тейк и закрыть по рынку (тот же выход, что вслед за китом);
   работает и при «Стоп» во вкладке; усреднения нет (правило владельца
@@ -473,10 +474,13 @@ class Signals:
                 "usd_against": round(self.whale_usd(opp), 2)}
 
     def whale_loss(self, coin: str, side: int, wallets: dict[str, Any], now: int) -> list[tuple[str, float]]:
-        """Киты сигнала, закрывшие позицию по этой бумаге и стороне в убыток:
-        закрывающие сделки (закрытие, разворот, ликвидация) после их первой
-        сделки в окне сигнала и до «сейчас», итог closed_pnl < 0. Кит, у
-        которого закрытия в сумме в плюс, — не в счёт. → [(кошелёк, $)]."""
+        """Киты сигнала, ПОЛНОСТЬЮ закрывшие позицию по этой бумаге и стороне
+        в убыток: закрывающие сделки (закрытие, разворот, ликвидация) после их
+        первой сделки в окне сигнала и до «сейчас»; на сделке, которая закрыла
+        позицию до нуля (flat = 1 в базе бота: закрытие до нуля, разворот,
+        ликвидация), итог closed_pnl с начала < 0. Частичное закрытие (даже в
+        минус) и закрытие в плюс — не в счёт (правило владельца 22.11.2026).
+        → [(кошелёк, $)]."""
         since = {str(k): int(num(v)) for k, v in wallets.items() if isinstance(k, str)}
         if not since:
             return []
@@ -488,17 +492,20 @@ class Signals:
         con = self._con()
         try:
             rows = con.execute(
-                f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
+                f"SELECT wallet, ts, closed_pnl_nanos, flat FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
                 f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
-                f"AND (dir_code != {core.FLIP} OR dir LIKE ?)",
+                f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid",
                 (coin, *since, *codes, min(since.values()), now, flip)).fetchall()
         finally:
             con.close()
         pnl: dict[str, int] = {}
-        for wl, ts, p in rows:
+        lost: dict[str, int] = {}
+        for wl, ts, p, flat in rows:
             if ts >= since.get(wl, now + 1):
                 pnl[wl] = pnl.get(wl, 0) + int(p or 0)
-        return [(wl, p / NANOS) for wl, p in sorted(pnl.items()) if p < 0]
+                if flat == 1 and pnl[wl] < 0 and wl not in lost:
+                    lost[wl] = pnl[wl]
+        return [(wl, p / NANOS) for wl, p in sorted(lost.items())]
 
     def wallets_at(self, coin: str, side: int, ts: int) -> dict[str, int]:
         """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
