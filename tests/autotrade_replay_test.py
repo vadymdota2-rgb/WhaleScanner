@@ -94,15 +94,23 @@ class ReplayTest(unittest.TestCase):
 
     def args(self, **kw) -> argparse.Namespace:
         a = rp.parser().parse_args(["--db", self.db, "--out", self.out, "--cache", self.cache, "--pause", "0",
-                                    "--deposit", "20000", "--max-mem-mb", "0"])
+                                    "--deposit", "20000", "--max-mem-mb", "0",
+                                    "--wt-dir", os.path.join(self.tmp.name, "no-wallet-tracker")])
         for k, v in kw.items():
             setattr(a, k, v)
         return a
 
-    def go(self, rows: list[tuple], price, **kw) -> dict:
+    def go(self, rows: list[tuple], price, liq: object = None, **kw) -> dict:
         make_db(self.db, rows)
         self.market = FakeMarket(price)
-        return rp.run(self.args(**kw), fetch=self.market, now_ms=NOW)
+        return rp.run(self.args(**kw), fetch=self.market, now_ms=NOW, liq_get=self.liq_get, liq_model=liq)
+
+    def liq_get(self, url: str) -> object:
+        """Биржи для карты: Binance и Bybit, 15-минутные ряды BTC у 100 000."""
+        from autotrade_liq_test import FakeEx
+        if not hasattr(self, "ex"):
+            self.ex = FakeEx(px=100_000, start=NOW - 40 * DAY, end=NOW)
+        return self.ex(url)
 
     def whales(self, side: int = 1, coin: str = "BTC", px: float = 100_000, t: int = T, base: int = 1) -> list[tuple]:
         return [opn(base, "0xa", coin, side, t - 2 * MIN, 5000, px), opn(base + 1, "0xb", coin, side, t, 5000, px)]
@@ -141,6 +149,33 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual(t.why, "тейк")
         self.assertGreater(t.mae, 2_000, "провал внутри сделки виден")
+
+    def test_liq_map_filter(self) -> None:
+        """Карта ликвидаций — как у живого бота: лонг — шортов над ценой больше;
+        против — пропуск «liq_against»; модели нет или карты нет — как без неё."""
+        from autotrade_liq_test import FakeModel
+        up = step_price(100_000, [(T + 60 * MIN, 0.012)])
+        r = self.go(self.whales(), up, liq=FakeModel(longs=10, shorts=5))
+        self.assertEqual(r["trades"], [])
+        self.assertEqual(r["skips"].get("liq_against"), 1)
+        d = r["summary"]["data"]
+        self.assertEqual((d["liq_model"], d["liq_maps"], d["liq_none"]), (True, 1, 0))
+        self.assertIn("решений с картой 1, без карты 0", r["text"])
+        os.remove(self.db)
+        self.cache += "2"
+        m = FakeModel(longs=5, shorts=10)
+        r = self.go(self.whales(), step_price(100_200, [(T + 60 * MIN, 0.012)]), liq=m)  # OKX на 0,2 % выше китов
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
+        sym, rng, got, _ref, at, px = m.calls[0]
+        self.assertEqual((sym, rng, at), ("BTC", "1d", (T + 5_000) // 1000))
+        self.assertAlmostEqual(px, 100_200, delta=1, msg="карта — по цене OKX на момент решения")
+        self.assertLessEqual(max(rows[-1][0] for rows in got.values()) * 1000 + 900_000, T + 5_000)
+        os.remove(self.db)
+        self.cache += "3"
+        r = self.go(self.whales(), up)          # модели нет — без карты
+        self.assertEqual(len(r["trades"]), 1)
+        self.assertEqual(r["summary"]["data"]["liq_model"], False)
+        self.assertIn("модели нет", r["text"])
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет

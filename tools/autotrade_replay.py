@@ -14,6 +14,10 @@
   одна;
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск), рыночный вход (проскальзывание);
+- карта ликвидаций (сутки, 2 % от цены) за сторону сделки: шорт — лонгов
+  под ценой ликвидируется больше, чем шортов над ней; лонг — наоборот; карты
+  нет — входим, как без неё. Карта на момент сигнала — autotrade_liq.py
+  (история Binance и Bybit, модель wt_liqmap.py из Wallet-Tracker, --wt-dir);
 - выход: лимитный тейк +0,75 % от цены входа; по рынку — кит сигнала
   закрыл (хоть часть) в убыток; стопа и усреднения нет.
 
@@ -47,6 +51,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import autotrade_core as core
+import autotrade_liq as lq
 import autotrade_live as lv
 
 BAR_MS = 300_000                  # 5-минутные свечи OKX
@@ -212,8 +217,9 @@ class Replay:
     правила входа; открытая позиция ведётся по свечам до выхода."""
 
     def __init__(self, a: argparse.Namespace, prices: Prices, instr: dict[str, dict[str, Any]],
-                 progress: Callable[[dict[str, Any]], None]) -> None:
-        self.a, self.px, self.instr, self.progress = a, prices, instr, progress
+                 progress: Callable[[dict[str, Any]], None], liq: lq.LiqHist | None = None) -> None:
+        self.a, self.px, self.instr, self.progress, self.liq = a, prices, instr, progress, liq
+        self.liq_seen: defaultdict[str, int] = defaultdict(int)   # решений с картой и без неё
         self.sig = lv.Signals(a.db)
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
@@ -250,6 +256,10 @@ class Replay:
             return "other_asset"
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
+        cum = self.liq.cum(base, now, last) if self.liq is not None else None
+        self.liq_seen["map" if core.liq_near(cum) else "none"] += 1
+        if core.liq_ok(cum, s["side"]) is False:
+            return "liq_against"
         if self.equity <= 0:
             return "no_equity"
         sz = lv.contract_size(ins, self.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)  # как у живого бота
@@ -446,7 +456,9 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         "sizing": {"deposit": a.deposit, "deposit_end": round(rp.equity, 2), "margin_pct": lv.MARGIN_FRAC * 100,
                    "leverage": lv.LEVERAGE, "fee_taker_pct": a.fee_taker, "fee_maker_pct": a.fee_maker,
                    "slippage_pct": a.slippage},
-        "data": {"signals": sum(rp.skips.values()), "requests": rp.px.requests, "errors": rp.px.errors},
+        "data": {"signals": sum(rp.skips.values()), "requests": rp.px.requests, "errors": rp.px.errors,
+                 # Карта ликвидаций: решений с картой и без неё (модели нет — liq_model false).
+                 "liq_model": rp.liq is not None, "liq_maps": rp.liq_seen["map"], "liq_none": rp.liq_seen["none"]},
         "full": st_all, "first": stats(first), "last": st_last,
         "equity": curve,
         "by_coin": group(lambda t: t.coin),
@@ -475,10 +487,13 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание рыночного ордера, %%")
     ap.add_argument("--fee-taker", type=float, default=0.05, help="комиссия тейкера OKX, %%")
     ap.add_argument("--fee-maker", type=float, default=0.02, help="комиссия мейкера OKX (тейк лимитом), %%")
+    ap.add_argument("--wt-dir", default=os.environ.get("WT_DIR") or os.path.expanduser("~/WalletTracker"),
+                    help="Wallet-Tracker (модель карты ликвидаций wt_liqmap.py)")
     return ap
 
 
-def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None) -> dict[str, Any]:
+def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None,
+        liq_get: lq.Get | None = None, liq_model: Any = None) -> dict[str, Any]:
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     os.makedirs(a.out, exist_ok=True)
 
@@ -491,8 +506,11 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     progress({"stage": "каталог OKX", "done": 0, "total": 0, "trades": 0, "requests": 0})
     f = fetch or okx_fetch
     prices = Prices(a.cache, f, a.pause, a.offline, now)
-    rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress)
     since = now - a.since_days * core.DAY_MS
+    model = liq_model if liq_model is not None else lq.load_model(a.wt_dir)
+    liq = lq.LiqHist(model, a.cache, liq_get or lq.http_json, since - (lq.WINDOW + lq.PRE) * lq.ROW_MS, now,
+                     a.offline, a.pause) if model is not None else None
+    rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress, liq)
     rp.run(since, now)
     s = summary(a, rp, since, now)
 
@@ -513,6 +531,9 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "Последняя 1/4: " + line(s["last"]),
         "Сигналы: " + ", ".join(f"{k} — {v}" for k, v in s["skips"].items()),
         f"Запросов к OKX: {prices.requests}" + (f", сбоев: {prices.errors}" if prices.errors else ""),
+        (f"Карта ликвидаций: решений с картой {s['data']['liq_maps']}, без карты {s['data']['liq_none']}; "
+         f"запросов к биржам {liq.requests}") if liq is not None else
+        f"Карта ликвидаций: модели нет ({a.wt_dir}/wt_liqmap.py) — повтор без карты",
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "

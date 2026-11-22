@@ -43,7 +43,9 @@ CI (`.github/workflows/tests.yml`) гоняет всё это на каждый 
 Реальная торговля на OKX — служба [`tools/autotrade_live.py`](tools/autotrade_live.py):
 от 2 китов Hyperliquid в одну сторону за 2 часа (каждый от 1000 $), против —
 не крупнее; маржа 5 % × 10×, одна позиция; тейк +0,75 %, выход вслед за китом в
-убытке (хоть частичном закрытии; стопа и усреднения нет). Бэктест — повтор истории по тем же правилам:
+убытке (хоть частичном закрытии; стопа и усреднения нет); вход — только если карта ликвидаций
+(сутки, 2 % от цены) за сторону сделки или её нет. Бэктест — повтор истории по тем же правилам
+(карта на момент сигнала — [`tools/autotrade_liq.py`](tools/autotrade_liq.py)):
 [`tools/autotrade_replay.py`](tools/autotrade_replay.py); общее —
 [`tools/autotrade_core.py`](tools/autotrade_core.py). База бота — только
 чтение. Устройство — [`docs/autotrade-how-it-works.md`](docs/autotrade-how-it-works.md),

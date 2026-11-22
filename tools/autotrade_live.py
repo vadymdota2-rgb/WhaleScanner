@@ -25,6 +25,10 @@
   тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
   закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
 - стопа и усреднения нет (правило владельца 22.11.2026);
+- карта ликвидаций (Wallet-Tracker, /api/liqmap, окно — сутки): шорт — только
+  если ликвидаций лонгов в 2 % под ценой больше, чем шортов в 2 % над ней;
+  лонг — наоборот. Карта собирается — ждём её до минуты; карты нет (монеты
+  нет на биржах, сервер карты молчит) — входим, как без неё;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
   крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
@@ -99,6 +103,8 @@ ADOPT_TOL = 0.5            # подхват позиции: средняя це�
 TP_SLACK = 0.005           # тейк на шаге цены — не дальше +1,25 % (иначе шаг цены слишком крупный)
 
 FRESH_MS = 15 * 60_000     # сигнал старше — не входим (бот мог отстать, момент ушёл)
+LIQ_URL = "http://127.0.0.1:8090/api/liqmap"  # карта ликвидаций whale_api (тот же сервер; WT_LIQMAP_URL)
+LIQ_WAIT_MS = 60_000       # карта собирается — ждём не дольше минуты, потом входим без неё
 POLL_SEC = 5               # опрос базы
 SYNC_SEC = 15              # сверка счёта
 INSTR_TTL = 3600           # каталог OKX — раз в час
@@ -118,6 +124,17 @@ MARKET_CODES = {"50124"}
 MARKET_PAUSE_MS = 30 * 60_000
 BLOCK_MS = 7 * 86_400_000
 FAIL_PAUSE_MS = 15 * 60_000  # другой отказ ордера — эту бумагу не трогать 15 минут
+
+
+def liq_fetch(base: str) -> object:
+    """Карта ликвидаций монеты (окно — сутки) у whale_api; сбой сети — None."""
+    url = os.environ.get("WT_LIQMAP_URL") or LIQ_URL
+    q = urllib.parse.urlencode({"sym": base, "range": core.LIQ_RANGE})
+    try:
+        with urllib.request.urlopen(f"{url}?{q}", timeout=20) as r:
+            return json.loads(r.read(8 << 20))
+    except (OSError, ValueError):
+        return None
 
 
 def now_ms() -> int:
@@ -801,8 +818,9 @@ OPEN_KEYS = ("coin", "inst", "side", "opened", "px", "size", "tp", "tp_s", "noti
 
 class Trader:
     def __init__(self, okx: Okx, signals: Signals, data_dir: str, clock: Callable[[], int] = now_ms,
-                 log: Callable[[str], None] | None = None) -> None:
+                 log: Callable[[str], None] | None = None, liq: Callable[[str], object] | None = None) -> None:
         self.okx, self.sig, self.clock = okx, signals, clock
+        self.liq = liq or liq_fetch   # карта ликвидаций: монета → ответ /api/liqmap
         self.dir = os.path.join(data_dir, "live")
         self.switch = os.path.join(data_dir, "switch.json")
         os.makedirs(self.dir, exist_ok=True)
@@ -820,6 +838,8 @@ class Trader:
         self._checked: dict[str, float] = {}
         self.skip_code = "other"
         self._skip_seen: set[tuple[str, int, str, int]] = set()
+        self._liq_wait: dict[tuple[str, int, int], int] = {}   # сигнал → когда карта впервые «собирается»
+        self._liq_retry: list[dict[str, Any]] = []              # сигналы, что ждут карту, — снова на шаге
 
     # состояние
     def _load(self) -> dict[str, Any]:
@@ -1189,6 +1209,29 @@ class Trader:
         bucket[code] = int(num(bucket.get(code))) + 1
         self.st["skips"] = skips
 
+    def liq_check(self, base: str, s: dict[str, Any]) -> str:
+        """Карта ликвидаций: '' — за нас или карты нет (входим), иначе —
+        причина пропуска. Карта собирается — пропуск «ждём» до LIQ_WAIT_MS с
+        первой попытки по этому сигналу, дальше — как без карты."""
+        now = self.clock()
+        try:
+            res = self.liq(base)
+        except Exception:  # noqa: BLE001 — карта — подсказка: её сбой не должен ронять торговлю
+            res = None
+        got = res if isinstance(res, dict) else {}
+        self._liq_wait = {k: v for k, v in self._liq_wait.items() if now - v < FRESH_MS}
+        if got.get("ok") is not True and got.get("error") in ("building", "busy"):
+            first = self._liq_wait.setdefault((s["coin"], s["side"], int(s["ts"])), now)
+            if now - first < LIQ_WAIT_MS:
+                return self._skip("liq_wait", f"карта ликвидаций {base} собирается — ждём до минуты")
+        cum = got.get("cum") if got.get("ok") is True else None
+        near = core.liq_near(cum)
+        if near is None or core.liq_ok(cum, s["side"]):
+            return ""
+        return self._skip("liq_against", f"карта ликвидаций против: в {core.LIQ_PCT} % под ценой лонгов {near[0]:,.0f} $, "
+                                         f"над ценой шортов {near[1]:,.0f} $ — {'шорт' if s['side'] < 0 else 'лонг'} "
+                                         "не входит".replace(",", " "))
+
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
@@ -1244,6 +1287,9 @@ class Trader:
             return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE:
             return self._skip("chase", f"цена ушла от китов дальше {CHASE * 100:g} %")
+        why = self.liq_check(base, s)
+        if why:
+            return why
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
         notional = self.equity * MARGIN_FRAC * LEVERAGE
@@ -1435,11 +1481,16 @@ class Trader:
         if not self.is_on():
             self.save()
             return
-        for s in self.candidates(sigs):
+        # Сигнал, что ждёт карту ликвидаций, — снова (новые сделки китов того
+        # же сигнала — свежее, их и берём).
+        retry, self._liq_retry = self._liq_retry, []
+        for s in self.candidates(retry + sigs):
             self.skip_code = "other"
             why = self.try_enter(s)
             if not why:
                 break
+            if self.skip_code == "liq_wait":
+                self._liq_retry.append(s)
             self.st["last_skip"] = {"coin": s["coin"], "side": s["side"], "why": why, "at": self.clock(),
                                     "code": self.skip_code}
             self.count_skip(s, self.skip_code)

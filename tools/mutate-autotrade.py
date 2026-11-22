@@ -16,8 +16,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(ROOT, "tools", "autotrade_live.py")
 CORE_PATH = os.path.join(ROOT, "tools", "autotrade_core.py")  # окно китов и база — общие с бэктестом-повтором
 RP_PATH = os.path.join(ROOT, "tools", "autotrade_replay.py")    # бэктест-повтор по правилам живого бота
+LIQ_PATH = os.path.join(ROOT, "tools", "autotrade_liq.py")      # карта ликвидаций на момент в прошлом (повтор)
 TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py",
-         "tests/autotrade_replay_test.py", "tests/autotrade_core_test.py"]
+         "tests/autotrade_replay_test.py", "tests/autotrade_core_test.py", "tests/autotrade_liq_test.py"]
 ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "AUTOTRADE_SCALE_ROWS": "20000",
        "PYTHONDONTWRITEBYTECODE": "1"}
 # Выброс встречного окна в опросе — для снимка в сигнале; решение всё равно
@@ -127,6 +128,21 @@ MUTS = [
     ("                if avg > 0 and abs(avg / op[\"px\"] - 1) <= FILL_TOL:", "                if False:", "тейк — от новой средней цены входа"),
     ("            if op.get(\"tp_id\") and any(o.get(\"ordId\") == op[\"tp_id\"]", "            if any(o.get(\"ordId\") == op.get(\"tp_id\")",
      "тейка нет в записи — его надо поставить"),
+    # Карта ликвидаций (живой бот)
+    ("        why = self.liq_check(base, s)\n        if why:\n            return why\n", "", "карта проверяется перед входом"),
+    ("            if now - first < LIQ_WAIT_MS:", "            if True:", "карта собирается — ждём не дольше минуты"),
+    ("LIQ_WAIT_MS = 60_000", "LIQ_WAIT_MS = 600_000", "ждём карту — минуту"),
+    ("        if got.get(\"ok\") is not True and got.get(\"error\") in (\"building\", \"busy\"):",
+     "        if got.get(\"ok\") is not True and got.get(\"error\") == \"building\":", "карта занята — тоже ждём"),
+    ("        cum = got.get(\"cum\") if got.get(\"ok\") is True else None", "        cum = got.get(\"cum\")", "карта не готова — её цифры не берём"),
+    ("            if self.skip_code == \"liq_wait\":\n                self._liq_retry.append(s)", "            pass",
+     "ждущий карту сигнал — снова на шаге"),
+    ("        self.liq = liq or liq_fetch", "        self.liq = liq_fetch", "своя карта — для проверки"),
+    ("    q = urllib.parse.urlencode({\"sym\": base, \"range\": core.LIQ_RANGE})",
+     "    q = urllib.parse.urlencode({\"sym\": base})", "карта — окно сутки в запросе"),
+    ("    url = os.environ.get(\"WT_LIQMAP_URL\") or LIQ_URL", "    url = LIQ_URL", "адрес карты — из настроек"),
+    ("        res = self.liq(base)\n        except Exception:", "        res = self.liq(s[\"coin\"])\n        except Exception:",
+     "карта — по имени бумаги на OKX"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
@@ -182,6 +198,10 @@ RP_MUTS = [
     ("self.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "self.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
     ("            if side * (best - tp) >= 0:", "            if False:", "повтор: тейк"),
     ("            if exit_at is not None and exit_at + SYNC_MS < end:", "            if False:", "повтор: выход вслед за китом"),
+    ("        if core.liq_ok(cum, s[\"side\"]) is False:\n            return \"liq_against\"",
+     "        if False:\n            return \"liq_against\"", "повтор: карта ликвидаций против — не входим"),
+    ("        cum = self.liq.cum(base, now, last) if self.liq is not None else None",
+     "        cum = self.liq.cum(base, now, s[\"ref_px\"]) if self.liq is not None else None", "повтор: карта — по цене OKX"),
     ("        if isinstance(rows, list) and end <= self.now_ms:", "        if end <= self.now_ms:", "повтор: сбой сети не ложится в кеш"),
     ("                            got[int(k)] = [c for c in v if candle_ok(c)]", "                            got[int(k)] = v",
      "повтор: испорченный кеш — без мусора"),
@@ -194,6 +214,42 @@ CORE_MUTS = [
      "        self.count += (k1 > 0 and n1 > self.limit) - (k0 > 0 and n0 > self.limit)", "кит — от порога включительно"),
     ("    return bool(coin) and not coin.startswith(\"@\") and \"/\" not in coin", "    return bool(coin)", "спот — не сигнал"),
     ("    con.execute(\"PRAGMA query_only=1\")\n", "", "база бота — только чтение"),
+    # Карта ликвидаций — правило владельца (общее для торговли и повтора)
+    ("LIQ_PCT = 2", "LIQ_PCT = 5", "карта — ликвидации в 2 % от цены"),
+    ("LIQ_RANGE = \"1d\"", "LIQ_RANGE = \"7d\"", "карта — окно сутки"),
+    ("    return longs > shorts if side < 0 else shorts > longs", "    return longs > shorts if side > 0 else shorts > longs",
+     "карта: шорт — к лонгам под ценой, лонг — к шортам"),
+    ("    return longs > shorts if side < 0 else shorts > longs", "    return longs >= shorts if side < 0 else shorts >= longs",
+     "карта: поровну — не за нас"),
+    ("    return (vals[0], vals[1]) if vals[0] + vals[1] > 0 else None", "    return (vals[0], vals[1])", "карта пуста — как без карты"),
+    ("not isinstance(v, (int, float)) or not 0 <= v < float(\"inf\")", "not isinstance(v, (int, float))",
+     "карта: отрицательные и бесконечные — мусор"),
+    ("        if isinstance(v, bool) or not", "        if not", "карта: true/false — не число"),
+    ("    near = cum.get(LIQ_PCT, cum.get(str(LIQ_PCT)))", "    near = cum.get(str(LIQ_PCT))", "карта: ключ числом тоже"),
+]
+
+LIQ_MUTS = [
+    ("        cut = (t - ROW_MS) // 1000", "        cut = t // 1000", "карта повтора: только закрытые свечи"),
+    ("WINDOW = 96 ", "WINDOW = 48 ", "карта повтора: окно — сутки"),
+    ("PRE = 3 * WINDOW", "PRE = 0", "карта повтора: учёт до окна"),
+    ("PX_TOL = 0.03", "PX_TOL = 0.3", "карта повтора: чужой актив по цене"),
+    ("cut - part[-1][0] < 3600", "cut - part[-1][0] < 10**9", "карта повтора: дыра в истории — без карты"),
+    ("            if len(ref) >= WINDOW // 2:", "            if True:", "карта повтора: окно короче половины — без карты"),
+    ("    return one if one > 0 else _f(r.get(\"openInterest\")) / 2", "    return one if one > 0 else _f(r.get(\"openInterest\"))",
+     "Bybit: интерес — с одной стороны"),
+    ("                tk[_t(r.get(\"timestamp\"))] = x / (1 + x) if x >= 0 else 0.5",
+     "                tk[_t(r.get(\"timestamp\"))] = x if x >= 0 else 0.5", "Binance: доля покупок из отношения"),
+    ("                return [(t, h / k, lo / k, c / k, v, bs) for t, h, lo, c, v, bs in got]",
+     "                return got", "1000PEPE — цена за одну монету"),
+    ("            got = {ex: rows if ex == \"Binance\" else [(*r[:5], share.get(r[0], r[5])) for r in rows]\n                   for ex, rows in got.items()}\n",
+     "", "доля покупок Bybit — у Binance"),
+    ("            ref = max(got.values(), key=lambda r: r[-1][4])[-WINDOW:]", "            ref = max(got.values(), key=lambda r: r[-1][4])",
+     "карта повтора: опора — только окно"),
+    ("        if key in self.memo:\n            return self.memo[key]", "        if False:\n            return self.memo[key]",
+     "карта повтора: одна сборка на 15 минут"),
+    ("            if not self.offline and (not rows or rows[0][0] * 1000 > self.start or rows[-1][0] < need):",
+     "            if not self.offline:", "карта повтора: кеш — без сети"),
+    ("        if not (t > 0 and 0 < low <= hi and c > 0 and oi >= 0):", "        if not t > 0:", "ряды биржи — без мусора"),
 ]
 
 
@@ -209,7 +265,7 @@ def main() -> int:
             return 2
     alive: list[str] = []
     total = 0
-    for path, muts in ((PATH, pick(MUTS)), (CORE_PATH, pick(CORE_MUTS)), (RP_PATH, pick(RP_MUTS))):
+    for path, muts in ((PATH, pick(MUTS)), (CORE_PATH, pick(CORE_MUTS)), (RP_PATH, pick(RP_MUTS)), (LIQ_PATH, pick(LIQ_MUTS))):
         alive += run(path, muts)
         total += len(muts) - len(EQUIV & {m[2] for m in muts})
     print(f"ИТОГ: убито {total - len(alive)} из {total}; выжили: {alive}")

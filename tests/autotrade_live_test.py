@@ -15,12 +15,14 @@ long/short; kPEPE → PEPE ×1000; без ключей — понятная ош
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 import unittest
+import urllib.error
 import urllib.parse
 from decimal import Decimal
 from unittest import mock
@@ -161,6 +163,9 @@ def fill(tid: int, wallet: str, coin: str, side: int, ts: int, usd: float, px: f
     return (tid, wallet, coin, 1 if side > 0 else 2, ts, int(usd * 1e9), str(usd / px))
 
 
+REAL_LIQ_FETCH = lv.liq_fetch   # настоящая — до подмены в тестах
+
+
 class Base(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -174,6 +179,12 @@ class Base(unittest.TestCase):
         sleep = mock.patch.object(lv.time, "sleep", lambda _s: None)
         sleep.start()
         self.addCleanup(sleep.stop)
+        # Карта ликвидаций — поддельная (без сети): по умолчанию её нет.
+        self.liq_res: object = None
+        self.liq_calls: list[str] = []
+        liq = mock.patch.object(lv, "liq_fetch", lambda base: (self.liq_calls.append(base), self.liq_res)[1])
+        liq.start()
+        self.addCleanup(liq.stop)
 
     def on(self, value: bool = True) -> None:
         with open(os.path.join(self.dir, "switch.json"), "w") as f:
@@ -949,6 +960,142 @@ class NoStopTest(Base):
                              "тейк стоит")
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+
+
+class LiqMapTest(Base):
+    """Правило владельца (22.11.2026): карта ликвидаций (сутки, 2 % от цены).
+    Шорт — только если лонгов под ценой ликвидируется больше, чем шортов над
+    ней; лонг — наоборот. Карта собирается — ждём до минуты; карты нет —
+    входим, как без неё."""
+
+    def go(self, side: int, liq: object, coin: str = "BTC") -> lv.Trader:
+        self.liq_res = liq
+        px = 100_000 if coin == "BTC" else 0.01
+        tr = self.trader(self.whales(coin, side, px=px))
+        self.on()
+        tr.step()
+        return tr
+
+    @staticmethod
+    def cum(longs: float, shorts: float, key: object = "2") -> dict:
+        return {"ok": True, "cum": {key: {"L": longs, "S": shorts}, "5": {"L": 0, "S": 10**12}}}
+
+    def test_short_needs_more_long_liqs_below(self) -> None:
+        self.go(-1, self.cum(600_000, 400_000))
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "sell")
+        self.assertEqual(self.liq_calls, ["BTC"])
+
+    def test_short_against_map_is_skipped(self) -> None:
+        for longs, shorts in ((400_000, 600_000), (500_000, 500_000)):  # меньше и поровну — не за нас
+            self.go(-1, self.cum(longs, shorts))
+            self.assertEqual(self.market_orders(), [], (longs, shorts))
+            st = self.state()["last_skip"]
+            self.assertEqual(st["code"], "liq_against")
+            self.assertIn(f"лонгов {longs:,.0f} $".replace(",", " "), st["why"])
+            self.assertIn("шорт не входит", st["why"])
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_long_mirrors_short(self) -> None:
+        self.go(1, self.cum(600_000, 400_000, key=2))   # ключ — числом тоже
+        self.assertEqual(self.market_orders(), [])
+        self.assertIn("лонг не входит", self.state()["last_skip"]["why"])
+        os.remove(self.db)
+        os.remove(os.path.join(self.dir, "live", "state.json"))
+        self.ex = FakeOkx()
+        self.go(1, self.cum(400_000, 600_000))
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_no_map_enters_as_before(self) -> None:
+        for res in (None, {"ok": False, "error": "no_data"}, {"ok": True, "cum": {"2": {"L": 0, "S": 0}}},
+                    {"ok": True, "cum": {"2": {"L": "x", "S": 5}}}, {"ok": True, "cum": {"2": {"L": float("nan"), "S": 5}}},
+                    {"ok": True, "cum": {"2": {"L": True, "S": 5}}}, {"ok": True, "cum": {"2": {"L": -1, "S": 5}}},
+                    {"ok": True, "cum": {"2": {"L": float("inf"), "S": 5}}}, {"ok": True, "cum": []},
+                    {"ok": True, "cum": {"5": {"L": 1, "S": 5}}}, {"ok": "yes", "cum": {"2": {"L": 9, "S": 1}}},
+                    {"ok": False, "error": "no_data", "cum": {"2": {"L": 9, "S": 1}}}, []):
+            self.ex = FakeOkx()
+            self.go(1, res)
+            self.assertEqual(len(self.market_orders()), 1, res)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_map_failure_does_not_break_trading(self) -> None:
+        def boom(_base: str) -> object:
+            raise RuntimeError("сервер карты упал")
+        make_db(self.db, self.whales())
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                       clock=lambda: self.now, log=self.logs.append, liq=boom)
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_injected_map_is_used(self) -> None:
+        make_db(self.db, self.whales())
+        asked: list[str] = []
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir, clock=lambda: self.now,
+                       log=self.logs.append, liq=lambda base: (asked.append(base), self.cum(9, 1))[1])
+        self.on()
+        tr.step()
+        self.assertEqual((asked, self.market_orders(), self.liq_calls), (["BTC"], [], []))
+
+    def test_building_waits_up_to_a_minute(self) -> None:
+        tr = self.go(-1, {"ok": False, "error": "building"})
+        self.assertEqual(self.market_orders(), [])
+        self.assertEqual(self.state()["last_skip"]["code"], "liq_wait")
+        self.liq_res = {"ok": False, "error": "busy"}
+        self.now += 50_000
+        tr.step()                              # новых сделок китов нет — сигнал спрошен снова сам
+        self.assertEqual(len(self.liq_calls), 2)
+        self.assertEqual(self.market_orders(), [], "50 с — ещё ждём")
+        self.liq_res = {"ok": False, "error": "building"}
+        self.now += 10_000                     # минута с первой попытки — входим без карты
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        tr.step()
+        self.assertEqual(len(self.liq_calls), 3, "вошли — больше не спрашиваем")
+
+    def test_built_map_decides_waiting_signal(self) -> None:
+        tr = self.go(-1, {"ok": False, "error": "building"})
+        self.liq_res = self.cum(1, 2)          # собралась и против
+        self.now += 5_000
+        tr.step()
+        self.assertEqual(self.state()["last_skip"]["code"], "liq_against")
+        self.liq_res = self.cum(2, 1)
+        self.now += 5_000
+        tr.step()
+        self.assertEqual(self.market_orders(), [], "решение карты — окончательное: сигнал больше не ждёт")
+        self.assertEqual(len(self.liq_calls), 2)
+
+    def test_waiting_signal_expires_with_freshness(self) -> None:
+        tr = self.go(-1, {"ok": False, "error": "building"})
+        self.now += lv.FRESH_MS
+        tr.step()
+        self.assertEqual(len(self.liq_calls), 1, "сигнал устарел — не спрашиваем")
+
+    def test_pepe_asks_okx_name(self) -> None:
+        self.go(1, None, coin="kPEPE")
+        self.assertEqual(self.liq_calls[:1], ["PEPE"])
+
+    def test_fetch_asks_own_server_daily_map(self) -> None:
+        seen: list[str] = []
+
+        def opener(url: str, timeout: float) -> io.BytesIO:
+            seen.append(url)
+            if "BAD" in url:
+                return io.BytesIO(b"<html>")
+            if "DOWN" in url:
+                raise urllib.error.URLError("refused")
+            return io.BytesIO(b'{"ok": true, "cum": {"2": {"L": 1, "S": 2}}}')
+
+        with mock.patch.object(lv.urllib.request, "urlopen", opener):
+            self.assertEqual(REAL_LIQ_FETCH("BTC"), {"ok": True, "cum": {"2": {"L": 1, "S": 2}}})
+            self.assertIsNone(REAL_LIQ_FETCH("BAD"))
+            self.assertIsNone(REAL_LIQ_FETCH("DOWN"))
+            with mock.patch.dict(os.environ, {"WT_LIQMAP_URL": "http://10.0.0.5:9000/api/liqmap"}):
+                REAL_LIQ_FETCH("ETH")
+        self.assertEqual(seen[0], "http://127.0.0.1:8090/api/liqmap?sym=BTC&range=1d")
+        self.assertEqual(seen[-1], "http://10.0.0.5:9000/api/liqmap?sym=ETH&range=1d")
 
 
 class EeaTest(Base):
