@@ -113,7 +113,7 @@ class FakeOkx:
         if p == "/api/v5/trade/orders-history":
             return ok([o for o in reversed(self.orders) if o["instId"] == q["instId"] and o["state"] != "live"])
         if p == "/api/v5/trade/orders-pending":
-            return ok([o for o in self.orders if o["state"] == "live" and o["instId"] == q["instId"]])
+            return ok([o for o in self.orders if o["state"] in ("live", "partially_filled") and o["instId"] == q["instId"]])
         if p == "/api/v5/trade/cancel-order":
             for o in self.orders:
                 if o["ordId"] == b["ordId"]:
@@ -825,6 +825,89 @@ class BiggerSideTest(Base):
         tr.step()
         self.assertEqual(len(self.market_orders()), 1)
         self.assertEqual(self.state()["open"]["usd_against"], 0.0)
+
+
+class PartialEntryTest(Base):
+    """Рыночный вход исполнился частично (6 из 10), потом доисполнился:
+    запись и тейк — на весь объём, а не на первую часть."""
+
+    def partial(self, mode: str = "net_mode") -> lv.Trader:
+        self.ex = FakeOkx(mode)
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.order
+
+        def order(body):
+            got = real(body)
+            if body["clOrdId"].startswith("wtin"):
+                self.ex.orders[-1].update(state="partially_filled", accFillSz="6")
+                self.ex.pos[0]["pos"] = "6"
+            return got
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        tr.step()
+        op = self.state()["open"]
+        self.assertEqual((op["size"], op["in_done"]), (6.0, False))
+        [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
+        self.assertEqual(tp["sz"], "6")
+        return tr
+
+    def fill_rest(self, px: float = 100_000.0) -> None:
+        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
+        entry.update(state="filled", accFillSz="10", avgPx=str(px))
+        self.ex.pos[0]["pos"] = "10"
+
+    def test_late_fill_moves_record_and_tp_to_full_size(self) -> None:
+        for mode in ("net_mode", "long_short_mode"):
+            tr = self.partial(mode)
+            self.fill_rest(px=100_100.0)  # средняя цена всего входа — выше
+            self.now += MIN
+            tr.last_sync = 0
+            tr.step()
+            op = self.state()["open"]
+            self.assertEqual((op["size"], op["in_done"], op["px"]), (10.0, True, 100_100.0), mode)
+            live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
+            self.assertEqual([(o["sz"], o["px"]) for o in live], [("10", "101101")], "тейк — на весь объём от новой средней")
+            self.assertTrue(any("вход доисполнился" in e for e in self.state()["events"]))
+            for _ in range(2):   # дальше ничего не меняется и тейк не дублируется
+                self.now += MIN
+                tr.last_sync = 0
+                tr.step()
+            self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]), 1)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_no_late_fill_keeps_partial_and_stops_checking(self) -> None:
+        tr = self.partial()
+        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
+        entry.update(state="canceled")   # остаток рыночного отменён — 6 и есть весь вход
+        self.now += MIN
+        tr.last_sync = 0
+        tr.step()
+        op = self.state()["open"]
+        self.assertEqual((op["size"], op["in_done"]), (6.0, True))
+        self.assertEqual([o["sz"] for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], ["6"])
+
+    def test_tp_already_filling_is_not_touched(self) -> None:
+        tr = self.partial()
+        tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
+        tp.update(state="partially_filled", accFillSz="2")
+        self.fill_rest()
+        self.now += MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(tp["state"], "partially_filled", "тейк не снят")
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "и не задвоен")
+        self.assertTrue(any("тейк уже исполняется" in e for e in self.state()["events"]))
+
+    def test_never_more_than_ordered(self) -> None:
+        tr = self.partial()
+        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
+        entry.update(state="filled", accFillSz="1000")   # порча ответа
+        self.now += MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.state()["open"]["size"], 10.0)
 
 
 class EeaTest(Base):

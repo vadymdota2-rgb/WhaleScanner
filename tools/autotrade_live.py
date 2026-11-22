@@ -925,7 +925,9 @@ class Trader:
             op.update(mark=num(p.get("markPx")), upl=num(p.get("upl")))
             if op.get("exit"):
                 return  # выходим вслед за китом — тейк не ставить; закрытие повторит follow_whales
-            if any(o.get("ordId") == op.get("tp_id") for o in self.okx.pending(op["inst"])):
+            if op.get("in_done") is False:
+                self._entry_fill(op)
+            if op.get("tp_id") and any(o.get("ordId") == op["tp_id"] for o in self.okx.pending(op["inst"])):
                 return
             # Тейка в ожидающих нет: исполнен — сделка закрыта, хотя позиция на
             # бумаге осталась (её докупили руками) — новый тейк закрыл бы часть
@@ -944,6 +946,41 @@ class Trader:
             op.setdefault("gone_at", self.clock())  # позиции нет, а истории ещё нет — подождать до 5 минут
             return
         self._record_close(op, hist[0] if hist else {})
+
+    def _entry_fill(self, op: dict[str, Any]) -> None:
+        """Рыночный вход исполнился частично, а потом доисполнился: запись
+        позиции (объём, средняя цена, номинал) и тейк — на весь исполненный
+        объём, не на первую часть. Тейк ещё не тронут — снять и поставить
+        заново (ниже в _track_open) по новой средней цене; тейк уже начал
+        исполняться — не трогать, сказать в журнал."""
+        o = self.okx.get_order(op["inst"], str(op.get("in_id") or ""))
+        got = size_of(o.get("accFillSz"))
+        if got > size_of(op.get("size")):
+            got = min(got, size_of(op.get("ordered") or op.get("size")) or got)  # не больше заказанного
+            ins = self.instruments().get(op["inst"], {})
+            tp_o = self.okx.get_order(op["inst"], str(op["tp_id"])) if op.get("tp_id") else {}
+            if op.get("tp_id") and not (tp_o.get("state") == "live" and size_of(tp_o.get("accFillSz")) <= 0):
+                self.event(f"{op['inst']}: вход доисполнился до {fmt_dec(got)}, но тейк уже исполняется — "
+                           "остаток без тейка (выход вслед за китом работает)")
+            else:
+                avg = num(o.get("avgPx"))
+                if avg > 0 and abs(avg / op["px"] - 1) <= FILL_TOL:
+                    op["px"] = avg
+                    tp = round_step(avg * (1 + op["side"] * TP), ins.get("tickSz", "0.0001"),
+                                    ROUND_CEILING if op["side"] > 0 else ROUND_FLOOR)
+                    if tp > 0:
+                        op["tp"], op["tp_s"] = float(tp), fmt_dec(tp)
+                if op.get("tp_id"):
+                    self.okx.cancel(op["inst"], str(op["tp_id"]))
+                    op.pop("tp_id")  # _track_open поставит тейк заново на весь объём
+                in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
+                ct = num(ins.get("ctVal")) * num(ins.get("ctMult"), 1.0)
+                op["size"] = float(got)
+                op["notional"] = round(float(got) * ct * (1 if in_usd else op["px"]), 2)
+                self.event(f"{op['inst']}: вход доисполнился — {fmt_dec(got)} по {op['px']}, тейк {op['tp_s']} "
+                           "на весь объём")
+        if o.get("state") in ("filled", "canceled", "mmp_canceled"):
+            op["in_done"] = True
 
     def _record_close(self, op: dict[str, Any], h: dict[str, Any]) -> None:
         """Сделка закрыта: запись — один раз (сначала «позиции нет» в состоянии,
@@ -1261,7 +1298,10 @@ class Trader:
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id,
               "margin_pct": round(frac * 100, 2), "wallets": s.get("wallets") or {},
-              "usd": s.get("usd"), "usd_against": s.get("usd_against")}
+              "usd": s.get("usd"), "usd_against": s.get("usd_against"),
+              # Рыночный исполнен частично — может доисполниться: сверка
+              # увеличит запись и тейк (_entry_fill).
+              "in_done": o.get("state") == "filled", "ordered": float(sz)}
         self.st["open"] = op
         self.st["entered"][s["coin"]] = now
         self.st.pop("entering", None)

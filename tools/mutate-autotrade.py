@@ -20,7 +20,9 @@ ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "PYTHOND
 # Выброс встречного окна в опросе — для снимка в сигнале; решение всё равно
 # перепроверяет перевес на окнах за 2 часа до «сейчас» (balance) — наблюдаемо
 # то же самое.
-EQUIV: set[str] = {"киты против — те же 2 часа"}
+# Проверка «тейк в записи есть» перед поиском в ожидающих — защита от ответа
+# OKX без ordId; у настоящей OKX ordId есть всегда — наблюдаемо то же самое.
+EQUIV: set[str] = {"киты против — те же 2 часа", "тейка нет в записи — его надо поставить"}
 
 MUTS = [
     # Правила владельца
@@ -112,6 +114,18 @@ MUTS = [
      "повтор выхода — только остаток своего объёма"),
     ("            op[\"exit\"].setdefault(\"ids\", []).append(cl)\n", "            op[\"exit\"].setdefault(\"ids\", [])\n",
      "метка ордера выхода — в запись до отправки"),
+    # Частичный рыночный вход
+    ("            if op.get(\"in_done\") is False:\n                self._entry_fill(op)", "            if False:\n                self._entry_fill(op)",
+     "доисполнение входа — запись и тейк на весь объём"),
+    ("            got = min(got, size_of(op.get(\"ordered\") or op.get(\"size\")) or got)", "            pass",
+     "доисполнение — не больше заказанного"),
+    ("            if op.get(\"tp_id\") and not (tp_o.get(\"state\") == \"live\" and size_of(tp_o.get(\"accFillSz\")) <= 0):",
+     "            if False:", "тейк уже исполняется — не трогать"),
+    ("        if o.get(\"state\") in (\"filled\", \"canceled\", \"mmp_canceled\"):\n            op[\"in_done\"] = True",
+     "        if False:\n            op[\"in_done\"] = True", "вход завершён — больше не проверять"),
+    ("                if avg > 0 and abs(avg / op[\"px\"] - 1) <= FILL_TOL:", "                if False:", "тейк — от новой средней цены входа"),
+    ("            if op.get(\"tp_id\") and any(o.get(\"ordId\") == op[\"tp_id\"]", "            if any(o.get(\"ordId\") == op.get(\"tp_id\")",
+     "тейка нет в записи — его надо поставить"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
