@@ -85,12 +85,12 @@ jobs:
           --select E,F,W,B,UP,SIM,PL,RUF,S,BLE,I
           --ignore E501,PLR2004,RUF001,RUF002,RUF003,S310,S603,S607,PLR0911,PLR0912,PLR0913,PLR0915,PLR0917
           --per-file-ignores 'tests/*:PLC0415' --per-file-ignores 'tests/*:S311'
-          tools/autotrade_live.py tools/autotrade_backtest.py tools/mutate-autotrade.py
+          tools/autotrade_live.py tools/autotrade_backtest.py tools/autotrade_replay.py tools/mutate-autotrade.py
           tests/autotrade_live_test.py tests/autotrade_live_security_test.py tests/autotrade_live_props_test.py
-          tests/autotrade_backtest_test.py tests/autotrade_scale_test.py
+          tests/autotrade_backtest_test.py tests/autotrade_scale_test.py tests/autotrade_replay_test.py
       - name: Строгие типы (mypy --strict)
         working-directory: tools
-        run: pipx run mypy==1.11.2 --strict --python-version 3.10 autotrade_live.py autotrade_backtest.py
+        run: pipx run mypy==1.11.2 --strict --python-version 3.10 autotrade_live.py autotrade_backtest.py autotrade_replay.py
 
   autotrade-python:
     runs-on: ubuntu-latest
@@ -116,6 +116,7 @@ jobs:
           python tests/autotrade_live_security_test.py
           python tests/autotrade_live_props_test.py
           python tests/autotrade_backtest_test.py
+          python tests/autotrade_replay_test.py
 
   # Боевой сервер — Debian 13 со своим Python и SQLite.
   autotrade-debian:
@@ -138,6 +139,7 @@ jobs:
           python3 tests/autotrade_live_security_test.py
           python3 tests/autotrade_live_props_test.py
           python3 tests/autotrade_backtest_test.py
+          python3 tests/autotrade_replay_test.py
           python3 tests/autotrade_scale_test.py
 
   autotrade-mutation:

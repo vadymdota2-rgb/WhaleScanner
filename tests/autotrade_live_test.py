@@ -1733,6 +1733,11 @@ out = sys.argv[sys.argv.index("--out") + 1]
 mode = open(os.path.join(os.path.dirname(out), "mode")).read().strip()
 if mode == "sleep":
     time.sleep(60)
+if mode == "progress":
+    os.makedirs(out, exist_ok=True)
+    json.dump({"stage": "повтор", "done": 250, "total": 1000, "trades": 3, "requests": 17},
+              open(os.path.join(out, "progress.json"), "w"))
+    time.sleep(60)
 code = int(mode)
 if code == 0:
     os.makedirs(out, exist_ok=True)
@@ -1871,6 +1876,32 @@ class BacktestServiceTest(unittest.TestCase):
         files = [io.StringIO("0::/system.slice/x\n"), io.StringIO("мусор\n")]
         with mock.patch("builtins.open", side_effect=lambda *a, **k: files.pop(0)):
             self.assertEqual(lv.cgroup_limit_mb(), float("inf"))
+
+    def test_progress_shown_and_runs_replay_with_live_rules(self) -> None:
+        """Ход пересчёта — строкой во вкладку (раньше — только «считается»
+        часами); бэктест — повтор по правилам живого бота, капитал — как у
+        счёта сейчас, последние 30 дней."""
+        os.makedirs(os.path.join(self.dir, "live"))
+        with open(os.path.join(self.dir, "live", "state.json"), "w") as f:
+            json.dump({"equity": 124.83}, f)
+        b = self.bts("progress")
+        self.request()
+        b.tick(True)
+        args = b.proc.args
+        self.assertEqual((args[args.index("--since-days") + 1], args[args.index("--deposit") + 1]), ("30", "124.83"))
+        for _ in range(100):
+            b.tick(True)
+            if "25 %" in self.status().get("progress", ""):
+                break
+            lv.time.sleep(0.05)
+        self.assertEqual(self.status()["progress"], "повтор: 25 % (250 из 1 000 сделок китов), сделок 3, запросов к OKX 17")
+        b.tick(False)
+        self.assertEqual(self.status()["progress"], "")
+        self.assertTrue(lv.Backtests(self.dir, "/db").script.endswith("autotrade_replay.py"))
+        self.assertTrue(os.path.isfile(lv.Backtests(self.dir, "/db").script))
+
+    def test_deposit_unknown_is_1000(self) -> None:
+        self.assertEqual(lv.Backtests(self.dir, "/db").deposit(), 1000.0)
 
     def test_next_run_nightly_utc(self) -> None:
         day = 1_800_000_000 // 86400 * 86400

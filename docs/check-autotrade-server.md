@@ -15,7 +15,9 @@
 после «да» владельца по отчёту.
 
 Части модуля:
-- `~/WhaleScanner/tools/autotrade_backtest.py` — бэктест;
+- `~/WhaleScanner/tools/autotrade_replay.py` — бэктест-повтор по актуальным правилам
+  живого бота (его запускает служба ночью и по кнопке);
+- `~/WhaleScanner/tools/autotrade_backtest.py` — прежний бэктест-сетка (вручную, для исследований);
 - `~/WhaleScanner/tools/autotrade_live.py` — служба `whale-autotrade`:
   реальная торговля на OKX и пересчёт бэктеста (ночью и по кнопке) — со
   своим пределом памяти, не в API;
@@ -141,12 +143,13 @@ D=~/WalletTracker/autotrade_data
 ls -la "$D" "$D/latest" 2>/dev/null
 cat "$D/switch.json" 2>/dev/null || echo "switch.json нет — модуль выключен («Старт» не нажимали)"
 tail -n 20 "$D/last_run.log" 2>/dev/null
-cat "$D/backtest_status.json" 2>/dev/null           # running, started, finished, error, next
+cat "$D/backtest_status.json" 2>/dev/null           # running, started, finished, error, next, progress
+cat "$D/run/progress.json" 2>/dev/null              # ход идущего пересчёта: stage, done/total, trades, requests
 journalctl -u whale-api --since "-2 day" --no-pager | grep '\[AUTO\]' | tail -n 20
 journalctl -u whale-autotrade --since "-1 day" --no-pager | grep -v -iE 'key|secret|pass' | tail -n 30
 journalctl -k --since "-1 day" --no-pager | grep -iE 'oom|killed process' | tail -n 5   # ожидается пусто
-pgrep -af autotrade_backtest || echo "пересчёт сейчас не идёт"
-for p in $(pgrep -f autotrade_backtest); do ps -o pid,ni,rss,etime,cmd -p "$p"; done   # NI 19, RSS < 1 ГБ
+pgrep -af 'autotrade_(replay|backtest)' || echo "пересчёт сейчас не идёт"
+for p in $(pgrep -f 'autotrade_(replay|backtest)'); do ps -o pid,ni,rss,etime,cmd -p "$p"; done   # NI 19, RSS < 1 ГБ
 ```
 
 Что искать в журнале:

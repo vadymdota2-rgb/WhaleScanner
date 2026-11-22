@@ -15,7 +15,9 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PATH = os.path.join(ROOT, "tools", "autotrade_live.py")
 BT_PATH = os.path.join(ROOT, "tools", "autotrade_backtest.py")  # окно китов — общее с бэктестом
-TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py"]
+RP_PATH = os.path.join(ROOT, "tools", "autotrade_replay.py")    # бэктест-повтор по правилам живого бота
+TESTS = ["tests/autotrade_live_test.py", "tests/autotrade_live_security_test.py", "tests/autotrade_live_props_test.py",
+         "tests/autotrade_replay_test.py"]
 ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "PYTHONDONTWRITEBYTECODE": "1"}
 # Выброс встречного окна в опросе — для снимка в сигнале; решение всё равно
 # перепроверяет перевес на окнах за 2 часа до «сейчас» (balance) — наблюдаемо
@@ -196,6 +198,22 @@ MUTS = [
     ("            if now - mtime > CACHE_MAX_DAYS * 86400:", "            if False:", "кеш старше 30 дней — удаляется"),
 ]
 
+RP_MUTS = [
+    ("        if now < self.busy_until:", "        if False:", "повтор: позиция одна"),
+    ("        if now - self.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
+    ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
+    ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
+    ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),
+    ("        if s[\"side\"] * (hl_px / s[\"ref_px\"] - 1) > lv.CHASE:", "        if False:", "повтор: не догоняем"),
+    ("self.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "self.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
+    ("            if side * (best - tp) >= 0:", "            if False:", "повтор: тейк"),
+    ("            if exit_at is not None and exit_at + SYNC_MS < end:", "            if False:", "повтор: выход вслед за китом"),
+    ("            if not averaged and add_at is not None and add_at < end:", "            if False:", "повтор: усреднение"),
+    ("                edge = avg_px * (1 - side * lv.AVG_LOSS)", "                edge = avg_px", "повтор: усреднение — минус больше 1 %"),
+    ("            if ts > since:\n                run[w] += n", "            if True:\n                run[w] += n", "повтор: добор — после нашего входа"),
+    ("                if run[w] >= lv.MIN_WHALE_USD * lv.NANOS:", "                if run[w] > 0:", "повтор: добор от 1000 $"),
+]
+
 BT_MUTS = [
     ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
 ]
@@ -213,7 +231,7 @@ def main() -> int:
             return 2
     alive: list[str] = []
     total = 0
-    for path, muts in ((PATH, pick(MUTS)), (BT_PATH, pick(BT_MUTS))):
+    for path, muts in ((PATH, pick(MUTS)), (BT_PATH, pick(BT_MUTS)), (RP_PATH, pick(RP_MUTS))):
         alive += run(path, muts)
         total += len(muts) - len(EQUIV & {m[2] for m in muts})
     print(f"ИТОГ: убито {total - len(alive)} из {total}; выжили: {alive}")

@@ -392,6 +392,15 @@ class Signals:
                 "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now)).fetchall()
         finally:
             con.close()
+        out = self.feed(rows)
+        cut = now - WINDOW_MS - 20 * 60_000
+        self.seen = {t: s for t, s in self.seen.items() if s >= cut}
+        return out
+
+    def feed(self, rows: Any) -> list[dict[str, Any]]:
+        """Строки сделок открытия (tid, кошелёк, бумага, код, время, нано $,
+        штук) → окна и сигналы. Тот же код — и у живого бота (poll), и у
+        бэктеста-повтора (autotrade_replay.py): правила одни."""
         out: list[dict[str, Any]] = []
         for tid, wallet, coin, code, ts, nanos, units in rows:
             if tid in self.seen or not bt.is_perp(coin):
@@ -422,8 +431,6 @@ class Signals:
             if opp is not None and opp.count[0] >= MIN_WHALES and opp.big_u > 0 \
                     and self.whale_usd(opp) > self.whale_usd(w):
                 out.append(self._signal(coin, -side, opp, w, newest))
-        cut = now - WINDOW_MS - 20 * 60_000
-        self.seen = {t: s for t, s in self.seen.items() if s >= cut}
         return out
 
     def whale_usd(self, w: bt.Window | None) -> float:
@@ -530,7 +537,11 @@ class Signals:
 # ── бэктест: ночью и по кнопке, в этой службе (не в API) ─────────────────────
 
 BT_HOUR_UTC, BT_MINUTE = 3, 17
-BT_PAUSE_SEC = 15                 # между запросами к Hyperliquid
+# Бэктест — повтор по правилам живого бота (autotrade_replay.py): свечи OKX
+# (публичное API) только под кандидатов и сделки. Раньше — сетка прежнего
+# бэктеста с паузой 15 с к Hyperliquid: часы без видимого хода («завис»).
+BT_PAUSE_SEC = 0.15               # между запросами к OKX (публичное API: до 20 в 2 с)
+BT_DAYS = 30                      # сколько последних дней повторять
 BT_MEM_MB = 1200                  # предел памяти самого бэктеста (RLIMIT_AS)
 BT_NEED_MB = 1600                 # столько должна разрешать служба (MemoryMax) — иначе не запускаем
 BT_TIMEOUT_SEC = 6 * 3600
@@ -568,7 +579,7 @@ class Backtests:
     def __init__(self, data_dir: str, db: str, script: str | None = None,
                  limit_mb: Callable[[], float] = cgroup_limit_mb) -> None:
         self.dir, self.db = data_dir, db
-        self.script = script or os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotrade_backtest.py")
+        self.script = script or os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotrade_replay.py")
         self.limit_mb = limit_mb
         self.proc: subprocess.Popen[bytes] | None = None
         self.log: TextIO | None = None
@@ -579,6 +590,7 @@ class Backtests:
         for k in ("started", "finished"):
             self.st[k] = int(num(self.st.get(k)))
         self.st["error"] = self.st["error"] if isinstance(self.st.get("error"), str) else ""
+        self.st["progress"] = ""
 
     def _read(self) -> dict[str, Any]:
         try:
@@ -599,6 +611,7 @@ class Backtests:
         req = os.path.join(self.dir, "run.request")
         if self.proc is not None:
             rc = self.proc.poll()
+            self._progress()
             if not on and rc is None:
                 self._stop(self.proc, terminate=True)
                 self._done(None, "остановлено кнопкой «Стоп»")
@@ -629,10 +642,39 @@ class Backtests:
         self.log = open(os.path.join(self.dir, "last_run.log"), "w", encoding="utf-8")  # noqa: SIM115 — закрывается в _done
         self.proc = subprocess.Popen(  # свой скрипт, аргументы списком — без оболочки
             [sys.executable, "-I", self.script, "--db", self.db, "--out", out, "--cache",
-             os.path.join(self.dir, "cache"), "--pause", str(BT_PAUSE_SEC), "--max-mem-mb", str(BT_MEM_MB)],
+             os.path.join(self.dir, "cache"), "--pause", str(BT_PAUSE_SEC), "--max-mem-mb", str(BT_MEM_MB),
+             "--since-days", str(BT_DAYS), "--deposit", str(self.deposit())],
             stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(19))  # noqa: PLW1509 — однопоточная служба
-        self.st.update(running=True, started=int(now), error="")
+        self.st.update(running=True, started=int(now), error="", progress="запуск")
         self._write()
+
+    def deposit(self) -> float:
+        """Капитал для бэктеста — как у счёта сейчас (из состояния торговли);
+        неизвестен — 1000 $."""
+        try:
+            with open(os.path.join(self.dir, "live", "state.json"), encoding="utf-8") as f:
+                eq = num(json.load(f).get("equity"))
+        except (OSError, ValueError, AttributeError):
+            eq = 0.0
+        return round(eq, 2) if eq > 0 else 1000.0
+
+    def _progress(self) -> None:
+        """Ход пересчёта (progress.json бэктеста) — во вкладку строкой."""
+        try:
+            with open(os.path.join(self.dir, "run", "progress.json"), encoding="utf-8") as f:
+                p = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(p, dict):
+            return
+        total, done = num(p.get("total")), num(p.get("done"))
+        text = f"{p.get('stage', '')}".strip()
+        if total > 0:
+            text += f": {done / total * 100:.0f} % ({int(done):,} из {int(total):,} сделок китов)".replace(",", " ")
+        text += f", сделок {int(num(p.get('trades')))}, запросов к OKX {int(num(p.get('requests')))}"
+        if text != self.st.get("progress"):
+            self.st["progress"] = text[:200]
+            self._write()
 
     @staticmethod
     def _stop(proc: subprocess.Popen[bytes], terminate: bool) -> None:
@@ -664,7 +706,7 @@ class Backtests:
             if os.path.isdir(cur):
                 os.replace(cur, prev)
             os.replace(out, cur)
-        self.st.update(running=False, finished=int(time.time()), error=why)
+        self.st.update(running=False, finished=int(time.time()), error=why, progress="")
         self._write()
 
 
