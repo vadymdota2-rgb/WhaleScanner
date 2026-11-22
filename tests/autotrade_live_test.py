@@ -138,10 +138,8 @@ def make_db(path: str, fills: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, "
                 "ts INTEGER, notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, "
-                "dir TEXT NOT NULL DEFAULT '', leverage INTEGER NOT NULL DEFAULT 0)")
-    con.executemany(INS, [f[:7] for f in fills])
-    # 8-е поле (необязательное) — плечо сделки.
-    con.executemany("UPDATE hl_fills SET leverage = ? WHERE tid = ?", [(f[7], f[0]) for f in fills if len(f) > 7])
+                "dir TEXT NOT NULL DEFAULT '')")
+    con.executemany(INS, fills)
     con.commit()
     con.close()
 
@@ -790,33 +788,6 @@ class BiggerSideTest(Base):
         sk = self.state()["last_skip"]
         self.assertEqual(sk["code"], "bigger_against")
         self.assertIn("шорты 700 000 $ против 10 000 $", sk["why"])
-
-    def test_sides_compared_without_leverage(self) -> None:
-        """Правило владельца: стороны — по объёму БЕЗ плеча (маржа = номинал ÷
-        плечо). Шорты 2 × 50 000 $ при 50× — 2 000 $ своих денег; лонги 2 ×
-        5 000 $ при 1× — 10 000 $: с плечом крупнее шорты, без плеча — лонги.
-        Входим в лонг."""
-        shorts = [(*f, 50) for f in self.shorts(usd=50_000)]
-        longs = [(*f, 1) for f in self.whales()]
-        tr = self.trader(shorts + longs)
-        self.on()
-        tr.step()
-        [m] = self.market_orders()
-        self.assertEqual(m["side"], "buy")
-        self.assertEqual((self.state()["open"]["usd"], self.state()["open"]["usd_against"]), (10_000.0, 2_000.0))
-
-    def test_without_leverage_bigger_side_wins(self) -> None:
-        """Лонги 2 × 5 000 $ при 20× — 500 $ своих денег; шорты 2 × 4 000 $ при
-        1× — 8 000 $: с плечом крупнее лонги, без плеча — шорты. Входим с
-        шортами."""
-        shorts = [(*f, 1) for f in self.shorts(usd=4000)]
-        longs = [(*f, 20) for f in self.whales()]
-        tr = self.trader(shorts + longs)
-        self.on()
-        tr.step()
-        [m] = self.market_orders()
-        self.assertEqual(m["side"], "sell")
-        self.assertEqual((self.state()["open"]["usd"], self.state()["open"]["usd_against"]), (8_000.0, 500.0))
 
     def test_smaller_against_does_not_block(self) -> None:
         tr = self.trader(self.shorts(n=2, usd=2000) + self.whales())

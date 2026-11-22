@@ -56,10 +56,8 @@ class FakeMarket:
 def make_db(path: str, rows: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
-                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '', "
-                "leverage INTEGER NOT NULL DEFAULT 0)")
-    # 10-й столбец (необязательный) — плечо; нет — 0 (неизвестно), как у бота без позиции.
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?,?)", [(*r, 0)[:10] if len(r) == 9 else r for r in rows])
+                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '')")
+    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
     # Как в базе бота (hyperliquid_core.cpp): без этих индексов запросы китов — полным перебором.
     con.execute("CREATE INDEX idx_hl_fills_code_ts ON hl_fills(dir_code, ts)")
     con.execute("CREATE INDEX idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)")
@@ -179,15 +177,6 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual([t.coin for t in r["trades"]], ["BTC"], "позиция одна")
         self.assertGreater(r["skips"]["own_open"], 0)
 
-    def test_sides_compared_without_leverage(self) -> None:
-        # Шорты 2 × 700 000 $ при 100× — 14 000 $ без плеча (сами не входят: цена ушла от них на 0,4 %);
-        # лонги 2 × 15 000 $ при 1× (и каждый уже больше шортов без плеча): с плечом крупнее шорты,
-        # без плеча — лонги. Входим в лонг.
-        big = [(*opn(100 + i, f"0xbig{i}", "BTC", -1, T - (40 + i) * MIN, 700_000, 100_000), 100) for i in range(2)]
-        longs = [(*opn(1, "0xa", "BTC", 1, T - 2 * MIN, 15_000, 100_000), 1), (*opn(2, "0xb", "BTC", 1, T, 15_000, 100_000), 1)]
-        r = self.go(big + longs, step_price(100_000, [(T - 45 * MIN, -0.004), (T - 5 * MIN, 0.0), (T + 60 * MIN, 0.012)]))
-        self.assertEqual([(t.side, t.why) for t in r["trades"]], [(1, "тейк")])
-
     def test_coin_pause_three_hours(self) -> None:
         rows = [*self.whales(), *self.whales(t=T + 120 * MIN, base=10), *self.whales(t=T + 200 * MIN, base=20)]
         r = self.go(rows, step_price(100_000, [(T + 60 * MIN, 0.012), (T + 61 * MIN, 0.0),
@@ -267,7 +256,7 @@ class ReplayTest(unittest.TestCase):
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]
         r = self.go(rows, step_price(100_000, [(T + 20 * MIN, 0.005), (T + 90 * MIN, 0.012)]))
         b = r["books"]
-        self.assertEqual(list(b), ["live", "with_whales", "tp_or_whales", "no_average", "flows", "flows_half"])
+        self.assertEqual(list(b), ["live", "with_whales", "tp_or_whales", "no_average"])
         self.assertEqual(b["live"].trades[0].why, "тейк")
         for key in ("with_whales", "tp_or_whales"):
             [t] = b[key].trades
@@ -302,47 +291,6 @@ class ReplayTest(unittest.TestCase):
         [t] = r["books"]["no_average"].trades
         self.assertEqual((t.averaged, t.why), (False, "открыта"))
         self.assertEqual({x["key"]: x["averaged"] for x in r["summary"]["variants"]}["no_average"], 0)
-
-    def btc_flow(self, last_in: int, last_out: int) -> None:
-        """btc.db рядом с базой бота: 31 сутки ±100 до T, последние 24 часа — свои."""
-        con = sqlite3.connect(os.path.join(self.tmp.name, "btc.db"))
-        con.execute("DROP TABLE IF EXISTS btc_flow")
-        con.execute("CREATE TABLE btc_flow (ts INTEGER, ex TEXT, in_sats INTEGER, out_sats INTEGER, in_n INTEGER, out_n INTEGER)")
-        t = T // 1000
-        rows = [(t - k * 86400 - 3600, "binance", *((100, 0) if k % 2 else (0, 100))) for k in range(1, 32)]
-        con.executemany("INSERT INTO btc_flow VALUES (?,?,?,?,1,1)", [*rows, (t - 3600, "binance", last_in, last_out)])
-        con.commit()
-        con.close()
-
-    def test_flow_filter_variants(self) -> None:
-        """Варианты с фильтром потоков: сильный завод BTC на биржи (3σ) — лонг
-        не открываем (у правил бота — открыли); 0,7σ — только «от 0,5σ»
-        против; вывод — лонгу не мешает; по монете без данных — как всегда."""
-        price = step_price(100_000, [(T + 60 * MIN, 0.012)])
-        self.btc_flow(300, 0)
-        r = self.go(self.whales(), price)
-        b = r["books"]
-        self.assertEqual([t.why for t in b["live"].trades], ["тейк"])
-        self.assertEqual((b["flows"].trades, b["flows_half"].trades), ([], []))
-        v = {x["key"]: x for x in r["summary"]["variants"]}
-        self.assertGreater(v["flows"]["blocked"], 0)
-        self.assertEqual(v["live"]["blocked"], 0)
-        self.assertEqual(r["summary"]["data"]["flow_coins"], ["BTC"])
-        for last, flows, half in (((70, 0), 1, 0), ((0, 300), 1, 1)):
-            os.remove(self.db)
-            self.btc_flow(*last)
-            b = self.go(self.whales(), price)["books"]
-            self.assertEqual((len(b["flows"].trades), len(b["flows_half"].trades)), (flows, half), last)
-        # Шорт: сильный вывод с бирж (−3σ) — против шорта; сильный завод — за.
-        for last, flows in (((0, 300), 0), ((300, 0), 1)):
-            os.remove(self.db)
-            self.btc_flow(*last)
-            b = self.go(self.whales(side=-1), step_price(100_000, [(T + 60 * MIN, -0.012)]))["books"]
-            self.assertEqual(len(b["flows"].trades), flows, ("шорт", last))
-        os.remove(self.db)
-        self.cache += "eth"
-        r = self.go(self.whales(coin="ETH", px=3000), lambda c, t: 3000.0 * (1.012 if t >= T + 60 * MIN else 1))
-        self.assertEqual([t.why for t in r["books"]["flows"].trades], ["тейк"], "по ETH данных нет — как всегда")
 
     def test_same_signal_as_live_bot(self) -> None:
         """Повтор и живой бот на одних и тех же сделках китов видят один и тот

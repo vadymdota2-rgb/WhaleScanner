@@ -30,8 +30,7 @@
   новой средней) — на весь объём; при «Стоп» не усредняемся;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
-  крупнее по объёму БЕЗ плеча (маржа: номинал ÷ плечо; кошельки от 1000 $
-  номинала) — в слабую сторону не входим; если
+  крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
   крупных от 2 — входим в их сторону.
 
 Кнопки «Старт»/«Стоп» во вкладке пишут switch.json: «Стоп» — новых входов
@@ -91,9 +90,6 @@ NANOS = core.NANOS
 MIN_WHALES = 2
 MIN_WHALE_USD = 1000
 WINDOW_MS = 2 * 3_600_000
-# Объём сделки без плеча (маржа): номинал ÷ плечо; плечо неизвестно (0) —
-# номинал (как 1×). По нему сравниваются киты «за» и «против».
-MARGIN_SQL = "CASE WHEN leverage > 0 THEN notional_nanos / leverage ELSE notional_nanos END"
 CHASE = 0.003
 MATCH_TOL = 0.02
 # Маржа входа — всегда 5 % капитала (правило владельца 22.11.2026; раньше —
@@ -389,7 +385,7 @@ class Signals:
         con = self._con()
         try:
             rows = con.execute(
-                f"SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)), {MARGIN_SQL} FROM hl_fills "  # noqa: S608 — константа
+                "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
                 "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now)).fetchall()
         finally:
             con.close()
@@ -400,18 +396,16 @@ class Signals:
 
     def feed(self, rows: Any) -> list[dict[str, Any]]:
         """Строки сделок открытия (tid, кошелёк, бумага, код, время, нано $,
-        штук[, нано $ без плеча]) → окна и сигналы. Тот же код — и у живого бота (poll), и у
+        штук) → окна и сигналы. Тот же код — и у живого бота (poll), и у
         бэктеста-повтора (autotrade_replay.py): правила одни."""
         out: list[dict[str, Any]] = []
-        for row in rows:
-            tid, wallet, coin, code, ts, nanos, units = row[:7]
-            margin = int(row[7] or 0) if len(row) > 7 and row[7] is not None else None
+        for tid, wallet, coin, code, ts, nanos, units in rows:
             if tid in self.seen or not core.is_perp(coin):
                 continue
             self.seen[tid] = ts
             side = 1 if code == core.OPEN_LONG else -1
             w = self.windows.setdefault((coin, side), core.Window(self.limit))
-            w.add(ts, wallet, int(nanos or 0), float(units or 0.0), margin)
+            w.add(ts, wallet, int(nanos or 0), float(units or 0.0))
             # Окно — 2 часа до самой свежей сделки (опоздавшая старше окна
             # тут же выходит); момент сигнала — самая свежая сделка окна.
             newest = w.orders[-1][0]
@@ -428,45 +422,44 @@ class Signals:
                 continue
             if w.count >= MIN_WHALES and w.big_u > 0:
                 out.append(self._signal(coin, side, w, opp, newest))
-            # Против этих китов стоят киты крупнее (по объёму без плеча) и их тоже от 2 —
+            # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
             # сигнал и в их сторону: входим с крупными (правило владельца).
             if opp is not None and opp.count >= MIN_WHALES and opp.big_u > 0 \
-                    and self.whale_margin(opp) > self.whale_margin(w):
+                    and self.whale_usd(opp) > self.whale_usd(w):
                 out.append(self._signal(coin, -side, opp, w, newest))
         return out
 
-    def whale_margin(self, w: core.Window | None) -> float:
-        """Объём китов окна (кошельки от 1000 $) без плеча — маржа, $: по нему
-        сравниваются стороны (правило владельца — не по номиналу с плечом)."""
+    def whale_usd(self, w: core.Window | None) -> float:
+        """Объём китов окна (кошельки от 1000 $), $."""
         if w is None:
             return 0.0
-        return float(sum(v[4] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
+        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
 
     def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:
         """На момент решения (окна за 2 часа до «сейчас»), а не на момент строки
-        сигнала: объём китов (без плеча) за и против и сколько китов за (за время опроса
+        сигнала: объём китов за и против и сколько китов за (за время опроса
         могли прийти киты в другую сторону, а старые — выйти из окна)."""
         out = []
         for sd in (side, -side):
             w = self.windows.get((coin, sd))
             if w is not None:
                 w.expire(now - WINDOW_MS)
-            out.append(self.whale_margin(w))
+            out.append(self.whale_usd(w))
         w = self.windows.get((coin, side))
         return out[0], out[1], (w.count if w is not None else 0)
 
     def _signal(self, coin: str, side: int, w: core.Window, opp: core.Window | None, ts: int) -> dict[str, Any]:
         """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
         (от неё смотрим, не закрыли ли они в убыток), средняя цена китов,
-        объём китов сигнала и китов против без плеча (та же бумага, те же 2 часа)."""
+        объём китов сигнала и китов против (та же бумага, те же 2 часа)."""
         big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit}
         first: dict[str, int] = {}
-        for t, wl, _n, _u, _m in w.orders:
+        for t, wl, _n, _u in w.orders:
             if wl in big and wl not in first:
                 first[wl] = t
         return {"coin": coin, "side": side, "ts": ts, "whales": w.count, "wallets": first,
-                "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_margin(w), 2),
-                "usd_against": round(self.whale_margin(opp), 2)}
+                "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_usd(w), 2),
+                "usd_against": round(self.whale_usd(opp), 2)}
 
     def whale_loss(self, coin: str, side: int, wallets: dict[str, Any], now: int) -> list[tuple[str, float]]:
         """Киты сигнала, закрывшие позицию по этой бумаге и стороне в убыток:
@@ -1352,7 +1345,7 @@ class Trader:
             # Против сигнала — киты крупнее: в их сторону не идём (их сигнал,
             # если их от 2, — отдельный кандидат, он и войдёт).
             return self._skip("bigger_against", f"против сигнала киты крупнее: {'шорты' if s['side'] > 0 else 'лонги'} "
-                                                f"{against:,.0f} $ против {usd:,.0f} $ без плеча — входим только с крупными".replace(",", " "))
+                                                f"{against:,.0f} $ против {usd:,.0f} $ — входим только с крупными".replace(",", " "))
         lost = self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now)
         if lost:
             return self._skip("whale_exit", f"кит сигнала уже закрыл позицию в убыток ({lost[0][0][:10]}…, "
