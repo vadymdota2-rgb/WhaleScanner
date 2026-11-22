@@ -2,8 +2,8 @@
 # © 2026 Wallet Tracker. Все права защищены — см. LICENSE.
 """Бэктест-повтор (tools/autotrade_replay.py) — на синтетической базе китов
 и поддельных свечах OKX: без сети. Проверяется, что повтор торгует по тем же
-правилам, что живой бот: вход от 2 китов, тейк +1 %, выход вслед за китом в
-убытке, стоп −4 %, «входим с крупными», одна позиция, пауза на
+правилам, что живой бот: вход от 2 китов, тейк +0,75 %, выход вслед за китом
+в убытке, без стопа, «входим с крупными», одна позиция, пауза на
 бумагу, нет на OKX — пропуск; ход — в progress.json; итог — summary.json
 для вкладки; второй прогон — из кеша, без сети.
 """
@@ -56,10 +56,8 @@ class FakeMarket:
 def make_db(path: str, rows: list[tuple]) -> None:
     con = sqlite3.connect(path)
     con.execute("CREATE TABLE hl_fills (tid INTEGER PRIMARY KEY, wallet TEXT, coin TEXT, dir_code INTEGER, ts INTEGER, "
-                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '', "
-                "flat INTEGER NOT NULL DEFAULT 0)")
-    # 10-й столбец — flat (позиция закрыта до нуля, как пишет бот); у открытий — 0.
-    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?,?)", [r if len(r) == 10 else (*r, 0) for r in rows])
+                "notional_nanos INTEGER, sz TEXT, closed_pnl_nanos INTEGER NOT NULL DEFAULT 0, dir TEXT NOT NULL DEFAULT '')")
+    con.executemany("INSERT INTO hl_fills VALUES (?,?,?,?,?,?,?,?,?)", rows)
     # Как в базе бота (hyperliquid_core.cpp): без этих индексов запросы китов — полным перебором.
     con.execute("CREATE INDEX idx_hl_fills_code_ts ON hl_fills(dir_code, ts)")
     con.execute("CREATE INDEX idx_hl_fills_wallet_coin_ts ON hl_fills(wallet, coin, ts)")
@@ -71,9 +69,8 @@ def opn(tid: int, wallet: str, coin: str, side: int, ts: int, usd: float, px: fl
     return (tid, wallet, coin, 1 if side > 0 else 2, ts, int(usd * 1e9), str(usd / px), 0, "")
 
 
-def cls(tid: int, wallet: str, coin: str, side: int, ts: int, pnl: float, full: bool = True) -> tuple:
-    """Кит закрыл позицию (full — до нуля, flat = 1; иначе — частично)."""
-    return (tid, wallet, coin, 3 if side > 0 else 4, ts, int(5000 * 1e9), "0.05", int(pnl * 1e9), "", int(full))
+def cls(tid: int, wallet: str, coin: str, side: int, ts: int, pnl: float) -> tuple:
+    return (tid, wallet, coin, 3 if side > 0 else 4, ts, int(5000 * 1e9), "0.05", int(pnl * 1e9), "")
 
 
 def step_price(base: float, moves: list[tuple[int, float]]):
@@ -115,8 +112,8 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
         self.assertGreater(t.pnl, 0)
-        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +1 % ≈ +100 $ минус комиссии.
-        self.assertAlmostEqual(t.pnl, 100 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
+        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +0,75 % ≈ +75 $ минус комиссии.
+        self.assertAlmostEqual(t.pnl, 75 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
         s = r["summary"]
         self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
         self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])
@@ -133,47 +130,17 @@ class ReplayTest(unittest.TestCase):
         self.assertLess(t.pnl, 0)
         self.assertGreaterEqual(t.exit_t, T + 30 * MIN)
 
-    def test_partial_whale_loss_is_not_an_exit(self) -> None:
-        # Кит закрыл часть позиции в минус — сидим до тейка; закрыл всё в минус — выход.
-        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, -100.0, full=False)]
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003), (T + 90 * MIN, 0.012)]))
-        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
-        os.remove(self.db)
-        self.cache += "2"
-        rows = [*rows, cls(11, "0xa", "BTC", 1, T + 60 * MIN, +20.0)]   # полностью: −100 + 20 — в минусе
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003), (T + 90 * MIN, 0.012)]))
-        [t] = r["trades"]
-        self.assertEqual(t.why, "кит вышел в убыток")
-        self.assertGreaterEqual(t.exit_t, T + 60 * MIN)
-
     def test_whale_profit_close_keeps_position(self) -> None:
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]
         r = self.go(rows, step_price(100_000, [(T + 90 * MIN, 0.012)]))
         self.assertEqual(r["trades"][0].why, "тейк")
 
-    def test_stop_4pct(self) -> None:
-        """Стоп: цена против входа на 4 % — выход по рынку по цене стопа (или
-        хуже, если свеча открылась уже за ним); 3,9 % — держим; в одной свече
-        со стопом тейк не засчитывается."""
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.045)]))
+    def test_no_stop(self) -> None:
+        """Стопа нет: цена против входа на 30 % — держим; вернулась — тейк."""
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.3), (T + 90 * MIN, 0.009)]))
         [t] = r["trades"]
-        self.assertEqual(t.why, "стоп")
-        self.assertAlmostEqual(t.exit_px, 95_500 * 0.9995, delta=1, msg="свеча открылась за стопом — по её открытию")
-        self.assertLess(t.pnl, -400)
-        os.remove(self.db)
-        self.cache += "2"
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.039), (T + 90 * MIN, 0.012)]))
-        self.assertEqual([t.why for t in r["trades"]], ["тейк"], "3,9 % — не стоп")
-        os.remove(self.db)
-        self.cache += "3"
-
-        def dip(c: str, t: int) -> float:   # свеча в T+20 мин: открытие 100 000, минимум −4,2 %
-            return 95_800.0 if T + 20 * MIN < t < T + 25 * MIN else 100_000.0
-
-        r = self.go(self.whales(), dip)
-        [t] = r["trades"]
-        self.assertEqual(t.why, "стоп")
-        self.assertAlmostEqual(t.exit_px, 100_000 * 1.0005 * 0.96 * 0.9995, delta=1, msg="по цене стопа")
+        self.assertEqual(t.why, "тейк")
+        self.assertGreater(t.mae, 2_000, "провал внутри сделки виден")
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет

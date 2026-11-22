@@ -14,8 +14,8 @@
   одна;
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск), рыночный вход (проскальзывание);
-- выход: лимитный тейк +1 % от цены входа; по рынку — стоп (цена против
-  входа на 4 %) или кит сигнала закрыл в убыток; усреднения нет.
+- выход: лимитный тейк +0,75 % от цены входа; по рынку — кит сигнала
+  закрыл (хоть часть) в убыток; стопа и усреднения нет.
 
 Цены — 5-минутные свечи OKX (публичное API, без ключа; история — годы, по
 100 свечей за запрос), только под кандидатов и сделки, с кешем блоками по
@@ -23,7 +23,7 @@
 Итог — summary.json (его рисует вкладка) и report.txt.
 
 Допущения: цена решения — открытие 5-минутной свечи; внутри свечи при
-одновременном тейке и стопе (или выходе за китом) — стоп/выход (хуже);
+одновременном тейке и выходе за китом — выход (хуже);
 фандинг не учитывается.
 
     python3 tools/autotrade_replay.py --db ~/WhaleScanner/hyperliquid.db --since-days 30
@@ -199,7 +199,7 @@ class Trade:
     exit_px: float      # цена выхода; открытая — цена на конец данных
     notional: float     # $ по цене входа
     pnl: float          # $ с комиссиями
-    why: str            # тейк / стоп / кит вышел в убыток / открыта
+    why: str            # тейк / кит вышел в убыток / открыта
     mae: float          # худший ход против нас внутри сделки, $
 
     @property
@@ -274,11 +274,10 @@ class Replay:
         avg_px = entry
         fees = qty * entry * a.fee_taker / 100
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
-        stop = avg_px * (1 - side * lv.STOP)               # стоп: цена против входа на 4 %
         exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
-        for tf, o, h, lo, cl in self.px.candles(inst, now, self.px.now_ms):
+        for tf, _o, h, lo, cl in self.px.candles(inst, now, self.px.now_ms):
             t = int(tf)
             end = t + BAR_MS
             # Кит вышел в убыток — бот замечает на сверке (до 15 с) и закрывает по рынку.
@@ -287,15 +286,6 @@ class Replay:
                 fees += qty * px_out * a.fee_taker / 100
                 break
             worst = lo if side > 0 else h
-            # Стоп: цена дошла до −4 % — по рынку (бот видит на сверке; цена —
-            # стоп или хуже, если свеча открылась уже за ним). Раньше тейка в той
-            # же свече — хуже для нас.
-            if side * (worst - stop) <= 0:
-                why, t_out = "стоп", t
-                px_out = (o if side * (o - stop) <= 0 else stop) * (1 - side * slip)
-                mae = max(mae, qty * side * (avg_px - px_out))
-                fees += qty * px_out * a.fee_taker / 100
-                break
             mae = max(mae, qty * side * (avg_px - worst))
             best = h if side > 0 else lo
             if side * (best - tp) >= 0:
@@ -311,27 +301,25 @@ class Replay:
         self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae))
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
-        """Когда кто-то из китов сигнала впервые полностью закрыл позицию в
-        убытке (как Signals.whale_loss, но по времени): сделка с flat = 1, а
-        сумма closed_pnl его закрытий с первой сделки в окне < 0 — после
-        нашего входа. Частичное закрытие — не выход."""
+        """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
+        (как Signals.whale_loss, но по времени): сумма closed_pnl закрытий с
+        его первой сделки в окне < 0 — после нашего входа."""
         run: dict[str, int] = defaultdict(int)
-        for w, ts, p, flat in self.whale_rows(coin, side, wallets):
+        for w, ts, p in self.whale_rows(coin, side, wallets):
             run[w] += p
-            if ts > since and flat == 1 and run[w] < 0:
+            if ts > since and run[w] < 0:
                 return ts
         return None
 
-    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int, int]]:
+    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int]]:
         """Закрытия китов сигнала по бумаге (закрытие, разворот против нас,
-        ликвидация) с их первой сделки в окне: (кошелёк, время, closed_pnl,
-        flat — позиция закрыта полностью)."""
+        ликвидация) с их первой сделки в окне: (кошелёк, время, closed_pnl)."""
         since = {str(k): int(lv.num(v)) for k, v in wallets.items()}
         if not since:
             return []
         marks = ",".join("?" * len(since))
         codes = core.CLOSES_FOR[1 if side > 0 else -1]
-        q = (f"SELECT wallet, ts, closed_pnl_nanos, flat FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
+        q = (f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
              f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? "
              f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid")
         args = (coin, *since, *codes, min(since.values()), "%Long > Short%" if side > 0 else "%Short > Long%")
@@ -340,7 +328,7 @@ class Replay:
             rows = con.execute(q, args).fetchall()
         finally:
             con.close()
-        return [(str(w), int(t), int(v or 0), int(f or 0)) for w, t, v, f in rows if int(t) >= since.get(str(w), 10**18)]
+        return [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
 
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)
@@ -518,7 +506,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     text = "\n".join([
         "Бэктест-повтор по актуальным правилам живого бота",
         f"Период: {fmt(since)} — {fmt(now)}; капитал {a.deposit:.2f} $ → {rp.equity:.2f} $ (закрытые сделки); "
-        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, стоп −{lv.STOP * 100:g} %, "
+        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, без стопа, "
         "выход вслед за китом в убытке.",
         "Весь период: " + line(s["full"]),
         "Первые 3/4: " + line(s["first"]),

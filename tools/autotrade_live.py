@@ -19,16 +19,12 @@
   руками на счёте входу не мешают);
   на ту же бумагу, где ручная позиция, — не входит;
 - у бота своя позиция — всегда одна: пока её не закрыли, вторую не открываем;
-- выход — тейк +1 % движения цены (лимитный ордер на бирже); и второй
-  выход: кто-то из китов сигнала закрыл свою позицию по этой бумаге
-  ПОЛНОСТЬЮ (закрытие до нуля, разворот или ликвидация — flat в базе бота) и
-  итог его закрытий В УБЫТКЕ — бот снимает тейк и закрывает свою позицию
-  рыночным ордером (только на закрытие). Кит закрыл часть позиции (даже в
-  минус) или закрыл в плюс — сидим. Кит уже вышел так до входа — не входим;
-- стоп: цена против нашего входа на 4 % и больше (при 10× — около −40 %
-  PnL) — снять тейк и закрыть по рынку (тот же выход, что вслед за китом);
-  работает и при «Стоп» во вкладке; усреднения нет (правило владельца
-  22.11.2026);
+- выход — тейк +0,75 % движения цены (лимитный ордер на бирже); и второй
+  выход: кто-то из китов сигнала закрыл свою сделку по этой бумаге В УБЫТКЕ
+  (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
+  тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
+  закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
+- стопа и усреднения нет (правило владельца 22.11.2026);
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
   крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
@@ -96,12 +92,11 @@ MATCH_TOL = 0.02
 # 10 %, а при ручной сделке на счёте — 5 %). Своя позиция у бота — одна.
 MARGIN_FRAC = 0.05
 LEVERAGE = 10
-STOP = 0.04                # стоп: цена против входа на 4 % — по рынку (правило владельца 22.11.2026)
-TP = 0.01
+TP = 0.0075                # тейк +0,75 % движения цены (правило владельца 22.11.2026)
 COIN_PAUSE_MS = 3 * 3_600_000
 FILL_TOL = 0.05            # цена исполнения рыночного входа — не дальше 5 % от тикера
 ADOPT_TOL = 0.5            # подхват позиции: средняя цена — не дальше 50 % от рынка
-TP_SLACK = 0.005           # тейк на шаге цены — не дальше +1,5 % (иначе шаг цены слишком крупный)
+TP_SLACK = 0.005           # тейк на шаге цены — не дальше +1,25 % (иначе шаг цены слишком крупный)
 
 FRESH_MS = 15 * 60_000     # сигнал старше — не входим (бот мог отстать, момент ушёл)
 POLL_SEC = 5               # опрос базы
@@ -474,13 +469,10 @@ class Signals:
                 "usd_against": round(self.whale_usd(opp), 2)}
 
     def whale_loss(self, coin: str, side: int, wallets: dict[str, Any], now: int) -> list[tuple[str, float]]:
-        """Киты сигнала, ПОЛНОСТЬЮ закрывшие позицию по этой бумаге и стороне
-        в убыток: закрывающие сделки (закрытие, разворот, ликвидация) после их
-        первой сделки в окне сигнала и до «сейчас»; на сделке, которая закрыла
-        позицию до нуля (flat = 1 в базе бота: закрытие до нуля, разворот,
-        ликвидация), итог closed_pnl с начала < 0. Частичное закрытие (даже в
-        минус) и закрытие в плюс — не в счёт (правило владельца 22.11.2026).
-        → [(кошелёк, $)]."""
+        """Киты сигнала, закрывшие позицию по этой бумаге и стороне в убыток:
+        закрывающие сделки (закрытие, разворот, ликвидация) после их первой
+        сделки в окне сигнала и до «сейчас», итог closed_pnl < 0. Кит, у
+        которого закрытия в сумме в плюс, — не в счёт. → [(кошелёк, $)]."""
         since = {str(k): int(num(v)) for k, v in wallets.items() if isinstance(k, str)}
         if not since:
             return []
@@ -492,20 +484,17 @@ class Signals:
         con = self._con()
         try:
             rows = con.execute(
-                f"SELECT wallet, ts, closed_pnl_nanos, flat FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
+                f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
                 f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
-                f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid",
+                f"AND (dir_code != {core.FLIP} OR dir LIKE ?)",
                 (coin, *since, *codes, min(since.values()), now, flip)).fetchall()
         finally:
             con.close()
         pnl: dict[str, int] = {}
-        lost: dict[str, int] = {}
-        for wl, ts, p, flat in rows:
+        for wl, ts, p in rows:
             if ts >= since.get(wl, now + 1):
                 pnl[wl] = pnl.get(wl, 0) + int(p or 0)
-                if flat == 1 and pnl[wl] < 0 and wl not in lost:
-                    lost[wl] = pnl[wl]
-        return [(wl, p / NANOS) for wl, p in sorted(lost.items())]
+        return [(wl, p / NANOS) for wl, p in sorted(pnl.items()) if p < 0]
 
     def wallets_at(self, coin: str, side: int, ts: int) -> dict[str, int]:
         """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
@@ -1043,8 +1032,7 @@ class Trader:
                  "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": num(h.get("fee")),
                  "funding": num(h.get("fundingFee")), "notional": op["notional"],
                  "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.002
-                 else ("стоп" if op["exit"].get("kind") == "stop" else "кит вышел в убыток") if op.get("exit")
-                 else "закрыта"}
+                 else "кит вышел в убыток" if op.get("exit") else "закрыта"}
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
         self.st["open"] = None
@@ -1060,32 +1048,27 @@ class Trader:
         except OkxError as e:
             self.event(f"{op['inst']}: остаток тейка не снят — {e}; проверьте ордера в OKX")
 
-    # выход по рынку: стоп или вслед за китом
+    # выход вслед за китом
     def follow_whales(self) -> None:
-        """Стоп (цена против нашего входа на 4 % и больше) или кит сигнала
-        закрыл позицию в убыток — закрыть свою: снять тейк и рыночным ордером
-        только на закрытие. Не вышло (сбой, отказ) — запись «выходим»
-        остаётся, тейк заново не ставится, попытка — раз в минуту."""
+        """Кит сигнала закрыл позицию в убыток — закрыть свою: снять тейк и
+        рыночным ордером только на закрытие. Не вышло (сбой, отказ) — запись
+        «выходим» остаётся, тейк заново не ставится, попытка — раз в минуту."""
         op = self.st.get("open")
         if op and "wallets" not in op and num(op.get("signal_ts")) > 0:
             # Позиция открыта прежней версией (без китов в записи) — найти их по базе.
             op["wallets"] = self.sig.wallets_at(op["coin"], op["side"], int(num(op["signal_ts"])))
             self.event(f"{op['inst']}: киты сигнала восстановлены по базе — {len(op['wallets'])}; "
                        "выход вслед за ними в убытке включён")
-        if not op:
+        if not op or not isinstance(op.get("wallets"), dict) or not op["wallets"]:
             return
         now = self.clock()
         if not op.get("exit"):
-            why = self._stop_hit(op)
-            kind = "stop"
-            if not why and isinstance(op.get("wallets"), dict) and op["wallets"]:
-                lost = self.sig.whale_loss(op["coin"], op["side"], op["wallets"], now)
-                why = f"кит {lost[0][0][:10]}… закрыл в убыток {lost[0][1]:+.0f} $" if lost else ""
-                kind = "whale"
-            if not why:
+            lost = self.sig.whale_loss(op["coin"], op["side"], op["wallets"], now)
+            if not lost:
                 return
-            op["exit"] = {"at": now, "tried": 0, "why": why, "kind": kind}
-            self.event(f"{op['inst']}: {why} — закрываю позицию бота по рынку")
+            wl, usd = lost[0]
+            op["exit"] = {"at": now, "tried": 0, "why": f"кит {wl[:10]}… закрыл в убыток {usd:+.0f} $"}
+            self.event(f"{op['inst']}: {op['exit']['why']} — закрываю позицию бота по рынку")
         if now - num(op["exit"].get("tried")) < 60_000:
             return
         op["exit"]["tried"] = now
@@ -1127,27 +1110,13 @@ class Trader:
                 time.sleep(0.5)
             got = self._exit_fills(op)
         except OkxError as e:
-            self.event(f"{op['inst']}: закрыть по рынку не вышло — {e}; повтор через минуту")
+            self.event(f"{op['inst']}: закрыть вслед за китом не вышло — {e}; повтор через минуту")
             return
         if got is not None and got[0] >= size_of(op.get("size")):
             self._record_close(op, got[1])
 
-    def _stop_hit(self, op: dict[str, Any]) -> str:
-        """Стоп: цена позиции (mark) против нашего входа на STOP и больше —
-        причина строкой; нет — пусто. Позиции на счёте нет — не стоп (её
-        закрытие запишет _track_open)."""
-        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
-        px = num(op.get("px"))
-        if not live or px <= 0:
-            return ""
-        mark = num(live[0].get("markPx")) or self.okx.ticker(op["inst"])
-        move = op["side"] * (mark / px - 1) if mark > 0 else 0.0
-        if move > -STOP:
-            return ""
-        return f"стоп: цена {mark:.6g} против входа {px:.6g} ({move * 100:+.2f} %)"
-
     def _exit_fills(self, op: dict[str, Any]) -> tuple[Decimal, dict[str, Any]] | None:
-        """Ордера выхода по рынку (стоп или вслед за китом): сколько исполнено и итог для записи
+        """Ордера выхода вслед за китом: сколько исполнено и итог для записи
         (средняя цена, PnL и комиссии — суммой). Какой-то ещё исполняется — None."""
         done, val, pnl, fee, last = Decimal(0), 0.0, 0.0, 0.0, 0.0
         for cl in op["exit"].get("ids", []):
@@ -1175,7 +1144,7 @@ class Trader:
     def _place_tp(self, op: dict[str, Any], size: Decimal) -> None:
         ins = self.instruments().get(op["inst"], {})
         sz = round_step(size, ins.get("lotSz", "1"), ROUND_DOWN)
-        # Тейк — только по ту сторону от входа, не ближе +1 % (ни нулевой цены,
+        # Тейк — только по ту сторону от входа, не ближе тейка (ни нулевой цены,
         # ни цены «в рынок»: такой лимит исполнился бы сразу с убытком).
         if sz <= 0 or not (op.get("px", 0) > 0 and op.get("tp", 0) > 0
                            and op["side"] * (op["tp"] / op["px"] - 1) >= TP * 0.999):
@@ -1287,11 +1256,11 @@ class Trader:
         ct = float(ct_val * ct_mult)
         in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
         sz = contract_size(ins, notional, last)
-        # Тейк должен встать на шаг цены не ближе +1 % и не дальше +1,5 %: шаг
+        # Тейк должен встать на шаг цены не ближе TP и не дальше TP + 0,5 %: шаг
         # слишком крупный для этой цены — тейк невозможен, без выхода не входим.
         tp_try = round_step(last * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= TP + TP_SLACK:
-            return self._skip("tick", f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +1 % при цене {last}")
+            return self._skip("tick", f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +{TP * 100:g} % при цене {last}")
         if sz <= 0:
             return self._skip("min_size", f"позиция {notional:.0f} $ меньше минимальной на OKX")
         cl = f"{TAG}in{now % 10**12}"
