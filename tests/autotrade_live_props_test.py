@@ -9,7 +9,7 @@
      сходится с ценой китов (±2 %) и не хуже её больше чем на 0,3 %,
      размер не меньше минимума бумаги.
   2. Размер — ровно floor(маржа × капитал × 10 / (контракт × цена) / шаг) × шаг,
-     маржа 10 %, а при ручной позиции владельца на счёте — 5 % (контракт в
+     маржа всегда 5 %, и при ручной позиции владельца на счёте (контракт в
      долларах — без цены); номинал не больше маржа × 10 капитала.
   3. Вход — рыночный; выход — один лимитный ордер на весь объём; цена тейка
      — на шаге цены, по ту сторону от входа, не ближе +1 % и не дальше
@@ -89,7 +89,7 @@ class PropsTest(Base):
             self.on(on)
             tr.step()
             markets = [o for o in self.ex.orders if o["ordType"] == "market"]
-            frac = lv.MARGIN_FRAC_SHARED if manual else lv.MARGIN_FRAC
+            frac = lv.MARGIN_FRAC
             notional = Decimal(repr(round(self.ex.eq * frac * lv.LEVERAGE, 6)))
             qty = notional / (ct_val if ct_usd else ct_val * Decimal(repr(price)))
             want_sz = (qty / lot).to_integral_value(rounding=ROUND_DOWN) * lot
@@ -122,7 +122,7 @@ class PropsTest(Base):
             self.assertLessEqual(move, min(lv.TP + float(tick) / price + 1e-9, lv.TP + lv.TP_SLACK), ctx)
         # Проверка не пустая: заметная доля случаев дошла до входа.
         self.assertGreater(entered, PROPS // 20)
-        self.assertGreater(shared, 0, "ни одного входа при ручной позиции (5 %) — генератор не проверяет правило")
+        self.assertGreater(shared, 0, "ни одного входа при ручной позиции — генератор не проверяет правило")
 
 
 class FuzzTest(Base):
