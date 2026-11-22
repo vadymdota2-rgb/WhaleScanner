@@ -136,21 +136,21 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(r["trades"][0].why, "тейк")
 
     def test_average_once_then_tp_from_new_average(self) -> None:
-        # −1,5 % через 20 мин, кит добирает 2 000 $ в +40 мин, потом цена +0,3 % от входа.
+        # −3,5 % через 20 мин, кит добирает 2 000 $ в +40 мин, потом цена +0,3 % от входа.
         rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.035), (T + 120 * MIN, 0.003)]))
         [t] = r["trades"]
         self.assertEqual(r["summary"]["averaged"], 1)
         self.assertEqual(t.why, "тейк", "после усреднения тейк ближе — +1 % от новой средней")
         self.assertLess(t.tp, 100_000 * 1.01)
 
     def test_no_average_without_whale_add(self) -> None:
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.035), (T + 120 * MIN, 0.003)]))
         self.assertEqual(r["summary"]["averaged"], 0)
         self.assertEqual(r["trades"][0].why, "открыта", "без усреднения тейк +1 % от 100 000 не достигнут")
 
     def test_no_average_small_dip_or_small_add(self) -> None:
-        for dip, add in ((-0.005, 2000), (-0.015, 500)):   # минус 0,5 % — мало; добор 500 $ — мало
+        for dip, add in ((-0.025, 2000), (-0.035, 500)):   # минус 2,5 % — мало (нужно больше 3 %); добор 500 $ — мало
             self.cache = os.path.join(self.tmp.name, f"cache{dip}")  # свои свечи у каждого случая
             rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, add, 98_500)]
             r = self.go(rows, step_price(100_000, [(T + 20 * MIN, dip)]))

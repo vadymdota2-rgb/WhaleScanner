@@ -926,7 +926,7 @@ class PartialEntryTest(Base):
 
 
 class AverageTest(Base):
-    """Правило владельца: позиция в минусе больше 1 % (цена против входа) и
+    """Правило владельца: позиция в минусе больше 3 % (цена против входа) и
     кит сигнала добирает позицию после нашего входа — один раз доливаем 5 %
     капитала × 10× рыночным; средняя и тейк (+1 % от средней) — на весь объём."""
 
@@ -958,17 +958,17 @@ class AverageTest(Base):
     def avg_orders(self) -> list[dict]:
         return [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtav")]
 
-    def test_loss_over_1pct_and_whale_adds_average_once(self) -> None:
+    def test_loss_over_3pct_and_whale_adds_average_once(self) -> None:
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             tr = self.setup_long(mode, side)
             self.now += 20 * MIN
-            self.move(-side * 0.011)               # цена против нас на 1,1 %
+            self.move(-side * 0.031)               # цена против нас на 3,1 %
             self.whale_adds(side=side)              # кит сигнала добрал 3 000 $
             self.run_sync(tr)
             [av] = self.avg_orders()
-            # 5 % × 20 000 $ × 10 = 10 000 $ / (0,01 × 98 900) = 10,111 → 10,11 (шаг 0,01);
-            # шорт: цена 101 100 → 9,89.
-            px2 = 100_000 * (1 - side * 0.011)
+            # 5 % × 20 000 $ × 10 = 10 000 $ / (0,01 × 96 900) = 10,319 → 10,31 (шаг 0,01);
+            # шорт: цена 103 100 → 9,69; 10 + 9,69 — ровно 19,69 (не 19,689999… → 19,68).
+            px2 = 100_000 * (1 - side * 0.031)
             add = int(10_000 / (0.01 * px2) * 100) / 100
             self.assertEqual((av["ordType"], av["side"], av["sz"]),
                              ("market", "buy" if side > 0 else "sell", f"{add:g}"), mode)
@@ -982,7 +982,7 @@ class AverageTest(Base):
             self.assertAlmostEqual(float(live[0]["px"]), op["px"] * (1 + side * lv.TP), delta=0.1)
             self.assertTrue(any("усредняюсь на 5 %" in e for e in self.state()["events"]))
             # Только один раз: минус глубже, кит добирает ещё — второй доливки нет.
-            self.move(-side * 0.03)
+            self.move(-side * 0.05)
             self.whale_adds(side=side, tid=301)
             self.run_sync(tr, 3)
             self.assertEqual(len(self.avg_orders()), 1)
@@ -990,10 +990,10 @@ class AverageTest(Base):
             os.remove(os.path.join(self.dir, "live", "state.json"))
 
     def test_no_average_without_all_conditions(self) -> None:
-        cases = [("минус меньше 1 %", -0.009, "0xa", 3000, 1),
-                 ("кит добрал меньше 1000 $", -0.02, "0xa", 900, 1),
-                 ("добрал не кит сигнала", -0.02, "0xother", 50_000, 1),
-                 ("кит добрал до нашего входа", -0.02, "0xa", 3000, 30),
+        cases = [("минус меньше 3 %", -0.029, "0xa", 3000, 1),
+                 ("кит добрал меньше 1000 $", -0.04, "0xa", 900, 1),
+                 ("добрал не кит сигнала", -0.04, "0xother", 50_000, 1),
+                 ("кит добрал до нашего входа", -0.04, "0xa", 3000, 30),
                  ("в плюсе", +0.02, "0xa", 3000, 1)]
         for name, pct, wallet, usd, ago in cases:
             self.ex = FakeOkx()
@@ -1011,7 +1011,7 @@ class AverageTest(Base):
         tr = self.setup_long()
         self.on(False)
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
         self.run_sync(tr)
         self.assertEqual(self.avg_orders(), [])
@@ -1028,12 +1028,12 @@ class AverageTest(Base):
 
         tr.okx.order = order  # type: ignore[method-assign]
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
         self.run_sync(tr, 3)
         self.assertEqual(len(self.avg_orders()), 1)
         op = self.state()["open"]
-        self.assertEqual((op["size"], op["avg"]["done"]), (20.2, True))   # 10 000 $ / 980 = 10,2
+        self.assertEqual((op["size"], op["avg"]["done"]), (20.41, True))   # 10 000 $ / 960 = 10,41
 
     def test_refused_is_not_retried(self) -> None:
         tr = self.setup_long()
@@ -1046,7 +1046,7 @@ class AverageTest(Base):
 
         tr.okx.order = order  # type: ignore[method-assign]
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
         self.run_sync(tr, 3)
         op = self.state()["open"]
@@ -1068,7 +1068,7 @@ class AverageTest(Base):
 
         tr.okx.order = order  # type: ignore[method-assign]
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
         tr.last_sync = 0
         with self.assertRaises(SystemExit):
@@ -1078,7 +1078,7 @@ class AverageTest(Base):
         self.on()
         self.run_sync(tr, 2)
         self.assertEqual(len(self.avg_orders()), 1)
-        self.assertEqual(self.state()["open"]["size"], 20.2)
+        self.assertEqual(self.state()["open"]["size"], 20.41)
 
     def avg_with(self, tr: lv.Trader, patch) -> None:
         real = tr.okx.order
@@ -1091,7 +1091,7 @@ class AverageTest(Base):
 
         tr.okx.order = order  # type: ignore[method-assign]
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
 
     def test_partial_then_final_applied_once(self) -> None:
@@ -1115,7 +1115,7 @@ class AverageTest(Base):
         tr = self.setup_long()
         self.avg_with(tr, lambda o: o.update(accFillSz="1000"))
         self.run_sync(tr)
-        self.assertEqual(self.state()["open"]["size"], 20.2)
+        self.assertEqual(self.state()["open"]["size"], 20.41)
 
     def test_tp_already_filling_not_touched_on_average(self) -> None:
         tr = self.setup_long()
@@ -1130,13 +1130,13 @@ class AverageTest(Base):
     def test_whale_loss_exit_closes_averaged_size(self) -> None:
         tr = self.setup_long()
         self.now += 20 * MIN
-        self.move(-0.02)
+        self.move(-0.04)
         self.whale_adds()
         self.run_sync(tr)
         close_fill(self.db, 400, "0xb", "BTC", 3, self.now, -100.0)
         self.run_sync(tr)
         [ex] = [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
-        self.assertEqual(ex["sz"], "20.2", "выход — весь усреднённый объём")
+        self.assertEqual(ex["sz"], "20.41", "выход — весь усреднённый объём")
         self.assertIsNone(self.state()["open"])
 
 
