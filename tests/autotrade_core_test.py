@@ -23,6 +23,8 @@ sys.path.insert(0, os.path.join(ROOT, "tests"))
 import autotrade_core as core  # noqa: E402
 import autotrade_replay as rp  # noqa: E402
 
+NOW_S = 1_800_000_000
+
 
 class CoreTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -43,6 +45,64 @@ class CoreTest(unittest.TestCase):
         ro.close()
         with self.assertRaises(OSError):  # не SystemExit: у службы это ошибка шага, а не выход
             core.open_ro(os.path.join(self.tmp.name, "нет.db"))
+
+    def flow_dbs(self, btc_days: list[tuple[int, int]] | None, bsc: list[tuple[int, str, int, int]] | None = None,
+                 names: dict[str, str] | None = None) -> core.Flows:
+        """btc_days: [(завод, вывод)] по суткам, [0] — последние 24 часа до NOW_S."""
+        d = self.tmp.name
+        btc, bscex, main = (os.path.join(d, x) for x in ("btc.db", "bsc_ex.db", "whale_bot.db"))
+        for f in (btc, bscex, main):
+            if os.path.exists(f):
+                os.remove(f)
+        if btc_days is not None:
+            con = sqlite3.connect(btc)
+            con.execute("CREATE TABLE btc_flow (ts INTEGER, ex TEXT, in_sats INTEGER, out_sats INTEGER, in_n INTEGER, out_n INTEGER)")
+            con.executemany("INSERT INTO btc_flow VALUES (?,?,?,?,1,1)",
+                            [(NOW_S - k * 86400 - 3600, "binance", i, o) for k, (i, o) in enumerate(btc_days)])
+            con.commit()
+            con.close()
+        if bsc is not None:
+            con = sqlite3.connect(bscex)
+            con.execute("CREATE TABLE bsc_ex_flow (ts INTEGER, ex TEXT, token TEXT, in_usd INTEGER, out_usd INTEGER, "
+                        "in_n INTEGER, out_n INTEGER, in_qty REAL, out_qty REAL)")
+            con.executemany("INSERT INTO bsc_ex_flow VALUES (?,?,?,?,?,1,1,0,0)", [(t, "binance", tok, i, o) for t, tok, i, o in bsc])
+            con.commit()
+            con.close()
+            con = sqlite3.connect(main)
+            con.execute("CREATE TABLE token_cache (address TEXT PRIMARY KEY, symbol TEXT)")
+            con.executemany("INSERT INTO token_cache VALUES (?,?)", list((names or {}).items()))
+            con.commit()
+            con.close()
+        return core.Flows(btc, bscex, main)
+
+    def test_exchange_flows_z(self) -> None:
+        """Потоки на биржи: z — чистый завод за 24 часа против разброса дневных
+        за 30 дней (плюс — заводят, минус — выводят); нет данных, мало истории,
+        акции — None; токены BSC — по тикеру (BNB — «native:bnb»), стейблкоины
+        не в счёт; 10-минутная строка, не закончившаяся к «сейчас», — не в счёт."""
+        hist = [(100, 0) if k % 2 else (0, 100) for k in range(1, 32)]   # ±100 — разброс 100, среднее 0 (31-е — до окна)
+        fl = self.flow_dbs([(300, 0), *hist])
+        self.assertAlmostEqual(fl.z("BTC", NOW_S * 1000) or 0, 3.0, places=6)
+        self.assertTrue(fl.covered("BTC"))
+        self.assertIsNone(fl.z("xyz:TSLA", NOW_S * 1000))
+        self.assertIsNone(fl.z("ETH", NOW_S * 1000), "по ETH данных нет")
+        fl = self.flow_dbs([(0, 300), *hist])
+        self.assertAlmostEqual(fl.z("BTC", NOW_S * 1000) or 0, -3.0, places=6)
+        fl = self.flow_dbs([(0, 300), *hist[:5]])                      # 5 суток истории — мало
+        self.assertIsNone(fl.z("BTC", NOW_S * 1000))
+        os.remove(os.path.join(self.tmp.name, "btc.db"))
+        self.assertFalse(core.Flows(os.path.join(self.tmp.name, "btc.db"), "", "").covered("BTC"))
+        cake = "0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82"
+        rows = [(NOW_S - k * 86400 - 3600, tok, *((100, 0) if k % 2 else (0, 100))) for k in range(1, 32)
+                for tok in ("native:bnb", cake, "0xusdt", "0xfoo")]
+        rows += [(NOW_S - 3600, "native:bnb", 500, 0), (NOW_S - 300, "native:bnb", 0, 10**6),   # последняя — не закончилась
+                 (NOW_S - 3600, cake, 0, 200), (NOW_S - 3600, "0xfoo", 300, 0)]
+        fl = self.flow_dbs(None, rows, {"0xusdt": "USDT", "0xfoo": "FOO"})
+        self.assertAlmostEqual(fl.z("BNB", NOW_S * 1000) or 0, 5.0, places=6)
+        self.assertAlmostEqual(fl.z("CAKE", NOW_S * 1000) or 0, -2.0, places=6)
+        self.assertAlmostEqual(fl.z("FOO", NOW_S * 1000) or 0, 3.0, places=6, msg="тикер — из token_cache")
+        self.assertFalse(fl.covered("USDT"), "стейблкоины — не монета для сделки")
+        self.assertEqual(fl.cache[("BNB", NOW_S // 600)], fl.z("BNB", NOW_S * 1000), "кеш — по 10 минут")
 
     def test_okx_names(self) -> None:
         self.assertEqual(core.okx_candidate("kPEPE"), ("PEPE", 1000.0))

@@ -208,6 +208,9 @@ RP_MUTS = [
     ("        if now - b.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
     ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
     ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
+    ("                if s[\"side\"] * z > b.rules.flow_z:", "                if z > b.rules.flow_z:", "повтор: потоки — по стороне сделки"),
+    ("                self.flow_seen.add(s[\"coin\"])\n", "", "повтор: монеты с потоками — в итог"),
+    ("\"blocked\": b.skips.get(\"flow_against\", 0)}", "\"blocked\": 0}", "повтор: сколько не вошли из-за потоков"),
     ("ABS(CAST(sz AS REAL)), {lv.MARGIN_SQL} FROM hl_fills", "ABS(CAST(sz AS REAL)), notional_nanos FROM hl_fills",
      "повтор: стороны — без плеча"),
     ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),
@@ -233,6 +236,14 @@ RP_MUTS = [
 ]
 
 CORE_MUTS = [
+    ("            nets = [i - o for i, o in days]", "            nets = [o - i for i, o in days]", "потоки: завод на биржи — плюс"),
+    ("            past = nets[1:]", "            past = nets", "потоки: разброс — по прошлым суткам"),
+    ("        if days is not None and len(days) - 1 >= FLOW_MIN_DAYS:", "        if days is not None and len(days) > 1:",
+     "потоки: от 7 суток истории"),
+    ("            args = (t_s, *toks, t_s - 31 * 86400, t_s - 600)", "            args = (t_s, *toks, t_s - 31 * 86400, t_s)",
+     "потоки: строка BSC — только закончившаяся"),
+    (" and sym not in self.STABLE", "", "потоки: стейблкоины — не монета сделки"),
+    (" or names.get(t.lower())", "", "потоки: тикер токена BSC — из базы бота"),
     ("            self.orders.insert(i, item)", "            self.orders.append(item)", "опоздавшая сделка — на своё место"),
     ("        m = nanos if margin is None else margin", "        m = nanos", "окно: маржа сделки, а не номинал"),
     ("            self._change(w, -n, -u, -1, -int(u > 0), -m)", "            self._change(w, -n, -u, -1, -int(u > 0), 0)",

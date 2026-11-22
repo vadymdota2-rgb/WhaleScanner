@@ -25,8 +25,9 @@
 
 Сравнение вариантов: тот же поток сигналов ведут сразу несколько счетов —
 правила живого бота и варианты выхода (VARIANTS: «вместе с китами» без
-тейка, тейк или раньше — вместе с китом, без усреднения). Вход у всех — по
-правилам живого бота; у каждого счёта свой капитал, своя позиция и паузы.
+тейка, тейк или раньше — вместе с китом, без усреднения, фильтр потоков на
+биржи: сильный завод — не лонг, сильный вывод — не шорт). Вход у всех — по
+правилам живого бота (у вариантов с фильтром — ещё и он); у каждого счёта свой капитал, своя позиция и паузы.
 Вкладка показывает их рядом — правила меняются по цифрам, а не на глаз.
 
 Допущения: цена решения — открытие 5-минутной свечи; внутри свечи при
@@ -235,6 +236,7 @@ class Rules:
     tp: bool = True             # лимитный тейк +1 % от средней
     with_whales: bool = False   # выход, когда кит сигнала закрыл от 1000 $ (в плюс или в минус); иначе — только в убытке
     average: bool = True        # разовое усреднение
+    flow_z: float | None = None  # фильтр потоков на биржи: завод сильнее flow_z σ — не лонг, вывод — не шорт
 
 
 VARIANTS = (
@@ -243,6 +245,8 @@ VARIANTS = (
           tp=False, with_whales=True),
     Rules("tp_or_whales", "тейк +1 % или раньше — вместе с китом", with_whales=True),
     Rules("no_average", "как сейчас, без усреднения", average=False),
+    Rules("flows", "как сейчас + потоки на биржи: сильный завод (от 1σ) — не лонг, сильный вывод — не шорт", flow_z=1.0),
+    Rules("flows_half", "как сейчас + потоки на биржи (от 0,5σ)", flow_z=0.5),
 )
 
 
@@ -268,6 +272,11 @@ class Replay:
         self.a, self.px, self.instr, self.progress = a, prices, instr, progress
         self.sig = lv.Signals(a.db)
         self.books = [Book(r, float(a.deposit)) for r in VARIANTS]
+        # Заводы на биржи и выводы (BTC и токены BSC) — для вариантов с фильтром потоков.
+        here = os.path.dirname(os.path.abspath(a.db))
+        self.flows = core.Flows(a.btc_db or os.path.join(here, "btc.db"), a.bscex_db or os.path.join(here, "bsc_ex.db"),
+                                a.main_db or os.path.join(here, "whale_bot.db"))
+        self.flow_seen: set[str] = set()
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, b: Book, s: dict[str, Any], now: int) -> str:
@@ -309,6 +318,13 @@ class Replay:
         tp_try = lv.round_step(last * (1 + s["side"] * lv.TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not lv.TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= lv.TP + lv.TP_SLACK:
             return "tick"
+        if b.rules.flow_z is not None:
+            z = self.flows.z(s["coin"], now)
+            if z is not None:
+                self.flow_seen.add(s["coin"])
+                # Плюс — заводят на биржи (к продаже): против лонга; минус — выводят: против шорта.
+                if s["side"] * z > b.rules.flow_z:
+                    return "flow_against"
         self.open_trade(b, s, inst, ins, sz, last, now)
         return ""
 
@@ -524,7 +540,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         v_all, _v_first, v_last = split(b.trades, cut)
         variants.append({"key": b.rules.key, "name": b.rules.name, "deposit_end": round(b.equity, 2),
                          "verdict": passed(v_all, v_last, crit), "full": v_all, "last": v_last,
-                         "averaged": sum(t.averaged for t in b.trades)})
+                         "averaged": sum(t.averaged for t in b.trades), "blocked": b.skips.get("flow_against", 0)})
 
     def group(key: Callable[[Trade], str]) -> list[dict[str, Any]]:
         g: dict[str, list[Trade]] = defaultdict(list)
@@ -554,7 +570,9 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         "sizing": {"deposit": a.deposit, "deposit_end": round(main.equity, 2), "margin_pct": lv.MARGIN_FRAC * 100,
                    "leverage": lv.LEVERAGE, "fee_taker_pct": a.fee_taker, "fee_maker_pct": a.fee_maker,
                    "slippage_pct": a.slippage},
-        "data": {"signals": sum(main.skips.values()), "requests": rp.px.requests, "errors": rp.px.errors},
+        "data": {"signals": sum(main.skips.values()), "requests": rp.px.requests, "errors": rp.px.errors,
+                 # Монеты, по которым были данные о потоках на биржи (BTC, токены BSC).
+                 "flow_coins": sorted(rp.flow_seen)[:50]},
         "full": st_all, "first": st_first, "last": st_last,
         # Те же сигналы — другие правила выхода (первый — сами правила бота).
         "variants": variants,
@@ -583,6 +601,9 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--since-days", type=int, default=30, help="сколько последних дней повторить")
     ap.add_argument("--deposit", type=float, default=1000, help="капитал на начало, $")
     ap.add_argument("--delay", type=int, default=5, help="задержка решения после сделки кита, с (опрос базы)")
+    ap.add_argument("--btc-db", default=os.environ.get("WHALE_BTC_DB_FILE", ""), help="база биткоина бота (потоки на биржи)")
+    ap.add_argument("--bscex-db", default=os.environ.get("WHALE_BSCEX_DB_FILE", ""), help="база бирж BSC бота (потоки на биржи)")
+    ap.add_argument("--main-db", default="", help="основная база бота (тикеры токенов BSC)")
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание рыночного ордера, %%")
     ap.add_argument("--fee-taker", type=float, default=0.05, help="комиссия тейкера OKX, %%")
     ap.add_argument("--fee-maker", type=float, default=0.02, help="комиссия мейкера OKX (тейк лимитом), %%")
