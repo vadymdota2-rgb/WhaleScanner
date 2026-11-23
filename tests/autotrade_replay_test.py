@@ -27,6 +27,8 @@ MIN = 60_000
 INSTR = [{"instId": "BTC-USDT-SWAP", "ctVal": "0.01", "ctMult": "1", "ctValCcy": "BTC", "lotSz": "0.01", "minSz": "0.01",
           "tickSz": "0.1", "state": "live"},
          {"instId": "ETH-USDT-SWAP", "ctVal": "0.1", "ctMult": "1", "ctValCcy": "ETH", "lotSz": "0.01", "minSz": "0.01",
+          "tickSz": "0.01", "state": "live"},
+         {"instId": "SOL-USDT-SWAP", "ctVal": "1", "ctMult": "1", "ctValCcy": "SOL", "lotSz": "0.01", "minSz": "0.01",
           "tickSz": "0.01", "state": "live"}]
 
 
@@ -156,6 +158,26 @@ class ReplayTest(unittest.TestCase):
             r = self.go(rows, step_price(100_000, [(T + 20 * MIN, dip)]))
             self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
             os.remove(self.db)
+
+    def test_after_close_bigger_dominance_first(self) -> None:
+        """Позиция BTC открыта; за это время — сигналы ETH (первым, потом ещё
+        кит — самый свежий, 15 000 $) и SOL (перевес 100 000 $). BTC закрылась
+        по тейку — входим в SOL: из пула за 15 минут — больший перевес, а не
+        первый и не последний сигнал."""
+        base = {"BTC": 100_000.0, "ETH": 3000.0, "SOL": 200.0}
+
+        def price(c: str, t: int) -> float:
+            k = 1.012 if c == "BTC" and t >= T + 15 * MIN else 1.0
+            return base[c] * (1.012 if c == "SOL" and t >= T + 40 * MIN else k)
+
+        rows = [*self.whales(),
+                opn(10, "0xe1", "ETH", 1, T + 9 * MIN, 5000, 3000.0), opn(11, "0xe2", "ETH", 1, T + 10 * MIN, 5000, 3000.0),
+                opn(12, "0xs1", "SOL", 1, T + 11 * MIN, 50_000, 200.0), opn(13, "0xs2", "SOL", 1, T + 12 * MIN, 50_000, 200.0),
+                opn(15, "0xe3", "ETH", 1, T + 13 * MIN, 5000, 3000.0),
+                opn(14, "0xdust", "ETH", -1, T + 22 * MIN, 50, 3000.0)]   # строка после закрытия BTC — шаг повтора
+        r = self.go(rows, price)
+        self.assertEqual([(t.coin, t.why) for t in r["trades"]], [("BTC", "тейк"), ("SOL", "тейк")])
+        self.assertEqual(r["skips"]["entered"], 2)
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет

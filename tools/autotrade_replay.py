@@ -9,6 +9,8 @@
 - от 2 китов в одну сторону за 2 часа, у каждого от 1000 $; на момент входа —
   тоже от 2; против — киты крупнее или поровну — не входим, крупных от 2 —
   входим с ними; кит сигнала уже вышел в убыток — не входим;
+- не первая попавшаяся сделка: из сигналов за 15 минут — сначала тот, где
+  перевес китов в $ больше (объём за минус против, Signals.rank);
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
   средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; позиция —
   одна;
@@ -52,6 +54,7 @@ import autotrade_live as lv
 BAR_MS = 300_000                  # 5-минутные свечи OKX
 BLOCK_MS = 100 * BAR_MS           # блок кеша — 100 свечей (один запрос)
 SYNC_MS = 15_000                  # живой бот сверяет счёт раз в 15 с
+REEVAL_MS = 60_000                # пул сигналов без новых — перебрать снова не реже раза в минуту
 Fetch = Callable[[dict[str, Any]], object]
 
 
@@ -221,11 +224,13 @@ class Replay:
         self.entered: dict[str, int] = {}
         self.busy_until = 0
         self.skips: defaultdict[str, int] = defaultdict(int)
+        self.pool: dict[tuple[str, int], dict[str, Any]] = {}   # сигналы за 15 минут, как у живого бота
+        self.last_eval = -(10**18)
+        self.fresh = False   # в пуле есть сигналы, которых ещё не перебирали
+        self.counted: set[tuple[str, int, int, str]] = set()   # пропуск сигнала с причиной — один раз
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, s: dict[str, Any], now: int) -> str:
-        if now < self.busy_until:
-            return "own_open"
         if now - self.entered.get(s["coin"], -10**15) < lv.COIN_PAUSE_MS:
             return "coin_pause"
         # Бумаги нет на OKX — сразу (живой бот проверяет это позже, итог тот же,
@@ -363,6 +368,42 @@ class Replay:
             con.close()
         return [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
 
+    def count(self, s: dict[str, Any], why: str) -> None:
+        key = (s["coin"], s["side"], int(s["ts"]), why)
+        if key not in self.counted:
+            self.counted.add(key)
+            self.skips[why] += 1
+
+    def step(self, new: list[dict[str, Any]], now: int) -> None:
+        """Как шаг живого бота (Trader.candidates): новые сигналы — в пул за 15
+        минут (по бумаге и стороне — последний); бот свободен — пул по
+        перевесу китов в $ (Signals.rank), лучший первым, не вышло — следующий.
+        Живой бот перебирает пул каждые 5 с; повтор — новые сигналы не чаще
+        раза в 5 с, сразу как позиция закрылась и не реже раза в REEVAL_MS."""
+        for s in new:
+            key = (s["coin"], s["side"])
+            if f"{core.okx_candidate(s['coin'])[0]}-USDT-SWAP" not in self.instr:
+                self.count(s, "no_inst")   # бумаги нет на OKX — в пул незачем (решение было бы то же)
+                continue
+            if s["ts"] >= self.pool.get(key, {"ts": -1})["ts"]:
+                self.pool[key] = s
+                self.fresh = True
+        if now < self.busy_until:
+            for s in new:
+                self.count(s, "own_open")
+            return
+        # Живой бот перебирает пул раз в опрос (5 с): новые сигналы — не чаще;
+        # без новых — не реже раза в REEVAL_MS; закрылась позиция — сразу.
+        if now - self.last_eval < (lv.POLL_SEC * 1000 if self.fresh else REEVAL_MS) and self.last_eval >= self.busy_until:
+            return
+        self.last_eval, self.fresh = now, False
+        self.pool = {k: s for k, s in self.pool.items() if now - s["ts"] <= lv.FRESH_MS}
+        for s in self.sig.rank(list(self.pool.values()), now):
+            why = self.decide(s, now)
+            self.count(s, why or "entered")
+            if not why:
+                break
+
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)
         try:
@@ -376,11 +417,7 @@ class Replay:
             while rows := cur.fetchmany(5000):
                 for row in rows:
                     done += 1
-                    for s in reversed(self.sig.feed([row])):  # как candidates: встречный «крупный» — первым
-                        why = self.decide(s, s["ts"] + self.a.delay * 1000)
-                        self.skips[why or "entered"] += 1
-                        if not why:
-                            break
+                    self.step(self.sig.feed([row]), int(row[4]) + self.a.delay * 1000)
                 self.sig.seen.clear()  # повтор идёт по строкам один раз — повторов нет, память не копим
                 if time.time() - last_note > 2:
                     last_note = time.time()
@@ -388,6 +425,8 @@ class Replay:
                                    "requests": self.px.requests})
                     self.px.save()
                     self.sig.sweep(int(rows[-1][4]))
+                    cut = int(rows[-1][4]) - lv.FRESH_MS
+                    self.counted = {k for k in self.counted if k[2] >= cut}
         finally:
             con.close()
         self.px.save()

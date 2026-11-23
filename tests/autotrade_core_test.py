@@ -55,7 +55,7 @@ class CoreTest(unittest.TestCase):
 
     def test_window_matches_brute_force(self) -> None:
         """Окно по ходу (прибавили — вычли) даёт ровно то же, что пересчёт с
-        нуля: китов от порога и средняя цена китов; опоздавшие сделки — тоже."""
+        нуля: китов от порога, их объём и средняя цена китов; опоздавшие сделки — тоже."""
         rnd = random.Random(7)
         for limit in (0, 1000 * core.NANOS):
             w = core.Window(limit)
@@ -75,6 +75,7 @@ class CoreTest(unittest.TestCase):
                     v[0] += n
                     v[1] += u
                 self.assertEqual(w.count, sum(1 for v in per.values() if v[0] >= limit))
+                self.assertEqual(w.whale_n, sum(v[0] for v in per.values() if v[0] >= limit))
                 big = [v for v in per.values() if v[0] >= limit and v[1] > 0]
                 self.assertEqual(w.big_n, sum(v[0] for v in big))
                 self.assertAlmostEqual(w.big_u, sum(v[1] for v in big), places=6)

@@ -1153,6 +1153,88 @@ class AverageTest(Base):
         self.assertIsNone(self.state()["open"])
 
 
+class RankTest(Base):
+    """Правило владельца (23.11.2026): не первая попавшаяся сделка, а явный
+    перевес — из сигналов за 15 минут сначала тот, где перевес китов в $
+    больше (объём китов за минус против за 2 часа)."""
+
+    def stx(self, usd: float, ago: int = 2, tid: int = 10, against: float = 0) -> list[tuple]:
+        out = [fill(tid, "0xs1", "STX", 1, self.now - ago * MIN - MIN, usd, 0.5),
+               fill(tid + 1, "0xs2", "STX", 1, self.now - ago * MIN, usd, 0.5)]
+        if against:
+            out.append(fill(tid + 2, "0xshort", "STX", -1, self.now - 30 * MIN, against, 0.5))
+        return out
+
+    def test_bigger_dominance_wins_over_newer(self) -> None:
+        tr = self.trader(self.whales(usd=50_000) + self.stx(5000, ago=1))   # BTC 100 000 $ раньше, STX 10 000 $ свежее
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["instId"], "BTC-USDT-SWAP")
+
+    def test_against_volume_counts(self) -> None:
+        # STX: 100 000 $ за, 95 000 $ против — перевес 5 000 $; BTC: 10 000 $ — больше.
+        tr = self.trader(self.whales() + self.stx(50_000, ago=1, against=95_000))
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["instId"], "BTC-USDT-SWAP")
+
+    def test_best_blocked_next_one_enters(self) -> None:
+        self.ex.last["BTC-USDT-SWAP"] = 100_500        # BTC — цена ушла от китов: не догоняем
+        tr = self.trader(self.whales(usd=50_000) + self.stx(5000))
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["instId"], "STX-USDT-SWAP")
+
+    def test_pool_retried_without_new_fills(self) -> None:
+        """Сигнал не вошёл (цена ушла) — на следующем шаге без новых сделок
+        китов пробуем снова: цена вернулась — входим. Старше 15 минут — нет."""
+        self.ex.last["BTC-USDT-SWAP"] = 100_500
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        self.ex.last["BTC-USDT-SWAP"] = 100_000
+        self.now += lv.FRESH_MS - 5 * MIN - 1000       # сигналу (−5 мин) — 15 минут без секунды
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_pool_expires_after_15_minutes(self) -> None:
+        self.ex.last["BTC-USDT-SWAP"] = 100_500
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.ex.last["BTC-USDT-SWAP"] = 100_000
+        self.now += lv.FRESH_MS - 5 * MIN + 1000
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+
+    def test_signal_while_stopped_taken_after_start(self) -> None:
+        tr = self.trader(self.whales())
+        tr.step()                                       # «Стоп» — сигнал в пул, входа нет
+        self.assertEqual(self.market_orders(), [])
+        self.on()
+        self.now += MIN
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1, "«Старт» — сигнал последних 15 минут")
+
+    def test_rank_order_and_ties(self) -> None:
+        sig = lv.Signals(self.db)
+        make_db(self.db, [])
+        a = {"coin": "A", "side": 1, "ts": 1}
+        b = {"coin": "B", "side": 1, "ts": 2}
+        for k, usd in (("A", 3000), ("B", 3000)):
+            w = sig.windows.setdefault((k, 1), lv.core.Window(sig.limit))
+            w.add(self.now, "0x1", int(usd * lv.NANOS), 1.0)
+        self.assertEqual([x["coin"] for x in sig.rank([a, b], self.now)], ["B", "A"], "поровну — свежий первым")
+        sig.windows[("A", 1)].add(self.now, "0x2", int(2000 * lv.NANOS), 1.0)
+        self.assertEqual([x["coin"] for x in sig.rank([b, a], self.now)], ["A", "B"])
+
+
 class EeaTest(Base):
     def test_european_account_trades_xperp_not_usdt_swap(self) -> None:
         """OKX EEA: бессрочные — FUTURES «BTC-USD_UM_XPERP-310815», а
