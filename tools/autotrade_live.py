@@ -29,10 +29,6 @@
   доливаем ещё 5 % капитала × 10× рыночным; средняя цена и тейк (+1 % от
   новой средней) — на весь объём; при «Стоп» не усредняемся;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
-- не первая попавшаяся сделка: из сигналов за последние 15 минут (по всем
-  бумагам) — сначала тот, где перевес китов в $ больше (объём китов за
-  минус против за 2 часа до «сейчас»); не вышло — следующий (правило
-  владельца 23.11.2026);
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
   крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
   крупных от 2 — входим в их сторону.
@@ -450,7 +446,9 @@ class Signals:
 
     def whale_usd(self, w: core.Window | None) -> float:
         """Объём китов окна (кошельки от 1000 $), $."""
-        return w.whale_n / NANOS if w is not None else 0.0
+        if w is None:
+            return 0.0
+        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
 
     def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:
         """На момент решения (окна за 2 часа до «сейчас»), а не на момент строки
@@ -464,16 +462,6 @@ class Signals:
             out.append(self.whale_usd(w))
         w = self.windows.get((coin, side))
         return out[0], out[1], (w.count if w is not None else 0)
-
-    def rank(self, sigs: list[dict[str, Any]], now: int) -> list[dict[str, Any]]:
-        """Не первая попавшаяся сделка, а явный перевес (правило владельца
-        23.11.2026): сигналы по перевесу китов в $ на момент решения — объём
-        китов за минус против (за 2 часа до «сейчас»), больший — первым;
-        поровну — свежий первым. Тот же порядок — у бэктеста."""
-        def key(s: dict[str, Any]) -> tuple[float, int]:
-            usd, against, _ = self.balance(s["coin"], s["side"], now)
-            return (against - usd, -int(s["ts"]))
-        return sorted(sigs, key=key)
 
     def _signal(self, coin: str, side: int, w: core.Window, opp: core.Window | None, ts: int) -> dict[str, Any]:
         """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
@@ -856,7 +844,6 @@ class Trader:
         self._checked: dict[str, float] = {}
         self.skip_code = "other"
         self._skip_seen: set[tuple[str, int, str, int]] = set()
-        self.pool: dict[tuple[str, int], dict[str, Any]] = {}   # сигналы за 15 минут: бумага и сторона → последний
 
     # состояние
     def _load(self) -> dict[str, Any]:
@@ -1304,16 +1291,16 @@ class Trader:
         self.event(f"тейк {op['inst']} {op['tp_s']} × {fmt_dec(sz)}")
 
     def candidates(self, sigs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Сигналы за последние 15 минут — не только новые этого опроса (по
-        бумаге и стороне — последний), по перевесу китов в $ на «сейчас»:
-        больший — первым (Signals.rank)."""
         now = self.clock()
-        for s in sigs:
+        seen: set[tuple[str, int]] = set()
+        out = []
+        for s in reversed(sigs):  # свежие первыми, по бумаге и стороне — один
             key = (s["coin"], s["side"])
-            if s["ts"] >= num(self.pool.get(key, {}).get("ts"), -1.0):
-                self.pool[key] = s
-        self.pool = {k: s for k, s in self.pool.items() if now - s["ts"] <= FRESH_MS}
-        return self.sig.rank(list(self.pool.values()), now)
+            if key in seen or now - s["ts"] > FRESH_MS:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out
 
     def _skip(self, code: str, why: str) -> str:
         """Причина пропуска: текст — вкладке, код — в счётчик за сутки."""
@@ -1577,11 +1564,10 @@ class Trader:
         sigs = self.sig.poll(self.clock())
         if time.time() - self.last_sync >= SYNC_SEC or sigs:
             self.sync()
-        cands = self.candidates(sigs)   # пул — и при «Стоп»: «Старт» берёт сигналы последних 15 минут
         if not self.is_on():
             self.save()
             return
-        for s in cands:
+        for s in self.candidates(sigs):
             self.skip_code = "other"
             why = self.try_enter(s)
             if not why:

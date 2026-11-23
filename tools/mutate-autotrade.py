@@ -38,6 +38,7 @@ MUTS = [
     ("LEVERAGE = 10\n", "LEVERAGE = 20\n", "плечо 10×"),
     ("TP = 0.01\n", "TP = 0.005\n", "тейк +1 %"),
     ("COIN_PAUSE_MS = 3 * 3_600_000", "COIN_PAUSE_MS = 3_600_000", "в бумагу — раз в 3 часа"),
+    ("if key in seen or now - s[\"ts\"] > FRESH_MS:", "if key in seen:", "сигнал старше 15 минут — не входим"),
     ("        if self.st.get(\"open\"):\n            return self._skip(\"own_open\"", "        if False:\n            return self._skip(\"own_open\"",
      "своя позиция у бота — одна"),
     ("        if inst in foreign:", "        if False:", "на бумагу с ручной позицией — не входим"),
@@ -106,6 +107,8 @@ MUTS = [
      "решение — по китам за 2 часа до «сейчас»"),
     ("        usd, against, count = self.sig.balance(s[\"coin\"], s[\"side\"], now)",
      "        usd, against, count = num(s.get(\"usd\")), num(s.get(\"usd_against\")), 2", "решение — по текущему перевесу, а не по строке сигнала"),
+    ("        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS",
+     "        return float(sum(v[0] for v in w.per.values() if v[2] > 0)) / NANOS", "против — только кошельки от 1000 $"),
     # Ревизия 2
     ("                f\"AND (dir_code != {core.FLIP} OR dir LIKE ?)\",", "                \"\",", "разворот в нашу сторону — не выход"),
     ("            if v is None or v[0] < self.limit:\n                continue\n", "", "мелкая сделка сигнал не освежает"),
@@ -152,19 +155,6 @@ MUTS = [
      "            op[\"px\"] = base_px", "средняя цена после усреднения"),
     ("                self._place_tp(op, size_of(op[\"size\"]))  # сразу", "                pass  # сразу", "тейк после усреднения — сразу"),
     ("        self.average_down()\n", "\n", "сверка следит за усреднением"),
-    # Явный перевес: из сигналов за 15 минут — больший перевес китов в $ первым
-    ("            return (against - usd, -int(s[\"ts\"]))", "            return (usd - against, -int(s[\"ts\"]))",
-     "перевес — больший первым"),
-    ("            return (against - usd, -int(s[\"ts\"]))", "            return (-usd, -int(s[\"ts\"]))",
-     "перевес — объём за минус против"),
-    ("            return (against - usd, -int(s[\"ts\"]))", "            return (against - usd, int(s[\"ts\"]))",
-     "перевес поровну — свежий первым"),
-    ("        return self.sig.rank(list(self.pool.values()), now)", "        return list(self.pool.values())",
-     "кандидаты — по перевесу, а не по порядку"),
-    ("        self.pool = {k: s for k, s in self.pool.items() if now - s[\"ts\"] <= FRESH_MS}", "",
-     "пул — только сигналы за 15 минут"),
-    ("            if s[\"ts\"] >= num(self.pool.get(key, {}).get(\"ts\"), -1.0):", "            if key not in self.pool:",
-     "пул — последний сигнал бумаги и стороны"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
@@ -211,6 +201,7 @@ MUTS = [
 ]
 
 RP_MUTS = [
+    ("        if now < self.busy_until:", "        if False:", "повтор: позиция одна"),
     ("        if now - self.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
     ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
     ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
@@ -219,10 +210,6 @@ RP_MUTS = [
     ("self.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "self.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
     ("            if side * (best - tp) >= 0:", "            if False:", "повтор: тейк"),
     ("            if exit_at is not None and exit_at + SYNC_MS < end:", "            if False:", "повтор: выход вслед за китом"),
-    ("        for s in self.sig.rank(list(self.pool.values()), now):", "        for s in list(self.pool.values()):",
-     "повтор: пул по перевесу"),
-    ("        if now < self.busy_until:\n            for s in new:", "        if False:\n            for s in new:",
-     "повтор: позиция одна — занят, пул ждёт закрытия"),
     ("            if not averaged and add_at is not None and add_at < end:", "            if False:", "повтор: усреднение"),
     ("                edge = avg_px * (1 - side * lv.AVG_LOSS)", "                edge = avg_px", "повтор: усреднение — минус больше 1 %"),
     ("            if ts > since:\n                run[w] += n", "            if True:\n                run[w] += n", "повтор: добор — после нашего входа"),
@@ -239,8 +226,6 @@ CORE_MUTS = [
      "        self.count += (k1 > 0 and n1 > self.limit) - (k0 > 0 and n0 > self.limit)", "кит — от порога включительно"),
     ("    return bool(coin) and not coin.startswith(\"@\") and \"/\" not in coin", "    return bool(coin)", "спот — не сигнал"),
     ("    con.execute(\"PRAGMA query_only=1\")\n", "", "база бота — только чтение"),
-    ("        self.whale_n += (n1 if k1 > 0 and n1 >= self.limit else 0)", "        self.whale_n += (n1 if k1 > 0 else 0)",
-     "объём китов — только кошельки от порога"),
 ]
 
 

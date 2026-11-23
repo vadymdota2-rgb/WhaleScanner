@@ -77,17 +77,15 @@ class Window:
     не пересчётом на каждую сделку. Объём — в нано-долларах целыми: сумма и
     разность точны, сравнение с порогом не «плывёт» от округления.
 
-    count — кошельков от порога (китов); whale_n — их нано $ (объём китов
-    окна: по нему сравниваются стороны и монеты); big_n / big_u — нано $ и
-    штуки китов, у кого штуки известны, — для средней цены китов."""
-    __slots__ = ("big_k", "big_n", "big_u", "count", "limit", "orders", "per", "whale_n")
+    count — кошельков от порога (китов); big_n / big_u — их нано $ и штуки
+    (у кого штуки известны) — для средней цены китов."""
+    __slots__ = ("big_k", "big_n", "big_u", "count", "limit", "orders", "per")
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self.orders: deque[tuple[int, str, int, float]] = deque()
         self.per: dict[str, list[Any]] = {}   # кошелёк → [нано $, штук, сделок, сделок со штуками]
         self.count = 0
-        self.whale_n = 0
         self.big_n = 0
         self.big_u = 0.0
         self.big_k = 0
@@ -99,7 +97,6 @@ class Window:
         n1 = n0 + dn if k1 else 0
         u1 = u0 + du if ku1 else 0.0
         self.count += (k1 > 0 and n1 >= self.limit) - (k0 > 0 and n0 >= self.limit)
-        self.whale_n += (n1 if k1 > 0 and n1 >= self.limit else 0) - (n0 if k0 > 0 and n0 >= self.limit else 0)
         if k0 and ku0 and n0 >= self.limit:
             self.big_n -= n0
             self.big_u -= u0
