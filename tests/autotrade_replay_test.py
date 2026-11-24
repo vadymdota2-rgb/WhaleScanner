@@ -112,8 +112,8 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
         self.assertGreater(t.pnl, 0)
-        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +1 % ≈ +100 $ минус комиссии.
-        self.assertAlmostEqual(t.pnl, 100 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
+        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +0,5 % ≈ +50 $ минус комиссии.
+        self.assertAlmostEqual(t.pnl, 50 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
         s = r["summary"]
         self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
         self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])

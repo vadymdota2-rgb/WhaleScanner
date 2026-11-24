@@ -36,7 +36,7 @@ MUTS = [
     ("MATCH_TOL = 0.02", "MATCH_TOL = 0.2", "другой актив — расхождение цен больше 2 %"),
     ("MARGIN_FRAC = 0.05", "MARGIN_FRAC = 0.10", "маржа — всегда 5 % капитала"),
     ("LEVERAGE = 10\n", "LEVERAGE = 20\n", "плечо 10×"),
-    ("TP = 0.01\n", "TP = 0.005\n", "тейк +1 %"),
+    ("TP = 0.005 ", "TP = 0.01 ", "тейк +0,5 %"),
     ("COIN_PAUSE_MS = 3 * 3_600_000", "COIN_PAUSE_MS = 3_600_000", "в бумагу — раз в 3 часа"),
     ("if key in seen or now - s[\"ts\"] > FRESH_MS:", "if key in seen:", "сигнал старше 15 минут — не входим"),
     ("        if self.st.get(\"open\"):\n            return self._skip(\"own_open\"", "        if False:\n            return self._skip(\"own_open\"",

@@ -102,7 +102,7 @@ cp -r ~/WalletTracker/tests "$T/wt/"
 (cd "$T/ws/tools" && python3 - <<'EOF'
 import autotrade_live as lv
 want = {"MIN_WHALES": 2, "MIN_WHALE_USD": 1000, "WINDOW_MS": 7_200_000, "CHASE": 0.003, "MARGIN_FRAC": 0.05,
-        "LEVERAGE": 10, "TP": 0.01, "COIN_PAUSE_MS": 10_800_000, "AVG_LOSS": 0.01, "AVG_FRAC": 0.05}
+        "LEVERAGE": 10, "TP": 0.005, "COIN_PAUSE_MS": 10_800_000, "AVG_LOSS": 0.01, "AVG_FRAC": 0.05}
 bad = {k: (getattr(lv, k), v) for k, v in want.items() if getattr(lv, k) != v}
 print("правила — как у владельца" if not bad else f"РАСХОЖДЕНИЕ: {bad}")
 EOF
@@ -111,7 +111,7 @@ EOF
 
 Ожидается «правила — как у владельца»: от 2 китов за 2 часа, у каждого от
 1000 $; не дороже средней китов больше чем на 0,3 %; маржа 5 % × 10×, кросс;
-одна позиция; в бумагу — раз в 3 часа; тейк +1 %; выход вслед за китом в
+одна позиция; в бумагу — раз в 3 часа; тейк +0,5 %; выход вслед за китом в
 убытке; разовое усреднение 5 % при минусе больше 1 % и доборе кита.
 
 ## 5. Бэктест руками — не запускать
