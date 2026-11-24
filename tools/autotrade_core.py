@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -55,6 +56,23 @@ def okx_candidate(coin: str) -> tuple[str, float]:
     if ":" not in coin and len(base) > 1 and base[0] == "k" and base[1:].isupper():
         return base[1:], 1000.0
     return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
+
+
+# Уровни часового графика (правило владельца 24.11.2026): поддержка —
+# минимум, сопротивление — максимум цены за последние 24 часа. Лонг — только
+# ближе к поддержке (ниже 40 % диапазона), шорт — ближе к сопротивлению (выше
+# 60 %); середина 40–60 % — мёртвая зона для обеих сторон.
+LEVEL_MS = 24 * HOUR_MS
+LEVEL_LONG_BELOW = 0.4
+LEVEL_SHORT_ABOVE = 0.6
+
+
+def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
+    """Цена px у «своего» уровня? None — уровней нет (входим, как без них)."""
+    if not all(math.isfinite(x) for x in (lo, hi, px)) or not 0 < lo < hi or px <= 0:
+        return None
+    pos = (px - lo) / (hi - lo)   # цена за краем диапазона — за 0 или 1: у самого уровня
+    return pos < LEVEL_LONG_BELOW if side > 0 else pos > LEVEL_SHORT_ABOVE
 
 
 def safe_name(name: str) -> str:

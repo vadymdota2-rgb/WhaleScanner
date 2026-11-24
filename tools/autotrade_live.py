@@ -29,6 +29,11 @@
   доливаем ещё 5 % капитала × 10× рыночным; средняя цена и тейк (+0,5 % от
   новой средней) — на весь объём; при «Стоп» не усредняемся;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
+- уровни часового графика: поддержка — минимум, сопротивление — максимум
+  цены за последние 24 часа; лонг — только ниже 40 % диапазона (у
+  поддержки), шорт — только выше 60 % (у сопротивления), середина 40–60 % —
+  мёртвая зона; свечей нет — входим, как без них (правило владельца
+  24.11.2026);
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
   крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
   крупных от 2 — входим в их сторону.
@@ -256,6 +261,13 @@ class Okx:
 
     def call(self, method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None,
              private: bool = True) -> list[Any]:
+        # Только объекты: строка или число в списке ответа — порча, не запись.
+        return [x for x in self.call_raw(method, path, params, body, private) if isinstance(x, dict)]
+
+    def call_raw(self, method: str, path: str, params: dict[str, Any] | None = None, body: dict[str, Any] | None = None,
+                 private: bool = True) -> list[Any]:
+        """Ответ OKX — список data как есть (у свечей записи — списки, а не
+        объекты); отказ — OkxError."""
         if params:
             path += "?" + urllib.parse.urlencode(params)
         raw = json.dumps(body, separators=(",", ":")) if body is not None else ""
@@ -277,8 +289,7 @@ class Okx:
             err.args = (f"{err.args[0]} [{method} {path.split('?')[0]}]",)  # какой запрос — для разбора
             raise err
         data = got.get("data")
-        # Только объекты: строка или число в списке ответа — порча, не запись.
-        return [x for x in data if isinstance(x, dict)] if isinstance(data, list) else []
+        return data if isinstance(data, list) else []
 
     # Обёртки — только то, что нужно трейдеру.
     def instruments(self, inst_type: str = "SWAP") -> list[dict[str, Any]]:
@@ -287,6 +298,19 @@ class Okx:
     def ticker(self, inst: str) -> float:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
         return max(0.0, num(d[0].get("last"))) if d and isinstance(d[0], dict) else 0.0
+
+    def range_24h(self, inst: str) -> tuple[float, float]:
+        """Минимум и максимум цены за последние 24 часовые свечи (с идущей);
+        мусор в свечах — не в счёт; свечей нет — (0, 0)."""
+        d = self.call_raw("GET", "/api/v5/market/candles", {"instId": inst, "bar": "1H", "limit": "24"}, private=False)
+        lows, highs = [], []
+        for r in d:
+            if isinstance(r, list) and len(r) >= 5:
+                h, lo = num(r[2], math.nan), num(r[3], math.nan)
+                if math.isfinite(h) and math.isfinite(lo) and 0 < lo <= h:
+                    lows.append(lo)
+                    highs.append(h)
+        return (min(lows), max(highs)) if lows else (0.0, 0.0)
 
     def config(self) -> dict[str, Any]:
         d = self.call("GET", "/api/v5/account/config")
@@ -1321,6 +1345,18 @@ class Trader:
         bucket[code] = int(num(bucket.get(code))) + 1
         self.st["skips"] = skips
 
+    def level_check(self, inst: str, last: float, side: int) -> str:
+        """Уровни часового графика: '' — цена у своего уровня или свечей нет
+        (входим), иначе — причина пропуска."""
+        try:
+            lo, hi = self.okx.range_24h(inst)
+        except OkxError:
+            lo, hi = 0.0, 0.0
+        if core.level_ok(lo, hi, last, side) is not False:
+            return ""
+        return self._skip("level", f"{inst}: цена {last:.6g} ближе к {'сопротивлению' if side > 0 else 'поддержке'} "
+                                   f"(24 ч: {lo:.6g}–{hi:.6g}) — {'лонг' if side > 0 else 'шорт'} не входит")
+
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
@@ -1376,6 +1412,9 @@ class Trader:
             return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE:
             return self._skip("chase", f"цена ушла от китов дальше {CHASE * 100:g} %")
+        why = self.level_check(inst, last, s["side"])
+        if why:
+            return why
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
         notional = self.equity * MARGIN_FRAC * LEVERAGE

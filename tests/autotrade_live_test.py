@@ -52,6 +52,7 @@ class FakeOkx:
         self.pos_mode = pos_mode
         self.n = 0
         self.reject: dict[str, str] = {}   # бумага → код отказа OKX на ордер
+        self.hl: dict[str, object] = {}    # бумага → (минимум, максимум) часовых свечей за сутки или свои строки
 
     def __call__(self, method: str, url: str, headers: dict, body: bytes | None):
         u = urllib.parse.urlparse(url)
@@ -63,6 +64,13 @@ class FakeOkx:
         if p == "/api/v5/public/instruments":
             kind = q.get("instType", "SWAP")
             return ok([r for r in self.instr.values() if r.get("instType", "SWAP") == kind])
+        if p == "/api/v5/market/candles":
+            got = self.hl.get(q["instId"])
+            if isinstance(got, tuple):
+                lo, hi = got
+                return ok([[str(self.n + i), "1", str(hi if i == 3 else (lo + hi) / 2), str(lo if i == 7 else (lo + hi) / 2), "1"]
+                           for i in range(int(q.get("limit", "24")))])
+            return ok(got if isinstance(got, list) else [])
         if p == "/api/v5/market/ticker":
             return ok([{"instId": q["instId"], "last": str(self.last[q["instId"]])}])
         if p == "/api/v5/account/config":
@@ -1151,6 +1159,93 @@ class AverageTest(Base):
         [ex] = [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
         self.assertEqual(ex["sz"], "20.2", "выход — весь усреднённый объём")
         self.assertIsNone(self.state()["open"])
+
+
+class LevelTest(Base):
+    """Правило владельца (24.11.2026): уровни часового графика — поддержка
+    (минимум за 24 часа) и сопротивление (максимум). Лонг — только ближе к
+    поддержке, шорт — только ближе к сопротивлению; свечей нет — как без них."""
+
+    def go(self, side: int, lo_hi: object) -> lv.Trader:
+        self.ex.hl["BTC-USDT-SWAP"] = lo_hi
+        tr = self.trader(self.whales(side=side))
+        self.on()
+        tr.step()
+        return tr
+
+    def test_long_near_support_enters(self) -> None:
+        self.go(1, (99_000.0, 103_000.0))            # цена 100 000 — четверть диапазона
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "buy")
+        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles"]
+        self.assertEqual((c[2]["instId"], c[2]["bar"], c[2]["limit"]), ("BTC-USDT-SWAP", "1H", "24"))
+
+    def test_long_near_resistance_skipped(self) -> None:
+        self.go(1, (97_000.0, 101_000.0))            # три четверти — у сопротивления
+        self.assertEqual(self.market_orders(), [])
+        sk = self.state()["last_skip"]
+        self.assertEqual(sk["code"], "level")
+        self.assertIn("ближе к сопротивлению (24 ч: 97000–101000) — лонг не входит", sk["why"])
+
+    def test_short_mirrors(self) -> None:
+        self.go(-1, (99_000.0, 103_000.0))
+        self.assertEqual(self.market_orders(), [])
+        self.assertIn("ближе к поддержке", self.state()["last_skip"]["why"])
+        os.remove(self.db)
+        os.remove(os.path.join(self.dir, "live", "state.json"))
+        self.ex = FakeOkx()
+        self.go(-1, (97_000.0, 101_000.0))
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "sell")
+
+    def test_middle_40_60_is_neither(self) -> None:
+        """Середина диапазона (40–60 %) — мёртвая зона: цена 100 000 при 99 000–
+        101 500 — 40 %, при 98 500–101 000 — 60 %: ни лонг, ни шорт."""
+        for side, lo_hi in ((1, (99_000.0, 101_500.0)), (-1, (98_500.0, 101_000.0)),
+                            (1, (99_000.0, 101_000.0)), (-1, (99_000.0, 101_000.0))):
+            self.ex = FakeOkx()
+            self.go(side, lo_hi)
+            self.assertEqual(self.market_orders(), [], side)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_no_candles_or_garbage_enters(self) -> None:
+        bad = [["1", "1", "nan", "1", "1"], ["2", "1", "5", "9", "1"], ["3", "1", "-1", "-2", "1"], "x", ["4", "1"]]
+        for got in ([], bad, (100_000.0, 100_000.0)):
+            self.ex = FakeOkx()
+            self.go(1, got)
+            self.assertEqual(len(self.market_orders()), 1, got)
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_candles_error_enters(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        with mock.patch.object(tr.okx, "range_24h", side_effect=lv.OkxError("50011", "часто")):
+            tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+
+    def test_range_ignores_garbage_rows(self) -> None:
+        self.ex.hl["BTC-USDT-SWAP"] = [["1", "1", "102000", "99500", "1"], ["2", "1", "nan", "1", "1"],
+                                       ["3", "1", "5", "9", "1"], ["4", "1", "101000", "98000", "1"], "x"]
+        okx = lv.Okx("K", "S", "P", False, self.ex)
+        self.assertEqual(okx.range_24h("BTC-USDT-SWAP"), (98_000.0, 102_000.0))
+
+    def test_level_rule(self) -> None:
+        ok = lv.core.level_ok
+        # Диапазон 90–110: лонг — ниже 98 (40 %), шорт — выше 102 (60 %), 98–102 — мёртвая зона.
+        self.assertTrue(ok(90.0, 110.0, 97.9, 1))
+        self.assertTrue(ok(90.0, 110.0, 102.1, -1))
+        for px in (98.0, 99.0, 100.0, 101.0, 102.0):
+            self.assertFalse(ok(90.0, 110.0, px, 1), px)
+            self.assertFalse(ok(90.0, 110.0, px, -1), px)
+        self.assertFalse(ok(90.0, 110.0, 97.9, -1))
+        self.assertFalse(ok(90.0, 110.0, 102.1, 1))
+        self.assertTrue(ok(90.0, 110.0, 80.0, 1), "цена ниже минимума — у самой поддержки")
+        self.assertTrue(ok(90.0, 110.0, 120.0, -1))
+        for lo, hi, px in ((0.0, 0.0, 100.0), (100.0, 100.0, 100.0), (110.0, 90.0, 100.0), (90.0, 110.0, 0.0),
+                           (float("nan"), 110.0, 100.0), (90.0, float("inf"), 100.0), (-5.0, 110.0, 100.0)):
+            self.assertIsNone(ok(lo, hi, px, 1), (lo, hi, px))
 
 
 class EeaTest(Base):

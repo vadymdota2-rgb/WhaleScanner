@@ -9,6 +9,8 @@
 - от 2 китов в одну сторону за 2 часа, у каждого от 1000 $; на момент входа —
   тоже от 2; против — киты крупнее или поровну — не входим, крупных от 2 —
   входим с ними; кит сигнала уже вышел в убыток — не входим;
+- уровни часового графика: лонг — только ниже 40 % диапазона цены за 24
+  часа (у поддержки), шорт — выше 60 % (у сопротивления), середина — нет;
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
   средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; позиция —
   одна;
@@ -251,6 +253,8 @@ class Replay:
             return "other_asset"
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
+        if core.level_ok(*self.range_24h(inst, now), last, s["side"]) is False:
+            return "level"
         if self.equity <= 0:
             return "no_equity"
         sz = lv.contract_size(ins, self.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)  # как у живого бота
@@ -339,6 +343,13 @@ class Replay:
                 if run[w] >= lv.MIN_WHALE_USD * core.NANOS:
                     return ts
         return None
+
+    def range_24h(self, inst: str, now: int) -> tuple[float, float]:
+        """Уровни часового графика на момент now: минимум и максимум цены за 24
+        часа — по закрытым 5-минутным свечам (идущая заглянула бы в будущее;
+        живой бот берёт часовые свечи OKX с идущей). Свечей нет — (0, 0)."""
+        got = [c for c in self.px.candles(inst, now - core.LEVEL_MS, now) if c[0] + BAR_MS <= now]
+        return (min(c[3] for c in got), max(c[2] for c in got)) if got else (0.0, 0.0)
 
     def whale_rows(self, coin: str, side: int, wallets: dict[str, Any], closes: bool) -> list[tuple[str, int, int]]:
         since = {str(k): int(lv.num(v)) for k, v in wallets.items()}

@@ -157,6 +157,25 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
             os.remove(self.db)
 
+    def test_levels_24h(self) -> None:
+        """Уровни: минимум и максимум цены за 24 часа до решения. Был минимум
+        99 000 за 10 часов до сигнала, цена 100 000 — у сопротивления: лонг не
+        входит, шорт входит. Идущая свеча (до 103 000 к своему закрытию) — не в
+        счёт: это будущее."""
+        def price(c: str, t: int) -> float:
+            if T - 10 * 60 * MIN <= t < T - 9 * 60 * MIN:
+                return 99_000.0
+            if T + 1000 <= t < T + 5 * MIN:
+                return 103_000.0
+            return 100_000.0
+        r = self.go(self.whales(), price)
+        self.assertEqual(r["trades"], [])
+        self.assertEqual(r["skips"].get("level"), 1)
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(side=-1), lambda c, t: price(c, t) if t < T else 100_000.0 * (0.988 if t > T + 60 * MIN else 1))
+        self.assertEqual([(t.side, t.why) for t in r["trades"]], [(-1, "тейк")])
+
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
         r = self.go(big + self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
