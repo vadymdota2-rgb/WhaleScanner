@@ -1225,6 +1225,14 @@ class LevelTest(Base):
             tr.step()
         self.assertEqual(len(self.market_orders()), 1)
 
+    def test_candles_network_failure_enters(self) -> None:
+        """Обрыв сети на свечах — как без уровней: шаг не падает, сигнал не теряется."""
+        tr = self.trader(self.whales())
+        self.on()
+        with mock.patch.object(tr.okx, "range_24h", side_effect=TimeoutError("timed out")):
+            tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+
     def test_range_ignores_garbage_rows(self) -> None:
         self.ex.hl["BTC-USDT-SWAP"] = [["1", "1", "102000", "99500", "1"], ["2", "1", "nan", "1", "1"],
                                        ["3", "1", "5", "9", "1"], ["4", "1", "101000", "98000", "1"], "x"]

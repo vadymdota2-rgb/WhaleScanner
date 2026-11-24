@@ -104,6 +104,9 @@ import autotrade_live as lv
 want = {"MIN_WHALES": 2, "MIN_WHALE_USD": 1000, "WINDOW_MS": 7_200_000, "CHASE": 0.003, "MARGIN_FRAC": 0.05,
         "LEVERAGE": 10, "TP": 0.005, "COIN_PAUSE_MS": 10_800_000, "AVG_LOSS": 0.01, "AVG_FRAC": 0.05}
 bad = {k: (getattr(lv, k), v) for k, v in want.items() if getattr(lv, k) != v}
+lvl = (lv.core.LEVEL_MS, lv.core.LEVEL_LONG_BELOW, lv.core.LEVEL_SHORT_ABOVE)
+if lvl != (86_400_000, 0.4, 0.6):
+    bad["уровни"] = (lvl, (86_400_000, 0.4, 0.6))
 print("правила — как у владельца" if not bad else f"РАСХОЖДЕНИЕ: {bad}")
 EOF
 )

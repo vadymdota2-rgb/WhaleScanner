@@ -1350,7 +1350,7 @@ class Trader:
         (входим), иначе — причина пропуска."""
         try:
             lo, hi = self.okx.range_24h(inst)
-        except OkxError:
+        except (OkxError, OSError):   # нет свечей (отказ, обрыв сети) — как без уровней, шаг не падает
             lo, hi = 0.0, 0.0
         if core.level_ok(lo, hi, last, side) is not False:
             return ""

@@ -52,7 +52,6 @@ import autotrade_core as core
 import autotrade_live as lv
 
 BAR_MS = 300_000                  # 5-минутные свечи OKX
-BLOCK_MS = 100 * BAR_MS           # блок кеша — 100 свечей (один запрос)
 SYNC_MS = 15_000                  # живой бот сверяет счёт раз в 15 с
 Fetch = Callable[[dict[str, Any]], object]
 
@@ -72,8 +71,10 @@ class Prices:
     только ответ OKX за уже закончившийся блок: сбой сети или незаконченный
     блок — лишь на этот прогон (иначе пустой блок от сбоя остался бы навсегда)."""
 
-    def __init__(self, cache: str, fetch: Fetch, pause: float, offline: bool, now_ms: int) -> None:
+    def __init__(self, cache: str, fetch: Fetch, pause: float, offline: bool, now_ms: int,
+                 bar: str = "5m", bar_ms: int = BAR_MS) -> None:
         self.cache, self.fetch, self.pause, self.offline, self.now_ms = cache, fetch, pause, offline, now_ms
+        self.bar, self.bar_ms, self.block_ms = bar, bar_ms, 100 * bar_ms
         self.blocks: dict[str, dict[int, list[list[float]]]] = {}
         self.fresh: dict[tuple[str, int], list[list[float]]] = {}
         self.dirty: set[str] = set()
@@ -82,7 +83,7 @@ class Prices:
         os.makedirs(cache, exist_ok=True)
 
     def _file(self, inst: str) -> str:
-        return os.path.join(self.cache, f"replay_{core.safe_name(inst)}_5m.json")
+        return os.path.join(self.cache, f"replay_{core.safe_name(inst)}_{self.bar}.json")
 
     def _load(self, inst: str) -> dict[int, list[list[float]]]:
         if inst not in self.blocks:
@@ -110,7 +111,7 @@ class Prices:
     def block(self, inst: str, b: int) -> list[list[float]]:
         """Свечи блока b: [[время, open, high, low, close], …] по времени."""
         have = self._load(inst)
-        end = (b + 1) * BLOCK_MS
+        end = (b + 1) * self.block_ms
         if b in have:
             return have[b]
         if (inst, b) in self.fresh:
@@ -122,7 +123,7 @@ class Prices:
         self.requests += 1
         try:
             rows = self.fetch({"okx": "/api/v5/market/history-candles",
-                               "params": {"instId": inst, "bar": "5m", "after": end, "limit": 100}})
+                               "params": {"instId": inst, "bar": self.bar, "after": end, "limit": 100}})
         except Exception:  # noqa: BLE001 — сеть: сбой — блок без свечей, а не падение
             rows = None
         if not isinstance(rows, list):
@@ -133,7 +134,7 @@ class Prices:
                 c = [int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])]
             except (IndexError, TypeError, ValueError):
                 continue
-            if b * BLOCK_MS <= c[0] < end and candle_ok(c):
+            if b * self.block_ms <= c[0] < end and candle_ok(c):
                 out.append(c)
         out.sort()
         if isinstance(rows, list) and end <= self.now_ms:
@@ -145,15 +146,15 @@ class Prices:
 
     def candle(self, inst: str, t: int) -> list[float] | None:
         """Свеча, в которую попадает момент t."""
-        start = t // BAR_MS * BAR_MS
-        return next((c for c in self.block(inst, t // BLOCK_MS) if c[0] == start), None)
+        start = t // self.bar_ms * self.bar_ms
+        return next((c for c in self.block(inst, t // self.block_ms) if c[0] == start), None)
 
     def candles(self, inst: str, start: int, end: int) -> Iterator[list[float]]:
         """Свечи с момента start до end — по блокам, по мере надобности."""
-        b = start // BLOCK_MS
-        while b * BLOCK_MS < end:
+        b = start // self.block_ms
+        while b * self.block_ms < end:
             for c in self.block(inst, b):
-                if c[0] + BAR_MS > start and c[0] < end:
+                if c[0] + self.bar_ms > start and c[0] < end:
                     yield c
             b += 1
 
@@ -215,8 +216,11 @@ class Replay:
     правила входа; открытая позиция ведётся по свечам до выхода."""
 
     def __init__(self, a: argparse.Namespace, prices: Prices, instr: dict[str, dict[str, Any]],
-                 progress: Callable[[dict[str, Any]], None]) -> None:
+                 progress: Callable[[dict[str, Any]], None], hours: Prices | None = None) -> None:
         self.a, self.px, self.instr, self.progress = a, prices, instr, progress
+        # Часовые свечи — для уровней (24 ч); кеш и сеть — те же, что у 5-минутных.
+        self.hours = hours or Prices(prices.cache, prices.fetch, prices.pause, prices.offline, prices.now_ms,
+                                     bar="1H", bar_ms=core.HOUR_MS)
         self.sig = lv.Signals(a.db)
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
@@ -345,10 +349,13 @@ class Replay:
         return None
 
     def range_24h(self, inst: str, now: int) -> tuple[float, float]:
-        """Уровни часового графика на момент now: минимум и максимум цены за 24
-        часа — по закрытым 5-минутным свечам (идущая заглянула бы в будущее;
-        живой бот берёт часовые свечи OKX с идущей). Свечей нет — (0, 0)."""
-        got = [c for c in self.px.candles(inst, now - core.LEVEL_MS, now) if c[0] + BAR_MS <= now]
+        """Уровни часового графика на момент now — как у живого бота (24 часовые
+        свечи OKX с идущей): 23 закрытые часовые свечи и идущий час — по его
+        закрытым 5-минутным (идущая 5-минутка заглянула бы в будущее). Свечей
+        нет — (0, 0)."""
+        hour = now // core.HOUR_MS * core.HOUR_MS
+        got = [c for c in self.hours.candles(inst, hour - core.LEVEL_MS + core.HOUR_MS, hour) if c[0] + core.HOUR_MS <= hour]
+        got += [c for c in self.px.candles(inst, hour, now) if c[0] + BAR_MS <= now]
         return (min(c[3] for c in got), max(c[2] for c in got)) if got else (0.0, 0.0)
 
     def whale_rows(self, coin: str, side: int, wallets: dict[str, Any], closes: bool) -> list[tuple[str, int, int]]:
@@ -374,6 +381,9 @@ class Replay:
             con.close()
         return [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
 
+    def requests(self) -> int:
+        return self.px.requests + self.hours.requests
+
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)
         try:
@@ -396,14 +406,16 @@ class Replay:
                 if time.time() - last_note > 2:
                     last_note = time.time()
                     self.progress({"stage": "повтор", "done": done, "total": total, "trades": len(self.trades),
-                                   "requests": self.px.requests})
+                                   "requests": self.requests()})
                     self.px.save()
+                    self.hours.save()
                     self.sig.sweep(int(rows[-1][4]))
         finally:
             con.close()
         self.px.save()
+        self.hours.save()
         self.progress({"stage": "готово", "done": total, "total": total, "trades": len(self.trades),
-                       "requests": self.px.requests})
+                       "requests": self.requests()})
 
 
 # ── итоги ────────────────────────────────────────────────────────────────────
@@ -490,7 +502,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         "sizing": {"deposit": a.deposit, "deposit_end": round(rp.equity, 2), "margin_pct": lv.MARGIN_FRAC * 100,
                    "leverage": lv.LEVERAGE, "fee_taker_pct": a.fee_taker, "fee_maker_pct": a.fee_maker,
                    "slippage_pct": a.slippage},
-        "data": {"signals": sum(rp.skips.values()), "requests": rp.px.requests, "errors": rp.px.errors},
+        "data": {"signals": sum(rp.skips.values()), "requests": rp.requests(), "errors": rp.px.errors + rp.hours.errors},
         "full": st_all, "first": stats(first), "last": st_last,
         "equity": curve,
         "by_coin": group(lambda t: t.coin),
@@ -536,7 +548,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     progress({"stage": "каталог OKX", "done": 0, "total": 0, "trades": 0, "requests": 0})
     f = fetch or okx_fetch
     prices = Prices(a.cache, f, a.pause, a.offline, now)
-    rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress)
+    hours = Prices(a.cache, f, a.pause, a.offline, now, bar="1H", bar_ms=core.HOUR_MS)  # уровни часового графика
+    rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress, hours)
     since = now - a.since_days * core.DAY_MS
     rp.run(since, now)
     s = summary(a, rp, since, now)
@@ -557,7 +570,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "Первые 3/4: " + line(s["first"]),
         "Последняя 1/4: " + line(s["last"]),
         "Сигналы: " + ", ".join(f"{k} — {v}" for k, v in s["skips"].items()),
-        f"Запросов к OKX: {prices.requests}" + (f", сбоев: {prices.errors}" if prices.errors else ""),
+        f"Запросов к OKX: {rp.requests()} (часовых — {hours.requests})"
+        + (f", сбоев: {prices.errors + hours.errors}" if prices.errors + hours.errors else ""),
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "

@@ -44,11 +44,12 @@ class FakeMarket:
         p = body["params"]
         coin = p["instId"].split("-")[0]
         end = int(p["after"])
+        step = 3_600_000 if p.get("bar") == "1H" else rp.BAR_MS   # часовые — для уровней (24 ч)
         rows = []
-        for t in range(end - 100 * rp.BAR_MS, end, rp.BAR_MS):
+        for t in range(end - 100 * step, end, step):
             if t >= NOW:
                 continue
-            o, c = self.price(coin, t), self.price(coin, t + rp.BAR_MS - 1)
+            o, c = self.price(coin, t), self.price(coin, t + step - 1)
             rows.append([str(t), str(o), str(max(o, c)), str(min(o, c)), str(c), "1", "1", "1", "1"])
         return list(reversed(rows))
 
@@ -165,7 +166,7 @@ class ReplayTest(unittest.TestCase):
         def price(c: str, t: int) -> float:
             if T - 10 * 60 * MIN <= t < T - 9 * 60 * MIN:
                 return 99_000.0
-            if T + 1000 <= t < T + 5 * MIN:
+            if T + 1000 <= t < T + 60 * MIN:   # идущий час (и идущая 5-минутка) — к закрытию 103 000
                 return 103_000.0
             return 100_000.0
         r = self.go(self.whales(), price)
@@ -175,6 +176,19 @@ class ReplayTest(unittest.TestCase):
         self.cache += "2"
         r = self.go(self.whales(side=-1), lambda c, t: price(c, t) if t < T else 100_000.0 * (0.988 if t > T + 60 * MIN else 1))
         self.assertEqual([(t.side, t.why) for t in r["trades"]], [(-1, "тейк")])
+
+    def test_levels_current_hour_and_hourly_candles(self) -> None:
+        """Как у живого бота (24 часовые свечи с идущей): идущий час — по его
+        закрытым 5-минуткам. Сигнал в T+30 мин; в T+10…15 мин цена была 99 000 —
+        у сопротивления: лонг не входит. Часовые свечи — запросом bar=1H, кеш —
+        свой файл."""
+        def price(c: str, t: int) -> float:
+            return 99_000.0 if T + 10 * MIN <= t < T + 15 * MIN else 100_000.0
+        r = self.go(self.whales(t=T + 30 * MIN), price)
+        self.assertEqual(r["trades"], [])
+        self.assertEqual(r["skips"].get("level"), 1)
+        self.assertTrue(any(c["params"].get("bar") == "1H" for c in self.market.calls if "params" in c))
+        self.assertTrue(os.path.isfile(os.path.join(self.cache, "replay_BTC-USDT-SWAP_1H.json")))
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
