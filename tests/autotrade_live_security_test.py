@@ -110,7 +110,11 @@ class GarbageTradeTest(Base):
             os.remove(os.path.join(self.dir, "live", "state.json"))
 
     def test_bad_fill_data_uses_ticker_and_ordered_size(self) -> None:
+        """Цена исполнения — мусор: позиция по цене рынка на момент ордера
+        (99 900), а не по границе ордера (цена китов 100 000); объём — не
+        больше заказанного."""
         tr = self.trader(self.whales())
+        self.ex.last["BTC-USDT-SWAP"] = 99_900.0
         self.on()
         real = self.ex.__call__
 
@@ -123,7 +127,7 @@ class GarbageTradeTest(Base):
         tr.okx._t = spoil
         tr.step()
         op = self.state()["open"]
-        self.assertEqual((op["px"], op["size"], op["tp"]), (100_000.0, 10.0, 100_800.0))
+        self.assertEqual((op["px"], op["size"], op["tp"]), (99_900.0, 10.01, 101_398.5))
 
     def test_absurd_fill_price_never_puts_tp_into_market(self) -> None:
         """Шорт, биржа вернула цену исполнения 10^20: тейк (покупка) встал бы
@@ -142,7 +146,7 @@ class GarbageTradeTest(Base):
         tr.okx._t = spoil
         tr.step()
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"]), ("buy", "99200"))
+        self.assertEqual((tp["side"], tp["px"]), ("buy", "98500"))
 
     def test_adopt_with_absurd_entry_price_places_nothing(self) -> None:
         tr = self.trader(self.whales())
@@ -162,10 +166,11 @@ class GarbageTradeTest(Base):
 
     def test_tp_never_at_zero_or_into_market(self) -> None:
         tr = self.trader(self.whales())
-        for px, tp, side in ((0, 0, 1), (100.0, 0.0, 1), (100.0, 100.3, 1), (100.0, 99.0, 1), (100.0, 101.0, -1)):
+        for px, tp, side in ((0, 0, 1), (100.0, 0.0, 1), (100.0, 100.3, 1), (100.0, 101.0, 1), (100.0, 99.0, 1),
+                             (100.0, 101.5, -1)):
             tr._place_tp({"inst": "BTC-USDT-SWAP", "side": side, "px": px, "tp": tp, "tp_s": str(tp)}, 10)
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [])
-        tr._place_tp({"inst": "BTC-USDT-SWAP", "side": 1, "px": 100.0, "tp": 101.0, "tp_s": "101"}, 10)
+        tr._place_tp({"inst": "BTC-USDT-SWAP", "side": 1, "px": 100.0, "tp": 101.5, "tp_s": "101.5"}, 10)
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
 
     def test_secrets_never_in_files_and_files_private(self) -> None:

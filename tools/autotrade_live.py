@@ -23,7 +23,8 @@
   на ту же бумагу, где ручная позиция, — не входит;
 - своих позиций у бота — до 3 одновременно (правило владельца 27.11.2026;
   было — одна), на разных бумагах: на бумагу, где уже есть своя, — не входит;
-- выход — тейк +0,8 % движения цены (лимитный ордер на бирже); и второй
+- выход — тейк +1,5 % движения цены (лимитный ордер на бирже; правило
+  владельца 27.11.2026, было +0,8 %); и второй
   выход: кто-то из китов сигнала закрыл свою сделку по этой бумаге В УБЫТКЕ
   (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
   тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
@@ -31,22 +32,17 @@
 - стоп — 1,5 % от цены входа (лонг — ниже, шорт — выше; по бэктесту
   27.11.2026, было 3 %); на входе и не меняется;
   цена позиции (mark) дошла — снять тейк и закрыть по рынку (тот же выход,
-  что вслед за китом); работает и при «Стоп» во вкладке; свечи OKX не
-  получены (сбой) — не входим до следующего опроса; усреднения нет;
+  что вслед за китом); работает и при «Стоп» во вкладке; усреднения нет;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - MA30 15-минутного графика (средняя 30 закрытий, идущая — по цене): лонг —
-  только цена выше MA30, шорт — ниже; уровни важнее (проверяются первыми);
-  свечей нет — как без MA (правило владельца 27.11.2026);
+  только цена выше MA30, шорт — ниже; свечей нет — как без MA; свечи OKX не
+  получены (сбой) — не входим до следующего опроса (правило владельца 27.11.2026);
 - рейтинг китов по нашим сделкам (правило владельца 27.11.2026): сделка
   засчитывается всем китам её сигнала; винрейт — от 5 сделок; сигналы с
   китами выше винрейтом — раньше; кит с винрейтом выше 90 % —
-  приоритетный: с ним входим и в одиночку, без «против крупнее», уровней и
-  MA30 (не догоняем, «кит уже вышел» и стоп за уровнем — как всегда);
-- уровни графика 4ч: поддержка — минимум, сопротивление — максимум
-  цены за последние 24 свечи 4ч (4 дня); лонг — только ниже 40 % диапазона (у
-  поддержки), шорт — только выше 60 % (у сопротивления), середина 40–60 % —
-  мёртвая зона; свечей нет — входим, как без них (правило владельца
-  24.11.2026);
+  приоритетный: с ним входим и в одиночку, без «против крупнее» и MA30
+  (не догоняем, «кит уже вышел» и стоп — как всегда);
+- уровней графика 4ч нет (убраны по правилу владельца 27.11.2026);
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
   крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
   крупных от 2 — входим в их сторону.
@@ -121,7 +117,7 @@ LEVERAGE = 10
 # Своих позиций бота — до MAX_OPEN одновременно, на разных бумагах (правило
 # владельца 27.11.2026; раньше — одна): каждая — 5 % маржи × 10×.
 MAX_OPEN = 3
-TP = 0.008                  # тейк +0,8 % движения цены (правило владельца 27.11.2026; было +1 %, до того +0,5 %)
+TP = 0.015                  # тейк +1,5 % движения цены (правило владельца 27.11.2026; было +0,8 %, до того +1 %)
 COIN_PAUSE_MS = 3 * 3_600_000
 FILL_TOL = 0.05            # цена исполнения входа — не дальше 5 % от границы цены ордера
 ENTRY_WAIT_MS = 60_000      # ордер входа (IOC) не исполнен за минуту — снять остаток и решить по исполненному
@@ -321,20 +317,6 @@ class Okx:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
         return max(0.0, num(d[0].get("last"))) if d and isinstance(d[0], dict) else 0.0
 
-    def range_levels(self, inst: str) -> tuple[float, float]:
-        """Минимум и максимум цены за последние 24 свечи 4ч (4 дня, с идущей);
-        мусор в свечах — не в счёт; свечей нет — (0, 0)."""
-        d = self.call_raw("GET", "/api/v5/market/candles", {"instId": inst, "bar": "4H", "limit": str(core.LEVEL_BARS)},
-                          private=False)
-        lows, highs = [], []
-        for r in d:
-            if isinstance(r, list) and len(r) >= 5:
-                h, lo = num(r[2], math.nan), num(r[3], math.nan)
-                if math.isfinite(h) and math.isfinite(lo) and 0 < lo <= h:
-                    lows.append(lo)
-                    highs.append(h)
-        return (min(lows), max(highs)) if lows else (0.0, 0.0)
-
     def ma30_15m(self, inst: str, last: float) -> float:
         """MA30 15-минутного графика: средняя 30 закрытий (идущая свеча — по
         цене last). Свечей меньше 30 или мусор — 0 (MA нет)."""
@@ -511,10 +493,8 @@ class Signals:
             if v is None or v[0] < self.limit:
                 continue
             if (w.count >= MIN_WHALES or wallet in self.priority) and w.big_u > 0:
-                # Приоритетный кит — сигнал и в одиночку (правило владельца 27.11.2026);
-                # solo — чей это одиночный сигнал (бэктест сверяет со своими приоритетными).
-                out.append({**self._signal(coin, side, w, opp, newest),
-                            **({"solo": wallet} if w.count < MIN_WHALES else {})})
+                # Приоритетный кит — сигнал и в одиночку (правило владельца 27.11.2026).
+                out.append(self._signal(coin, side, w, opp, newest))
             # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
             # сигнал и в их сторону: входим с крупными (правило владельца).
             if opp is not None and opp.count >= MIN_WHALES and opp.big_u > 0 \
@@ -526,16 +506,14 @@ class Signals:
         """Объём китов окна (кошельки от 1000 $), $."""
         return float(w.whale_n) / NANOS if w is not None else 0.0   # сумма — по ходу (core.Window)
 
-    def priority_in(self, coin: str, side: int, wallets: object, now: int, priority: set[str] | None = None) -> str:
+    def priority_in(self, coin: str, side: int, wallets: object, now: int) -> str:
         """Приоритетный кит сигнала, что ещё в окне за 2 часа до «сейчас» (от
-        1000 $): кошелёк или ''. priority — свои приоритетные (вариант
-        бэктеста), иначе — self.priority."""
+        1000 $): кошелёк или ''."""
         w = self.windows.get((coin, side))
         if w is None or not isinstance(wallets, dict):
             return ""
         w.expire(now - WINDOW_MS)
-        prio = self.priority if priority is None else priority
-        return next((x for x in sorted(wallets) if x in prio and (v := w.per.get(x)) is not None
+        return next((x for x in sorted(wallets) if x in self.priority and (v := w.per.get(x)) is not None
                      and v[0] >= self.limit), "")
 
     def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:
@@ -716,7 +694,7 @@ class Backtests:
         self.proc = subprocess.Popen(  # свой скрипт, аргументы списком — без оболочки
             [sys.executable, "-I", self.script, "--db", self.db, "--out", out, "--cache",
              os.path.join(self.dir, "cache"), "--pause", str(BT_PAUSE_SEC), "--max-mem-mb", str(BT_MEM_MB),
-             "--since-days", str(BT_DAYS), "--deposit", str(self.deposit()), "--variants"],
+             "--since-days", str(BT_DAYS), "--deposit", str(self.deposit())],
             stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(19))  # noqa: PLW1509 — однопоточная служба
         self.st.update(running=True, started=int(now), error="", progress="запуск")
         self._write()
@@ -1323,23 +1301,8 @@ class Trader:
         bucket[code] = int(num(bucket.get(code))) + 1
         self.st["skips"] = skips
 
-    def level_check(self, inst: str, last: float, side: int, force: bool = False) -> tuple[str, float]:
-        """Уровни графика 4ч: ('', стоп) — цена у своего уровня или у
-        бумаги нет свечей (входим; стоп — core.fixed_stop: 1,5 % от цены
-        входа), иначе — (причина пропуска, 0). Свечи не получены
-        (отказ OKX, обрыв сети) — пропуск: без уровней и без стопа не входим,
-        сигнал свеж 15 минут — следующий опрос повторит."""
-        try:
-            lo, hi = self.okx.range_levels(inst)
-        except (OkxError, OSError) as e:
-            return self._skip("candles", f"{inst}: свечи OKX не получены ({str(e)[:120]}) — повтор на следующем опросе"), 0.0
-        if force or core.level_ok(lo, hi, last, side) is not False:   # force — приоритетный кит: только стоп
-            return "", core.fixed_stop(last, side)
-        return self._skip("level", f"{inst}: цена {last:.6g} ближе к {'сопротивлению' if side > 0 else 'поддержке'} "
-                                   f"(4ч × 24: {lo:.6g}–{hi:.6g}) — {'лонг' if side > 0 else 'шорт'} не входит"), 0.0
-
     def ma_check(self, inst: str, last: float, side: int) -> str:
-        """MA30 15-минутного графика (после уровней — они важнее): '' — цена
+        """MA30 15-минутного графика: '' — цена
         по ту же сторону MA30, что и сделка, или у бумаги нет 30 свечей
         (входим), иначе — причина пропуска. Свечи не получены (сбой) —
         пропуск до следующего опроса."""
@@ -1373,7 +1336,7 @@ class Trader:
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
         s = {**s, "usd": round(usd, 2), "usd_against": round(against, 2)}
         # Приоритетный кит (наш винрейт с ним > 90 % от 5 сделок): с ним входим
-        # и в одиночку, без «против крупнее», уровней и MA30.
+        # и в одиночку, без «против крупнее» и MA30.
         prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)
         if prio:
             s["priority"] = prio
@@ -1416,13 +1379,11 @@ class Trader:
             return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE + PX_EPS:
             return self._skip("chase", f"цена хуже средней цены китов{chase_text()}")
-        why, stop = self.level_check(inst, last, s["side"], force=bool(prio))
-        if why:
-            return why
         why = "" if prio else self.ma_check(inst, last, s["side"])
         if why:
             return why
-        s = {**s, "stop": stop}
+        # Стоп — STOP_PCT от цены входа (уровни 4ч убраны 27.11.2026: правило владельца).
+        s = {**s, "stop": core.fixed_stop(last, s["side"])}
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
         notional = self.equity * MARGIN_FRAC * LEVERAGE

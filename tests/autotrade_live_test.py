@@ -55,7 +55,6 @@ class FakeOkx:
         self.reject: dict[str, str] = {}   # бумага → код отказа OKX на ордер
         self.hold = False                  # лимиты входа висят (не исполняются сразу)
         self.book: dict[str, tuple[float, float]] = {}   # бумага → (лучшая покупка, лучшая продажа)
-        self.hl: dict[str, object] = {}    # бумага → (минимум, максимум) часовых свечей за сутки или свои строки
         self.ma: dict[str, object] = {}    # бумага → закрытие 15-минутных свечей (MA30 ≈ оно) или свои строки
 
     def __call__(self, method: str, url: str, headers: dict, body: bytes | None):
@@ -72,13 +71,6 @@ class FakeOkx:
             got = self.ma.get(q["instId"])
             if isinstance(got, (int, float)):
                 return ok([[str(self.n + i), "1", "1", "1", str(got), "1"] for i in range(int(q.get("limit", "30")))])
-            return ok(got if isinstance(got, list) else [])
-        if p == "/api/v5/market/candles":
-            got = self.hl.get(q["instId"])
-            if isinstance(got, tuple):
-                lo, hi = got
-                return ok([[str(self.n + i), "1", str(hi if i == 3 else (lo + hi) / 2), str(lo if i == 7 else (lo + hi) / 2), "1"]
-                           for i in range(int(q.get("limit", "24")))])
             return ok(got if isinstance(got, list) else [])
         if p == "/api/v5/market/ticker":
             bid, ask = self.book.get(q["instId"], ("", ""))
@@ -463,9 +455,9 @@ class TradeTest(Base):
         self.assertIn(("POST", "/api/v5/account/set-leverage", {"instId": "BTC-USDT-SWAP", "lever": "10", "mgnMode": "cross"}),
                       self.ex.calls)
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"], tp["sz"], tp["reduceOnly"]), ("sell", "100800", "10", True))
+        self.assertEqual((tp["side"], tp["px"], tp["sz"], tp["reduceOnly"]), ("sell", "101500", "10", True))
         st = self.state()
-        self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 100800.0))
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 101500.0))
         tr.sync()
         tr.save()
         self.assertEqual(set(self.state()["positions"][0]), {"instId", "upl"},
@@ -573,7 +565,7 @@ class TradeTest(Base):
         # 10 000 $ / (10 000 000 PEPE × 0,00001 $) = 100 контрактов.
         self.assertEqual((m["instId"], m["side"], m["posSide"], m["sz"]), ("PEPE-USDT-SWAP", "sell", "short", "100"))
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["posSide"], tp["px"]), ("buy", "short", "0.00000992"))
+        self.assertEqual((tp["side"], tp["posSide"], tp["px"]), ("buy", "short", "0.00000985"))
         self.assertNotIn("reduceOnly", tp)
 
     def test_close_records_trade_cancels_tp_then_pause_3h(self) -> None:
@@ -585,7 +577,7 @@ class TradeTest(Base):
         self.now += 30 * MIN
         self.ex.pos = []
         self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "88.5",
-                            "closeAvgPx": "100800", "fee": "-9", "fundingFee": "-2.5"}]
+                            "closeAvgPx": "101500", "fee": "-9", "fundingFee": "-2.5"}]
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
@@ -1096,9 +1088,9 @@ class EntryOrderTest(Base):
         self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
         self.sync(tr, 0)
         [op] = self.state()["opens"]
-        self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 100_800.0))
+        self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 101_500.0))
         self.assertNotIn("entering", self.state())
-        self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["100800"])
+        self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["101500"])
 
     def test_timeout_keeps_filled_part(self) -> None:
         """Исполнилось 6 из 10, минута прошла — остаток снят, позиция — 6,
@@ -1221,13 +1213,10 @@ class StopTest(Base):
     нет. Цена входа 100 000: лонг — стоп 98 500, шорт — 101 500 (1,5 %)."""
 
     trades = WhaleExitTest.trades
-    LEVELS: ClassVar[dict[int, tuple[float, float]]] = {1: (99_000.0, 103_000.0), -1: (97_000.0, 100_800.0)}
     STOPS: ClassVar[dict[int, float]] = {1: 98_500.0, -1: 101_500.0}
 
-    def enter(self, mode: str = "net_mode", side: int = 1, levels: bool = True) -> lv.Trader:
+    def enter(self, mode: str = "net_mode", side: int = 1) -> lv.Trader:
         self.ex = FakeOkx(mode)
-        if levels:
-            self.ex.hl["BTC-USDT-SWAP"] = self.LEVELS[side]
         tr = self.trader(self.whales(side=side))
         self.on()
         tr.step()
@@ -1274,17 +1263,15 @@ class StopTest(Base):
             os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
 
     def test_stop_fixed_at_entry(self) -> None:
-        """Уровни после входа сдвинулись (новый минимум 95 000) — стоп прежний."""
+        """Стоп ставится на входе и не меняется: 96 900 — за ним."""
         tr = self.enter()
-        self.ex.hl["BTC-USDT-SWAP"] = (95_000.0, 103_000.0)
         self.price(96_900.0)
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
 
     def test_no_levels_stop_at_cap_and_no_averaging(self) -> None:
-        """Уровней нет — стоп всё равно есть: 1,5 % от входа; до него — сидим,
-        без доливки."""
-        tr = self.enter(levels=False)
+        """Стоп — 1,5 % от входа; до него — сидим, без доливки."""
+        tr = self.enter()
         self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0)
         for px in (98_600.0, 100_300.0, 98_501.0):
             self.price(px)
@@ -1295,19 +1282,6 @@ class StopTest(Base):
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
 
-    def test_far_level_stop_capped(self) -> None:
-        """Уровни любые (поддержка 90 000) — стоп всё равно 1,5 % от входа; шорт —
-        зеркально."""
-        for side, levels, want in ((1, (90_000.0, 130_000.0), 98_500.0), (-1, (70_000.0, 110_000.0), 101_500.0)):
-            self.ex = FakeOkx()
-            self.ex.hl["BTC-USDT-SWAP"] = levels
-            tr = self.trader(self.whales(side=side))
-            self.on()
-            tr.step()
-            self.assertAlmostEqual(self.state()["open"]["stop"], want, msg=str(side))
-            os.remove(self.db)
-            os.remove(os.path.join(self.dir, "live", "state.json"))
-
     def test_fixed_stop_rule(self) -> None:
         fs = lv.core.fixed_stop
         self.assertAlmostEqual(fs(100.0, 1), 98.5)
@@ -1315,31 +1289,6 @@ class StopTest(Base):
         self.assertAlmostEqual(fs(100.0, 1, 0.05), 95.0)
         for px in (0.0, -1.0, float("nan"), float("inf")):
             self.assertEqual(fs(px, 1), 0.0, px)
-        self.assertAlmostEqual(lv.core.entry_stop(0.0, 0.0, 100.0, 1), 98.5, "за уровнем — по умолчанию не дальше 1,5 %")
-
-    def test_entry_stop_rule(self) -> None:
-        """Стоп за уровнем (вариант бэктеста), здесь — не дальше 1,5 %."""
-        def st(lo: float, hi: float, px: float, side: int, most: float = 0.015) -> float:
-            return lv.core.entry_stop(lo, hi, px, side, most)
-
-        self.assertAlmostEqual(st(99.0, 120.0, 100.0, 1), 99.0 * 0.995, msg="уровень ближе 1,5 % — за уровнем")
-        self.assertAlmostEqual(st(80.0, 100.9, 100.0, -1), 100.9 * 1.005)
-        self.assertAlmostEqual(st(90.0, 120.0, 100.0, 1), 98.5, msg="уровень дальше — 1,5 % от входа")
-        self.assertAlmostEqual(st(80.0, 110.0, 100.0, -1), 101.5)
-        self.assertAlmostEqual(st(0.0, 0.0, 100.0, 1), 98.5, msg="уровней нет — 1,5 %")
-        self.assertAlmostEqual(st(0.0, 0.0, 100.0, -1), 101.5)
-        self.assertAlmostEqual(st(101.0, 120.0, 100.0, 1), 98.5, msg="стоп за уровнем по ту сторону цены — 1,5 %")
-        self.assertAlmostEqual(st(80.0, 99.0, 100.0, -1), 101.5)
-        self.assertAlmostEqual(st(100.5, 120.0, 100.0, 1), 100.5 * 0.995, msg="поддержка чуть выше цены, стоп ниже — за уровнем")
-        self.assertAlmostEqual(st(100.0 / 0.995, 120.0, 100.0, 1), 98.5, msg="стоп за уровнем ровно на цене — 1,5 %")
-        for px in (0.0, -1.0, float("nan"), float("inf")):
-            self.assertEqual(st(99.0, 120.0, px, 1), 0.0, px)
-        inf = float("inf")
-        self.assertAlmostEqual(st(90.0, 120.0, 100.0, 1, inf), 89.55, msg="только за уровнем — без предела")
-        self.assertAlmostEqual(st(80.0, 110.0, 100.0, -1, inf), 110.55)
-        self.assertEqual(st(0.0, 0.0, 100.0, 1, inf), 0.0, "только за уровнем, уровней нет — стопа нет")
-        self.assertEqual(st(101.0, 120.0, 100.0, 1, inf), 0.0, "уровень по ту сторону — стопа нет")
-        self.assertAlmostEqual(st(90.0, 120.0, 100.0, 1, 0.025), 97.5)
 
     def test_stop_works_when_stopped_and_without_whales(self) -> None:
         """«Стоп» во вкладке — новых входов нет, но стоп открытой позиции
@@ -1393,16 +1342,15 @@ class StopTest(Base):
         ней): выход по рынку вслед за китом на 0,15 % ниже тейка — не тейк."""
         tr = self.enter()
         op = tr.st["open"]
-        self.assertEqual(op["tp"], 100_800.0)
+        self.assertEqual(op["tp"], 101_500.0)
         op["exit"] = {"kind": "whale", "why": "кит"}
-        tr._record_close(dict(op), {"closeAvgPx": "100650", "realizedPnl": "8", "uTime": str(self.now)})
-        tr._record_close(dict(op), {"closeAvgPx": "100800", "realizedPnl": "9", "uTime": str(self.now)})
+        tr._record_close(dict(op), {"closeAvgPx": "101350", "realizedPnl": "8", "uTime": str(self.now)})
+        tr._record_close(dict(op), {"closeAvgPx": "101500", "realizedPnl": "9", "uTime": str(self.now)})
         self.assertEqual([t["why"] for t in self.trades()], ["кит вышел в убыток", "тейк"])
 
     def test_stop_survives_crash_between_order_and_record(self) -> None:
         """Стоп — и в записи «входим»: служба упала после ордера — принятая
         сверкой позиция со стопом."""
-        self.ex.hl["BTC-USDT-SWAP"] = self.LEVELS[1]
         tr = self.trader(self.whales())
         self.on()
         real = tr.okx.order
@@ -1423,83 +1371,28 @@ class StopTest(Base):
         tr2.save()
         self.assertAlmostEqual(self.state()["open"]["stop"], self.STOPS[1])
 
-    def test_level_stop_rule(self) -> None:
-        st = lv.core.level_stop
-        self.assertAlmostEqual(st(100.0, 120.0, 1), 99.5)
-        self.assertAlmostEqual(st(100.0, 120.0, -1), 120.6)
-        for lo, hi in ((0.0, 0.0), (100.0, 100.0), (120.0, 100.0), (float("nan"), 120.0), (100.0, float("inf"))):
-            self.assertEqual(st(lo, hi, 1), 0.0, (lo, hi))
+class CandlesErrorTest(Base):
+    """Свечи 15м для MA30 не получены (отказ OKX, обрыв сети) — пропуск
+    «candles», шаг не падает; сигнал свеж 15 минут — следующий опрос повторит.
+    Уровней 4ч нет (правило владельца 27.11.2026): свечи 4ч не спрашиваем."""
 
-
-class LevelTest(Base):
-    """Правило владельца (24.11.2026): уровни часового графика — поддержка
-    (минимум за 24 часа) и сопротивление (максимум). Лонг — только ближе к
-    поддержке, шорт — только ближе к сопротивлению; свечей нет — как без них."""
-
-    def go(self, side: int, lo_hi: object) -> lv.Trader:
-        self.ex.hl["BTC-USDT-SWAP"] = lo_hi
-        tr = self.trader(self.whales(side=side))
+    def test_no_4h_candles_requested(self) -> None:
+        tr = self.trader(self.whales())
         self.on()
         tr.step()
-        return tr
-
-    def test_long_near_support_enters(self) -> None:
-        self.go(1, (99_000.0, 103_000.0))            # цена 100 000 — четверть диапазона
-        [m] = self.market_orders()
-        self.assertEqual(m["side"], "buy")
-        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles" and c[2]["bar"] == "4H"]
-        self.assertEqual((c[2]["instId"], c[2]["limit"]), ("BTC-USDT-SWAP", "24"))
-
-    def test_long_near_resistance_skipped(self) -> None:
-        self.go(1, (97_000.0, 101_000.0))            # три четверти — у сопротивления
-        self.assertEqual(self.market_orders(), [])
-        sk = self.state()["last_skip"]
-        self.assertEqual(sk["code"], "level")
-        self.assertIn("ближе к сопротивлению (4ч × 24: 97000–101000) — лонг не входит", sk["why"])
-
-    def test_short_mirrors(self) -> None:
-        self.go(-1, (99_000.0, 103_000.0))
-        self.assertEqual(self.market_orders(), [])
-        self.assertIn("ближе к поддержке", self.state()["last_skip"]["why"])
-        os.remove(self.db)
-        os.remove(os.path.join(self.dir, "live", "state.json"))
-        self.ex = FakeOkx()
-        self.go(-1, (97_000.0, 101_000.0))
-        [m] = self.market_orders()
-        self.assertEqual(m["side"], "sell")
-
-    def test_middle_40_60_is_neither(self) -> None:
-        """Середина диапазона (40–60 %) — мёртвая зона: цена 100 000 при 99 000–
-        101 500 — 40 %, при 98 500–101 000 — 60 %: ни лонг, ни шорт."""
-        for side, lo_hi in ((1, (99_000.0, 101_500.0)), (-1, (98_500.0, 101_000.0)),
-                            (1, (99_000.0, 101_000.0)), (-1, (99_000.0, 101_000.0))):
-            self.ex = FakeOkx()
-            self.go(side, lo_hi)
-            self.assertEqual(self.market_orders(), [], side)
-            os.remove(self.db)
-            os.remove(os.path.join(self.dir, "live", "state.json"))
-
-    def test_no_candles_or_garbage_enters(self) -> None:
-        bad = [["1", "1", "nan", "1", "1"], ["2", "1", "5", "9", "1"], ["3", "1", "-1", "-2", "1"], "x", ["4", "1"]]
-        for got in ([], bad, (100_000.0, 100_000.0)):
-            self.ex = FakeOkx()
-            self.go(1, got)
-            self.assertEqual(len(self.market_orders()), 1, got)
-            os.remove(self.db)
-            os.remove(os.path.join(self.dir, "live", "state.json"))
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "4H"], [])
+        self.assertFalse(hasattr(lv.Okx, "range_levels"))
+        self.assertFalse(hasattr(lv.core, "level_ok"))
 
     def test_candles_error_skips_then_enters(self) -> None:
-        """Свечи 4ч не получены (отказ OKX, обрыв сети) — без уровней и
-        стопа не входим: пропуск «candles», шаг не падает, MA не спрашиваем;
-        сигнал не теряется — следующий опрос входит."""
         for err in (lv.OkxError("50011", "часто"), TimeoutError("timed out")):
             tr = self.trader(self.whales())
             self.on()
-            with mock.patch.object(tr.okx, "range_levels", side_effect=err):
+            with mock.patch.object(tr.okx, "ma30_15m", side_effect=err):
                 tr.step()
             self.assertEqual(self.market_orders(), [], err)
             self.assertEqual(self.state()["last_skip"]["code"], "candles")
-            self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [])
             self.now += 5_000
             tr.step()
             self.assertEqual(len(self.market_orders()), 1, err)
@@ -1512,7 +1405,7 @@ class LevelTest(Base):
         сигнал той же бумаги и стороны (китов 3) важнее повторяемого (2)."""
         tr = self.trader(self.whales())
         self.on()
-        with mock.patch.object(tr.okx, "range_levels", side_effect=TimeoutError("timed out")):
+        with mock.patch.object(tr.okx, "ma30_15m", side_effect=TimeoutError("timed out")):
             tr.step()
         self.assertEqual([s["whales"] for s in tr.retry], [2])
         con = sqlite3.connect(self.db)
@@ -1528,7 +1421,7 @@ class LevelTest(Base):
         не повторяем его бесконечно."""
         tr = self.trader(self.whales())
         self.on()
-        with mock.patch.object(tr.okx, "range_levels", side_effect=TimeoutError("timed out")):
+        with mock.patch.object(tr.okx, "ma30_15m", side_effect=TimeoutError("timed out")):
             tr.step()
             self.assertEqual(len(tr.retry), 1)
             self.now += 16 * MIN
@@ -1537,39 +1430,14 @@ class LevelTest(Base):
         tr.step()
         self.assertEqual(self.market_orders(), [])
 
-    def test_range_ignores_garbage_rows(self) -> None:
-        self.ex.hl["BTC-USDT-SWAP"] = [["1", "1", "102000", "99500", "1"], ["2", "1", "nan", "1", "1"],
-                                       ["3", "1", "5", "9", "1"], ["4", "1", "101000", "98000", "1"], "x"]
-        okx = lv.Okx("K", "S", "P", False, self.ex)
-        self.assertEqual(okx.range_levels("BTC-USDT-SWAP"), (98_000.0, 102_000.0))
-
-    def test_level_rule(self) -> None:
-        ok = lv.core.level_ok
-        # Диапазон 90–110: лонг — ниже 98 (40 %), шорт — выше 102 (60 %), 98–102 — мёртвая зона.
-        self.assertTrue(ok(90.0, 110.0, 97.9, 1))
-        self.assertTrue(ok(90.0, 110.0, 102.1, -1))
-        for px in (98.0, 99.0, 100.0, 101.0, 102.0):
-            self.assertFalse(ok(90.0, 110.0, px, 1), px)
-            self.assertFalse(ok(90.0, 110.0, px, -1), px)
-        self.assertFalse(ok(90.0, 110.0, 97.9, -1))
-        self.assertFalse(ok(90.0, 110.0, 102.1, 1))
-        self.assertTrue(ok(90.0, 110.0, 80.0, 1), "цена ниже минимума — у самой поддержки")
-        self.assertTrue(ok(90.0, 110.0, 120.0, -1))
-        for lo, hi, px in ((0.0, 0.0, 100.0), (100.0, 100.0, 100.0), (110.0, 90.0, 100.0), (90.0, 110.0, 0.0),
-                           (float("nan"), 110.0, 100.0), (90.0, float("inf"), 100.0), (-5.0, 110.0, 100.0)):
-            self.assertIsNone(ok(lo, hi, px, 1), (lo, hi, px))
-
 
 class MaTest(Base):
     """Правило владельца (27.11.2026): MA30 15-минутного графика — лонг только
-    при цене выше MA30, шорт — ниже; уровни 24 ч важнее (проверяются первыми);
-    свечей нет — как без MA. Закрытия 99 000 → MA ≈ 99 033 (ниже цены 100 000),
+    при цене выше MA30, шорт — ниже; свечей нет — как без MA. Закрытия 99 000 → MA ≈ 99 033 (ниже цены 100 000),
     101 000 → ≈ 100 967 (выше)."""
 
-    def go(self, side: int, ma: object, levels: object = None) -> lv.Trader:
+    def go(self, side: int, ma: object) -> lv.Trader:
         self.ex.ma["BTC-USDT-SWAP"] = ma
-        if levels is not None:
-            self.ex.hl["BTC-USDT-SWAP"] = levels
         tr = self.trader(self.whales(side=side))
         self.on()
         tr.step()
@@ -1590,15 +1458,6 @@ class MaTest(Base):
                 self.assertIn(f"{'ниже' if side > 0 else 'выше'} MA30 15м", sk["why"])
                 self.assertIn("лонг не входит" if side > 0 else "шорт не входит", sk["why"])
             self.reset()
-
-    def test_levels_first(self) -> None:
-        """Уровни против (лонг у сопротивления) — пропуск «level», MA даже не спрашиваем."""
-        self.go(1, 99_000.0, levels=(97_000.0, 101_000.0))
-        self.assertEqual(self.state()["last_skip"]["code"], "level")
-        self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [])
-        self.reset()
-        self.go(1, 101_000.0, levels=(99_000.0, 103_000.0))   # уровни за, MA против
-        self.assertEqual(self.state()["last_skip"]["code"], "ma30")
 
     def test_request_and_current_candle_by_price(self) -> None:
         self.go(1, 99_000.0)
@@ -1726,9 +1585,8 @@ class RatingTest(Base):
         tr.step()
         self.assertEqual(self.market_orders(), [])
 
-    def test_priority_ignores_levels_ma_and_bigger_against_but_keeps_stop(self) -> None:
+    def test_priority_ignores_ma_and_bigger_against_but_keeps_stop(self) -> None:
         self.history(["0xa"], 5, 5)
-        self.ex.hl["BTC-USDT-SWAP"] = (97_000.0, 101_000.0)   # лонг у сопротивления — обычно «level»
         self.ex.ma["BTC-USDT-SWAP"] = 101_000.0               # MA выше цены — обычно «ma30»
         big = [fill(50, "0xbig", "BTC", -1, self.now - 30 * MIN, 900_000, 100_000)]  # против крупнее
         tr = self.trader(self.solo() + big)
@@ -1818,7 +1676,7 @@ class EeaTest(Base):
             self.assertEqual((m["instId"], m["sz"]), (x, str(int(10_000 / ct_usd))), ccy)
             self.assertAlmostEqual(tr.st["open"]["notional"], 10_000, delta=1)
             [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-            self.assertEqual((tp["instId"], tp["px"], tp["posSide"]), (x, "100800", "long"))
+            self.assertEqual((tp["instId"], tp["px"], tp["posSide"]), (x, "101500", "long"))
             self.assertFalse(any(c[2].get("instId") == "BTC-USDT-SWAP" for c in self.ex.calls if c[1] == "/api/v5/trade/order"))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
@@ -1841,7 +1699,7 @@ class EeaTest(Base):
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк один, не дубли")
         self.now += 10 * MIN
         self.ex.pos = []
-        self.ex.history = [{"instId": x, "uTime": str(self.now), "realizedPnl": "77.0", "closeAvgPx": "100800"}]
+        self.ex.history = [{"instId": x, "uTime": str(self.now), "realizedPnl": "77.0", "closeAvgPx": "101500"}]
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
@@ -2017,10 +1875,10 @@ class RecoverTest(Base):
         tr.sync()  # первая сверка шага после перезапуска
         tr.save()
         st = self.state()
-        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 100800.0, 2))
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 101500.0, 2))
         self.assertNotIn("entering", st)
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"]), ("sell", "100800"))
+        self.assertEqual((tp["side"], tp["px"]), ("sell", "101500"))
         tr.last_sync = 0
         tr.step()
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк не дублируется")
@@ -2190,14 +2048,14 @@ class ReviewTest(Base):
         self.on()
         tr.step()
         tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
-        tp.update(state="filled", avgPx="100800", accFillSz="10", pnl="100", fee="-5", fillTime=str(self.now + 5 * MIN))
+        tp.update(state="filled", avgPx="101500", accFillSz="10", pnl="100", fee="-5", fillTime=str(self.now + 5 * MIN))
         self.ex.pos[0]["pos"] = "15"
         self.now += 10 * MIN
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
             [t] = [json.loads(x) for x in f]
-        self.assertEqual((t["why"], t["pnl"], t["px_out"]), ("тейк", 100.0, 100800.0))
+        self.assertEqual((t["why"], t["pnl"], t["px_out"]), ("тейк", 100.0, 101500.0))
         self.assertIsNone(self.state()["open"])
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [])
 
@@ -2214,7 +2072,7 @@ class ReviewTest(Base):
             self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "4", "posSide": "short", "avgPx": "100500",
                             "markPx": "100500"}]
             self.now += 10 * MIN
-            px = "100800" if tp_state == "filled" else "100200"
+            px = "101500" if tp_state == "filled" else "100200"
             self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "9", "closeAvgPx": px}]
             tr.last_sync = 0
             tr.step()
@@ -2552,7 +2410,7 @@ class BacktestServiceTest(unittest.TestCase):
         b.tick(True)
         args = b.proc.args
         self.assertEqual((args[args.index("--since-days") + 1], args[args.index("--deposit") + 1]), ("30", "124.83"))
-        self.assertIn("--variants", args, "ночной бэктест сравнивает варианты правил")
+        self.assertNotIn("--variants", args, "вариантов нет — один расчёт по текущим правилам")
         for _ in range(100):
             b.tick(True)
             if "25 %" in self.status().get("progress", ""):

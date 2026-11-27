@@ -58,34 +58,15 @@ def okx_candidate(coin: str) -> tuple[str, float]:
     return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
 
 
-# Уровни 4-часового графика (правило владельца 24.11.2026, график 4ч —
-# 27.11.2026): поддержка — минимум, сопротивление — максимум цены за
-# последние 24 свечи 4ч (4 дня). Лонг — только
-# ближе к поддержке (ниже 40 % диапазона), шорт — ближе к сопротивлению (выше
-# 60 %); середина 40–60 % — мёртвая зона для обеих сторон.
-LEVEL_BAR_MS = 4 * HOUR_MS
-LEVEL_BARS = 24
-LEVEL_MS = LEVEL_BARS * LEVEL_BAR_MS
-LEVEL_LONG_BELOW = 0.4
-LEVEL_SHORT_ABOVE = 0.6
-LEVEL_STOP_BEYOND = 0.005   # стоп — на 0,5 % за уровнем входа (правило владельца 24.11.2026)
 # Стоп — 1,5 % от цены входа (по бэктесту с входом по рынку 27.11.2026: стоп
 # 1,5 % — итог на 17 $ лучше 3 % и просадка 38 $ против 52 $; было 3 %,
-# до того — за уровнем, не дальше 1,5 %). За уровнем (entry_stop) — вариант.
+# до того — за уровнем 4ч, не дальше 1,5 %; уровни убраны 27.11.2026).
 STOP_PCT = 0.015
-
-
-def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
-    """Цена px у «своего» уровня? None — уровней нет (входим, как без них)."""
-    if not all(math.isfinite(x) for x in (lo, hi, px)) or not 0 < lo < hi or px <= 0:
-        return None
-    pos = (px - lo) / (hi - lo)   # цена за краем диапазона — за 0 или 1: у самого уровня
-    return pos < LEVEL_LONG_BELOW if side > 0 else pos > LEVEL_SHORT_ABOVE
 
 
 # MA30 на 15-минутном графике (правило владельца 27.11.2026): средняя 30
 # закрытий 15-минутных свечей (идущая — по текущей цене). Лонг — только когда
-# цена выше MA30, шорт — ниже. Уровни (level_ok) важнее: проверяются первыми.
+# цена выше MA30, шорт — ниже.
 MA_BARS = 30
 MA_BAR_MS = 15 * 60_000
 
@@ -101,8 +82,7 @@ def ma_ok(ma: float, px: float, side: int) -> bool | None:
 # Рейтинг китов по нашим сделкам (правило владельца 27.11.2026): сделка бота
 # засчитывается всем китам её сигнала (плюс — всем плюс). Винрейт кита — от
 # RATING_MIN_TRADES сделок; выше — приоритетнее; выше PRIORITY_WINRATE —
-# приоритетный кит: с ним входим и в одиночку, без уровней, MA30 и «против
-# крупнее».
+# приоритетный кит: с ним входим и в одиночку, без MA30 и «против крупнее».
 RATING_MIN_TRADES = 5
 PRIORITY_WINRATE = 0.9
 
@@ -134,41 +114,12 @@ class Rating:
         return {w for w in self.per if (r := self.rate(w)) is not None and r > PRIORITY_WINRATE}
 
 
-def level_stop(lo: float, hi: float, side: int) -> float:
-    """Стоп за уровнем, от которого вошли: лонг — на LEVEL_STOP_BEYOND ниже
-    поддержки (минимума 24 свечей 4ч), шорт — выше сопротивления (максимума).
-    Уровней нет — 0."""
-    if not all(math.isfinite(x) for x in (lo, hi)) or not 0 < lo < hi:
-        return 0.0
-    return lo * (1 - LEVEL_STOP_BEYOND) if side > 0 else hi * (1 + LEVEL_STOP_BEYOND)
-
-
 def fixed_stop(px: float, side: int, pct: float = STOP_PCT) -> float:
     """Стоп входа: pct от цены входа px (лонг — ниже, шорт — выше); цена —
     мусор — 0 (вызывающий такое не открывает)."""
     if not math.isfinite(px) or px <= 0:
         return 0.0
     return px * (1 - side * pct)
-
-
-def entry_stop(lo: float, hi: float, px: float, side: int, most: float = STOP_PCT) -> float:
-    """Стоп за уровнем (вариант бэктеста): за уровнем (level_stop), но не
-    дальше most от цены входа px — ближний из двух. Уровней нет
-    или уровень по ту сторону цены — ровно most от px: без стопа бот не
-    входит. Цена px — мусор — 0 (вызывающий такое не открывает). most —
-    бесконечность (вариант бэктеста «стоп только за уровнем») — только
-    уровень, уровней нет — 0."""
-    if not math.isfinite(px) or px <= 0:
-        return 0.0
-    lvl = level_stop(lo, hi, side)
-    if lvl > 0 and side * (px - lvl) <= 0:
-        lvl = 0.0
-    if not math.isfinite(most):
-        return lvl
-    cap = px * (1 - side * most)
-    if lvl <= 0:
-        return cap
-    return max(lvl, cap) if side > 0 else min(lvl, cap)
 
 
 def safe_name(name: str) -> str:
