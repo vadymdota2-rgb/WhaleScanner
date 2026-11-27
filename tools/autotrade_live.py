@@ -15,6 +15,8 @@
 - только фьючерсы (крипта, акции, металлы), бумага должна быть на OKX и цена
   сходиться с ценой китов (±2 %) — иначе это другой актив;
 - не догоняем: цена OKX хуже средней цены китов больше чем на 0,3 % — пропуск;
+  вход — по рынку ордером IOC с границей «средняя китов ±0,3 %»: исполняется
+  сразу, но не хуже границы (правило владельца 27.11.2026);
 - маржа — всегда 5 % капитала счёта, плечо 10×, кросс (сделки владельца
   руками на счёте входу не мешают);
   на ту же бумагу, где ручная позиция, — не входит;
@@ -115,8 +117,8 @@ LEVERAGE = 10
 MAX_OPEN = 3
 TP = 0.008                  # тейк +0,8 % движения цены (правило владельца 27.11.2026; было +1 %, до того +0,5 %)
 COIN_PAUSE_MS = 3 * 3_600_000
-FILL_TOL = 0.05            # цена исполнения входа — не дальше 5 % от цены лимита
-LIMIT_WAIT_MS = 5 * 60_000  # лимит входа ждёт исполнения 5 минут, потом снимается
+FILL_TOL = 0.05            # цена исполнения входа — не дальше 5 % от границы цены ордера
+ENTRY_WAIT_MS = 60_000      # ордер входа (IOC) не исполнен за минуту — снять остаток и решить по исполненному
 ADOPT_TOL = 0.5            # подхват позиции: средняя цена — не дальше 50 % от рынка
 TP_SLACK = 0.005           # тейк на шаге цены — не дальше +1 % (иначе шаг цены слишком крупный)
 
@@ -307,12 +309,6 @@ class Okx:
     def ticker(self, inst: str) -> float:
         d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
         return max(0.0, num(d[0].get("last"))) if d and isinstance(d[0], dict) else 0.0
-
-    def best(self, inst: str, side: int) -> float:
-        """Лучшая цена своей стороны стакана: лонг — покупка (bidPx), шорт —
-        продажа (askPx); нет — 0."""
-        d = self.call("GET", "/api/v5/market/ticker", {"instId": inst}, private=False)
-        return max(0.0, num(d[0].get("bidPx" if side > 0 else "askPx"))) if d else 0.0
 
     def range_levels(self, inst: str) -> tuple[float, float]:
         """Минимум и максимум цены за последние 24 свечи 4ч (4 дня, с идущей);
@@ -1044,7 +1040,7 @@ class Trader:
             self.st.pop("entering", None)
             return
         if e.get("limit"):
-            self._resolve_limit(e)
+            self._resolve_entry(e)
             return
         # Запись прежней версии (вход по рынку).
         try:
@@ -1352,7 +1348,7 @@ class Trader:
         if len(mine) >= MAX_OPEN:
             return self._skip("own_open", f"у бота уже {len(mine)} позиции ({', '.join(sorted(mine))}) — больше {MAX_OPEN} не открываем")
         if self.st.get("entering"):
-            return self._skip("entering", "прошлый лимит входа ещё ждёт исполнения — по одному")
+            return self._skip("entering", "прошлый ордер входа ещё не исполнен — по одному")
         if self.unverified:
             return self._skip("unverified", f"не удалось проверить позиции ({', '.join(sorted(self.unverified))}) — свои они или ваши")
         unknown = [str(p.get("instId")) for p in self.positions if str(p.get("instId")) in self.st.get("own_unknown", {})]
@@ -1426,20 +1422,17 @@ class Trader:
                 or tick is None:
             return self._skip("bad_params", f"{inst}: неверные параметры бумаги в каталоге OKX")
         sz = contract_size(ins, notional, last)
-        # Вход — лимитом «только мейкер» (post_only), не по рынку (правило
-        # владельца 27.11.2026): по лучшей цене своей стороны стакана (лонг —
-        # покупка, шорт — продажа), нет её — по цене сделки; на шаге цены.
-        # Ждёт исполнения LIMIT_WAIT_MS; не исполнился — снять, входа нет.
-        try:
-            best = self.okx.best(inst, s["side"])
-        except (OkxError, OSError):   # стакан не получен — по цене сделки, шаг не падает
-            best = 0.0
-        lim = round_step(best or last, tick, ROUND_FLOOR if s["side"] > 0 else ROUND_CEILING)
-        # Тейк (от цены лимита) должен встать на шаг цены не ближе TP и не дальше
-        # TP + 0,5 %: шаг слишком крупный для этой цены — тейк невозможен, без
-        # выхода не входим.
-        tp_try = round_step(float(lim) * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
-        if lim <= 0 or tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / float(lim) - 1) <= TP + TP_SLACK:
+        # Вход — по рынку, но не дальше CHASE от средней цены китов (правило
+        # владельца 27.11.2026: «вход маркет ордером, но соблюдаем 0,3 % и не
+        # гонимся за ценой»): ордер IOC с границей цены — исполняется сразу по
+        # лучшим ценам стакана, как рыночный, но не хуже границы (лонг —
+        # средняя китов +0,3 %, шорт — −0,3 %, на шаге цены внутрь); остаток —
+        # снимается биржей. Простой рыночный ордер при проскальзывании ушёл бы дальше.
+        lim = round_step(s["ref_px"] / scale * (1 + s["side"] * CHASE), tick, ROUND_FLOOR if s["side"] > 0 else ROUND_CEILING)
+        # Тейк должен встать на шаг цены не ближе TP и не дальше TP + 0,5 %: шаг
+        # слишком крупный для этой цены — тейк невозможен, без выхода не входим.
+        tp_try = round_step(last * (1 + s["side"] * TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
+        if lim <= 0 or tp_try <= 0 or not TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= TP + TP_SLACK:
             return self._skip("tick", f"{inst}: шаг цены {fmt_dec(tick)} слишком крупный для тейка +{TP * 100:g} % при цене {last}")
         if sz <= 0:
             return self._skip("min_size", f"позиция {notional:.0f} $ меньше минимальной на OKX")
@@ -1453,11 +1446,11 @@ class Trader:
             self.st["entering"] = {"inst": inst, "cl": cl, "at": now, "coin": s["coin"], "side": s["side"],
                                    "whales": s["whales"], "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"],
                                    "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against"),
-                                   "stop": s.get("stop", 0.0), "limit": fmt_dec(lim), "until": now + LIMIT_WAIT_MS,
+                                   "stop": s.get("stop", 0.0), "limit": fmt_dec(lim), "last": last, "until": now + ENTRY_WAIT_MS,
                                    "ordered": fmt_dec(sz), **({"priority": s["priority"]} if s.get("priority") else {})}
             self.save()
             self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
-                            "ordType": "post_only", "px": fmt_dec(lim), "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
+                            "ordType": "ioc", "px": fmt_dec(lim), "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
         except OkxError as e:
             if self.st.get("entering") and not (e.code.isdigit() and len(e.code) == 5):
                 # Ответ не от биржи (ошибка шлюза, обрыв, порча ответа): ордер
@@ -1485,36 +1478,41 @@ class Trader:
             return self._skip("rejected", f"{inst}: ордер не принят ({e.code})")
         if (self.st.get("key_problem") or {}).get("market") == inst_type(inst):
             self.st.pop("key_problem", None)  # ордер на этом рынке принят — ключ в порядке
-        self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} лимитом {fmt_dec(sz)} по {fmt_dec(lim)} "
-                   f"(маржа {MARGIN_FRAC * 100:g} %, китов {s['whales']}) — ждём исполнения до {LIMIT_WAIT_MS // 60_000} минут")
+        self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} по рынку {fmt_dec(sz)}, не хуже {fmt_dec(lim)} "
+                   f"(средняя китов ±{CHASE * 100:g} %; маржа {MARGIN_FRAC * 100:g} %, китов {s['whales']})")
         self.save()
-        # Исполнился сразу — позиция и тейк сейчас; иначе — на сверке.
-        if self._resolve_limit(self.st["entering"]) == "miss":
-            return self._skip("limit_miss", f"{inst}: лимит входа не исполнился — входа нет")
+        # Исполнился (обычно сразу) — позиция и тейк сейчас; иначе — на сверке.
+        if self._resolve_entry(self.st["entering"]) == "miss":
+            return self._skip("limit_miss", f"{inst}: цена ушла дальше {CHASE * 100:g} % от китов — вход не исполнился")
         return ""
 
-    def _resolve_limit(self, e: dict[str, Any]) -> str:
-        """Лимит входа: исполнен (или снят с частью) — позиция и тейк ('open');
-        ждёт и время не вышло — 'wait'; вышло — снять и решить по исполненному;
-        снят без исполнения (post_only в рынок, отмена биржей) — входа нет
-        ('miss'). Ордера не найти дольше 10 минут — запись снята ('miss')."""
+    def _resolve_entry(self, e: dict[str, Any]) -> str:
+        """Ордер входа (IOC с границей цены; у записи прежней версии — лимит):
+        исполнен (или снят с частью) — позиция и тейк ('open'); висит и время
+        не вышло — 'wait'; вышло — снять и решить по исполненному; снят без
+        исполнения (цена ушла за границу) — входа нет ('miss'). Ордера не
+        найти дольше 10 минут — запись снята ('miss')."""
         inst, cl = str(e.get("inst")), str(e.get("cl"))
         try:
             o = self.okx.get_order(inst, cl_id=cl)
             if o.get("state") in ("live", "partially_filled"):
-                # Время вышло — или кит сигнала, пока лимит висел, закрылся в
+                # Время вышло — или кит сигнала, пока ордер висел, закрылся в
                 # убытке (иначе вход и сразу выход по рынку в минус): снять остаток.
                 wallets = e.get("wallets") if isinstance(e.get("wallets"), dict) else {}
                 lost = self.clock() < num(e.get("until")) and wallets and self.sig.whale_loss(
                     str(e.get("coin")), 1 if num(e.get("side")) > 0 else -1, wallets, self.clock())
                 if self.clock() >= num(e.get("until")) or lost:
                     if lost:
-                        self.event(f"{inst}: кит сигнала закрылся в убытке, пока лимит входа ждал, — снимаю лимит")
-                    self.okx.cancel(inst, str(o.get("ordId")))
+                        self.event(f"{inst}: кит сигнала закрылся в убытке, пока ордер входа ждал, — снимаю его")
+                    with contextlib.suppress(OkxError):   # уже исполнен или снят — решит повторный запрос
+                        self.okx.cancel(inst, str(o.get("ordId")))
                     o = self.okx.get_order(inst, cl_id=cl)
+                    if o.get("state") in ("live", "partially_filled") and size_of(o.get("accFillSz")) > 0:
+                        self._open_from_fill(e, o)   # снять не вышло — исполненное и есть вход
+                        return "open"
         except OkxError as err:
             if err.code != "51603":   # 51603 «ордера нет» — как не найден
-                self.event(f"{inst}: лимит входа не проверен — {err}; повтор на сверке")
+                self.event(f"{inst}: ордер входа не проверен — {err}; повтор на сверке")
                 return "wait"
             o = {}
         state = o.get("state")   # висит (live, partially_filled) — ниже ничего не подходит: ждём
@@ -1522,20 +1520,21 @@ class Trader:
             self._open_from_fill(e, o)
             return "open"
         if state in ("canceled", "mmp_canceled") or (not state and self.clock() - num(e.get("at")) > 600_000):
-            self.event(f"{inst}: лимит входа не исполнился ({state or 'ордера нет'}) — входа нет")
+            self.event(f"{inst}: ордер входа не исполнился ({state or 'ордера нет'}) — входа нет")
             self.st.pop("entering", None)
             return "miss"
         return "wait"
 
     def _open_from_fill(self, e: dict[str, Any], o: dict[str, Any]) -> None:
-        """Лимит входа исполнен: запись позиции (цена и объём — с биржи, не
-        больше заказанного; цена дальше 5 % от лимита — порча: цена лимита)
-        и тейк на весь исполненный объём."""
+        """Ордер входа исполнен: запись позиции (цена и объём — с биржи, не
+        больше заказанного; цена дальше 5 % от цены сделки на решении — порча:
+        цена сделки; её нет (запись прежней версии) — граница ордера) и тейк
+        на весь исполненный объём."""
         inst, side = str(e["inst"]), 1 if num(e.get("side")) > 0 else -1
         ins = self.instruments().get(inst, {})
-        lim = num(e.get("limit"))
+        ref = num(e.get("last")) or num(e.get("limit"))
         avg = num(o.get("avgPx"))
-        fill_px = avg if avg > 0 and abs(avg / lim - 1) <= FILL_TOL else lim
+        fill_px = avg if avg > 0 and abs(avg / ref - 1) <= FILL_TOL else ref
         ordered = size_of(e.get("ordered"))
         got = min(size_of(o.get("accFillSz")), ordered) if ordered > 0 else size_of(o.get("accFillSz"))
         tp = round_step(fill_px * (1 + side * TP), ins.get("tickSz", "0.0001"), ROUND_CEILING if side > 0 else ROUND_FLOOR)
@@ -1554,7 +1553,7 @@ class Trader:
         self.st["entered"][op["coin"]] = now
         self.st.pop("entering", None)
         prio = op.get("priority")
-        self.event(f"вход {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(got)} по {fill_px} лимитом "
+        self.event(f"вход {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(got)} по {fill_px} "
                    f"(≈{op['notional']:.0f} $, маржа {MARGIN_FRAC * 100:g} %, китов {op['whales']}), тейк {op['tp_s']}"
                    + (f"; приоритетный кит {prio[:10]}… (наш винрейт с ним "
                       f"{(self.rating.rate(prio) or 0) * 100:.0f} %)" if prio else ""))
@@ -1622,8 +1621,8 @@ class Trader:
         self.unverified &= held
         for p in self.positions:
             inst = str(p.get("instId") or "")
-            # Бумага висящего лимита входа — его решит _resolve_limit (позиция
-            # частью исполненного лимита — ещё не вся: принять её рано).
+            # Бумага висящего ордера входа — его решит _resolve_entry (позиция
+            # частью исполненного ордера — ещё не вся: принять её рано).
             if not inst or inst in mine or inst == waiting or time.time() - checked.get(inst, 0) < 3600:
                 continue
             side = self._side_of(p)

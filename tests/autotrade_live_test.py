@@ -100,14 +100,19 @@ class FakeOkx:
             o = {**b, "ordId": str(self.n), "state": "live", "cTime": str(T0)}
             closing = b.get("reduceOnly") or (b.get("posSide") == "long" and b["side"] == "sell") \
                 or (b.get("posSide") == "short" and b["side"] == "buy")
-            # Лимит входа «только мейкер»: по умолчанию исполняется сразу по своей
-            # цене (как вход), hold — висит, пока тест не исполнит или не снимет.
+            # Вход — IOC с границей цены: исполняется сразу по цене сделки, если
+            # она не хуже границы, иначе снят без исполнения; hold — висит, пока
+            # тест не исполнит или не снимет.
             kind, fill = b["ordType"], self.last[b["instId"]]
-            if kind == "post_only":
+            if kind == "ioc":
                 if self.hold:
                     self.orders.append(o)
                     return ok([{"ordId": o["ordId"], "clOrdId": b.get("clOrdId", ""), "sCode": "0"}])
-                kind, fill = "market", float(b["px"])
+                if (fill > float(b["px"])) if b["side"] == "buy" else (fill < float(b["px"])):
+                    o.update(state="canceled", accFillSz="0")
+                    self.orders.append(o)
+                    return ok([{"ordId": o["ordId"], "clOrdId": b.get("clOrdId", ""), "sCode": "0"}])
+                kind = "market"
             if kind == "market" and closing:
                 # Закрытие: уменьшить свою позицию (не открыть встречную).
                 px = self.last[b["instId"]]
@@ -215,8 +220,8 @@ class Base(unittest.TestCase):
             return json.load(f)
 
     def market_orders(self) -> list[dict]:
-        """Вход (лимит «только мейкер») и выходы по рынку."""
-        return [o for o in self.ex.orders if o["ordType"] in ("market", "post_only")]
+        """Вход (по рынку, IOC с границей цены) и выходы по рынку."""
+        return [o for o in self.ex.orders if o["ordType"] in ("market", "ioc")]
 
     def whales(self, coin: str = "BTC", side: int = 1, px: float = 100_000, usd: float = 5000, ago: int = 5) -> list:
         return [fill(1, "0xa", coin, side, self.now - ago * MIN - MIN, usd, px),
@@ -647,10 +652,10 @@ class SignalsTest(Base):
 
 
 class OrderTypeTest(Base):
-    def test_entry_limit_post_only_exit_limit_at_tp(self) -> None:
-        """Правило владельца (27.11.2026): вход — не по рынку, а лимитом «только
-        мейкер» (post_only); выход — лимитом по цене тейка; по рынку бот
-        закрывает только стоп и вслед за китом в убытке."""
+    def test_entry_market_ioc_exit_limit_at_tp(self) -> None:
+        """Правило владельца (27.11.2026): вход — по рынку ордером IOC с границей
+        «средняя китов ±0,3 %» (не гонимся за ценой); выход — лимитом по цене
+        тейка; по рынку бот закрывает только стоп и вслед за китом в убытке."""
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             self.ex = FakeOkx(mode)
             tr = self.trader(self.whales(side=side))
@@ -659,8 +664,8 @@ class OrderTypeTest(Base):
             opening = "buy" if side > 0 else "sell"
             entries = [o for o in self.ex.orders if o["side"] == opening]
             exits = [o for o in self.ex.orders if o["side"] != opening]
-            self.assertEqual([o["ordType"] for o in entries], ["post_only"], mode)
-            self.assertEqual(entries[0]["px"], "100000", "нет стакана — по цене сделки")
+            self.assertEqual([o["ordType"] for o in entries], ["ioc"], mode)
+            self.assertEqual(entries[0]["px"], "100300" if side > 0 else "99700", "граница — средняя китов ±0,3 %")
             self.assertEqual([o["ordType"] for o in exits], ["limit"], mode)
             self.assertEqual(float(exits[0]["px"]), tr.st["open"]["tp"])
             self.assertAlmostEqual(tr.st["open"]["tp"] / tr.st["open"]["px"], 1 + side * lv.TP)
@@ -1034,9 +1039,10 @@ class BiggerSideTest(Base):
         self.assertEqual(self.state()["open"]["usd_against"], 0.0)
 
 
-class LimitEntryTest(Base):
-    """Вход — лимит «только мейкер» по лучшей цене своей стороны стакана; ждёт
-    5 минут, потом снимается: исполненная часть — позиция, ничего — входа нет."""
+class EntryOrderTest(Base):
+    """Вход — по рынку ордером IOC с границей «средняя китов ±0,3 %»: исполнен
+    — позиция; висит дольше минуты — снять остаток, исполненная часть —
+    позиция, ничего — входа нет; цена ушла за границу — входа нет."""
 
     def pending(self, side: int = 1) -> lv.Trader:
         self.ex.hold = True
@@ -1055,49 +1061,50 @@ class LimitEntryTest(Base):
         tr.last_sync = 0
         tr.step()
 
-    def test_at_best_bid_or_ask_on_tick(self) -> None:
-        """Лонг — по лучшей покупке (вниз на шаг), шорт — по лучшей продаже
-        (вверх на шаг)."""
-        for side, want in ((1, "99990.1"), (-1, "100010.2")):
+    def test_ioc_bound_is_whales_price_plus_chase_on_tick(self) -> None:
+        """Вход — по рынку, но не хуже средней цены китов ±0,3 % (граница на шаге
+        цены 0,7 — внутрь): лонг — 100 300 вниз (100 299,5), шорт — 99 700
+        вверх (99 700,3). Исполнение — по цене сделки (лучше границы)."""
+        for side, want in ((1, "100299.5"), (-1, "99700.3")):
             self.ex = FakeOkx()
-            self.ex.book["BTC-USDT-SWAP"] = (99_990.17, 100_010.13)
+            self.ex.instr["BTC-USDT-SWAP"]["tickSz"] = "0.7"
             tr = self.trader(self.whales(side=side))
             self.on()
             tr.step()
             e = self.entry()
-            self.assertEqual((e["ordType"], e["px"], e["side"]), ("post_only", want, "buy" if side > 0 else "sell"))
-            self.assertAlmostEqual(self.state()["opens"][0]["px"], float(want))
-            self.assertTrue(any("лимитом" in x for x in self.state()["events"]))
+            self.assertEqual((e["ordType"], e["px"], e["side"]), ("ioc", want, "buy" if side > 0 else "sell"))
+            self.assertAlmostEqual(self.state()["opens"][0]["px"], 100_000.0)
+            self.assertTrue(any("по рынку" in x and f"не хуже {want}" in x for x in self.state()["events"]))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
 
     def test_waits_then_fills(self) -> None:
-        """Пока лимит висит — позиции нет, второй вход не идёт («по одному»);
-        исполнился — позиция, тейк от цены исполнения."""
+        """Пока ордер входа висит — позиции нет, второй вход не идёт («по
+        одному»); исполнился — позиция, тейк от цены исполнения."""
         tr = self.pending()
         con = sqlite3.connect(self.db)
         con.executemany(INS, [fill(10, "0xc", "STX", 1, self.now - 2 * MIN, 5000, 0.5),
                               fill(11, "0xd", "STX", 1, self.now - MIN, 5000, 0.5)])
         con.commit()
         con.close()
-        self.sync(tr, 1)
+        self.sync(tr, 0)
         self.assertEqual(self.state()["last_skip"]["code"], "entering")
-        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "post_only"]), 1)
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "ioc"]), 1)
         self.entry().update(state="filled", accFillSz="10", avgPx="100000", fillTime=str(T0))
         self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
-        self.sync(tr, 1)
+        self.sync(tr, 0)
         [op] = self.state()["opens"]
         self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 100_800.0))
         self.assertNotIn("entering", self.state())
         self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["100800"])
 
     def test_timeout_keeps_filled_part(self) -> None:
-        """Исполнилось 6 из 10, 5 минут прошли — остаток снят, позиция — 6,
+        """Исполнилось 6 из 10, минута прошла — остаток снят, позиция — 6,
         тейк — на 6."""
         tr = self.pending()
         self.entry().update(state="partially_filled", accFillSz="6", avgPx="100000")
         self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "6", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
-        self.sync(tr, 4)
+        self.sync(tr, 0)
         self.assertEqual(self.state()["opens"], [], "время не вышло — ждём")
         self.sync(tr, 2)
         self.assertEqual(self.entry()["state"], "canceled", "остаток снят")
@@ -1112,64 +1119,57 @@ class LimitEntryTest(Base):
         st = self.state()
         self.assertEqual(st["opens"], [])
         self.assertNotIn("entering", st)
-        self.assertTrue(any("лимит входа не исполнился" in x for x in st["events"]))
+        self.assertTrue(any("ордер входа не исполнился" in x for x in st["events"]))
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
         self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
 
-    def test_post_only_canceled_at_once_is_a_miss(self) -> None:
-        """Лимит «только мейкер» встал бы в рынок — биржа снимает его сразу:
-        пропуск «limit_miss» в том же шаге, следующий сигнал — дальше."""
+    def test_price_ran_past_bound_is_a_miss(self) -> None:
+        """Пока шёл ордер, цена ушла дальше 0,3 % от китов — IOC не исполнился
+        (биржа сняла сразу): пропуск «limit_miss» в том же шаге, за ценой не
+        гонимся."""
         tr = self.trader(self.whales())
         self.on()
         real = tr.okx.order
 
         def order(body):
-            got = real(body)
-            if body["ordType"] == "post_only":
-                self.ex.orders[-1].update(state="canceled", accFillSz="0")
-                self.ex.pos.clear()
-            return got
+            if body["ordType"] == "ioc":
+                self.ex.last["BTC-USDT-SWAP"] = 100_400.0
+            return real(body)
 
         tr.okx.order = order  # type: ignore[method-assign]
         tr.step()
         st = self.state()
         self.assertEqual((st["opens"], st["last_skip"]["code"]), ([], "limit_miss"))
+        self.assertIn("цена ушла дальше 0.3 % от китов", st["last_skip"]["why"])
         self.assertNotIn("entering", st)
+        self.assertEqual(self.ex.pos, [], "позиции нет")
 
     def test_never_more_than_ordered_and_garbage_price(self) -> None:
         tr = self.pending()
         self.entry().update(state="filled", accFillSz="1000", avgPx=str(10**20))   # порча ответа
         self.sync(tr, 1)
         [op] = self.state()["opens"]
-        self.assertEqual((op["size"], op["px"]), (10.0, 100_000.0), "не больше заказанного; цена — лимита")
+        self.assertEqual((op["size"], op["px"]), (10.0, 100_000.0), "не больше заказанного; цена — сделки на решении")
 
     def test_whale_loss_while_waiting_cancels_limit(self) -> None:
-        """Пока лимит висел, кит сигнала закрылся в убытке — лимит снят, входа
-        нет (иначе вход и сразу выход по рынку в минус)."""
+        """Пока ордер входа висел, кит сигнала закрылся в убытке — ордер снят,
+        входа нет (иначе вход и сразу выход по рынку в минус)."""
         tr = self.pending()
-        close_fill(self.db, 50, "0xa", "BTC", 3, self.now + MIN, -120.0)
-        self.sync(tr, 2)
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now - MIN // 2, -120.0)
+        self.sync(tr, 0)
         st = self.state()
         self.assertEqual(self.entry()["state"], "canceled")
         self.assertEqual(st["opens"], [])
         self.assertNotIn("entering", st)
-        self.assertTrue(any("кит сигнала закрылся в убытке, пока лимит входа ждал" in x for x in st["events"]))
-
-    def test_book_error_uses_trade_price(self) -> None:
-        """Стакан не получен (отказ OKX) — лимит по цене сделки, шаг не падает."""
-        tr = self.trader(self.whales())
-        self.on()
-        with mock.patch.object(tr.okx, "best", side_effect=lv.OkxError("50011", "часто")):
-            tr.step()
-        self.assertEqual(self.entry()["px"], "100000")
+        self.assertTrue(any("кит сигнала закрылся в убытке, пока ордер входа ждал" in x for x in st["events"]))
 
     def test_check_error_waits(self) -> None:
-        """Проверка лимита — отказ OKX: запись остаётся, повтор на сверке."""
+        """Проверка ордера входа — отказ OKX: запись остаётся, повтор на сверке."""
         tr = self.pending()
         with mock.patch.object(tr.okx, "get_order", side_effect=lv.OkxError("50011", "часто")):
             self.sync(tr, 1)
         self.assertIn("entering", self.state())
-        self.assertTrue(any("лимит входа не проверен" in x for x in self.state()["events"]))
+        self.assertTrue(any("ордер входа не проверен" in x for x in self.state()["events"]))
         self.entry().update(state="filled", accFillSz="10", avgPx="100000")
         self.sync(tr, 1)
         self.assertEqual(len(self.state()["opens"]), 1)
@@ -1189,7 +1189,7 @@ class LimitEntryTest(Base):
             with mock.patch.object(tr.okx, "get_order", side_effect=lv.OkxError("51603", "Order does not exist")):
                 self.sync(tr, 2)
             self.assertNotIn("entering", self.state(), gone)
-            self.assertFalse(any("лимит входа не проверен" in x for x in self.state()["events"]), gone)
+            self.assertFalse(any("ордер входа не проверен" in x for x in self.state()["events"]), gone)
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
             self.ex = FakeOkx()
@@ -1389,7 +1389,7 @@ class StopTest(Base):
 
         def order_then_crash(body):
             real(body)
-            if body["ordType"] == "post_only":
+            if body["ordType"] == "ioc":
                 raise SystemExit("упала")
             return ""
 
@@ -1975,7 +1975,7 @@ class RecoverTest(Base):
 
         def order_then_crash(body):
             real_order(body)
-            if body["ordType"] == "post_only":
+            if body["ordType"] == "ioc":
                 raise SystemExit("упала")
             return ""
 
@@ -2094,7 +2094,7 @@ class ReviewTest(Base):
         def btc(kind: str) -> list:
             return [o for o in self.ex.orders if o["ordType"] == kind and o["instId"] == "BTC-USDT-SWAP"]
 
-        self.assertEqual(len(btc("post_only")), 1, "второго входа в BTC нет")
+        self.assertEqual(len(btc("ioc")), 1, "второго входа в BTC нет")
         self.ex.pos = [*shown, *self.ex.pos]
         tr.last_sync = 0
         tr.step()
@@ -2102,7 +2102,7 @@ class ReviewTest(Base):
         self.assertEqual(st["open"]["inst"], "BTC-USDT-SWAP")
         self.assertNotIn("entering", st)
         self.assertEqual(len(btc("limit")), 1, "тейк BTC — один")
-        self.assertEqual(len(btc("post_only")), 1)
+        self.assertEqual(len(btc("ioc")), 1)
 
     def test_gateway_error_on_order_is_not_a_refusal(self) -> None:
         """Шлюз ответил 502 (не JSON), а ордер на бирже исполнился: это не
@@ -2114,7 +2114,7 @@ class ReviewTest(Base):
 
         def order(body):
             got = real(body)
-            if body["ordType"] == "post_only":
+            if body["ordType"] == "ioc":
                 raise lv.OkxError("502", "HTTP")
             return got
 
@@ -2124,7 +2124,7 @@ class ReviewTest(Base):
         st = self.state()
         self.assertIn("entering", st)
         self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
-        self.assertIn("ждёт исполнения", st["last_skip"]["why"])
+        self.assertIn("ещё не исполнен", st["last_skip"]["why"])
         tr.okx.order = real  # type: ignore[method-assign]
         tr.last_sync = 0
         tr.step()
@@ -2132,7 +2132,7 @@ class ReviewTest(Base):
         self.assertEqual(len(self.market_orders()), 1)
 
     def test_unconfirmed_fill_is_not_recorded_as_position(self) -> None:
-        """Биржа приняла лимит входа, он висит (state live, исполнено 0):
+        """Биржа приняла ордер входа, он висит (state live, исполнено 0):
         позицию не записывать — ждать сверки."""
         tr = self.trader(self.whales())
         self.on()
@@ -2140,7 +2140,7 @@ class ReviewTest(Base):
 
         def order(body):
             got = real(body)
-            if body["ordType"] == "post_only":
+            if body["ordType"] == "ioc":
                 self.ex.orders[-1].update(state="live", accFillSz="0")
                 self.ex.pos.clear()
             return got
