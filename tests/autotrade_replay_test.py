@@ -113,8 +113,8 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
         self.assertGreater(t.pnl, 0)
-        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +0,5 % ≈ +50 $ минус комиссии.
-        self.assertAlmostEqual(t.pnl, 50 - 10_000 * (0.0005 + 0.0002) - 5, delta=6)
+        # 5 % × 20 000 × 10 = 10 000 $ ≈ 0,1 BTC; +1 % ≈ +100 $ минус комиссии.
+        self.assertAlmostEqual(t.pnl, 100 - 10_000 * (0.0005 + 0.0002), delta=1)
         s = r["summary"]
         self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
         self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])
@@ -156,7 +156,7 @@ class ReplayTest(unittest.TestCase):
         self.assertAlmostEqual(t.exit_px, 98_000 * 0.9995, delta=1, msg="свеча открылась за стопом — по её открытию")
         os.remove(self.db)
         self.cache += "2"
-        r = self.go(self.whales(), hist(lambda t: 100_700.0 if t >= T + 90 * MIN else 98_600.0 if t >= T + 20 * MIN else 100_000.0))
+        r = self.go(self.whales(), hist(lambda t: 101_200.0 if t >= T + 90 * MIN else 98_600.0 if t >= T + 20 * MIN else 100_000.0))
         self.assertEqual([t.why for t in r["trades"]], ["тейк"], "98 600 — выше стопа")
         os.remove(self.db)
         self.cache += "3"
@@ -166,8 +166,89 @@ class ReplayTest(unittest.TestCase):
         self.assertAlmostEqual(t.exit_px, 98_505 * 0.9995, delta=1, msg="по цене стопа")
         os.remove(self.db)
         self.cache += "4"
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.3)]))   # сутки ровно 100 000 — уровней нет
-        self.assertEqual([t.why for t in r["trades"]], ["открыта"], "уровней нет — стопа нет")
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.014)]))   # сутки ровно 100 000 — уровней нет
+        self.assertEqual([t.why for t in r["trades"]], ["открыта"], "уровней нет — стоп 1,5 %: −1,4 % — держим")
+        os.remove(self.db)
+        self.cache += "5"
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.016)]))
+        [t] = r["trades"]
+        self.assertEqual(t.why, "стоп", "уровней нет — стоп 1,5 % от входа")
+        self.assertAlmostEqual(t.exit_px, 98_400 * 0.9995, delta=1, msg="свеча открылась за стопом")
+
+    def test_variants_one_change_each(self) -> None:
+        """--variants: те же киты по 7 вариантам правил (по одному изменению).
+        Цена +1,2 %: тейк +0,5 % и +1 % — тейк, +1,5 % — не дошла (открыта).
+        Без вариантов — список пуст, повтор один."""
+        r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(list(v), ["текущие правила", *(x.name for x in rp.VARIANTS)])
+        self.assertEqual((v["текущие правила"]["trades"], v["текущие правила"]["net"]), (1, r["summary"]["full"]["net"]))
+        self.assertEqual((v["текущие правила"]["tp_pct"], v["текущие правила"]["stop_max_pct"]), (1.0, 1.5))
+        self.assertEqual(v["тейк +1,5 %"]["open"], 1)
+        self.assertEqual(v["тейк +0,5 %"]["open"], 0)
+        self.assertLess(v["тейк +0,5 %"]["net"], v["текущие правила"]["net"])
+        self.assertIsNone(v["стоп только за уровнем"]["stop_max_pct"])
+        self.assertEqual((v["без уровней 4ч"]["levels"], v["без MA30"]["ma"]), (False, False))
+        self.assertIn("Варианты (те же киты, одно изменение правил):", r["text"])
+        self.assertIn("  тейк +1,5 %: сделок 1", r["text"])
+        with open(os.path.join(self.out, "progress.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["stage"], "готово")
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]))
+        self.assertEqual(r["summary"]["variants"], [])
+        self.assertNotIn("Варианты", r["text"])
+
+    def test_variants_stop_and_filters(self) -> None:
+        """Поддержка далеко (стоп за ней — 89 550), цена дошла до 98 450:
+        стоп до 1 % и 1,5 % — стоп; до 2,5 % и «только за уровнем» — сидим.
+        Лонг у сопротивления — «без уровней 4ч» входит; MA30 выше цены —
+        «без MA30» входит."""
+        H = 60 * MIN
+
+        def far(c: str, t: int) -> float:
+            if t < T:
+                return 90_000.0 if T - 16 * H <= t < T - 12 * H else 130_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
+            return 98_450.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
+
+        v = {x["name"]: x for x in self.go(self.whales(), far, variants=True)["summary"]["variants"]}
+        self.assertEqual([v[n]["open"] for n in ("текущие правила", "стоп не дальше 1 %", "стоп не дальше 2,5 %",
+                                                 "стоп только за уровнем")], [0, 0, 1, 1])
+        self.assertLess(v["стоп не дальше 1 %"]["net"], 0)
+        os.remove(self.db)
+        self.cache += "2"
+
+        def top(c: str, t: int) -> float:   # 4 дня 97 000–101 000, цена 100 000 — у сопротивления
+            if t < T:
+                return 97_000.0 if T - 16 * H <= t < T - 12 * H else 101_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
+            return 102_000.0 if t >= T + 60 * MIN else 100_000.0
+
+        v = {x["name"]: x for x in self.go(self.whales(), top, variants=True)["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["без уровней 4ч"]["trades"], v["без MA30"]["trades"]), (0, 1, 0))
+        os.remove(self.db)
+        self.cache += "3"
+
+        def ma_up(c: str, t: int) -> float:   # 7 часов до сигнала — 101 000: MA30 выше цены
+            if T - 7 * H <= t < T:
+                return 101_000.0
+            return 102_000.0 if t >= T + 60 * MIN else 100_000.0
+
+        v = {x["name"]: x for x in self.go(self.whales(), ma_up, variants=True)["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["без MA30"]["trades"], v["без уровней 4ч"]["trades"]), (0, 1, 0))
+
+    def test_far_level_stop_capped(self) -> None:
+        """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 1,5 % от
+        цены входа с проскальзыванием не считая (100 000 → 98 500)."""
+        H = 60 * MIN
+
+        def f(c: str, t: int) -> float:
+            if t < T:
+                return 90_000.0 if T - 16 * H <= t < T - 12 * H else 130_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
+            return 98_450.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
+
+        [t] = self.go(self.whales(), f)["trades"]
+        self.assertEqual(t.why, "стоп", "за уровнем стоп был бы 89 550 — сидели бы")
+        self.assertAlmostEqual(t.exit_px, 98_450 * 0.9995, delta=1, msg="свеча открылась за стопом 98 500")
 
     def test_levels_24h(self) -> None:
         """Уровни: минимум и максимум цены за 24 часа до решения. Был минимум
@@ -217,7 +298,7 @@ class ReplayTest(unittest.TestCase):
                 if t >= T:
                     if T + 1000 <= t < T + 5 * MIN:
                         return 60_000.0 if recent is None else 100_000.0
-                    return 101_000.0 if t >= T + 60 * MIN else 100_000.0
+                    return 102_000.0 if t >= T + 60 * MIN else 100_000.0
                 if T - 24 * H <= t < T - 20 * H:
                     return 97_000.0
                 if T - 16 * H <= t < T - 12 * H:
@@ -256,11 +337,11 @@ class ReplayTest(unittest.TestCase):
                 if e <= t < e + 5 * MIN:
                     return 100_000.0                  # вход — у поддержки
                 if e + 5 * MIN <= t < e + 30 * MIN:
-                    return 100_600.0                  # тейк +0,5 %
+                    return 101_200.0                  # тейк +1 %
             if T + 20 * H <= t < T + 20 * H + 5 * MIN:
                 return 108_000.0                      # приоритетный: у сопротивления — уровни ему не помеха
             if T + 20 * H + 5 * MIN <= t < T + 20 * H + 30 * MIN:
-                return 108_700.0
+                return 109_300.0
             return 99_000.0                           # MA30 ниже цены входа
 
         rows: list[tuple] = []

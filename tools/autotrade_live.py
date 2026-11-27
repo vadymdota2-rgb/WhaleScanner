@@ -19,17 +19,18 @@
   руками на счёте входу не мешают);
   на ту же бумагу, где ручная позиция, — не входит;
 - у бота своя позиция — всегда одна: пока её не закрыли, вторую не открываем;
-- выход — тейк +0,5 % движения цены (лимитный ордер на бирже); и второй
+- выход — тейк +1 % движения цены (лимитный ордер на бирже); и второй
   выход: кто-то из китов сигнала закрыл свою сделку по этой бумаге В УБЫТКЕ
   (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
   тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
   закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
 - стоп — за уровнем, от которого вошли: лонг — на 0,5 % ниже поддержки
   (минимум 24 свечей 4ч на момент входа), шорт — на 0,5 % выше
-  сопротивления (максимум); уровень стопа — на входе и дальше не меняется;
+  сопротивления (максимум), но не дальше 1,5 % от цены входа (ближний);
+  уровней нет — 1,5 % от входа; стоп — на входе и дальше не меняется;
   цена позиции (mark) дошла — снять тейк и закрыть по рынку (тот же выход,
-  что вслед за китом); работает и при «Стоп» во вкладке; уровней на входе
-  нет — стопа нет; усреднения нет (правило владельца 24.11.2026);
+  что вслед за китом); работает и при «Стоп» во вкладке; свечи OKX не
+  получены (сбой) — не входим до следующего опроса; усреднения нет;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - MA30 15-минутного графика (средняя 30 закрытий, идущая — по цене): лонг —
   только цена выше MA30, шорт — ниже; уровни важнее (проверяются первыми);
@@ -110,7 +111,8 @@ MATCH_TOL = 0.02
 # 10 %, а при ручной сделке на счёте — 5 %). Своя позиция у бота — одна.
 MARGIN_FRAC = 0.05
 LEVERAGE = 10
-TP = 0.005                  # тейк +0,5 % движения цены (правило владельца 24.11.2026; было +1 %)
+TP = 0.01                   # тейк +1 % движения цены (27.11.2026: при +0,5 % комиссии и проскальзывание
+                            # ~0,2 % съедали почти половину тейка; было +0,5 %)
 COIN_PAUSE_MS = 3 * 3_600_000
 FILL_TOL = 0.05            # цена исполнения рыночного входа — не дальше 5 % от тикера
 ADOPT_TOL = 0.5            # подхват позиции: средняя цена — не дальше 50 % от рынка
@@ -688,7 +690,7 @@ class Backtests:
         self.proc = subprocess.Popen(  # свой скрипт, аргументы списком — без оболочки
             [sys.executable, "-I", self.script, "--db", self.db, "--out", out, "--cache",
              os.path.join(self.dir, "cache"), "--pause", str(BT_PAUSE_SEC), "--max-mem-mb", str(BT_MEM_MB),
-             "--since-days", str(BT_DAYS), "--deposit", str(self.deposit())],
+             "--since-days", str(BT_DAYS), "--deposit", str(self.deposit()), "--variants"],
             stdout=self.log, stderr=subprocess.STDOUT, preexec_fn=lambda: os.nice(19))  # noqa: PLW1509 — однопоточная служба
         self.st.update(running=True, started=int(now), error="", progress="запуск")
         self._write()
@@ -880,6 +882,7 @@ class Trader:
         self._checked: dict[str, float] = {}
         self.skip_code = "other"
         self._skip_seen: set[tuple[str, int, str, int]] = set()
+        self.retry: list[dict[str, Any]] = []   # сигналы, пропущенные из-за сбоя свечей — повторить
         self.rating = core.Rating()   # наш винрейт с китами — по trades.jsonl
         self._load_rating()
 
@@ -1110,7 +1113,9 @@ class Trader:
                  "closed": int(num(h.get("uTime"), self.clock())) or self.clock(), "px_in": op["px"], "px_out": out_px,
                  "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": num(h.get("fee")),
                  "funding": num(h.get("fundingFee")), "notional": op["notional"],
-                 "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.002
+                 # Тейк — лимит: исполнение ровно по его цене (0,05 % — запас на
+                 # среднюю цену); выход по рынку рядом с тейком — не тейк.
+                 "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.0005
                  else ("стоп" if op["exit"].get("kind") == "stop" else "кит вышел в убыток") if op.get("exit")
                  else "закрыта",
                  "wallets": sorted(w for w in op.get("wallets") or {} if isinstance(w, str))}
@@ -1133,7 +1138,7 @@ class Trader:
 
     # выход по рынку: стоп или вслед за китом
     def follow_whales(self) -> None:
-        """Стоп (цена против нашего входа на 4 % и больше) или кит сигнала
+        """Стоп (цена позиции дошла до стопа входа) или кит сигнала
         закрыл позицию в убыток — закрыть свою: снять тейк и рыночным ордером
         только на закрытие. Не вышло (сбой, отказ) — запись «выходим»
         остаётся, тейк заново не ставится, попытка — раз в минуту."""
@@ -1204,18 +1209,25 @@ class Trader:
             self._record_close(op, got[1])
 
     def _stop_hit(self, op: dict[str, Any]) -> str:
-        """Стоп за уровнем входа: цена позиции (mark) дошла до op["stop"] (лонг —
-        ниже или на нём, шорт — выше или на нём) — причина строкой; нет —
-        пусто. Стопа нет (уровней на входе не было) или позиции на счёте нет —
+        """Стоп входа: цена позиции (mark) и цена сделки (тикер) обе дошли до
+        op["stop"] (лонг — ниже или на нём, шорт — выше или на нём; mark нет —
+        по тикеру) — причина строкой; нет — пусто.
+        Стопа в записи нет (позиция прежней версии) или позиции на счёте нет —
         не стоп (закрытие запишет _track_open)."""
         stop = num(op.get("stop"))
         live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
         if not live or stop <= 0:
             return ""
-        mark = num(live[0].get("markPx")) or self.okx.ticker(op["inst"])
-        if mark <= 0 or op["side"] * (mark - stop) > 0:
+        mark = num(live[0].get("markPx"))
+        if mark > 0 and op["side"] * (mark - stop) > 0:
             return ""
-        return f"стоп: цена {mark:.6g} за уровнем {stop:.6g} ({'ниже поддержки' if op['side'] > 0 else 'выше сопротивления'})"
+        # Цена позиции за стопом (или её нет) — подтвердить ценой сделки
+        # (тикер): одна испорченная цена в ответе OKX не закрывает позицию.
+        last = self.okx.ticker(op["inst"])
+        if last <= 0 or op["side"] * (last - stop) > 0:
+            return ""
+        mark = mark if mark > 0 else last
+        return f"стоп: цена {mark:.6g} дошла до стопа {stop:.6g} ({'ниже' if op['side'] > 0 else 'выше'} входа {op['px']:.6g})"
 
     def _exit_fills(self, op: dict[str, Any]) -> tuple[Decimal, dict[str, Any]] | None:
         """Ордера выхода по рынку (стоп или вслед за китом): сколько исполнено и итог для записи
@@ -1294,26 +1306,29 @@ class Trader:
         self.st["skips"] = skips
 
     def level_check(self, inst: str, last: float, side: int, force: bool = False) -> tuple[str, float]:
-        """Уровни графика 4ч: ('', стоп) — цена у своего уровня или
-        свечей нет (входим; стоп — за уровнем, 0 — уровней нет), иначе —
-        (причина пропуска, 0)."""
+        """Уровни графика 4ч: ('', стоп) — цена у своего уровня или у
+        бумаги нет свечей (входим; стоп — core.entry_stop: за уровнем, но не
+        дальше STOP_MAX), иначе — (причина пропуска, 0). Свечи не получены
+        (отказ OKX, обрыв сети) — пропуск: без уровней и без стопа не входим,
+        сигнал свеж 15 минут — следующий опрос повторит."""
         try:
             lo, hi = self.okx.range_levels(inst)
-        except (OkxError, OSError):   # нет свечей (отказ, обрыв сети) — как без уровней, шаг не падает
-            lo, hi = 0.0, 0.0
+        except (OkxError, OSError) as e:
+            return self._skip("candles", f"{inst}: свечи OKX не получены ({str(e)[:120]}) — повтор на следующем опросе"), 0.0
         if force or core.level_ok(lo, hi, last, side) is not False:   # force — приоритетный кит: только стоп
-            return "", core.level_stop(lo, hi, side)
+            return "", core.entry_stop(lo, hi, last, side)
         return self._skip("level", f"{inst}: цена {last:.6g} ближе к {'сопротивлению' if side > 0 else 'поддержке'} "
                                    f"(4ч × 24: {lo:.6g}–{hi:.6g}) — {'лонг' if side > 0 else 'шорт'} не входит"), 0.0
 
     def ma_check(self, inst: str, last: float, side: int) -> str:
         """MA30 15-минутного графика (после уровней — они важнее): '' — цена
-        по ту же сторону MA30, что и сделка, или MA нет (входим), иначе —
-        причина пропуска."""
+        по ту же сторону MA30, что и сделка, или у бумаги нет 30 свечей
+        (входим), иначе — причина пропуска. Свечи не получены (сбой) —
+        пропуск до следующего опроса."""
         try:
             ma = self.okx.ma30_15m(inst, last)
-        except (OkxError, OSError):   # нет свечей — как без MA, шаг не падает
-            ma = 0.0
+        except (OkxError, OSError) as e:
+            return self._skip("candles", f"{inst}: свечи OKX не получены ({str(e)[:120]}) — повтор на следующем опросе")
         if core.ma_ok(ma, last, side) is not False:
             return ""
         return self._skip("ma30", f"{inst}: цена {last:.6g} {'ниже' if side > 0 else 'выше'} MA30 15м {ma:.6g} — "
@@ -1575,15 +1590,21 @@ class Trader:
                 return
 
     def step(self) -> None:
-        sigs = self.sig.poll(self.clock())
-        if time.time() - self.last_sync >= SYNC_SEC or sigs:
+        new = self.sig.poll(self.clock())
+        if time.time() - self.last_sync >= SYNC_SEC or new:
             self.sync()
+        # Сигналы, пропущенные из-за сбоя свечей, — снова, пока свежие (15
+        # минут): сигнал рождается только на сделке кита и сам не повторится.
+        # Первыми в списке — новый сигнал той же бумаги и стороны важнее.
+        sigs, self.retry = [*self.retry, *new], []
         if not self.is_on():
             self.save()
             return
         for s in self.candidates(sigs):
             self.skip_code = "other"
             why = self.try_enter(s)
+            if self.skip_code == "candles":
+                self.retry.append(s)
             if not why:
                 break
             self.st["last_skip"] = {"coin": s["coin"], "side": s["side"], "why": why, "at": self.clock(),

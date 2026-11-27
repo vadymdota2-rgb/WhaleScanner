@@ -123,7 +123,7 @@ class GarbageTradeTest(Base):
         tr.okx._t = spoil
         tr.step()
         op = self.state()["open"]
-        self.assertEqual((op["px"], op["size"], op["tp"]), (100_000.0, 10.0, 100_500.0))
+        self.assertEqual((op["px"], op["size"], op["tp"]), (100_000.0, 10.0, 101_000.0))
 
     def test_absurd_fill_price_never_puts_tp_into_market(self) -> None:
         """Шорт, биржа вернула цену исполнения 10^20: тейк (покупка) встал бы
@@ -142,7 +142,7 @@ class GarbageTradeTest(Base):
         tr.okx._t = spoil
         tr.step()
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"]), ("buy", "99500"))
+        self.assertEqual((tp["side"], tp["px"]), ("buy", "99000"))
 
     def test_adopt_with_absurd_entry_price_places_nothing(self) -> None:
         tr = self.trader(self.whales())

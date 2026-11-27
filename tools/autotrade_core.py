@@ -69,6 +69,9 @@ LEVEL_MS = LEVEL_BARS * LEVEL_BAR_MS
 LEVEL_LONG_BELOW = 0.4
 LEVEL_SHORT_ABOVE = 0.6
 LEVEL_STOP_BEYOND = 0.005   # стоп — на 0,5 % за уровнем входа (правило владельца 24.11.2026)
+# Стоп — не дальше STOP_MAX от цены входа (27.11.2026): уровень 4 дней бывает
+# в 5–10 % от цены, а тейк — доли процента; такой стоп съедал бы десятки тейков.
+STOP_MAX = 0.015
 
 
 def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
@@ -132,11 +135,31 @@ class Rating:
 
 def level_stop(lo: float, hi: float, side: int) -> float:
     """Стоп за уровнем, от которого вошли: лонг — на LEVEL_STOP_BEYOND ниже
-    поддержки (минимума 24 ч), шорт — выше сопротивления (максимума).
-    Уровней нет — 0 (стопа нет)."""
+    поддержки (минимума 24 свечей 4ч), шорт — выше сопротивления (максимума).
+    Уровней нет — 0."""
     if not all(math.isfinite(x) for x in (lo, hi)) or not 0 < lo < hi:
         return 0.0
     return lo * (1 - LEVEL_STOP_BEYOND) if side > 0 else hi * (1 + LEVEL_STOP_BEYOND)
+
+
+def entry_stop(lo: float, hi: float, px: float, side: int, most: float = STOP_MAX) -> float:
+    """Стоп входа (фиксируется на входе): за уровнем (level_stop), но не
+    дальше most (STOP_MAX) от цены входа px — ближний из двух. Уровней нет
+    или уровень по ту сторону цены — ровно most от px: без стопа бот не
+    входит. Цена px — мусор — 0 (вызывающий такое не открывает). most —
+    бесконечность (вариант бэктеста «стоп только за уровнем») — только
+    уровень, уровней нет — 0."""
+    if not math.isfinite(px) or px <= 0:
+        return 0.0
+    lvl = level_stop(lo, hi, side)
+    if lvl > 0 and side * (px - lvl) <= 0:
+        lvl = 0.0
+    if not math.isfinite(most):
+        return lvl
+    cap = px * (1 - side * most)
+    if lvl <= 0:
+        return cap
+    return max(lvl, cap) if side > 0 else min(lvl, cap)
 
 
 def safe_name(name: str) -> str:

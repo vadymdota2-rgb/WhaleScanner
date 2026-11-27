@@ -178,8 +178,15 @@ class FuzzTest(Base):
                 except Exception as e:  # noqa: BLE001 — это и есть нарушение
                     self.fail(f"случай {case}: шаг бросил {type(e).__name__}: {e}")
                 for o in self.ex.orders[before:]:
-                    if o["ordType"] == "market":
+                    if str(o.get("clOrdId", "")).startswith("wtin"):
                         entries.append((o, known))
+                    elif o["ordType"] == "market":
+                        # Выход по рынку (стоп) — только закрытие своей стороны.
+                        entry = next((e for e, _k in entries if e["instId"] == o["instId"]), None)
+                        self.assertIsNotNone(entry, f"случай {case}: выход без входа {o}")
+                        if entry is not None:
+                            self.assertNotEqual(o["side"], entry["side"], f"случай {case}: {o}")
+                            self.assertTrue(o.get("reduceOnly") or o.get("posSide"), f"случай {case}: {o}")
                 self.now += r.choice([1, 2, 20]) * MIN
                 tr.last_sync = 0
             for o in self.ex.orders:

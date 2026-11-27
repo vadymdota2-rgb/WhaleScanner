@@ -21,9 +21,10 @@
   одна;
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск), рыночный вход (проскальзывание);
-- выход: лимитный тейк +0,5 % от цены входа; по рынку — стоп (0,5 % за
-  уровнем входа: ниже поддержки для лонга, выше сопротивления для шорта)
-  или кит сигнала закрыл в убыток; усреднения нет.
+- выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (0,5 % за
+  уровнем входа: ниже поддержки для лонга, выше сопротивления для шорта, но
+  не дальше core.STOP_MAX от входа; уровней нет — STOP_MAX) или кит сигнала
+  закрыл в убыток; усреднения нет.
 
 Цены — 5-минутные свечи OKX (публичное API, без ключа; история — годы, по
 100 свечей за запрос), только под кандидатов и сделки, с кешем блоками по
@@ -217,13 +218,34 @@ class Trade:
         return self.why == "открыта"
 
 
+@dataclass(frozen=True)
+class Rules:
+    """Тейк, предел стопа и фильтры повтора: по умолчанию — как у живого
+    бота; варианты (VARIANTS) — по одному изменению, на тех же сделках китов."""
+    name: str = "текущие правила"
+    tp: float = lv.TP
+    stop_max: float = core.STOP_MAX   # бесконечность — стоп только за уровнем
+    levels: bool = True               # фильтр уровней 4ч (стоп за уровнем — всегда)
+    ma: bool = True                   # фильтр MA30 15м
+
+
+# Сравнение (--variants): что дало бы одно изменение правил на тех же китах —
+# чтобы менять тейк, стоп и фильтры по данным, а не наугад.
+VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1,5 %", tp=0.015),
+            Rules("стоп не дальше 1 %", stop_max=0.01), Rules("стоп не дальше 2,5 %", stop_max=0.025),
+            Rules("стоп только за уровнем", stop_max=math.inf),
+            Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False))
+
+
 class Replay:
     """Повтор: строки сделок открытия по времени → Signals живого бота →
     правила входа; открытая позиция ведётся по свечам до выхода."""
 
     def __init__(self, a: argparse.Namespace, prices: Prices, instr: dict[str, dict[str, Any]],
-                 progress: Callable[[dict[str, Any]], None], hours: Prices | None = None) -> None:
+                 progress: Callable[[dict[str, Any]], None], hours: Prices | None = None,
+                 rules: Rules | None = None) -> None:
         self.a, self.px, self.instr, self.progress = a, prices, instr, progress
+        self.rules = rules or Rules()
         # Свечи 4ч — для уровней (24 свечи, 4 дня); кеш и сеть — те же, что у 5-минутных.
         self.hours = hours or Prices(prices.cache, prices.fetch, prices.pause, prices.offline, prices.now_ms,
                                      bar="4H", bar_ms=core.LEVEL_BAR_MS)
@@ -267,9 +289,9 @@ class Replay:
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
         lo, hi = self.range_levels(inst, now)
-        if not prio and core.level_ok(lo, hi, last, s["side"]) is False:
+        if self.rules.levels and not prio and core.level_ok(lo, hi, last, s["side"]) is False:
             return "level"
-        if not prio and core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
+        if self.rules.ma and not prio and core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
             return "ma30"
         if self.equity <= 0:
             return "no_equity"
@@ -279,10 +301,11 @@ class Replay:
         tick = lv.dec(ins.get("tickSz"))
         if tick is None:
             return "bad_params"
-        tp_try = lv.round_step(last * (1 + s["side"] * lv.TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
-        if tp_try <= 0 or not lv.TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= lv.TP + lv.TP_SLACK:
+        tp = self.rules.tp
+        tp_try = lv.round_step(last * (1 + s["side"] * tp), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
+        if tp_try <= 0 or not tp * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= tp + lv.TP_SLACK:
             return "tick"
-        self.open_trade(s, inst, ins, sz, last, now, core.level_stop(lo, hi, s["side"]))
+        self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, s["side"], self.rules.stop_max))
         return ""
 
     def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int,
@@ -295,7 +318,7 @@ class Replay:
         qty = float(sz) * coin_per_contract(ins, entry)      # монет в позиции
         avg_px = entry
         fees = qty * entry * a.fee_taker / 100
-        tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
+        tp = float(lv.round_step(avg_px * (1 + side * self.rules.tp), tick, rnd))
         exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
@@ -308,9 +331,9 @@ class Replay:
                 fees += qty * px_out * a.fee_taker / 100
                 break
             worst = lo if side > 0 else h
-            # Стоп: цена дошла до −4 % — по рынку (бот видит на сверке; цена —
-            # стоп или хуже, если свеча открылась уже за ним). Раньше тейка в той
-            # же свече — хуже для нас.
+            # Стоп входа (за уровнем, не дальше STOP_MAX) — по рынку (бот видит
+            # на сверке; цена — стоп или хуже, если свеча открылась уже за ним).
+            # Раньше тейка в той же свече — хуже для нас.
             if stop > 0 and side * (worst - stop) <= 0:
                 why, t_out = "стоп", t
                 px_out = (o if side * (o - stop) <= 0 else stop) * (1 - side * slip)
@@ -547,7 +570,16 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--slippage", type=float, default=0.05, help="проскальзывание рыночного ордера, %%")
     ap.add_argument("--fee-taker", type=float, default=0.05, help="комиссия тейкера OKX, %%")
     ap.add_argument("--fee-maker", type=float, default=0.02, help="комиссия мейкера OKX (тейк лимитом), %%")
+    ap.add_argument("--variants", action="store_true", help="сравнить варианты правил (VARIANTS) на тех же китах")
     return ap
+
+
+def variant_row(r: Rules, st: dict[str, Any]) -> dict[str, Any]:
+    """Строка сравнения: настройки варианта и его итог."""
+    return {"name": r.name, "tp_pct": round(r.tp * 100, 3),
+            "stop_max_pct": round(r.stop_max * 100, 3) if math.isfinite(r.stop_max) else None,
+            "levels": r.levels, "ma": r.ma,
+            **{k: st[k] for k in ("trades", "win_pct", "net", "pf", "max_dd", "open")}}
 
 
 def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None) -> dict[str, Any]:
@@ -564,10 +596,21 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     f = fetch or okx_fetch
     prices = Prices(a.cache, f, a.pause, a.offline, now)
     hours = Prices(a.cache, f, a.pause, a.offline, now, bar="4H", bar_ms=core.LEVEL_BAR_MS)  # уровни графика 4ч
-    rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress, hours)
+    instr = instruments(f, a.offline, a.cache)
+    rp = Replay(a, prices, instr, progress, hours)
     since = now - a.since_days * core.DAY_MS
     rp.run(since, now)
     s = summary(a, rp, since, now)
+    s["variants"] = []
+    if getattr(a, "variants", False):
+        s["variants"].append(variant_row(rp.rules, s["full"]))
+        for i, r in enumerate(VARIANTS, 1):
+            def note(p: dict[str, Any], i: int = i, r: Rules = r) -> None:
+                progress({**p, "stage": f"вариант {i} из {len(VARIANTS)}: {r.name}"})
+            alt = Replay(a, prices, instr, note, hours, rules=r)   # свечи — те же (кеш в памяти)
+            alt.run(since, now)
+            s["variants"].append(variant_row(r, stats(alt.trades)))
+        progress({"stage": "готово", "done": 1, "total": 1, "trades": len(rp.trades), "requests": rp.requests()})
 
     def fmt(ms: float) -> str:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -580,6 +623,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "Бэктест-повтор по актуальным правилам живого бота",
         f"Период: {fmt(since)} — {fmt(now)}; капитал {a.deposit:.2f} $ → {rp.equity:.2f} $ (закрытые сделки); "
         f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, стоп — {core.LEVEL_STOP_BEYOND * 100:g} % за уровнем входа, "
+        f"не дальше {core.STOP_MAX * 100:g} % от входа, "
         "выход вслед за китом в убытке.",
         "Весь период: " + line(s["full"]),
         "Первые 3/4: " + line(s["first"]),
@@ -587,6 +631,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "Сигналы: " + ", ".join(f"{k} — {v}" for k, v in s["skips"].items()),
         f"Запросов к OKX: {rp.requests()} (часовых — {hours.requests})"
         + (f", сбоев: {prices.errors + hours.errors}" if prices.errors + hours.errors else ""),
+        *(["", "Варианты (те же киты, одно изменение правил):"] if s["variants"] else []),
+        *(f"  {v['name']}: " + line(v) for v in s["variants"]),
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "
