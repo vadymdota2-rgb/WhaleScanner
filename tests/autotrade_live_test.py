@@ -23,6 +23,7 @@ import tempfile
 import unittest
 import urllib.parse
 from decimal import Decimal
+from typing import ClassVar
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +54,7 @@ class FakeOkx:
         self.n = 0
         self.reject: dict[str, str] = {}   # бумага → код отказа OKX на ордер
         self.hl: dict[str, object] = {}    # бумага → (минимум, максимум) часовых свечей за сутки или свои строки
+        self.ma: dict[str, object] = {}    # бумага → закрытие 15-минутных свечей (MA30 ≈ оно) или свои строки
 
     def __call__(self, method: str, url: str, headers: dict, body: bytes | None):
         u = urllib.parse.urlparse(url)
@@ -64,6 +66,11 @@ class FakeOkx:
         if p == "/api/v5/public/instruments":
             kind = q.get("instType", "SWAP")
             return ok([r for r in self.instr.values() if r.get("instType", "SWAP") == kind])
+        if p == "/api/v5/market/candles" and q.get("bar") == "15m":
+            got = self.ma.get(q["instId"])
+            if isinstance(got, (int, float)):
+                return ok([[str(self.n + i), "1", "1", "1", str(got), "1"] for i in range(int(q.get("limit", "30")))])
+            return ok(got if isinstance(got, list) else [])
         if p == "/api/v5/market/candles":
             got = self.hl.get(q["instId"])
             if isinstance(got, tuple):
@@ -105,7 +112,7 @@ class FakeOkx:
             elif b["ordType"] == "market" and any(
                     p["instId"] == b["instId"] and p.get("posSide", "net") == b.get("posSide", "net")
                     and (b.get("posSide") or (float(p["pos"]) > 0) == (b["side"] == "buy")) for p in self.pos):
-                # Доливка в ту же позицию (усреднение): объём растёт, средняя — взвешенная.
+                # Докупка в ту же позицию: объём растёт, средняя — взвешенная.
                 px = self.last[b["instId"]]
                 o.update(state="filled", avgPx=str(px), accFillSz=b["sz"])
                 p = next(p for p in self.pos if p["instId"] == b["instId"] and p.get("posSide", "net") == b.get("posSide", "net"))
@@ -933,232 +940,133 @@ class PartialEntryTest(Base):
         self.assertEqual(self.state()["open"]["size"], 10.0)
 
 
-class AverageTest(Base):
-    """Правило владельца: позиция в минусе больше 1 % (цена против входа) и
-    кит сигнала добирает позицию после нашего входа — один раз доливаем 5 %
-    капитала × 10× рыночным; средняя и тейк (+1 % от средней) — на весь объём."""
+class StopTest(Base):
+    """Правило владельца (24.11.2026): стоп — за уровнем, от которого вошли:
+    лонг — на 0,5 % ниже поддержки (минимум 24 ч на входе), шорт — на 0,5 %
+    выше сопротивления (максимум). Уровень — на входе и не меняется. Цена
+    дошла — снять тейк и закрыть по рынку только на закрытие; усреднения нет.
+    Лонг: уровни 99 000–103 000 → стоп 98 505; шорт: 97 000–101 000 → 101 505."""
 
-    def setup_long(self, mode: str = "net_mode", side: int = 1) -> lv.Trader:
+    trades = WhaleExitTest.trades
+    LEVELS: ClassVar[dict[int, tuple[float, float]]] = {1: (99_000.0, 103_000.0), -1: (97_000.0, 101_000.0)}
+    STOPS: ClassVar[dict[int, float]] = {1: 98_505.0, -1: 101_505.0}
+
+    def enter(self, mode: str = "net_mode", side: int = 1, levels: bool = True) -> lv.Trader:
         self.ex = FakeOkx(mode)
+        if levels:
+            self.ex.hl["BTC-USDT-SWAP"] = self.LEVELS[side]
         tr = self.trader(self.whales(side=side))
         self.on()
         tr.step()
-        self.assertEqual(tr.st["open"]["size"], 10.0)
+        self.assertIsNotNone(tr.st["open"])
         return tr
 
-    def move(self, pct: float) -> None:
-        px = 100_000 * (1 + pct)
+    def price(self, px: float) -> None:
         self.ex.last["BTC-USDT-SWAP"] = px
-        self.ex.pos[0]["markPx"] = str(px)
+        for p in self.ex.pos:
+            p["markPx"] = str(px)
 
-    def whale_adds(self, wallet: str = "0xa", usd: float = 3000, side: int = 1, ago: int = 1, tid: int = 300) -> None:
-        con = sqlite3.connect(self.db)
-        con.execute(INS, fill(tid, wallet, "BTC", side, self.now - ago * MIN, usd, 100_000))
-        con.commit()
-        con.close()
-
-    def run_sync(self, tr: lv.Trader, n: int = 1) -> None:
-        for _ in range(n):
-            self.now += MIN
-            tr.last_sync = 0
-            tr.step()
-
-    def avg_orders(self) -> list[dict]:
-        return [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtav")]
-
-    def test_loss_over_1pct_and_whale_adds_average_once(self) -> None:
-        for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
-            tr = self.setup_long(mode, side)
-            self.now += 20 * MIN
-            self.move(-side * 0.011)               # цена против нас на 1,1 %
-            self.whale_adds(side=side)              # кит сигнала добрал 3 000 $
-            self.run_sync(tr)
-            [av] = self.avg_orders()
-            # 5 % × 20 000 $ × 10 = 10 000 $ / (0,01 × 98 900) = 10,111 → 10,11 (шаг 0,01);
-            # шорт: цена 101 100 → 9,89.
-            px2 = 100_000 * (1 - side * 0.011)
-            add = int(10_000 / (0.01 * px2) * 100) / 100
-            self.assertEqual((av["ordType"], av["side"], av["sz"]),
-                             ("market", "buy" if side > 0 else "sell", f"{add:g}"), mode)
-            op = self.state()["open"]
-            self.assertAlmostEqual(op["size"], 10 + add)
-            self.assertAlmostEqual(op["px"], (100_000 * 10 + px2 * add) / (10 + add))
-            self.assertTrue(op["avg"]["done"])
-            live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
-            self.assertEqual(len(live), 1, "тейк один")
-            self.assertEqual(live[0]["sz"], f"{10 + add:g}", "тейк на весь объём")
-            self.assertAlmostEqual(float(live[0]["px"]), op["px"] * (1 + side * lv.TP), delta=0.1)
-            self.assertTrue(any("усредняюсь на 5 %" in e for e in self.state()["events"]))
-            # Только один раз: минус глубже, кит добирает ещё — второй доливки нет.
-            self.move(-side * 0.03)
-            self.whale_adds(side=side, tid=301)
-            self.run_sync(tr, 3)
-            self.assertEqual(len(self.avg_orders()), 1)
-            os.remove(self.db)
-            os.remove(os.path.join(self.dir, "live", "state.json"))
-
-    def test_averaged_size_is_decimal(self) -> None:
-        """Шорт, цена против нас на 3,1 %: доливка 10 000 $ / (0,01 × 103 100) =
-        9,69; 10 + 9,69 в двоичных дробях — 19,689999…, тейк по шагу 0,01 встал
-        бы на 19,68 — часть позиции без тейка. Объём — десятичными: ровно 19,69."""
-        tr = self.setup_long("long_short_mode", -1)
-        self.now += 20 * MIN
-        self.move(0.031)
-        self.whale_adds(side=-1)
-        self.run_sync(tr)
-        self.assertEqual(self.state()["open"]["size"], 19.69)
-        live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
-        self.assertEqual([o["sz"] for o in live], ["19.69"], "тейк — на весь объём")
-
-    def test_no_average_without_all_conditions(self) -> None:
-        cases = [("минус меньше 1 %", -0.009, "0xa", 3000, 1),
-                 ("кит добрал меньше 1000 $", -0.02, "0xa", 900, 1),
-                 ("добрал не кит сигнала", -0.02, "0xother", 50_000, 1),
-                 ("кит добрал до нашего входа", -0.02, "0xa", 3000, 30),
-                 ("в плюсе", +0.02, "0xa", 3000, 1)]
-        for name, pct, wallet, usd, ago in cases:
-            self.ex = FakeOkx()
-            tr = self.setup_long()
-            self.now += 20 * MIN
-            self.move(pct)
-            self.whale_adds(wallet=wallet, usd=usd, ago=ago)
-            self.run_sync(tr, 2)
-            self.assertEqual(self.avg_orders(), [], name)
-            self.assertNotIn("avg", self.state()["open"] or {}, name)
-            os.remove(self.db)
-            os.remove(os.path.join(self.dir, "live", "state.json"))
-
-    def test_stop_button_no_average(self) -> None:
-        tr = self.setup_long()
-        self.on(False)
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
-        self.run_sync(tr)
-        self.assertEqual(self.avg_orders(), [])
-
-    def test_lost_reply_found_by_tag_no_second_order(self) -> None:
-        tr = self.setup_long()
-        real = tr.okx.order
-
-        def order(body):
-            got = real(body)
-            if body["clOrdId"].startswith("wtav"):
-                raise lv.OkxError("502", "HTTP")
-            return got
-
-        tr.okx.order = order  # type: ignore[method-assign]
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
-        self.run_sync(tr, 3)
-        self.assertEqual(len(self.avg_orders()), 1)
-        op = self.state()["open"]
-        self.assertEqual((op["size"], op["avg"]["done"]), (20.2, True))   # 10 000 $ / 980 = 10,2
-
-    def test_refused_is_not_retried(self) -> None:
-        tr = self.setup_long()
-        real = tr.okx.order
-
-        def order(body):
-            if body["clOrdId"].startswith("wtav"):
-                raise lv.OkxError("51008", "мало маржи")
-            return real(body)
-
-        tr.okx.order = order  # type: ignore[method-assign]
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
-        self.run_sync(tr, 3)
-        op = self.state()["open"]
-        self.assertEqual((op["size"], op["avg"]["done"]), (10.0, True))
-        self.assertIn("51008", op["avg"]["skipped"])
-        self.assertTrue(any("усреднение не принято" in e for e in self.state()["events"]))
-
-    def test_restart_mid_average_applies_once(self) -> None:
-        """Служба упала сразу после ордера усреднения: после перезапуска ордер
-        найден по метке, учтён один раз, второго нет."""
-        tr = self.setup_long()
-        real = tr.okx.order
-
-        def order(body):
-            got = real(body)
-            if body["clOrdId"].startswith("wtav"):
-                raise SystemExit("упала")
-            return got
-
-        tr.okx.order = order  # type: ignore[method-assign]
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
+    def sync(self, tr: lv.Trader) -> None:
+        self.now += MIN
         tr.last_sync = 0
+        tr.step()
+
+    def exits(self) -> list[dict]:
+        return [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
+
+    def test_stop_beyond_level_closes_by_market(self) -> None:
+        for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
+            tr = self.enter(mode, side)
+            self.assertAlmostEqual(self.state()["open"]["stop"], self.STOPS[side])
+            self.price(self.STOPS[side] + side * 10)             # не дошла — сидим
+            self.sync(tr)
+            self.assertEqual(self.exits(), [], mode)
+            self.price(self.STOPS[side])                          # дошла ровно до стопа — выходим
+            self.sync(tr)
+            [ex] = self.exits()
+            self.assertEqual((ex["ordType"], ex["side"], ex["sz"]), ("market", "sell" if side > 0 else "buy", "10"), mode)
+            if mode == "net_mode":
+                self.assertTrue(ex["reduceOnly"], "только закрытие")
+            else:
+                self.assertEqual(ex["posSide"], "short")
+            self.assertEqual(self.ex.pos, [], "позиции нет")
+            self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [], "тейк снят")
+            [t] = self.trades()
+            self.assertEqual(t["why"], "стоп")
+            want = "ниже поддержки" if side > 0 else "выше сопротивления"
+            self.assertTrue(any("стоп: цена" in e and want in e for e in self.state()["events"]))
+            self.assertEqual(len(self.market_orders()), 2, "вход и выход — второго входа и доливки нет")
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+            os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
+
+    def test_stop_fixed_at_entry(self) -> None:
+        """Уровни после входа сдвинулись (новый минимум 95 000) — стоп прежний."""
+        tr = self.enter()
+        self.ex.hl["BTC-USDT-SWAP"] = (95_000.0, 103_000.0)
+        self.price(98_000.0)
+        self.sync(tr)
+        self.assertEqual(self.trades()[0]["why"], "стоп")
+
+    def test_no_levels_no_stop_and_no_averaging(self) -> None:
+        tr = self.enter(levels=False)
+        self.assertEqual(self.state()["open"]["stop"], 0.0)
+        for px in (70_000.0, 100_900.0, 60_000.0):
+            self.price(px)
+            self.sync(tr)
+        self.assertEqual(self.exits(), [])
+        self.assertIsNotNone(self.state()["open"])
+        self.assertEqual(len(self.market_orders()), 1, "усреднения нет — только вход")
+
+    def test_stop_works_when_stopped_and_without_whales(self) -> None:
+        """«Стоп» во вкладке — новых входов нет, но стоп открытой позиции
+        работает; и у позиции без записи китов."""
+        tr = self.enter()
+        tr.st["open"]["wallets"] = {}
+        self.on(False)
+        self.price(97_000.0)
+        self.sync(tr)
+        [t] = self.trades()
+        self.assertEqual(t["why"], "стоп")
+
+    def test_mark_missing_uses_ticker(self) -> None:
+        tr = self.enter()
+        self.ex.last["BTC-USDT-SWAP"] = 98_000.0
+        for p in self.ex.pos:
+            p["markPx"] = ""
+        self.sync(tr)
+        self.assertEqual(self.trades()[0]["why"], "стоп")
+
+    def test_stop_survives_crash_between_order_and_record(self) -> None:
+        """Стоп — и в записи «входим»: служба упала после ордера — принятая
+        сверкой позиция со стопом."""
+        self.ex.hl["BTC-USDT-SWAP"] = self.LEVELS[1]
+        tr = self.trader(self.whales())
+        self.on()
+        real = tr.okx.order
+
+        def order_then_crash(body):
+            real(body)
+            if body["ordType"] == "market":
+                raise SystemExit("упала")
+            return ""
+
+        tr.okx.order = order_then_crash  # type: ignore[method-assign]
         with self.assertRaises(SystemExit):
             tr.step()
-        tr = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
-                       clock=lambda: self.now, log=self.logs.append)
-        self.on()
-        self.run_sync(tr, 2)
-        self.assertEqual(len(self.avg_orders()), 1)
-        self.assertEqual(self.state()["open"]["size"], 20.2)
+        self.assertAlmostEqual(self.state()["entering"]["stop"], self.STOPS[1])
+        tr2 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        tr2.sync()
+        tr2.save()
+        self.assertAlmostEqual(self.state()["open"]["stop"], self.STOPS[1])
 
-    def avg_with(self, tr: lv.Trader, patch) -> None:
-        real = tr.okx.order
-
-        def order(body):
-            got = real(body)
-            if body["clOrdId"].startswith("wtav"):
-                patch(self.ex.orders[-1])
-            return got
-
-        tr.okx.order = order  # type: ignore[method-assign]
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
-
-    def test_partial_then_final_applied_once(self) -> None:
-        tr = self.setup_long()
-
-        def partial(o):
-            o.update(state="partially_filled", accFillSz="5")
-            self.ex.pos[0]["pos"] = "15"
-
-        self.avg_with(tr, partial)
-        self.run_sync(tr)
-        self.assertEqual(self.state()["open"]["size"], 15.0)
-        self.avg_orders()[0]["state"] = "canceled"   # остаток рыночного отменён
-        self.run_sync(tr, 2)
-        op = self.state()["open"]
-        self.assertEqual((op["size"], op["avg"]["done"]), (15.0, True))
-        self.assertEqual(sum("усреднено" in e for e in self.state()["events"]), 1, "учтено один раз")
-        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]), 1)
-
-    def test_garbage_fill_never_more_than_ordered(self) -> None:
-        tr = self.setup_long()
-        self.avg_with(tr, lambda o: o.update(accFillSz="1000"))
-        self.run_sync(tr)
-        self.assertEqual(self.state()["open"]["size"], 20.2)
-
-    def test_tp_already_filling_not_touched_on_average(self) -> None:
-        tr = self.setup_long()
-        tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
-        tp.update(state="partially_filled", accFillSz="2")
-        self.avg_with(tr, lambda o: None)
-        self.run_sync(tr)
-        self.assertEqual(tp["state"], "partially_filled", "тейк не снят")
-        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "и не задвоен")
-        self.assertTrue(any("тейк уже исполняется" in e for e in self.state()["events"]))
-
-    def test_whale_loss_exit_closes_averaged_size(self) -> None:
-        tr = self.setup_long()
-        self.now += 20 * MIN
-        self.move(-0.02)
-        self.whale_adds()
-        self.run_sync(tr)
-        close_fill(self.db, 400, "0xb", "BTC", 3, self.now, -100.0)
-        self.run_sync(tr)
-        [ex] = [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
-        self.assertEqual(ex["sz"], "20.2", "выход — весь усреднённый объём")
-        self.assertIsNone(self.state()["open"])
+    def test_level_stop_rule(self) -> None:
+        st = lv.core.level_stop
+        self.assertAlmostEqual(st(100.0, 120.0, 1), 99.5)
+        self.assertAlmostEqual(st(100.0, 120.0, -1), 120.6)
+        for lo, hi in ((0.0, 0.0), (100.0, 100.0), (120.0, 100.0), (float("nan"), 120.0), (100.0, float("inf"))):
+            self.assertEqual(st(lo, hi, 1), 0.0, (lo, hi))
 
 
 class LevelTest(Base):
@@ -1177,8 +1085,8 @@ class LevelTest(Base):
         self.go(1, (99_000.0, 103_000.0))            # цена 100 000 — четверть диапазона
         [m] = self.market_orders()
         self.assertEqual(m["side"], "buy")
-        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles"]
-        self.assertEqual((c[2]["instId"], c[2]["bar"], c[2]["limit"]), ("BTC-USDT-SWAP", "1H", "24"))
+        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles" and c[2]["bar"] == "1H"]
+        self.assertEqual((c[2]["instId"], c[2]["limit"]), ("BTC-USDT-SWAP", "24"))
 
     def test_long_near_resistance_skipped(self) -> None:
         self.go(1, (97_000.0, 101_000.0))            # три четверти — у сопротивления
@@ -1254,6 +1162,95 @@ class LevelTest(Base):
         for lo, hi, px in ((0.0, 0.0, 100.0), (100.0, 100.0, 100.0), (110.0, 90.0, 100.0), (90.0, 110.0, 0.0),
                            (float("nan"), 110.0, 100.0), (90.0, float("inf"), 100.0), (-5.0, 110.0, 100.0)):
             self.assertIsNone(ok(lo, hi, px, 1), (lo, hi, px))
+
+
+class MaTest(Base):
+    """Правило владельца (27.11.2026): MA30 15-минутного графика — лонг только
+    при цене выше MA30, шорт — ниже; уровни 24 ч важнее (проверяются первыми);
+    свечей нет — как без MA. Закрытия 99 000 → MA ≈ 99 033 (ниже цены 100 000),
+    101 000 → ≈ 100 967 (выше)."""
+
+    def go(self, side: int, ma: object, levels: object = None) -> lv.Trader:
+        self.ex.ma["BTC-USDT-SWAP"] = ma
+        if levels is not None:
+            self.ex.hl["BTC-USDT-SWAP"] = levels
+        tr = self.trader(self.whales(side=side))
+        self.on()
+        tr.step()
+        return tr
+
+    def reset(self) -> None:
+        os.remove(self.db)
+        os.remove(os.path.join(self.dir, "live", "state.json"))
+        self.ex = FakeOkx()
+
+    def test_long_above_ma_short_below(self) -> None:
+        for side, ma, enters in ((1, 99_000.0, True), (1, 101_000.0, False), (-1, 101_000.0, True), (-1, 99_000.0, False)):
+            self.go(side, ma)
+            self.assertEqual(len(self.market_orders()), 1 if enters else 0, (side, ma))
+            if not enters:
+                sk = self.state()["last_skip"]
+                self.assertEqual(sk["code"], "ma30")
+                self.assertIn(f"{'ниже' if side > 0 else 'выше'} MA30 15м", sk["why"])
+                self.assertIn("лонг не входит" if side > 0 else "шорт не входит", sk["why"])
+            self.reset()
+
+    def test_levels_first(self) -> None:
+        """Уровни против (лонг у сопротивления) — пропуск «level», MA даже не спрашиваем."""
+        self.go(1, 99_000.0, levels=(97_000.0, 101_000.0))
+        self.assertEqual(self.state()["last_skip"]["code"], "level")
+        self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [])
+        self.reset()
+        self.go(1, 101_000.0, levels=(99_000.0, 103_000.0))   # уровни за, MA против
+        self.assertEqual(self.state()["last_skip"]["code"], "ma30")
+
+    def test_request_and_current_candle_by_price(self) -> None:
+        self.go(1, 99_000.0)
+        [c] = [c for c in self.ex.calls if c[2].get("bar") == "15m"]
+        self.assertEqual((c[2]["instId"], c[2]["limit"]), ("BTC-USDT-SWAP", "30"))
+        rows = [["1", "1", "1", "1", "200000", "1"], *[[str(i), "1", "1", "1", "99000", "1"] for i in range(29)]]
+        self.ex.ma["BTC-USDT-SWAP"] = rows
+        okx = lv.Okx("K", "S", "P", False, self.ex)
+        self.assertAlmostEqual(okx.ma30_15m("BTC-USDT-SWAP", 100_000.0), (29 * 99_000 + 100_000) / 30,
+                               msg="идущая свеча — по текущей цене, а не по её закрытию")
+
+    def test_no_ma_enters(self) -> None:
+        short = [[str(i), "1", "1", "1", "101000", "1"] for i in range(29)]
+        bad = [[str(i), "1", "1", "1", "nan" if i == 5 else "101000", "1"] for i in range(30)]
+        for ma in ([], short, bad, 100_000.0):     # нет, мало, мусор, цена ровно на MA
+            self.go(1, ma)
+            self.assertEqual(len(self.market_orders()), 1, str(ma)[:40])
+            self.reset()
+        # Мусор (закрытие 0 или −1) — MA нет: шорт входит (с мусором MA была бы
+        # ниже цены и шорт бы не вошёл).
+        for junk in ("0", "-1"):
+            rows = [[str(i), "1", "1", "1", junk if i == 5 else "101000", "1"] for i in range(30)]
+            self.go(-1, rows)
+            self.assertEqual(len(self.market_orders()), 1, junk)
+            self.reset()
+        okx = lv.Okx("K", "S", "P", False, self.ex)
+        self.ex.ma["BTC-USDT-SWAP"] = 99_000.0
+        self.assertEqual(okx.ma30_15m("BTC-USDT-SWAP", 0.0), 0.0, "нет цены — нет MA")
+
+    def test_candles_failure_enters(self) -> None:
+        for err in (lv.OkxError("50011", "часто"), TimeoutError("timed out")):
+            tr = self.trader(self.whales())
+            self.on()
+            with mock.patch.object(tr.okx, "ma30_15m", side_effect=err):
+                tr.step()
+            self.assertEqual(len(self.market_orders()), 1, err)
+            self.reset()
+
+    def test_ma_rule(self) -> None:
+        ok = lv.core.ma_ok
+        self.assertTrue(ok(99.0, 100.0, 1))
+        self.assertFalse(ok(101.0, 100.0, 1))
+        self.assertTrue(ok(101.0, 100.0, -1))
+        self.assertFalse(ok(99.0, 100.0, -1))
+        for ma, px in ((0.0, 100.0), (100.0, 0.0), (float("nan"), 100.0), (100.0, float("inf")), (100.0, 100.0),
+                       (100.0, 100.0 + 1e-8), (-1.0, 100.0)):
+            self.assertIsNone(ok(ma, px, 1), (ma, px))
+        self.assertTrue(ok(100.0, 100.001, 1), "на 0,001 % выше — уже выше")
 
 
 class EeaTest(Base):

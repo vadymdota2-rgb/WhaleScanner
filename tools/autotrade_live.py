@@ -24,11 +24,16 @@
   (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
   тейк и закрывает свою позицию рыночным ордером (только на закрытие). Кит
   закрыл в плюс — сидим до тейка. Кит уже вышел в убыток до входа — не входим;
-- разовое усреднение: позиция бота в минусе больше 1 % (цена против входа)
-  и кит сигнала добирает позицию после нашего входа (от 1000 $) — один раз
-  доливаем ещё 5 % капитала × 10× рыночным; средняя цена и тейк (+0,5 % от
-  новой средней) — на весь объём; при «Стоп» не усредняемся;
+- стоп — за уровнем, от которого вошли: лонг — на 0,5 % ниже поддержки
+  (минимум цены за 24 часа на момент входа), шорт — на 0,5 % выше
+  сопротивления (максимум); уровень стопа — на входе и дальше не меняется;
+  цена позиции (mark) дошла — снять тейк и закрыть по рынку (тот же выход,
+  что вслед за китом); работает и при «Стоп» во вкладке; уровней на входе
+  нет — стопа нет; усреднения нет (правило владельца 24.11.2026);
 - в одну и ту же бумагу — не чаще раза в 3 часа;
+- MA30 15-минутного графика (средняя 30 закрытий, идущая — по цене): лонг —
+  только цена выше MA30, шорт — ниже; уровни важнее (проверяются первыми);
+  свечей нет — как без MA (правило владельца 27.11.2026);
 - уровни часового графика: поддержка — минимум, сопротивление — максимум
   цены за последние 24 часа; лонг — только ниже 40 % диапазона (у
   поддержки), шорт — только выше 60 % (у сопротивления), середина 40–60 % —
@@ -99,11 +104,6 @@ MATCH_TOL = 0.02
 # Маржа входа — всегда 5 % капитала (правило владельца 22.11.2026; раньше —
 # 10 %, а при ручной сделке на счёте — 5 %). Своя позиция у бота — одна.
 MARGIN_FRAC = 0.05
-# Разовое усреднение: позиция в минусе больше 1 % (цена против входа) и кит
-# сигнала добирает позицию после нашего входа (от 1000 $) — один раз доливаем
-# ещё 5 % капитала × 10×; средняя и тейк (+0,5 % от новой средней) — на весь объём.
-AVG_LOSS = 0.01
-AVG_FRAC = 0.05
 LEVERAGE = 10
 TP = 0.005                  # тейк +0,5 % движения цены (правило владельца 24.11.2026; было +1 %)
 COIN_PAUSE_MS = 3 * 3_600_000
@@ -311,6 +311,16 @@ class Okx:
                     lows.append(lo)
                     highs.append(h)
         return (min(lows), max(highs)) if lows else (0.0, 0.0)
+
+    def ma30_15m(self, inst: str, last: float) -> float:
+        """MA30 15-минутного графика: средняя 30 закрытий (идущая свеча — по
+        цене last). Свечей меньше 30 или мусор — 0 (MA нет)."""
+        d = self.call_raw("GET", "/api/v5/market/candles",
+                          {"instId": inst, "bar": "15m", "limit": str(core.MA_BARS)}, private=False)
+        closes = [num(r[4], math.nan) for r in d if isinstance(r, list) and len(r) >= 5]
+        if len(closes) < core.MA_BARS or not all(math.isfinite(c) and c > 0 for c in closes) or last <= 0:
+            return 0.0
+        return (sum(closes[1:core.MA_BARS]) + last) / core.MA_BARS   # первая — идущая (OKX: свежие первыми)
 
     def config(self) -> dict[str, Any]:
         d = self.call("GET", "/api/v5/account/config")
@@ -527,22 +537,6 @@ class Signals:
             if ts >= since.get(wl, now + 1):
                 pnl[wl] = pnl.get(wl, 0) + int(p or 0)
         return [(wl, p / NANOS) for wl, p in sorted(pnl.items()) if p < 0]
-
-    def whale_adds(self, coin: str, side: int, wallets: dict[str, Any], since: int, now: int) -> list[tuple[str, float]]:
-        """Киты сигнала, добравшие позицию по этой бумаге и стороне после
-        since (нашего входа): сумма их сделок открытия, $ — по убыванию."""
-        ws = [str(k) for k in wallets if isinstance(k, str)]
-        if not ws:
-            return []
-        con = self._con()
-        try:
-            rows = con.execute(
-                f"SELECT wallet, SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(ws))}) "  # noqa: S608 — только «?»
-                "AND dir_code = ? AND ts > ? AND ts <= ? GROUP BY wallet",
-                (coin, *ws, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, since, now)).fetchall()
-        finally:
-            con.close()
-        return sorted(((str(w), int(n or 0) / NANOS) for w, n in rows), key=lambda x: -x[1])
 
     def wallets_at(self, coin: str, side: int, ts: int) -> dict[str, int]:
         """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
@@ -973,7 +967,6 @@ class Trader:
         self.find_own()
         self._track_open()
         self.follow_whales()
-        self.average_down()
 
     def resolve_entering(self) -> None:
         """Вход начат (ордер, возможно, ушёл), но не записан: сбой между
@@ -1081,7 +1074,8 @@ class Trader:
                  "tp": op["tp"], "size": op["size"], "pnl": round(pnl, 4), "fee": num(h.get("fee")),
                  "funding": num(h.get("fundingFee")), "notional": op["notional"],
                  "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.002
-                 else "кит вышел в убыток" if op.get("exit") else "закрыта"}
+                 else ("стоп" if op["exit"].get("kind") == "stop" else "кит вышел в убыток") if op.get("exit")
+                 else "закрыта"}
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
         self.st["open"] = None
@@ -1097,27 +1091,32 @@ class Trader:
         except OkxError as e:
             self.event(f"{op['inst']}: остаток тейка не снят — {e}; проверьте ордера в OKX")
 
-    # выход вслед за китом
+    # выход по рынку: стоп или вслед за китом
     def follow_whales(self) -> None:
-        """Кит сигнала закрыл позицию в убыток — закрыть свою: снять тейк и
-        рыночным ордером только на закрытие. Не вышло (сбой, отказ) — запись
-        «выходим» остаётся, тейк заново не ставится, попытка — раз в минуту."""
+        """Стоп (цена против нашего входа на 4 % и больше) или кит сигнала
+        закрыл позицию в убыток — закрыть свою: снять тейк и рыночным ордером
+        только на закрытие. Не вышло (сбой, отказ) — запись «выходим»
+        остаётся, тейк заново не ставится, попытка — раз в минуту."""
         op = self.st.get("open")
         if op and "wallets" not in op and num(op.get("signal_ts")) > 0:
             # Позиция открыта прежней версией (без китов в записи) — найти их по базе.
             op["wallets"] = self.sig.wallets_at(op["coin"], op["side"], int(num(op["signal_ts"])))
             self.event(f"{op['inst']}: киты сигнала восстановлены по базе — {len(op['wallets'])}; "
                        "выход вслед за ними в убытке включён")
-        if not op or not isinstance(op.get("wallets"), dict) or not op["wallets"]:
+        if not op:
             return
         now = self.clock()
         if not op.get("exit"):
-            lost = self.sig.whale_loss(op["coin"], op["side"], op["wallets"], now)
-            if not lost:
+            why = self._stop_hit(op)
+            kind = "stop"
+            if not why and isinstance(op.get("wallets"), dict) and op["wallets"]:
+                lost = self.sig.whale_loss(op["coin"], op["side"], op["wallets"], now)
+                why = f"кит {lost[0][0][:10]}… закрыл в убыток {lost[0][1]:+.0f} $" if lost else ""
+                kind = "whale"
+            if not why:
                 return
-            wl, usd = lost[0]
-            op["exit"] = {"at": now, "tried": 0, "why": f"кит {wl[:10]}… закрыл в убыток {usd:+.0f} $"}
-            self.event(f"{op['inst']}: {op['exit']['why']} — закрываю позицию бота по рынку")
+            op["exit"] = {"at": now, "tried": 0, "why": why, "kind": kind}
+            self.event(f"{op['inst']}: {why} — закрываю позицию бота по рынку")
         if now - num(op["exit"].get("tried")) < 60_000:
             return
         op["exit"]["tried"] = now
@@ -1159,13 +1158,27 @@ class Trader:
                 time.sleep(0.5)
             got = self._exit_fills(op)
         except OkxError as e:
-            self.event(f"{op['inst']}: закрыть вслед за китом не вышло — {e}; повтор через минуту")
+            self.event(f"{op['inst']}: закрыть по рынку не вышло — {e}; повтор через минуту")
             return
         if got is not None and got[0] >= size_of(op.get("size")):
             self._record_close(op, got[1])
 
+    def _stop_hit(self, op: dict[str, Any]) -> str:
+        """Стоп за уровнем входа: цена позиции (mark) дошла до op["stop"] (лонг —
+        ниже или на нём, шорт — выше или на нём) — причина строкой; нет —
+        пусто. Стопа нет (уровней на входе не было) или позиции на счёте нет —
+        не стоп (закрытие запишет _track_open)."""
+        stop = num(op.get("stop"))
+        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
+        if not live or stop <= 0:
+            return ""
+        mark = num(live[0].get("markPx")) or self.okx.ticker(op["inst"])
+        if mark <= 0 or op["side"] * (mark - stop) > 0:
+            return ""
+        return f"стоп: цена {mark:.6g} за уровнем {stop:.6g} ({'ниже поддержки' if op['side'] > 0 else 'выше сопротивления'})"
+
     def _exit_fills(self, op: dict[str, Any]) -> tuple[Decimal, dict[str, Any]] | None:
-        """Ордера выхода вслед за китом: сколько исполнено и итог для записи
+        """Ордера выхода по рынку (стоп или вслед за китом): сколько исполнено и итог для записи
         (средняя цена, PnL и комиссии — суммой). Какой-то ещё исполняется — None."""
         done, val, pnl, fee, last = Decimal(0), 0.0, 0.0, 0.0, 0.0
         for cl in op["exit"].get("ids", []):
@@ -1185,113 +1198,6 @@ class Trader:
             last = max(last, num(o.get("fillTime")) or num(o.get("uTime")))
         return done, {"uTime": last or None, "closeAvgPx": val / float(done) if done > 0 else 0.0,
                       "realizedPnl": pnl, "fee": fee}
-
-    # разовое усреднение
-    def average_down(self) -> None:
-        """Позиция в минусе больше 1 % (цена против нашей средней) и кит
-        сигнала добирает позицию после нашего входа (от 1000 $) — один раз
-        доливаем 5 % капитала × 10× рыночным. Запись «усредняемся» с меткой
-        ордера — до отправки: ответ не дошёл или служба упала — ордер найдётся
-        по метке, второго не будет. Не при «Стоп», не во время выхода вслед за
-        китом и не пока сам вход доисполняется."""
-        op = self.st.get("open")
-        if not op or op.get("exit") or op.get("in_done") is False:
-            return
-        if isinstance(op.get("avg"), dict):
-            if not op["avg"].get("done"):
-                self._avg_fill(op)
-            return
-        if not self.is_on() or not isinstance(op.get("wallets"), dict) or not op["wallets"]:
-            return
-        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
-        if not live:
-            return
-        mark = num(live[0].get("markPx")) or self.okx.ticker(op["inst"])
-        loss = op["side"] * (mark / op["px"] - 1) if mark > 0 and num(op.get("px")) > 0 else 0.0
-        if loss >= -AVG_LOSS:
-            return
-        now = self.clock()
-        adds = [(w, u) for w, u in self.sig.whale_adds(op["coin"], op["side"], op["wallets"], int(num(op["opened"])), now)
-                if u >= MIN_WHALE_USD]
-        if not adds:
-            return
-        why = f"кит {adds[0][0][:10]}… добрал {adds[0][1]:,.0f} $ при минусе {loss * 100:.2f} %".replace(",", " ")
-        sz = contract_size(self.instruments().get(op["inst"], {}), self.equity * AVG_FRAC * LEVERAGE, mark)
-        if sz <= 0:
-            op["avg"] = {"done": True, "at": now, "why": why, "skipped": "объём меньше минимального на OKX"}
-            self.event(f"{op['inst']}: {why} — усреднение не сделано: объём 5 % меньше минимального на OKX")
-            self.save()
-            return
-        cl = f"{TAG}av{now % 10**12}"
-        op["avg"] = {"cl": cl, "at": now, "why": why, "ordered": float(sz), "filled": 0.0, "done": False,
-                     "base_size": op["size"], "base_px": op["px"]}
-        self.event(f"{op['inst']}: {why} — усредняюсь на 5 % ({fmt_dec(sz)} по рынку), один раз")
-        self.save()
-        try:
-            self.okx.order({"instId": op["inst"], "tdMode": "cross", "side": "buy" if op["side"] > 0 else "sell",
-                            "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(op["side"])})
-        except OkxError as e:
-            if e.code.isdigit() and len(e.code) == 5:  # отказ биржи — ордера нет; второй попытки нет (разово)
-                op["avg"].update(done=True, skipped=str(e).split(" [")[0][:300])
-                self.event(f"{op['inst']}: усреднение не принято — {e}")
-                self.save()
-                return
-            # Ответ не от биржи — ордер мог уйти: _avg_fill найдёт его по метке.
-            self.event(f"{op['inst']}: ответ на ордер усреднения не получен — {e}; сверка по метке")
-        for _ in range(10):
-            if self.okx.get_order(op["inst"], cl_id=cl).get("state") in ("filled", "canceled", "mmp_canceled"):
-                break
-            time.sleep(0.5)
-        self._avg_fill(op)
-
-    def _avg_fill(self, op: dict[str, Any]) -> None:
-        """Ордер усреднения (по метке): исполненное — в запись позиции: объём,
-        средняя цена (взвешенная с прежней), номинал; тейк — +0,5 % от новой
-        средней на весь объём (ещё не тронутый тейк снимается и ставится
-        заново сразу). Ордер завершён — больше не проверять; ордера
-        нет 10 минут — до биржи не дошёл."""
-        av = op["avg"]
-        try:
-            o = self.okx.get_order(op["inst"], cl_id=str(av.get("cl")))
-        except OkxError as e:
-            if e.code != "51603":
-                raise
-            o = {}
-        got = min(size_of(o.get("accFillSz")), size_of(av.get("ordered")))
-        if got > size_of(av.get("filled")):
-            base_size, base_px = num(av.get("base_size")), num(av.get("base_px"))
-            last = self.okx.ticker(op["inst"])
-            px = num(o.get("avgPx"))
-            if not (px > 0 and last > 0 and abs(px / last - 1) <= FILL_TOL):
-                px = last  # мусор в цене исполнения — цена тикера
-            # Десятичными: 10 + 9,69 в двоичных дробях — 19,689999…, и тейк по
-            # шагу 0,01 встал бы на 19,68 — часть позиции без тейка.
-            new_size = float(size_of(av.get("base_size")) + got)
-            op["px"] = (base_px * base_size + px * float(got)) / new_size if new_size > 0 else base_px
-            op["size"] = new_size
-            av["filled"] = float(got)
-            ins = self.instruments().get(op["inst"], {})
-            in_usd = str(ins.get("ctValCcy", "")).upper() in ("USD", "USDC", "USDT")
-            ct = num(ins.get("ctVal")) * num(ins.get("ctMult"), 1.0)
-            op["notional"] = round(new_size * ct * (1 if in_usd else op["px"]), 2)
-            tp_o = self.okx.get_order(op["inst"], str(op["tp_id"])) if op.get("tp_id") else {}
-            if op.get("tp_id") and not (tp_o.get("state") == "live" and size_of(tp_o.get("accFillSz")) <= 0):
-                self.event(f"{op['inst']}: тейк уже исполняется — новый тейк от средней не ставлю")
-            else:
-                tp = round_step(op["px"] * (1 + op["side"] * TP), ins.get("tickSz", "0.0001"),
-                                ROUND_CEILING if op["side"] > 0 else ROUND_FLOOR)
-                if tp > 0:
-                    op["tp"], op["tp_s"] = float(tp), fmt_dec(tp)
-                if op.get("tp_id"):
-                    self.okx.cancel(op["inst"], str(op["tp_id"]))
-                    op.pop("tp_id")
-                self._place_tp(op, size_of(op["size"]))  # сразу — на весь объём от новой средней
-            self.event(f"{op['inst']}: усреднено — {fmt_dec(Decimal(str(new_size)))} по средней {op['px']:.6g}, "
-                       f"тейк {op['tp_s']}")
-        if o.get("state") in ("filled", "canceled", "mmp_canceled") or \
-                (not o and self.clock() - num(av.get("at")) > 600_000):
-            av["done"] = True
-        self.save()
 
     # вход
     def _ps(self, side: int) -> dict[str, Any]:
@@ -1345,17 +1251,31 @@ class Trader:
         bucket[code] = int(num(bucket.get(code))) + 1
         self.st["skips"] = skips
 
-    def level_check(self, inst: str, last: float, side: int) -> str:
-        """Уровни часового графика: '' — цена у своего уровня или свечей нет
-        (входим), иначе — причина пропуска."""
+    def level_check(self, inst: str, last: float, side: int) -> tuple[str, float]:
+        """Уровни часового графика: ('', стоп) — цена у своего уровня или
+        свечей нет (входим; стоп — за уровнем, 0 — уровней нет), иначе —
+        (причина пропуска, 0)."""
         try:
             lo, hi = self.okx.range_24h(inst)
         except (OkxError, OSError):   # нет свечей (отказ, обрыв сети) — как без уровней, шаг не падает
             lo, hi = 0.0, 0.0
         if core.level_ok(lo, hi, last, side) is not False:
-            return ""
+            return "", core.level_stop(lo, hi, side)
         return self._skip("level", f"{inst}: цена {last:.6g} ближе к {'сопротивлению' if side > 0 else 'поддержке'} "
-                                   f"(24 ч: {lo:.6g}–{hi:.6g}) — {'лонг' if side > 0 else 'шорт'} не входит")
+                                   f"(24 ч: {lo:.6g}–{hi:.6g}) — {'лонг' if side > 0 else 'шорт'} не входит"), 0.0
+
+    def ma_check(self, inst: str, last: float, side: int) -> str:
+        """MA30 15-минутного графика (после уровней — они важнее): '' — цена
+        по ту же сторону MA30, что и сделка, или MA нет (входим), иначе —
+        причина пропуска."""
+        try:
+            ma = self.okx.ma30_15m(inst, last)
+        except (OkxError, OSError):   # нет свечей — как без MA, шаг не падает
+            ma = 0.0
+        if core.ma_ok(ma, last, side) is not False:
+            return ""
+        return self._skip("ma30", f"{inst}: цена {last:.6g} {'ниже' if side > 0 else 'выше'} MA30 15м {ma:.6g} — "
+                                  f"{'лонг' if side > 0 else 'шорт'} не входит")
 
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
@@ -1412,9 +1332,13 @@ class Trader:
             return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE:
             return self._skip("chase", f"цена ушла от китов дальше {CHASE * 100:g} %")
-        why = self.level_check(inst, last, s["side"])
+        why, stop = self.level_check(inst, last, s["side"])
         if why:
             return why
+        why = self.ma_check(inst, last, s["side"])
+        if why:
+            return why
+        s = {**s, "stop": stop}
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
         notional = self.equity * MARGIN_FRAC * LEVERAGE
@@ -1443,7 +1367,8 @@ class Trader:
             # ордер найдётся по clOrdId, а не будет повторён).
             self.st["entering"] = {"inst": inst, "cl": cl, "at": now, "coin": s["coin"], "side": s["side"],
                                    "whales": s["whales"], "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"],
-                                   "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against")}
+                                   "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against"),
+                                   "stop": s.get("stop", 0.0)}
             self.save()
             ord_id = self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                                      "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
@@ -1504,7 +1429,7 @@ class Trader:
               "notional": round(filled * ct * (1 if in_usd else fill_px), 2), "tp": float(tp), "tp_s": fmt_dec(tp), "whales": s["whales"],
               "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"], "in_id": ord_id,
               "margin_pct": round(MARGIN_FRAC * 100, 2), "wallets": s.get("wallets") or {},
-              "usd": s.get("usd"), "usd_against": s.get("usd_against"),
+              "usd": s.get("usd"), "usd_against": s.get("usd_against"), "stop": num(s.get("stop")),
               # Рыночный исполнен частично — может доисполниться: сверка
               # увеличит запись и тейк (_entry_fill).
               "in_done": o.get("state") == "filled", "ordered": float(sz)}
@@ -1549,7 +1474,7 @@ class Trader:
         op: dict[str, Any] = {"coin": coin, "inst": inst, "side": side, "opened": opened, "px": px, "size": size,
               "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
-              "in_id": str(order.get("ordId") or ""), "adopted": True,
+              "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": num(info.get("stop")),
               "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {}}
         self.st["open"] = op
         self.st["entered"][coin] = opened

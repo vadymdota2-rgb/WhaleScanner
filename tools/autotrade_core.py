@@ -65,6 +65,7 @@ def okx_candidate(coin: str) -> tuple[str, float]:
 LEVEL_MS = 24 * HOUR_MS
 LEVEL_LONG_BELOW = 0.4
 LEVEL_SHORT_ABOVE = 0.6
+LEVEL_STOP_BEYOND = 0.005   # стоп — на 0,5 % за уровнем входа (правило владельца 24.11.2026)
 
 
 def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
@@ -73,6 +74,30 @@ def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
         return None
     pos = (px - lo) / (hi - lo)   # цена за краем диапазона — за 0 или 1: у самого уровня
     return pos < LEVEL_LONG_BELOW if side > 0 else pos > LEVEL_SHORT_ABOVE
+
+
+# MA30 на 15-минутном графике (правило владельца 27.11.2026): средняя 30
+# закрытий 15-минутных свечей (идущая — по текущей цене). Лонг — только когда
+# цена выше MA30, шорт — ниже. Уровни (level_ok) важнее: проверяются первыми.
+MA_BARS = 30
+MA_BAR_MS = 15 * 60_000
+
+
+def ma_ok(ma: float, px: float, side: int) -> bool | None:
+    """Цена по ту сторону MA30, что и сделка? None — MA нет или цена ровно на
+    ней (до погрешности округления): MA направления не даёт — как без неё."""
+    if not (math.isfinite(ma) and math.isfinite(px)) or ma <= 0 or px <= 0 or abs(px / ma - 1) < 1e-9:
+        return None
+    return px > ma if side > 0 else px < ma
+
+
+def level_stop(lo: float, hi: float, side: int) -> float:
+    """Стоп за уровнем, от которого вошли: лонг — на LEVEL_STOP_BEYOND ниже
+    поддержки (минимума 24 ч), шорт — выше сопротивления (максимума).
+    Уровней нет — 0 (стопа нет)."""
+    if not all(math.isfinite(x) for x in (lo, hi)) or not 0 < lo < hi:
+        return 0.0
+    return lo * (1 - LEVEL_STOP_BEYOND) if side > 0 else hi * (1 + LEVEL_STOP_BEYOND)
 
 
 def safe_name(name: str) -> str:

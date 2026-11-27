@@ -9,6 +9,8 @@
 - от 2 китов в одну сторону за 2 часа, у каждого от 1000 $; на момент входа —
   тоже от 2; против — киты крупнее или поровну — не входим, крупных от 2 —
   входим с ними; кит сигнала уже вышел в убыток — не входим;
+- MA30 15-минутного графика: лонг — цена выше MA30, шорт — ниже (после
+  уровней — они важнее);
 - уровни часового графика: лонг — только ниже 40 % диапазона цены за 24
   часа (у поддержки), шорт — выше 60 % (у сопротивления), середина — нет;
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
@@ -16,9 +18,9 @@
   одна;
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск), рыночный вход (проскальзывание);
-- выход: лимитный тейк +0,5 % от средней; кит сигнала закрыл в убыток — по
-  рынку; разовое усреднение: минус больше 1 % и кит добрал от 1000 $ после
-  нашего входа — ещё 5 % капитала, тейк +0,5 % от новой средней.
+- выход: лимитный тейк +0,5 % от цены входа; по рынку — стоп (0,5 % за
+  уровнем входа: ниже поддержки для лонга, выше сопротивления для шорта)
+  или кит сигнала закрыл в убыток; усреднения нет.
 
 Цены — 5-минутные свечи OKX (публичное API, без ключа; история — годы, по
 100 свечей за запрос), только под кандидатов и сделки, с кешем блоками по
@@ -26,7 +28,8 @@
 Итог — summary.json (его рисует вкладка) и report.txt.
 
 Допущения: цена решения — открытие 5-минутной свечи; внутри свечи при
-одновременном тейке и выходе за китом — выход (хуже); фандинг не учитывается.
+одновременном тейке и стопе (или выходе за китом) — стоп/выход (хуже);
+фандинг не учитывается.
 
     python3 tools/autotrade_replay.py --db ~/WhaleScanner/hyperliquid.db --since-days 30
 """
@@ -198,13 +201,12 @@ class Trade:
     entry_t: int
     exit_t: int
     entry_px: float     # цена первого входа (с проскальзыванием)
-    tp: float           # тейк на конец (после усреднения — от новой средней)
+    tp: float           # тейк
     exit_px: float      # цена выхода; открытая — цена на конец данных
-    notional: float     # $ по средней цене (после усреднения — весь объём)
+    notional: float     # $ по цене входа
     pnl: float          # $ с комиссиями
-    why: str            # тейк / кит вышел в убыток / открыта
+    why: str            # тейк / стоп / кит вышел в убыток / открыта
     mae: float          # худший ход против нас внутри сделки, $
-    averaged: bool
 
     @property
     def open(self) -> bool:
@@ -257,8 +259,11 @@ class Replay:
             return "other_asset"
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
-        if core.level_ok(*self.range_24h(inst, now), last, s["side"]) is False:
+        lo, hi = self.range_24h(inst, now)
+        if core.level_ok(lo, hi, last, s["side"]) is False:
             return "level"
+        if core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
+            return "ma30"
         if self.equity <= 0:
             return "no_equity"
         sz = lv.contract_size(ins, self.equity * lv.MARGIN_FRAC * lv.LEVERAGE, last)  # как у живого бота
@@ -270,10 +275,11 @@ class Replay:
         tp_try = lv.round_step(last * (1 + s["side"] * lv.TP), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not lv.TP * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= lv.TP + lv.TP_SLACK:
             return "tick"
-        self.open_trade(s, inst, ins, sz, last, now)
+        self.open_trade(s, inst, ins, sz, last, now, core.level_stop(lo, hi, s["side"]))
         return ""
 
-    def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int) -> None:
+    def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int,
+                   stop: float) -> None:
         a, side = self.a, s["side"]
         slip = a.slippage / 100
         rnd = ROUND_CEILING if side > 0 else ROUND_FLOOR
@@ -283,10 +289,7 @@ class Replay:
         avg_px = entry
         fees = qty * entry * a.fee_taker / 100
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
-        wallets = s.get("wallets") or {}
-        exit_at = self.loss_exit_time(s["coin"], side, wallets, now)
-        add_at = self.add_time(s["coin"], side, wallets, now)
-        averaged = False
+        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
         for tf, o, h, lo, cl in self.px.candles(inst, now, self.px.now_ms):
@@ -298,21 +301,16 @@ class Replay:
                 fees += qty * px_out * a.fee_taker / 100
                 break
             worst = lo if side > 0 else h
+            # Стоп: цена дошла до −4 % — по рынку (бот видит на сверке; цена —
+            # стоп или хуже, если свеча открылась уже за ним). Раньше тейка в той
+            # же свече — хуже для нас.
+            if stop > 0 and side * (worst - stop) <= 0:
+                why, t_out = "стоп", t
+                px_out = (o if side * (o - stop) <= 0 else stop) * (1 - side * slip)
+                mae = max(mae, qty * side * (avg_px - px_out))
+                fees += qty * px_out * a.fee_taker / 100
+                break
             mae = max(mae, qty * side * (avg_px - worst))
-            # Разовое усреднение: кит уже добрал, минус больше 1 % — по цене порога
-            # (или хуже, если свеча открылась уже за ним).
-            if not averaged and add_at is not None and add_at < end:
-                edge = avg_px * (1 - side * lv.AVG_LOSS)
-                if side * (worst - edge) < 0:
-                    fill = (o if side * (o - edge) < 0 else edge) * (1 + side * slip)
-                    add_sz = lv.contract_size(ins, self.equity * lv.AVG_FRAC * lv.LEVERAGE, fill)
-                    averaged = True
-                    if add_sz > 0:
-                        add_q = float(add_sz) * coin_per_contract(ins, fill)
-                        avg_px = (avg_px * qty + fill * add_q) / (qty + add_q)
-                        qty += add_q
-                        fees += add_q * fill * a.fee_taker / 100
-                        tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
             best = h if side > 0 else lo
             if side * (best - tp) >= 0:
                 why, t_out, px_out = "тейк", t, tp
@@ -324,29 +322,31 @@ class Replay:
             self.equity += pnl
         self.entered[s["coin"]] = now
         self.busy_until = t_out if why != "открыта" else 10**18
-        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out,
-                                 qty * avg_px, pnl, why, mae, averaged))
+        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae))
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
         """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
         (как Signals.whale_loss, но по времени): сумма closed_pnl закрытий с
         его первой сделки в окне < 0 — после нашего входа."""
         run: dict[str, int] = defaultdict(int)
-        for w, ts, p in self.whale_rows(coin, side, wallets, closes=True):
+        for w, ts, p in self.whale_rows(coin, side, wallets):
             run[w] += p
             if ts > since and run[w] < 0:
                 return ts
         return None
 
-    def add_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
-        """Когда кит сигнала добрал позицию после нашего входа на 1000 $ и больше."""
-        run: dict[str, int] = defaultdict(int)
-        for w, ts, n in self.whale_rows(coin, side, wallets, closes=False):
-            if ts > since:
-                run[w] += n
-                if run[w] >= lv.MIN_WHALE_USD * core.NANOS:
-                    return ts
-        return None
+    def ma30_15m(self, inst: str, now: int, last: float) -> float:
+        """MA30 15-минутного графика на момент now — как у живого бота: 29
+        закрытых 15-минутных свечей (закрытие — у последней 5-минутки свечи) и
+        идущая — по цене last. Свечи нет — 0 (MA нет)."""
+        cur = now // core.MA_BAR_MS * core.MA_BAR_MS
+        closes = []
+        for k in range(1, core.MA_BARS):
+            c = self.px.candle(inst, cur - (k - 1) * core.MA_BAR_MS - BAR_MS)
+            if c is None:
+                return 0.0
+            closes.append(c[4])
+        return (sum(closes) + last) / core.MA_BARS
 
     def range_24h(self, inst: str, now: int) -> tuple[float, float]:
         """Уровни часового графика на момент now — как у живого бота (24 часовые
@@ -358,22 +358,18 @@ class Replay:
         got += [c for c in self.px.candles(inst, hour, now) if c[0] + BAR_MS <= now]
         return (min(c[3] for c in got), max(c[2] for c in got)) if got else (0.0, 0.0)
 
-    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any], closes: bool) -> list[tuple[str, int, int]]:
+    def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int]]:
+        """Закрытия китов сигнала по бумаге (закрытие, разворот против нас,
+        ликвидация) с их первой сделки в окне: (кошелёк, время, closed_pnl)."""
         since = {str(k): int(lv.num(v)) for k, v in wallets.items()}
         if not since:
             return []
         marks = ",".join("?" * len(since))
-        if closes:
-            codes = core.CLOSES_FOR[1 if side > 0 else -1]
-            q = (f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
-                 f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? "
-                 f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid")
-            args: tuple[Any, ...] = (coin, *since, *codes, min(since.values()),
-                                     "%Long > Short%" if side > 0 else "%Short > Long%")
-        else:
-            q = (f"SELECT wallet, ts, notional_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608
-                 "AND dir_code = ? AND ts >= ? ORDER BY ts, tid")
-            args = (coin, *since, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, min(since.values()))
+        codes = core.CLOSES_FOR[1 if side > 0 else -1]
+        q = (f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
+             f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? "
+             f"AND (dir_code != {core.FLIP} OR dir LIKE ?) ORDER BY ts, tid")
+        args = (coin, *since, *codes, min(since.values()), "%Long > Short%" if side > 0 else "%Short > Long%")
         con = core.open_ro(self.a.db)
         try:
             rows = con.execute(q, args).fetchall()
@@ -491,7 +487,7 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         return {"coin": t.coin, "side": t.side, "entry": t.entry_t, "exit": t.exit_t,
                 "px_in": t.entry_px, "px_out": t.exit_px, "tp": t.tp, "usd": round(t.pnl, 2),
                 "pct": round(t.pnl / t.notional * 100, 3) if t.notional else 0.0, "why": t.why,
-                "averaged": t.averaged, "mae": round(t.mae, 2),
+                "mae": round(t.mae, 2),
                 "held_h": round((t.exit_t - t.entry_t) / core.HOUR_MS, 1)}
 
     return {
@@ -509,7 +505,6 @@ def summary(a: argparse.Namespace, rp: Replay, since: int, now: int) -> dict[str
         "by_session": group(lambda t: "open" if us_open(t.entry_t) else "closed"),
         "by_exit": group(lambda t: t.why),
         "skips": dict(sorted(rp.skips.items(), key=lambda kv: -kv[1])),
-        "averaged": sum(t.averaged for t in trades),
         "per_day": round(len(trades) / max(1.0, (now - since) / core.DAY_MS), 2),
         "trades": [row(t) for t in sorted(trades, key=lambda x: x.entry_t)[-100:]],
         # Открытая позиция модели (не дошла до выхода к концу данных — это «сейчас»).
@@ -564,8 +559,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     text = "\n".join([
         "Бэктест-повтор по актуальным правилам живого бота",
         f"Период: {fmt(since)} — {fmt(now)}; капитал {a.deposit:.2f} $ → {rp.equity:.2f} $ (закрытые сделки); "
-        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, выход вслед за китом в "
-        f"убытке, разовое усреднение (было {s['averaged']}).",
+        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, стоп — {core.LEVEL_STOP_BEYOND * 100:g} % за уровнем входа, "
+        "выход вслед за китом в убытке.",
         "Весь период: " + line(s["full"]),
         "Первые 3/4: " + line(s["first"]),
         "Последняя 1/4: " + line(s["last"]),
@@ -575,7 +570,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "
-          f"{t.why}{' (усреднено)' if t.averaged else ''} {t.pnl:+.2f} $" for t in rp.trades),
+          f"{t.why} {t.pnl:+.2f} $" for t in rp.trades),
     ]) + "\n"
     with open(os.path.join(a.out, "report.txt"), "w", encoding="utf-8") as fh:
         fh.write(text)

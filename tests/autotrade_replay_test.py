@@ -3,7 +3,7 @@
 """Бэктест-повтор (tools/autotrade_replay.py) — на синтетической базе китов
 и поддельных свечах OKX: без сети. Проверяется, что повтор торгует по тем же
 правилам, что живой бот: вход от 2 китов, тейк +1 %, выход вслед за китом в
-убытке, разовое усреднение, «входим с крупными», одна позиция, пауза на
+убытке, стоп −4 %, «входим с крупными», одна позиция, пауза на
 бумагу, нет на OKX — пропуск; ход — в progress.json; итог — summary.json
 для вкладки; второй прогон — из кеша, без сети.
 """
@@ -136,27 +136,38 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, step_price(100_000, [(T + 90 * MIN, 0.012)]))
         self.assertEqual(r["trades"][0].why, "тейк")
 
-    def test_average_once_then_tp_from_new_average(self) -> None:
-        # −1,5 % через 20 мин, кит добирает 2 000 $ в +40 мин, потом цена +0,3 % от входа.
-        rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, 2000, 98_500)]
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
+    def test_stop_beyond_level(self) -> None:
+        """Стоп за уровнем входа (как у живого бота): за сутки до сигнала — 99 000
+        и 103 000 (раньше окна MA30 — она ровная), цена 100 000 (лонг у поддержки) → стоп 99 000 × 0,995 = 98 505.
+        Свеча открылась за стопом — по её открытию; задела стоп — по цене стопа;
+        98 600 — держим; уровней не было — стопа нет."""
+        H = 60 * MIN
+
+        def hist(after):
+            def f(c: str, t: int) -> float:
+                if t < T:
+                    return 99_000.0 if T - 10 * H <= t < T - 9 * H else 103_000.0 if T - 12 * H <= t < T - 11 * H else 100_000.0
+                return after(t)
+            return f
+
+        r = self.go(self.whales(), hist(lambda t: 98_000.0 if t >= T + 20 * MIN else 100_000.0))
         [t] = r["trades"]
-        self.assertEqual(r["summary"]["averaged"], 1)
-        self.assertEqual(t.why, "тейк", "после усреднения тейк ближе — +1 % от новой средней")
-        self.assertLess(t.tp, 100_000 * 1.01)
-
-    def test_no_average_without_whale_add(self) -> None:
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.015), (T + 120 * MIN, 0.003)]))
-        self.assertEqual(r["summary"]["averaged"], 0)
-        self.assertEqual(r["trades"][0].why, "открыта", "без усреднения тейк +1 % от 100 000 не достигнут")
-
-    def test_no_average_small_dip_or_small_add(self) -> None:
-        for dip, add in ((-0.005, 2000), (-0.015, 500)):   # минус 0,5 % — мало; добор 500 $ — мало
-            self.cache = os.path.join(self.tmp.name, f"cache{dip}")  # свои свечи у каждого случая
-            rows = [*self.whales(), opn(20, "0xb", "BTC", 1, T + 40 * MIN, add, 98_500)]
-            r = self.go(rows, step_price(100_000, [(T + 20 * MIN, dip)]))
-            self.assertEqual(r["summary"]["averaged"], 0, (dip, add))
-            os.remove(self.db)
+        self.assertEqual(t.why, "стоп")
+        self.assertAlmostEqual(t.exit_px, 98_000 * 0.9995, delta=1, msg="свеча открылась за стопом — по её открытию")
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), hist(lambda t: 100_700.0 if t >= T + 90 * MIN else 98_600.0 if t >= T + 20 * MIN else 100_000.0))
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"], "98 600 — выше стопа")
+        os.remove(self.db)
+        self.cache += "3"
+        r = self.go(self.whales(), hist(lambda t: 98_400.0 if T + 20 * MIN < t < T + 25 * MIN else 100_000.0))
+        [t] = r["trades"]
+        self.assertEqual(t.why, "стоп")
+        self.assertAlmostEqual(t.exit_px, 98_505 * 0.9995, delta=1, msg="по цене стопа")
+        os.remove(self.db)
+        self.cache += "4"
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.3)]))   # сутки ровно 100 000 — уровней нет
+        self.assertEqual([t.why for t in r["trades"]], ["открыта"], "уровней нет — стопа нет")
 
     def test_levels_24h(self) -> None:
         """Уровни: минимум и максимум цены за 24 часа до решения. Был минимум
@@ -189,6 +200,44 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(r["skips"].get("level"), 1)
         self.assertTrue(any(c["params"].get("bar") == "1H" for c in self.market.calls if "params" in c))
         self.assertTrue(os.path.isfile(os.path.join(self.cache, "replay_BTC-USDT-SWAP_1H.json")))
+
+    def test_ma30_15m(self) -> None:
+        """MA30 15-минутного графика (29 закрытых свечей + идущая по цене); уровни
+        за (24 ч: 97 000–108 000+, цена 100 000 у поддержки).
+        1) 2,5 ч до сигнала — 101 000, раньше — 99 000: MA ≈ 99 700 ниже цены —
+           лонг входит (MA по 5-минуткам была бы 101 000 — не вошёл бы);
+        2) 8 ч — 100 500: MA выше цены — пропуск ma30; провал до 60 000 внутри
+           идущей 5-минутки (её закрытие — будущее) не в счёт;
+        3) 99 000, а последняя закрытая 5-минутка — 120 000: MA ≈ 99 900 — лонг
+           входит (идущая свеча — по цене 100 000, а не по прошлому закрытию)."""
+        H = 60 * MIN
+
+        def price(recent):
+            def f(c: str, t: int) -> float:
+                if t >= T:
+                    if T + 1000 <= t < T + 5 * MIN:
+                        return 60_000.0 if recent is None else 100_000.0
+                    return 101_000.0 if t >= T + 60 * MIN else 100_000.0
+                if T - 20 * H <= t < T - 19 * H:
+                    return 97_000.0
+                if T - 14 * H <= t < T - 13 * H:
+                    return 108_000.0
+                if t >= T - 8 * H:
+                    return recent(t) if recent else 100_500.0
+                return 100_000.0
+            return f
+
+        r = self.go(self.whales(), price(lambda t: 101_000.0 if t >= T - 150 * MIN else 99_000.0))
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), price(None))
+        self.assertEqual(r["trades"], [])
+        self.assertEqual(r["skips"].get("ma30"), 1)
+        os.remove(self.db)
+        self.cache += "3"
+        r = self.go(self.whales(), price(lambda t: 120_000.0 if t >= T - 5 * MIN else 99_000.0))
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"])
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет
