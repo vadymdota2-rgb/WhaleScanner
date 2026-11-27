@@ -364,6 +364,68 @@ class ReplayTest(unittest.TestCase):
         r.run(NOW - a.since_days * DAY, NOW)
         self.assertEqual(r.memo, {})
 
+    def test_against_whales_variants(self) -> None:
+        """«Против китов»: сторона сделки — обратная сигналу. Киты в лонг, цена
+        упала на 1,6 %: с китами — стоп, против — тейк; выхода вслед за китом
+        у «против» нет (кит закрылся в убытке — нам это в плюс)."""
+        # 0xa закрыл ещё и шорт в убытке: для сделки «против» (шорт) это не выход.
+        rows = [*self.whales(), cls(9, "0xa", "BTC", -1, T + 15 * MIN, -100.0)]
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.016)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        [t] = r["trades"]
+        self.assertEqual((t.side, t.why), (1, "стоп"))
+        self.assertLess(v["текущие правила"]["net"], 0)
+        for name in ("против китов", "против китов: тейк 1,5 %, стоп до 1 %", "против китов, вход рынком"):
+            self.assertEqual(v[name]["trades"], 1, name)
+            self.assertGreater(v[name]["net"], 0, name)
+            self.assertEqual(v[name]["win_pct"], 100.0, name)
+        # Цена выше средней китов на 0,4 %: в их сторону (лонг) — «догон», против
+        # (шорт) — цена лучше их: входим.
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), step_price(100_400, [(T + 20 * MIN, -0.016)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["против китов, вход рынком"]["trades"]), (0, 1))
+        self.assertEqual(r["skips"].get("chase"), 1)
+
+    def test_signal_study(self) -> None:
+        """Разбор сигналов (с --variants): ход цены после сигнала в сторону китов
+        через 15 мин, 1 ч, 4 ч и 24 ч по группам; повтор той же бумаги и
+        стороны в 15 минут — не в счёт. BTC (лонг) — цена +2 %, ETH (лонг) —
+        −2 %: в среднем 0, в сторону китов — половина."""
+        # BTC лонг: цена +2 % (в сторону китов +2); ETH шорт: цена +1 % (против
+        # китов: −1); SOL лонг: на месте (0 — не «в сторону»); DOGE лонг за 30
+        # минут до конца данных (через 1 ч цены нет); второй сигнал SOL с ценой
+        # китов 300 при 150 на OKX — другой актив, не в счёт.
+        rows = [*self.whales(), opn(5, "0xc", "BTC", 1, T + 5 * MIN, 5000, 100_000),
+                *self.whales(side=-1, coin="ETH", px=3000, t=T + 30 * MIN, base=10),
+                *self.whales(coin="SOL", px=150, t=T + 60 * MIN, base=20),
+                *self.whales(coin="SOL", px=300, t=T + 180 * MIN, base=40),
+                *self.whales(coin="DOGE", px=0.2, t=NOW - 30 * MIN, base=30)]
+
+        def price(c: str, ts: int) -> float:
+            if c == "BTC":
+                return 102_000.0 if ts >= T + 10 * MIN else 100_000.0
+            if c == "ETH":
+                return 3030.0 if ts >= T + 40 * MIN else 3000.0
+            return self.PX[c]
+
+        r = self.go(rows, price, variants=True)
+        e = {x["key"]: x for x in r["summary"]["edge"]}
+        allr = e["все сигналы"]
+        self.assertEqual(allr["n"], 4, "второй сигнал BTC через 5 минут — та же волна; SOL по 300 — другой актив")
+        self.assertAlmostEqual(allr["r15m"], (2 - 1 + 0 + 0) / 4, places=6)
+        self.assertAlmostEqual(allr["r1h"], round((2 - 1 + 0) / 3, 3), places=6, msg="у DOGE через 1 ч цены нет")
+        self.assertEqual(allr["up1h"], round(100 / 3, 1), "в сторону китов — только BTC (SOL на месте — не в счёт)")
+        self.assertEqual(e["китов 2"]["n"], 4)
+        self.assertEqual(e["уровней нет"]["n"], 4)
+        self.assertEqual(e["против — меньше или никого"]["n"], 4)
+        self.assertIn("Куда идёт цена после сигнала", r["text"])
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(rows, price)
+        self.assertEqual(r["summary"]["edge"], [], "без --variants — разбора нет")
+
     def test_far_level_stop_capped(self) -> None:
         """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 1,5 % от
         цены входа с проскальзыванием не считая (100 000 → 98 500)."""

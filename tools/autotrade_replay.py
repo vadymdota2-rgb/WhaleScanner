@@ -293,6 +293,7 @@ class Rules:
     max_open: int = lv.MAX_OPEN       # своих позиций одновременно
     pause_ms: int = lv.COIN_PAUSE_MS  # в бумагу — не чаще
     limit: bool = True                # вход лимитом по цене решения (мейкер, без проскальзывания), как у живого бота
+    flip: bool = False                # против китов: сторона сделки — обратная сигналу, выхода вслед за китом нет
 
 
 # Сравнение (--variants): что дало бы одно изменение правил на тех же китах —
@@ -303,7 +304,47 @@ VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1,5 %", tp=0.01
             Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False),
             Rules("тейк +0,3 %", tp=0.003), Rules("1 позиция", max_open=1),
             Rules("пауза бумаги 30 мин", pause_ms=30 * 60_000), Rules("вход рынком", limit=False),
-            Rules("скальпинг: тейк +0,3 %, стоп до 1 %, пауза 30 мин", tp=0.003, stop_max=0.01, pause_ms=30 * 60_000))
+            Rules("скальпинг: тейк +0,3 %, стоп до 1 %, пауза 30 мин", tp=0.003, stop_max=0.01, pause_ms=30 * 60_000),
+            Rules("против китов", flip=True), Rules("против китов: тейк 1,5 %, стоп до 1 %", flip=True, tp=0.015, stop_max=0.01),
+            Rules("против китов, вход рынком", flip=True, limit=False))
+
+
+# Разбор сигналов (--variants): куда идёт цена после сигнала — в сторону
+# китов, %, через 15 мин, 1 ч, 4 ч и 24 ч; по группам (число китов, объём,
+# «против — крупнее», уровни, MA30, ушла ли цена от китов). Повтор сигнала
+# той же бумаги и стороны чаще раза в 15 минут — не в счёт (одна волна китов).
+HORIZONS = ((15 * 60_000, "r15m"), (3_600_000, "r1h"), (4 * 3_600_000, "r4h"), (86_400_000, "r24h"))
+STUDY_GAP_MS = 15 * 60_000
+
+
+class Study:
+    """Итоги разбора по группам: число сигналов, средний ход цены и доля
+    сигналов, после которых цена пошла в сторону китов."""
+
+    def __init__(self) -> None:
+        self.last: dict[tuple[str, int], int] = {}
+        self.groups: dict[str, list[list[float]]] = {}   # группа → [сигналов], [сумма %], [в сторону китов], [с ценой]
+
+    def add(self, keys: Sequence[str], rets: Sequence[float | None]) -> None:
+        for k in keys:
+            g = self.groups.setdefault(k, [[0.0], [0.0] * len(HORIZONS), [0.0] * len(HORIZONS), [0.0] * len(HORIZONS)])
+            g[0][0] += 1
+            for i, r in enumerate(rets):
+                if r is not None:
+                    g[1][i] += r
+                    g[2][i] += r > 0
+                    g[3][i] += 1
+
+    def rows(self) -> list[dict[str, Any]]:
+        out = []
+        for k, (n, s, up, c) in self.groups.items():
+            row: dict[str, Any] = {"key": k, "n": int(n[0])}
+            for i, (_h, name) in enumerate(HORIZONS):
+                row[name] = round(s[i] / c[i], 3) if c[i] else None
+            row["up1h"] = round(100 * up[1] / c[1], 1) if c[1] else None
+            row["up4h"] = round(100 * up[2] / c[2], 1) if c[2] else None
+            out.append(row)
+        return out
 
 
 class Replay:
@@ -328,6 +369,7 @@ class Replay:
         self.memo: dict[Any, Any] = shared.memo if shared is not None else {}
         self.rows_cache: dict[Any, list[tuple[str, int, int]]] = shared.rows_cache if shared is not None else {}
         self.priority: set[str] = set()   # свои приоритетные киты (рейтинг этого варианта)
+        self.study: Study | None = None    # разбор сигналов — только у основного и только с --variants
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
         self.entered: dict[str, int] = {}
@@ -368,13 +410,14 @@ class Replay:
         hl_px = last * scale
         if abs(hl_px / s["ref_px"] - 1) > lv.MATCH_TOL:
             return "other_asset"
-        if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
+        side = -s["side"] if self.rules.flip else s["side"]   # сторона сделки
+        if side * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
         lo, hi = self.cached(("lvl", inst, now), lambda: self.range_levels(inst, now))
-        if self.rules.levels and not prio and core.level_ok(lo, hi, last, s["side"]) is False:
+        if self.rules.levels and not prio and core.level_ok(lo, hi, last, side) is False:
             return "level"
         if self.rules.ma and not prio and core.ma_ok(self.cached(("ma", inst, now), lambda: self.ma30_15m(inst, now, last)),
-                                                     last, s["side"]) is False:
+                                                     last, side) is False:
             return "ma30"
         if self.equity <= 0:
             return "no_equity"
@@ -385,17 +428,18 @@ class Replay:
         if tick is None:
             return "bad_params"
         tp = self.rules.tp
-        tp_try = lv.round_step(last * (1 + s["side"] * tp), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
-        if tp_try <= 0 or not tp * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= tp + lv.TP_SLACK:
+        tp_try = lv.round_step(last * (1 + side * tp), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
+        if tp_try <= 0 or not tp * 0.999 <= side * (float(tp_try) / last - 1) <= tp + lv.TP_SLACK:
             return "tick"
-        if not self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, s["side"], self.rules.stop_max)):
+        if not self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, side, self.rules.stop_max), side):
             return "limit_miss"
         return ""
 
     def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int,
-                   stop: float) -> bool:
-        """Сделка от входа до выхода по свечам; False — лимит входа не исполнился."""
-        a, side = self.a, s["side"]
+                   stop: float, side: int) -> bool:
+        """Сделка (сторона side) от входа до выхода по свечам; False — лимит
+        входа не исполнился."""
+        a = self.a
         slip = a.slippage / 100
         rnd = ROUND_CEILING if side > 0 else ROUND_FLOOR
         start, entry, fee_in = now, last * (1 + side * slip), a.fee_taker
@@ -412,7 +456,8 @@ class Replay:
         avg_px = entry
         fees = qty * entry * fee_in / 100
         tp = float(lv.round_step(avg_px * (1 + side * self.rules.tp), tick, rnd))
-        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
+        # Выход вслед за китом в убытке — только с китами (против китов — нет).
+        exit_at = None if self.rules.flip else self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
         if exit_at is not None and exit_at + SYNC_MS <= start:
             return False   # кит закрылся в убытке, пока лимит ждал, — бот снял лимит (как живой)
         mae = 0.0
@@ -452,6 +497,38 @@ class Replay:
         self.trades.append(Trade(s["coin"], side, start, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae,
                                  tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str)))))
         return True
+
+    def study_signal(self, s: dict[str, Any], now: int) -> None:
+        """Сигнал — в разбор: ход цены после него в сторону китов и группы."""
+        st = self.study
+        k = (s["coin"], s["side"])
+        if st is None or now - st.last.get(k, -10**15) < STUDY_GAP_MS:
+            return
+        base, scale = core.okx_candidate(s["coin"])
+        inst = f"{base}-USDT-SWAP"
+        c = self.px.candle(inst, now) if inst in self.instr else None
+        if c is None or abs(c[1] * scale / s["ref_px"] - 1) > lv.MATCH_TOL:
+            return   # бумаги нет на OKX или это другой актив
+        st.last[k] = now
+        last, side = c[1], s["side"]
+        rets: list[float | None] = []
+        for h, _name in HORIZONS:
+            c2 = self.px.candle(inst, now + h) if now + h < self.px.now_ms else None
+            rets.append(side * (c2[1] / last - 1) * 100 if c2 is not None else None)
+        usd, against, _count = self.cached(("bal", s["coin"], side, now), lambda: self.sig.balance(s["coin"], side, now))
+        lo, hi = self.cached(("lvl", inst, now), lambda: self.range_levels(inst, now))
+        lvl = core.level_ok(lo, hi, last, side)
+        ma = core.ma_ok(self.cached(("ma", inst, now), lambda: self.ma30_15m(inst, now, last)), last, side)
+        n = int(s["whales"])
+        keys = ["все сигналы", f"китов {n}" if n < 4 else "китов 4 и больше",
+                "объём китов до 10 тыс $" if s["usd"] < 10_000 else "объём китов 10–50 тыс $" if s["usd"] < 50_000
+                else "объём китов от 50 тыс $",
+                "против — киты крупнее" if 0 < usd <= against else "против — меньше или никого",
+                "цена ушла от китов > 0,3 %" if side * (c[1] * scale / s["ref_px"] - 1) > lv.CHASE else "цена у цены китов",
+                {True: "уровни: у своего", False: "уровни: у чужого", None: "уровней нет"}[lvl]]
+        if ma is not None:
+            keys.append("MA30: за сторону китов" if ma else "MA30: против стороны китов")
+        st.add(keys, rets)
 
     def whale_loss(self, s: dict[str, Any], now: int) -> bool:
         """Кит сигнала уже закрыл в убыток (Signals.whale_loss) — один запрос к
@@ -570,6 +647,7 @@ def replay_all(rps: Sequence[Replay], since: int, until: int) -> None:
                 # винрейту с китами, как у живого бота в одном опросе) почти нет.
                 for s in reversed(sig.feed([row])):  # как candidates: встречный «крупный» — первым
                     now = s["ts"] + main.a.delay * 1000
+                    main.study_signal(s, now)
                     for rp in rps:
                         if s.get("solo") and s["solo"] not in rp.priority:
                             continue
@@ -746,12 +824,14 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     # Варианты — тем же проходом, что основной (свечи, окна китов и запросы к базе — общие).
     alts = [Replay(a, prices, instr, progress, hours, rules=r, shared=rp) for r in VARIANTS] \
         if getattr(a, "variants", False) else []
+    rp.study = Study() if alts else None
     try:
         replay_all([rp, *alts], since, now)
     finally:
         pool.shutdown(wait=False, cancel_futures=True)
     s = summary(a, rp, since, now)
     s["variants"] = []
+    s["edge"] = rp.study.rows() if rp.study is not None else []
     if alts:
         days = (now - since) / core.DAY_MS
         s["variants"] = [variant_row(x.rules, stats(x.trades), days) for x in (rp, *alts)]
@@ -777,6 +857,9 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         + (f", сбоев: {prices.errors + hours.errors}" if prices.errors + hours.errors else ""),
         *(["", "Варианты (те же киты, одно изменение правил):"] if s["variants"] else []),
         *(f"  {v['name']}: " + line(v) + f", в месяц ≈ {v['per_month']:g}" for v in s["variants"]),
+        *(["", "Куда идёт цена после сигнала (в сторону китов, %: 15 мин / 1 ч / 4 ч / 24 ч; доля в сторону китов за 1 ч):"]
+          if s["edge"] else []),
+        *(f"  {e['key']} ({e['n']}): {e['r15m']} / {e['r1h']} / {e['r4h']} / {e['r24h']}; {e['up1h']} %" for e in s["edge"]),
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "
