@@ -58,11 +58,14 @@ def okx_candidate(coin: str) -> tuple[str, float]:
     return (OKX_ALIASES.get(base, base) if ":" in coin else base), 1.0
 
 
-# Уровни часового графика (правило владельца 24.11.2026): поддержка —
-# минимум, сопротивление — максимум цены за последние 24 часа. Лонг — только
+# Уровни 4-часового графика (правило владельца 24.11.2026, график 4ч —
+# 27.11.2026): поддержка — минимум, сопротивление — максимум цены за
+# последние 24 свечи 4ч (4 дня). Лонг — только
 # ближе к поддержке (ниже 40 % диапазона), шорт — ближе к сопротивлению (выше
 # 60 %); середина 40–60 % — мёртвая зона для обеих сторон.
-LEVEL_MS = 24 * HOUR_MS
+LEVEL_BAR_MS = 4 * HOUR_MS
+LEVEL_BARS = 24
+LEVEL_MS = LEVEL_BARS * LEVEL_BAR_MS
 LEVEL_LONG_BELOW = 0.4
 LEVEL_SHORT_ABOVE = 0.6
 LEVEL_STOP_BEYOND = 0.005   # стоп — на 0,5 % за уровнем входа (правило владельца 24.11.2026)
@@ -89,6 +92,42 @@ def ma_ok(ma: float, px: float, side: int) -> bool | None:
     if not (math.isfinite(ma) and math.isfinite(px)) or ma <= 0 or px <= 0 or abs(px / ma - 1) < 1e-9:
         return None
     return px > ma if side > 0 else px < ma
+
+
+# Рейтинг китов по нашим сделкам (правило владельца 27.11.2026): сделка бота
+# засчитывается всем китам её сигнала (плюс — всем плюс). Винрейт кита — от
+# RATING_MIN_TRADES сделок; выше — приоритетнее; выше PRIORITY_WINRATE —
+# приоритетный кит: с ним входим и в одиночку, без уровней, MA30 и «против
+# крупнее».
+RATING_MIN_TRADES = 5
+PRIORITY_WINRATE = 0.9
+
+
+class Rating:
+    """Наш винрейт с каждым китом: кошелёк → [плюсовых, всего]."""
+
+    def __init__(self) -> None:
+        self.per: dict[str, list[int]] = {}
+
+    def add(self, wallets: object, win: bool) -> None:
+        for w in wallets if isinstance(wallets, (list, tuple, dict, set)) else ():
+            if isinstance(w, str):
+                v = self.per.setdefault(w, [0, 0])
+                v[0] += int(win)
+                v[1] += 1
+
+    def rate(self, wallet: str) -> float | None:
+        v = self.per.get(wallet)
+        return v[0] / v[1] if v is not None and v[1] >= RATING_MIN_TRADES else None
+
+    def best(self, wallets: object) -> float:
+        """Лучший винрейт среди китов сигнала; оценённых нет — −1."""
+        rates = [r for w in (wallets if isinstance(wallets, (list, tuple, dict, set)) else ())
+                 if isinstance(w, str) and (r := self.rate(w)) is not None]
+        return max(rates, default=-1.0)
+
+    def priority(self) -> set[str]:
+        return {w for w in self.per if (r := self.rate(w)) is not None and r > PRIORITY_WINRATE}
 
 
 def level_stop(lo: float, hi: float, side: int) -> float:

@@ -25,7 +25,10 @@ ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "AUTOTRA
 # то же самое.
 # Проверка «тейк в записи есть» перед поиском в ожидающих — защита от ответа
 # OKX без ordId; у настоящей OKX ordId есть всегда — наблюдаемо то же самое.
-EQUIV: set[str] = {"киты против — те же 2 часа", "тейка нет в записи — его надо поставить"}
+# Рейтинг повтора — только по сделкам, закрытым к моменту решения: пока сделка
+# открыта, позиция занята и вход всё равно «own_open» — наблюдаемо то же самое
+# (проверка — защита от взгляда в будущее).
+EQUIV: set[str] = {"киты против — те же 2 часа", "тейка нет в записи — его надо поставить", "повтор: рейтинг — только закрытые к моменту решения"}
 
 MUTS = [
     # Правила владельца
@@ -107,8 +110,8 @@ MUTS = [
     ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
      "позиция прежней версии — киты по базе"),
     # Входим с крупными
-    ("        if against > 0 and against >= usd:", "        if False:", "против сигнала киты крупнее — не входим"),
-    ("        if against > 0 and against >= usd:", "        if against > 0 and against > usd:", "поровну — не входим"),
+    ("        if against > 0 and against >= usd and not prio:", "        if False:", "против сигнала киты крупнее — не входим"),
+    ("        if against > 0 and against >= usd and not prio:", "        if against > 0 and against > usd and not prio:", "поровну — не входим"),
     ("                out.append(self._signal(coin, -side, opp, w, newest))", "                pass", "крупных от 2 — входим с ними"),
     ("                opp.expire(newest - WINDOW_MS)", "                pass", "киты против — те же 2 часа"),
     ("            if w is not None:\n                w.expire(now - WINDOW_MS)", "            if False:\n                w.expire(now - WINDOW_MS)",
@@ -120,7 +123,7 @@ MUTS = [
     # Ревизия 2
     ("                f\"AND (dir_code != {core.FLIP} OR dir LIKE ?)\",", "                \"\",", "разворот в нашу сторону — не выход"),
     ("            if v is None or v[0] < self.limit:\n                continue\n", "", "мелкая сделка сигнал не освежает"),
-    ("        if (s[\"coin\"], s[\"side\"]) in self.sig.windows and count < MIN_WHALES:", "        if False:",
+    ("        if (s[\"coin\"], s[\"side\"]) in self.sig.windows and count < MIN_WHALES and not prio:", "        if False:",
      "на момент входа китов от 2"),
     ("            remaining = size_of(op.get(\"size\")) - got[0]", "            remaining = size_of(op.get(\"size\"))",
      "повтор выхода — только остаток своего объёма"),
@@ -139,19 +142,19 @@ MUTS = [
     ("            if op.get(\"tp_id\") and any(o.get(\"ordId\") == op[\"tp_id\"]", "            if any(o.get(\"ordId\") == op.get(\"tp_id\")",
      "тейка нет в записи — его надо поставить"),
     # Уровни часового графика (24 ч): лонг — у поддержки, шорт — у сопротивления
-    ("        why, stop = self.level_check(inst, last, s[\"side\"])\n        if why:\n            return why\n",
+    ("        why, stop = self.level_check(inst, last, s[\"side\"], force=bool(prio))\n        if why:\n            return why\n",
      "        stop = 0.0\n", "уровни проверяются перед входом"),
-    ("{\"instId\": inst, \"bar\": \"1H\", \"limit\": \"24\"}", "{\"instId\": inst, \"bar\": \"1H\", \"limit\": \"12\"}",
-     "уровни — за 24 часовые свечи"),
-    ("{\"instId\": inst, \"bar\": \"1H\", \"limit\": \"24\"}", "{\"instId\": inst, \"bar\": \"4H\", \"limit\": \"24\"}",
-     "уровни — часовой график"),
+    ("{\"instId\": inst, \"bar\": \"4H\", \"limit\": str(core.LEVEL_BARS)}", "{\"instId\": inst, \"bar\": \"4H\", \"limit\": \"12\"}",
+     "уровни — за 24 свечи"),
+    ("{\"instId\": inst, \"bar\": \"4H\", \"limit\": str(core.LEVEL_BARS)}", "{\"instId\": inst, \"bar\": \"1H\", \"limit\": str(core.LEVEL_BARS)}",
+     "уровни — график 4ч"),
     ("                if math.isfinite(h) and math.isfinite(lo) and 0 < lo <= h:", "                if True:",
      "свечи: мусор — не в счёт"),
-    ("        if core.level_ok(lo, hi, last, side) is not False:", "        if core.level_ok(lo, hi, last, -side) is not False:",
+    ("        if force or core.level_ok(lo, hi, last, side) is not False:", "        if force or core.level_ok(lo, hi, last, -side) is not False:",
      "уровни — по стороне сделки"),
     ("        except (OkxError, OSError):   # нет свечей (отказ", "        except OkxError:   # нет свечей (отказ", "свечи: обрыв сети — как без уровней"),
     # MA30 15-минутного графика: лонг — цена выше MA30, шорт — ниже (после уровней)
-    ("        why = self.ma_check(inst, last, s[\"side\"])\n        if why:\n            return why\n", "",
+    ("        why = \"\" if prio else self.ma_check(inst, last, s[\"side\"])\n", "        why = \"\"\n",
      "MA30 проверяется перед входом"),
     ("{\"instId\": inst, \"bar\": \"15m\", \"limit\": str(core.MA_BARS)}", "{\"instId\": inst, \"bar\": \"5m\", \"limit\": str(core.MA_BARS)}",
      "MA30 — 15-минутный график"),
@@ -162,6 +165,23 @@ MUTS = [
     ("        except (OkxError, OSError):   # нет свечей — как без MA", "        except OkxError:   # нет свечей — как без MA",
      "MA30: обрыв сети — как без MA"),
     ("        if core.ma_ok(ma, last, side) is not False:", "        if core.ma_ok(ma, last, -side) is not False:", "MA30 — по стороне сделки"),
+    # Рейтинг китов: выше наш винрейт — раньше; > 90 % (от 5) — приоритетный
+    ("            if (w.count >= MIN_WHALES or wallet in self.priority) and w.big_u > 0:",
+     "            if w.count >= MIN_WHALES and w.big_u > 0:", "приоритетный кит — сигнал и в одиночку"),
+    ("                     and v[0] >= self.limit), \"\")", "                     ), \"\")", "приоритетный кит — в окне от 1000 $"),
+    ("        if against > 0 and against >= usd and not prio:", "        if against > 0 and against >= usd:", "приоритетный — без «против крупнее»"),
+    ("count < MIN_WHALES and not prio:", "count < MIN_WHALES:", "приоритетный — и один в окне"),
+    ("        why, stop = self.level_check(inst, last, s[\"side\"], force=bool(prio))", "        why, stop = self.level_check(inst, last, s[\"side\"])",
+     "приоритетный — без уровней"),
+    ("        why = \"\" if prio else self.ma_check(inst, last, s[\"side\"])", "        why = self.ma_check(inst, last, s[\"side\"])",
+     "приоритетный — без MA30"),
+    ("        out.sort(key=lambda s: -self.rating.best(s.get(\"wallets\")))\n", "", "кандидаты — по нашему винрейту с китами"),
+    ("                        self.rating.add(t.get(\"wallets\"), num(t.get(\"pnl\")) > 0)",
+     "                        self.rating.add(t.get(\"wallets\"), num(t.get(\"pnl\")) >= 0)", "рейтинг: плюсовая — pnl > 0"),
+    ("        self.rating.add(trade[\"wallets\"], pnl > 0)\n        self.sig.priority = self.rating.priority()\n", "",
+     "рейтинг — после каждой закрытой сделки"),
+    ("                 \"wallets\": sorted(w for w in op.get(\"wallets\") or {} if isinstance(w, str))}", "                 }",
+     "сделка — с китами сигнала (для рейтинга)"),
     # Защита
     ("fill_px = avg if avg > 0 and abs(avg / last - 1) <= FILL_TOL else last", "fill_px = avg if avg > 0 else last",
      "цена исполнения — рядом с тикером"),
@@ -210,8 +230,13 @@ MUTS = [
 RP_MUTS = [
     ("        if now < self.busy_until:", "        if False:", "повтор: позиция одна"),
     ("        if now - self.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
-    ("        if against > 0 and against >= usd:", "        if False:", "повтор: против — киты крупнее"),
-    ("        if count < lv.MIN_WHALES:", "        if False:", "повтор: на момент входа китов от 2"),
+    ("        if against > 0 and against >= usd and not prio:", "        if False:", "повтор: против — киты крупнее"),
+    ("        if count < lv.MIN_WHALES and not prio:", "        if False:", "повтор: на момент входа китов от 2"),
+    ("        if count < lv.MIN_WHALES and not prio:", "        if count < lv.MIN_WHALES:", "повтор: приоритетный — и один в окне"),
+    ("                and self.trades[self.rated].exit_t <= now:", "                and self.trades[self.rated].exit_t <= now + 10**12:",
+     "повтор: рейтинг — только закрытые к моменту решения"),
+    ("        if not prio and core.level_ok(lo, hi, last, s[\"side\"]) is False:", "        if core.level_ok(lo, hi, last, s[\"side\"]) is False:",
+     "повтор: приоритетный — без уровней"),
     ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),
     ("        if s[\"side\"] * (hl_px / s[\"ref_px\"] - 1) > lv.CHASE:", "        if False:", "повтор: не догоняем"),
     ("self.equity * lv.MARGIN_FRAC * lv.LEVERAGE", "self.equity * 0.1 * lv.LEVERAGE", "повтор: маржа 5 %"),
@@ -222,18 +247,18 @@ RP_MUTS = [
     ("                px_out = (o if side * (o - stop) <= 0 else stop) * (1 - side * slip)",
      "                px_out = stop * (1 - side * slip)", "повтор: стоп — свеча открылась за ним — по ней"),
     ("            if exit_at is not None and exit_at + SYNC_MS < end:", "            if False:", "повтор: выход вслед за китом"),
-    ("        if core.level_ok(lo, hi, last, s[\"side\"]) is False:", "        if False:", "повтор: уровни"),
-    ("        if core.ma_ok(self.ma30_15m(inst, now, last), last, s[\"side\"]) is False:", "        if False:", "повтор: MA30"),
+    ("        if not prio and core.level_ok(lo, hi, last, s[\"side\"]) is False:", "        if False:", "повтор: уровни"),
+    ("        if not prio and core.ma_ok(self.ma30_15m(inst, now, last), last, s[\"side\"]) is False:", "        if False:", "повтор: MA30"),
     ("            c = self.px.candle(inst, cur - (k - 1) * core.MA_BAR_MS - BAR_MS)", "            c = self.px.candle(inst, cur - (k - 1) * core.MA_BAR_MS)",
      "повтор: MA30 — закрытия закрытых свечей (без будущего)"),
     ("        return (sum(closes) + last) / core.MA_BARS", "        return (sum(closes) + closes[0]) / core.MA_BARS",
      "повтор: MA30 — идущая свеча по цене"),
-    ("        got += [c for c in self.px.candles(inst, hour, now) if c[0] + BAR_MS <= now]",
-     "        got += list(self.px.candles(inst, hour, now))", "повтор: уровни — без идущей 5-минутки"),
-    ("        got += [c for c in self.px.candles(inst, hour, now) if c[0] + BAR_MS <= now]\n", "",
-     "повтор: уровни — идущий час по 5-минуткам"),
-    ("core.HOUR_MS, hour) if c[0] + core.HOUR_MS <= hour]", "core.HOUR_MS, hour + core.HOUR_MS)]",
-     "повтор: уровни — без идущей часовой свечи"),
+    ("        got += [c for c in self.px.candles(inst, bar, now) if c[0] + BAR_MS <= now]",
+     "        got += list(self.px.candles(inst, bar, now))", "повтор: уровни — без идущей 5-минутки"),
+    ("        got += [c for c in self.px.candles(inst, bar, now) if c[0] + BAR_MS <= now]\n", "",
+     "повтор: уровни — идущая свеча 4ч по 5-минуткам"),
+    ("core.LEVEL_BAR_MS, bar) if c[0] + core.LEVEL_BAR_MS <= bar]", "core.LEVEL_BAR_MS, bar + core.LEVEL_BAR_MS)]",
+     "повтор: уровни — без идущей свечи 4ч"),
     ("                               \"params\": {\"instId\": inst, \"bar\": self.bar,", "                               \"params\": {\"instId\": inst, \"bar\": \"5m\",",
      "повтор: часовые свечи — запросом 1H"),
     ("        if isinstance(rows, list) and end <= self.now_ms:", "        if end <= self.now_ms:", "повтор: сбой сети не ложится в кеш"),
@@ -250,6 +275,13 @@ CORE_MUTS = [
     ("    con.execute(\"PRAGMA query_only=1\")\n", "", "база бота — только чтение"),
     ("LEVEL_STOP_BEYOND = 0.005 ", "LEVEL_STOP_BEYOND = 0.05 ", "стоп — 0,5 % за уровнем"),
     ("MA_BARS = 30", "MA_BARS = 20", "MA — 30 свечей"),
+    ("RATING_MIN_TRADES = 5", "RATING_MIN_TRADES = 4", "рейтинг — от 5 сделок"),
+    ("PRIORITY_WINRATE = 0.9", "PRIORITY_WINRATE = 0.95", "приоритетный — выше 90 %"),
+    ("if (r := self.rate(w)) is not None and r > PRIORITY_WINRATE}", "if (r := self.rate(w)) is not None and r >= PRIORITY_WINRATE}",
+     "приоритетный — строго выше 90 %"),
+    ("        return max(rates, default=-1.0)", "        return min(rates, default=-1.0)", "рейтинг сигнала — лучший кит"),
+    ("                v[0] += int(win)", "                v[0] += 1", "рейтинг — только плюсовые в числитель"),
+    ("LEVEL_BAR_MS = 4 * HOUR_MS", "LEVEL_BAR_MS = HOUR_MS", "уровни — свечи 4ч"),
     ("MA_BAR_MS = 15 * 60_000", "MA_BAR_MS = 5 * 60_000", "MA — 15-минутные свечи"),
     ("    return px > ma if side > 0 else px < ma", "    return px < ma if side > 0 else px > ma", "MA: лонг — цена выше"),
     ("or ma <= 0 or px <= 0 or abs(px / ma - 1) < 1e-9:", "or ma <= 0 or px <= 0:", "MA: цена на MA — как без неё"),
@@ -263,7 +295,7 @@ CORE_MUTS = [
     ("    return pos < LEVEL_LONG_BELOW if side > 0 else pos > LEVEL_SHORT_ABOVE",
      "    return pos > LEVEL_SHORT_ABOVE if side > 0 else pos < LEVEL_LONG_BELOW", "уровни: лонг — у поддержки"),
     ("or not 0 < lo < hi or px <= 0:", "or px <= 0:", "уровни: пустой диапазон — нет уровней"),
-    ("LEVEL_MS = 24 * HOUR_MS", "LEVEL_MS = 8 * HOUR_MS", "уровни — за 24 часа"),
+    ("LEVEL_BARS = 24", "LEVEL_BARS = 6", "уровни — за 24 свечи 4ч"),
 ]
 
 

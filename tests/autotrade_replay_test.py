@@ -44,7 +44,7 @@ class FakeMarket:
         p = body["params"]
         coin = p["instId"].split("-")[0]
         end = int(p["after"])
-        step = 3_600_000 if p.get("bar") == "1H" else rp.BAR_MS   # часовые — для уровней (24 ч)
+        step = {"4H": 4 * 3_600_000, "1H": 3_600_000}.get(p.get("bar", ""), rp.BAR_MS)   # 4ч — для уровней
         rows = []
         for t in range(end - 100 * step, end, step):
             if t >= NOW:
@@ -146,7 +146,7 @@ class ReplayTest(unittest.TestCase):
         def hist(after):
             def f(c: str, t: int) -> float:
                 if t < T:
-                    return 99_000.0 if T - 10 * H <= t < T - 9 * H else 103_000.0 if T - 12 * H <= t < T - 11 * H else 100_000.0
+                    return 99_000.0 if T - 16 * H <= t < T - 12 * H else 103_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
                 return after(t)
             return f
 
@@ -175,7 +175,7 @@ class ReplayTest(unittest.TestCase):
         входит, шорт входит. Идущая свеча (до 103 000 к своему закрытию) — не в
         счёт: это будущее."""
         def price(c: str, t: int) -> float:
-            if T - 10 * 60 * MIN <= t < T - 9 * 60 * MIN:
+            if T - 12 * 60 * MIN <= t < T - 8 * 60 * MIN:
                 return 99_000.0
             if T + 1000 <= t < T + 60 * MIN:   # идущий час (и идущая 5-минутка) — к закрытию 103 000
                 return 103_000.0
@@ -198,8 +198,8 @@ class ReplayTest(unittest.TestCase):
         r = self.go(self.whales(t=T + 30 * MIN), price)
         self.assertEqual(r["trades"], [])
         self.assertEqual(r["skips"].get("level"), 1)
-        self.assertTrue(any(c["params"].get("bar") == "1H" for c in self.market.calls if "params" in c))
-        self.assertTrue(os.path.isfile(os.path.join(self.cache, "replay_BTC-USDT-SWAP_1H.json")))
+        self.assertTrue(any(c["params"].get("bar") == "4H" for c in self.market.calls if "params" in c))
+        self.assertTrue(os.path.isfile(os.path.join(self.cache, "replay_BTC-USDT-SWAP_4H.json")))
 
     def test_ma30_15m(self) -> None:
         """MA30 15-минутного графика (29 закрытых свечей + идущая по цене); уровни
@@ -218,9 +218,9 @@ class ReplayTest(unittest.TestCase):
                     if T + 1000 <= t < T + 5 * MIN:
                         return 60_000.0 if recent is None else 100_000.0
                     return 101_000.0 if t >= T + 60 * MIN else 100_000.0
-                if T - 20 * H <= t < T - 19 * H:
+                if T - 24 * H <= t < T - 20 * H:
                     return 97_000.0
-                if T - 14 * H <= t < T - 13 * H:
+                if T - 16 * H <= t < T - 12 * H:
                     return 108_000.0
                 if t >= T - 8 * H:
                     return recent(t) if recent else 100_500.0
@@ -238,6 +238,41 @@ class ReplayTest(unittest.TestCase):
         self.cache += "3"
         r = self.go(self.whales(), price(lambda t: 120_000.0 if t >= T - 5 * MIN else 99_000.0))
         self.assertEqual([t.why for t in r["trades"]], ["тейк"])
+
+    def test_rating_priority_whale_alone(self) -> None:
+        """Рейтинг — по сделкам повтора: 5 сделок BTC с китами 0xa и 0xb (каждые
+        4 ч) — все по тейку; потом 0xa один — приоритетный (5 из 5): входим с
+        ним одним, хоть цена и у сопротивления (уровни ему не помеха). До пятой
+        сделки одиночный 0xa — не сигнал."""
+        H = 60 * MIN
+        entries = [T + i * 4 * H for i in range(5)]
+
+        def price(c: str, t: int) -> float:
+            if T - 28 * H <= t < T - 24 * H:
+                return 96_000.0                       # поддержка 4 дня
+            if T - 24 * H <= t < T - 20 * H:
+                return 110_000.0                      # сопротивление
+            for e in entries:
+                if e <= t < e + 5 * MIN:
+                    return 100_000.0                  # вход — у поддержки
+                if e + 5 * MIN <= t < e + 30 * MIN:
+                    return 100_600.0                  # тейк +0,5 %
+            if T + 20 * H <= t < T + 20 * H + 5 * MIN:
+                return 108_000.0                      # приоритетный: у сопротивления — уровни ему не помеха
+            if T + 20 * H + 5 * MIN <= t < T + 20 * H + 30 * MIN:
+                return 108_700.0
+            return 99_000.0                           # MA30 ниже цены входа
+
+        rows: list[tuple] = []
+        for i, e in enumerate(entries):
+            rows += [opn(10 * i + 1, "0xa", "BTC", 1, e - MIN, 5000, 100_000), opn(10 * i + 2, "0xb", "BTC", 1, e, 5000, 100_000)]
+        early = opn(90, "0xa", "BTC", 1, T + 15 * H + 30 * MIN, 5000, 100_000)   # одиночный после паузы, до пятой — не сигнал
+        rows += [early, opn(99, "0xa", "BTC", 1, T + 20 * H, 5000, 108_000)]
+        rows.sort(key=lambda r: r[4])
+        r = self.go(rows, price)
+        self.assertEqual([(t.why, (t.entry_t - T) // H) for t in r["trades"]],
+                         [("тейк", 0), ("тейк", 4), ("тейк", 8), ("тейк", 12), ("тейк", 16), ("тейк", 20)])
+        self.assertEqual(r["trades"][-1].wallets, ("0xa",))
 
     def test_one_big_against_blocks_small_side(self) -> None:
         big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000)]   # один крупный — сигнала у него нет

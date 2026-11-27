@@ -11,8 +11,11 @@
   входим с ними; кит сигнала уже вышел в убыток — не входим;
 - MA30 15-минутного графика: лонг — цена выше MA30, шорт — ниже (после
   уровней — они важнее);
-- уровни часового графика: лонг — только ниже 40 % диапазона цены за 24
-  часа (у поддержки), шорт — выше 60 % (у сопротивления), середина — нет;
+- уровни графика 4ч: лонг — только ниже 40 % диапазона цены за 24 свечи 4ч
+  (4 дня; у поддержки), шорт — выше 60 % (у сопротивления), середина — нет;
+- рейтинг китов — по сделкам повтора, закрытым к моменту решения: выше наш
+  винрейт с китами сигнала — раньше; кит выше 90 % (от 5 сделок) — с ним и в
+  одиночку, без «против крупнее», уровней и MA30;
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
   средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; позиция —
   одна;
@@ -207,6 +210,7 @@ class Trade:
     pnl: float          # $ с комиссиями
     why: str            # тейк / стоп / кит вышел в убыток / открыта
     mae: float          # худший ход против нас внутри сделки, $
+    wallets: tuple[str, ...] = ()   # киты сигнала — для рейтинга
 
     @property
     def open(self) -> bool:
@@ -220,15 +224,17 @@ class Replay:
     def __init__(self, a: argparse.Namespace, prices: Prices, instr: dict[str, dict[str, Any]],
                  progress: Callable[[dict[str, Any]], None], hours: Prices | None = None) -> None:
         self.a, self.px, self.instr, self.progress = a, prices, instr, progress
-        # Часовые свечи — для уровней (24 ч); кеш и сеть — те же, что у 5-минутных.
+        # Свечи 4ч — для уровней (24 свечи, 4 дня); кеш и сеть — те же, что у 5-минутных.
         self.hours = hours or Prices(prices.cache, prices.fetch, prices.pause, prices.offline, prices.now_ms,
-                                     bar="1H", bar_ms=core.HOUR_MS)
+                                     bar="4H", bar_ms=core.LEVEL_BAR_MS)
         self.sig = lv.Signals(a.db)
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
         self.entered: dict[str, int] = {}
         self.busy_until = 0
         self.skips: defaultdict[str, int] = defaultdict(int)
+        self.rating = core.Rating()   # наш винрейт с китами — по закрытым сделкам повтора
+        self.rated = 0                # сколько сделок уже в рейтинге
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, s: dict[str, Any], now: int) -> str:
@@ -244,9 +250,10 @@ class Replay:
         if not ins:
             return "no_inst"
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
-        if against > 0 and against >= usd:
+        prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)   # приоритетный кит — без этих правил
+        if against > 0 and against >= usd and not prio:
             return "bigger_against"
-        if count < lv.MIN_WHALES:
+        if count < lv.MIN_WHALES and not prio:
             return "stale"
         if self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now):
             return "whale_exit"
@@ -259,10 +266,10 @@ class Replay:
             return "other_asset"
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
-        lo, hi = self.range_24h(inst, now)
-        if core.level_ok(lo, hi, last, s["side"]) is False:
+        lo, hi = self.range_levels(inst, now)
+        if not prio and core.level_ok(lo, hi, last, s["side"]) is False:
             return "level"
-        if core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
+        if not prio and core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
             return "ma30"
         if self.equity <= 0:
             return "no_equity"
@@ -322,7 +329,8 @@ class Replay:
             self.equity += pnl
         self.entered[s["coin"]] = now
         self.busy_until = t_out if why != "открыта" else 10**18
-        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae))
+        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae,
+                                 tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str)))))
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
         """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
@@ -348,14 +356,13 @@ class Replay:
             closes.append(c[4])
         return (sum(closes) + last) / core.MA_BARS
 
-    def range_24h(self, inst: str, now: int) -> tuple[float, float]:
-        """Уровни часового графика на момент now — как у живого бота (24 часовые
-        свечи OKX с идущей): 23 закрытые часовые свечи и идущий час — по его
-        закрытым 5-минутным (идущая 5-минутка заглянула бы в будущее). Свечей
-        нет — (0, 0)."""
-        hour = now // core.HOUR_MS * core.HOUR_MS
-        got = [c for c in self.hours.candles(inst, hour - core.LEVEL_MS + core.HOUR_MS, hour) if c[0] + core.HOUR_MS <= hour]
-        got += [c for c in self.px.candles(inst, hour, now) if c[0] + BAR_MS <= now]
+    def range_levels(self, inst: str, now: int) -> tuple[float, float]:
+        """Уровни графика 4ч на момент now — как у живого бота (24 свечи 4ч OKX
+        с идущей): 23 закрытые свечи 4ч и идущая — по её закрытым 5-минуткам
+        (идущая 5-минутка заглянула бы в будущее). Свечей нет — (0, 0)."""
+        bar = now // core.LEVEL_BAR_MS * core.LEVEL_BAR_MS
+        got = [c for c in self.hours.candles(inst, bar - core.LEVEL_MS + core.LEVEL_BAR_MS, bar) if c[0] + core.LEVEL_BAR_MS <= bar]
+        got += [c for c in self.px.candles(inst, bar, now) if c[0] + BAR_MS <= now]
         return (min(c[3] for c in got), max(c[2] for c in got)) if got else (0.0, 0.0)
 
     def whale_rows(self, coin: str, side: int, wallets: dict[str, Any]) -> list[tuple[str, int, int]]:
@@ -380,6 +387,16 @@ class Replay:
     def requests(self) -> int:
         return self.px.requests + self.hours.requests
 
+    def rate_closed(self, now: int) -> None:
+        """Рейтинг китов — по сделкам повтора, закрытым к моменту now (позиция
+        одна: закрываются по порядку входа), как у живого бота по trades.jsonl."""
+        while self.rated < len(self.trades) and not self.trades[self.rated].open \
+                and self.trades[self.rated].exit_t <= now:
+            t = self.trades[self.rated]
+            self.rating.add(t.wallets, t.pnl > 0)
+            self.sig.priority = self.rating.priority()
+            self.rated += 1
+
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)
         try:
@@ -393,6 +410,9 @@ class Replay:
             while rows := cur.fetchmany(5000):
                 for row in rows:
                     done += 1
+                    self.rate_closed(int(row[4]))
+                    # Строка — по одной: одновременных сигналов (порядок по нашему
+                    # винрейту с китами, как у живого бота в одном опросе) почти нет.
                     for s in reversed(self.sig.feed([row])):  # как candidates: встречный «крупный» — первым
                         why = self.decide(s, s["ts"] + self.a.delay * 1000)
                         self.skips[why or "entered"] += 1
@@ -543,7 +563,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     progress({"stage": "каталог OKX", "done": 0, "total": 0, "trades": 0, "requests": 0})
     f = fetch or okx_fetch
     prices = Prices(a.cache, f, a.pause, a.offline, now)
-    hours = Prices(a.cache, f, a.pause, a.offline, now, bar="1H", bar_ms=core.HOUR_MS)  # уровни часового графика
+    hours = Prices(a.cache, f, a.pause, a.offline, now, bar="4H", bar_ms=core.LEVEL_BAR_MS)  # уровни графика 4ч
     rp = Replay(a, prices, instruments(f, a.offline, a.cache), progress, hours)
     since = now - a.since_days * core.DAY_MS
     rp.run(since, now)

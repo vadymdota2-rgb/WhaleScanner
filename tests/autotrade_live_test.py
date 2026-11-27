@@ -1085,7 +1085,7 @@ class LevelTest(Base):
         self.go(1, (99_000.0, 103_000.0))            # цена 100 000 — четверть диапазона
         [m] = self.market_orders()
         self.assertEqual(m["side"], "buy")
-        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles" and c[2]["bar"] == "1H"]
+        [c] = [c for c in self.ex.calls if c[1] == "/api/v5/market/candles" and c[2]["bar"] == "4H"]
         self.assertEqual((c[2]["instId"], c[2]["limit"]), ("BTC-USDT-SWAP", "24"))
 
     def test_long_near_resistance_skipped(self) -> None:
@@ -1093,7 +1093,7 @@ class LevelTest(Base):
         self.assertEqual(self.market_orders(), [])
         sk = self.state()["last_skip"]
         self.assertEqual(sk["code"], "level")
-        self.assertIn("ближе к сопротивлению (24 ч: 97000–101000) — лонг не входит", sk["why"])
+        self.assertIn("ближе к сопротивлению (4ч × 24: 97000–101000) — лонг не входит", sk["why"])
 
     def test_short_mirrors(self) -> None:
         self.go(-1, (99_000.0, 103_000.0))
@@ -1129,7 +1129,7 @@ class LevelTest(Base):
     def test_candles_error_enters(self) -> None:
         tr = self.trader(self.whales())
         self.on()
-        with mock.patch.object(tr.okx, "range_24h", side_effect=lv.OkxError("50011", "часто")):
+        with mock.patch.object(tr.okx, "range_levels", side_effect=lv.OkxError("50011", "часто")):
             tr.step()
         self.assertEqual(len(self.market_orders()), 1)
 
@@ -1137,7 +1137,7 @@ class LevelTest(Base):
         """Обрыв сети на свечах — как без уровней: шаг не падает, сигнал не теряется."""
         tr = self.trader(self.whales())
         self.on()
-        with mock.patch.object(tr.okx, "range_24h", side_effect=TimeoutError("timed out")):
+        with mock.patch.object(tr.okx, "range_levels", side_effect=TimeoutError("timed out")):
             tr.step()
         self.assertEqual(len(self.market_orders()), 1)
 
@@ -1145,7 +1145,7 @@ class LevelTest(Base):
         self.ex.hl["BTC-USDT-SWAP"] = [["1", "1", "102000", "99500", "1"], ["2", "1", "nan", "1", "1"],
                                        ["3", "1", "5", "9", "1"], ["4", "1", "101000", "98000", "1"], "x"]
         okx = lv.Okx("K", "S", "P", False, self.ex)
-        self.assertEqual(okx.range_24h("BTC-USDT-SWAP"), (98_000.0, 102_000.0))
+        self.assertEqual(okx.range_levels("BTC-USDT-SWAP"), (98_000.0, 102_000.0))
 
     def test_level_rule(self) -> None:
         ok = lv.core.level_ok
@@ -1251,6 +1251,146 @@ class MaTest(Base):
                        (100.0, 100.0 + 1e-8), (-1.0, 100.0)):
             self.assertIsNone(ok(ma, px, 1), (ma, px))
         self.assertTrue(ok(100.0, 100.001, 1), "на 0,001 % выше — уже выше")
+
+
+class RatingTest(Base):
+    """Правило владельца (27.11.2026): рейтинг китов по нашим сделкам — сделка
+    засчитывается всем китам сигнала; винрейт — от 5 сделок; выше — раньше;
+    выше 90 % — приоритетный кит: с ним и в одиночку, без «против крупнее»,
+    уровней и MA30; «не догоняем» и стоп — как всегда."""
+
+    def history(self, wallets: list[str], wins: int, n: int) -> None:
+        path = os.path.join(self.dir, "live", "trades.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for i in range(n):
+                f.write(json.dumps({"coin": "X", "pnl": 5.0 if i < wins else -3.0, "wallets": wallets}) + "\n")
+
+    def solo(self, wallet: str = "0xa", side: int = 1) -> list[tuple]:
+        return [fill(1, wallet, "BTC", side, self.now - 2 * MIN, 5000, 100_000)]
+
+    def test_rating_class(self) -> None:
+        r = lv.core.Rating()
+        r.add(["0xa", "0xb"], True)
+        r.add({"0xa": 1}, False)
+        r.add("garbage", True)
+        r.add([5, None, "0xa"], True)
+        self.assertEqual(r.per, {"0xa": [2, 3], "0xb": [1, 1]})
+        self.assertIsNone(r.rate("0xa"), "меньше 5 сделок — винрейта нет")
+        for _ in range(2):
+            r.add(["0xa"], True)
+        self.assertAlmostEqual(r.rate("0xa") or 0, 0.8)
+        self.assertEqual(r.best(["0xb", "0xa", "0xz"]), 0.8)
+        for i in range(5):
+            r.add(["0xd"], i < 3)                    # 60 %
+        self.assertEqual(r.best(["0xd", "0xa"]), 0.8, "у сигнала — лучший кит")
+        self.assertEqual(r.best([]), -1.0)
+        self.assertEqual(r.best(None), -1.0)
+        self.assertEqual(r.priority(), set(), "80 % — не приоритетный")
+        r2 = lv.core.Rating()
+        for i in range(10):
+            r2.add(["0xc"], i < 9)
+        self.assertEqual(r2.priority(), set(), "ровно 90 % — ещё нет (нужно выше)")
+        r2.add(["0xc"], True)
+        self.assertEqual(r2.priority(), {"0xc"})
+
+    def test_loaded_from_trades_and_junk_ignored(self) -> None:
+        self.history(["0xa"], 5, 5)
+        self.history(["0xb"], 4, 4)
+        self.history(["0xz"], 4, 4)
+        path = os.path.join(self.dir, "live", "trades.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("not json\n[1, 2]\n" + json.dumps({"pnl": 9, "coin": "Y"}) + "\n")
+            f.write(json.dumps({"pnl": 0, "coin": "Z", "wallets": ["0xz"]}) + "\n")   # ноль — не плюс: 0xz 80 %
+        tr = self.trader([])
+        self.assertEqual(tr.sig.priority, {"0xa"})
+        self.assertIsNone(tr.rating.rate("0xb"))
+
+    def test_priority_whale_alone_enters(self) -> None:
+        self.history(["0xa"], 5, 5)
+        tr = self.trader(self.solo())
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["side"], "buy")
+        self.assertEqual(self.state()["open"]["priority"], "0xa")
+        self.assertTrue(any("приоритетный кит 0xa… (наш винрейт с ним 100 %)" in e for e in self.state()["events"]))
+
+    def test_ordinary_whale_alone_no_signal(self) -> None:
+        self.history(["0xa"], 4, 5)                 # 80 %
+        tr = self.trader(self.solo())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+
+    def test_priority_ignores_levels_ma_and_bigger_against_but_keeps_stop(self) -> None:
+        self.history(["0xa"], 5, 5)
+        self.ex.hl["BTC-USDT-SWAP"] = (97_000.0, 101_000.0)   # лонг у сопротивления — обычно «level»
+        self.ex.ma["BTC-USDT-SWAP"] = 101_000.0               # MA выше цены — обычно «ma30»
+        big = [fill(50, "0xbig", "BTC", -1, self.now - 30 * MIN, 900_000, 100_000)]  # против крупнее
+        tr = self.trader(self.solo() + big)
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertAlmostEqual(self.state()["open"]["stop"], 97_000 * 0.995, msg="стоп за уровнем — и у приоритетного")
+        self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [], "MA не спрашиваем")
+
+    def test_priority_still_respects_chase(self) -> None:
+        self.history(["0xa"], 5, 5)
+        self.ex.last["BTC-USDT-SWAP"] = 100_500
+        tr = self.trader(self.solo())
+        self.on()
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        self.assertEqual(self.state()["last_skip"]["code"], "chase")
+
+    def test_priority_gone_from_window_is_stale(self) -> None:
+        """Приоритетный кит вышел из окна 2 часов, второго кита нет — «устарел»."""
+        self.history(["0xa"], 5, 5)
+        tr = self.trader([])
+        sig = {"coin": "BTC", "side": 1, "ts": self.now, "whales": 1, "ref_px": 100_000, "wallets": {"0xa": self.now - 3 * 60 * MIN}}
+        tr.sig.windows[("BTC", 1)] = lv.core.Window(tr.sig.limit)
+        tr.sig.windows[("BTC", 1)].add(self.now - 3 * 60 * MIN, "0xa", 5000 * 10**9, 0.05)
+        self.on()
+        self.assertIn("сигнал устарел", tr.try_enter(sig))
+
+    def test_priority_below_1000_in_window_is_stale(self) -> None:
+        """Приоритетный кит в окне, но меньше 1000 $ (докупка на 500 $ после
+        выхода прежних из окна) — не кит: один сигнал без китов — «устарел»."""
+        self.history(["0xa"], 5, 5)
+        tr = self.trader([])
+        tr.sig.windows[("BTC", 1)] = lv.core.Window(tr.sig.limit)
+        tr.sig.windows[("BTC", 1)].add(self.now - MIN, "0xa", 500 * 10**9, 0.005)
+        sig = {"coin": "BTC", "side": 1, "ts": self.now, "whales": 1, "ref_px": 100_000, "wallets": {"0xa": self.now - MIN}}
+        self.on()
+        self.assertIn("сигнал устарел", tr.try_enter(sig))
+
+    def test_higher_rated_signal_first(self) -> None:
+        """BTC — свежее, но киты без рейтинга; STX — раньше, но наш винрейт с его
+        китом 80 %: входим в STX."""
+        self.history(["0xs1"], 4, 5)
+        stx = [fill(10, "0xs1", "STX", 1, self.now - 4 * MIN, 5000, 0.5), fill(11, "0xs2", "STX", 1, self.now - 3 * MIN, 5000, 0.5)]
+        tr = self.trader(stx + self.whales(ago=1))
+        self.on()
+        tr.step()
+        [m] = self.market_orders()
+        self.assertEqual(m["instId"], "STX-USDT-SWAP")
+
+    def test_close_records_wallets_and_updates_rating(self) -> None:
+        self.history(["0xa"], 4, 4)
+        tr = self.trader(self.whales())
+        self.on()
+        tr.step()
+        self.assertEqual(tr.sig.priority, set())
+        self.ex.pos = []
+        self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "50", "closeAvgPx": "100500"}]
+        self.now += 10 * MIN
+        tr.last_sync = 0
+        tr.step()
+        with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+            last = json.loads(f.readlines()[-1])
+        self.assertEqual(last["wallets"], ["0xa", "0xb"])
+        self.assertEqual(tr.sig.priority, {"0xa"}, "5 из 5 — приоритетный")
 
 
 class EeaTest(Base):
