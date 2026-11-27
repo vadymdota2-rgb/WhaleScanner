@@ -134,6 +134,16 @@ class ScaleTest(unittest.TestCase):
         peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024
         self.assertLess(peak, 400, f"пик памяти повтора {peak:.0f} МБ")
         print(f"autotrade_replay: {n} сделок китов — {took:.1f} с, пик памяти {peak:.0f} МБ", flush=True)
+        # С вариантами (как ночной бэктест службы) — тем же проходом: не в 13 раз
+        # дольше (раньше каждый вариант читал всю историю заново — часы).
+        t0 = time.time()
+        p = subprocess.run([*cmd, "--variants"], capture_output=True, text=True, timeout=600, check=False)
+        took_v = time.time() - t0
+        self.assertEqual(p.returncode, 0, p.stderr[-2000:])
+        with open(os.path.join(out, "summary.json"), encoding="utf-8") as f:
+            self.assertEqual(len(json.load(f)["variants"]), len(rp.VARIANTS) + 1)
+        self.assertLess(took_v, 3 * took + 30, f"варианты — {took_v:.0f} с против {took:.0f} с без них")
+        print(f"autotrade_replay: с {len(rp.VARIANTS)} вариантами — {took_v:.1f} с", flush=True)
 
 
 if __name__ == "__main__":

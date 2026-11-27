@@ -253,13 +253,19 @@ class Replay:
 
     def __init__(self, a: argparse.Namespace, prices: Prices, instr: dict[str, dict[str, Any]],
                  progress: Callable[[dict[str, Any]], None], hours: Prices | None = None,
-                 rules: Rules | None = None) -> None:
+                 rules: Rules | None = None, shared: Replay | None = None) -> None:
         self.a, self.px, self.instr, self.progress = a, prices, instr, progress
         self.rules = rules or Rules()
         # Свечи 4ч — для уровней (24 свечи, 4 дня); кеш и сеть — те же, что у 5-минутных.
         self.hours = hours or Prices(prices.cache, prices.fetch, prices.pause, prices.offline, prices.now_ms,
                                      bar="4H", bar_ms=core.LEVEL_BAR_MS)
-        self.sig = lv.Signals(a.db)
+        # Варианты идут одним проходом (replay_all): окна китов и запросы к базе
+        # о выходах китов — общие с основным повтором (shared), своё — капитал,
+        # позиции, рейтинг и пропуски.
+        self.sig: lv.Signals = shared.sig if shared is not None else lv.Signals(a.db)
+        self.loss_cache: dict[Any, Any] = shared.loss_cache if shared is not None else {}
+        self.rows_cache: dict[Any, list[tuple[str, int, int]]] = shared.rows_cache if shared is not None else {}
+        self.priority: set[str] = set()   # свои приоритетные киты (рейтинг этого варианта)
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
         self.entered: dict[str, int] = {}
@@ -286,12 +292,12 @@ class Replay:
         if any(b[1] == inst for b in self.busy):
             return "own_same"
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
-        prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)   # приоритетный кит — без этих правил
+        prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now, self.priority)   # приоритетный — без этих правил
         if against > 0 and against >= usd and not prio:
             return "bigger_against"
         if count < lv.MIN_WHALES and not prio:
             return "stale"
-        if self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now):
+        if self.whale_loss(s, now):
             return "whale_exit"
         c = self.px.candle(inst, now)
         if c is None:
@@ -382,6 +388,14 @@ class Replay:
                                  tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str)))))
         return True
 
+    def whale_loss(self, s: dict[str, Any], now: int) -> bool:
+        """Кит сигнала уже закрыл в убыток (Signals.whale_loss) — один запрос к
+        базе на сигнал и момент на все варианты."""
+        key = (s["coin"], s["side"], tuple(sorted((s.get("wallets") or {}).items())), now)
+        if key not in self.loss_cache:
+            self.loss_cache[key] = bool(self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now))
+        return bool(self.loss_cache[key])
+
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
         """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
         (как Signals.whale_loss, но по времени): сумма closed_pnl закрытий с
@@ -421,6 +435,10 @@ class Replay:
         since = {str(k): int(lv.num(v)) for k, v in wallets.items()}
         if not since:
             return []
+        key = (coin, side, tuple(sorted(since.items())))
+        got = self.rows_cache.get(key)
+        if got is not None:
+            return got   # тот же сигнал у другого варианта — без запроса к базе
         marks = ",".join("?" * len(since))
         codes = core.CLOSES_FOR[1 if side > 0 else -1]
         q = (f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({marks}) "  # noqa: S608 — только «?»
@@ -432,7 +450,9 @@ class Replay:
             rows = con.execute(q, args).fetchall()
         finally:
             con.close()
-        return [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
+        out = [(str(w), int(t), int(v or 0)) for w, t, v in rows if int(t) >= since.get(str(w), 10**18)]
+        self.rows_cache[key] = out
+        return out
 
     def requests(self) -> int:
         return self.px.requests + self.hours.requests
@@ -446,42 +466,61 @@ class Replay:
             t = self.trades[i]
             self.equity += t.pnl
             self.rating.add(t.wallets, t.pnl > 0)
-            self.sig.priority = self.rating.priority()
+            self.priority = self.rating.priority()
 
     def run(self, since: int, until: int) -> None:
-        con = core.open_ro(self.a.db)
-        try:
-            total = con.execute("SELECT COUNT(*) FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ?",
-                                (since, until)).fetchone()[0]
-            cur = con.execute(
-                "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
-                "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, until))
-            done = 0
-            last_note = 0.0
-            while rows := cur.fetchmany(5000):
-                for row in rows:
-                    done += 1
-                    self.settle(int(row[4]))
-                    # Строка — по одной: одновременных сигналов (порядок по нашему
-                    # винрейту с китами, как у живого бота в одном опросе) почти нет.
-                    for s in reversed(self.sig.feed([row])):  # как candidates: встречный «крупный» — первым
-                        why = self.decide(s, s["ts"] + self.a.delay * 1000)
-                        self.skips[why or "entered"] += 1
-                self.sig.seen.clear()  # повтор идёт по строкам один раз — повторов нет, память не копим
-                if time.time() - last_note > 2:
-                    last_note = time.time()
-                    self.progress({"stage": "повтор", "done": done, "total": total, "trades": len(self.trades),
-                                   "requests": self.requests()})
-                    self.px.save()
-                    self.hours.save()
-                    self.sig.sweep(int(rows[-1][4]))
-        finally:
-            con.close()
-        self.settle(10**17)   # закрытые к концу данных — в капитал (открытые — нет)
-        self.px.save()
-        self.hours.save()
-        self.progress({"stage": "готово", "done": total, "total": total, "trades": len(self.trades),
-                       "requests": self.requests()})
+        replay_all([self], since, until)
+
+
+def replay_all(rps: Sequence[Replay], since: int, until: int) -> None:
+    """Один проход по сделкам китов на все варианты (первый — основной): окна
+    и сигналы — общие (Signals первого), решение — у каждого своё. Раньше
+    каждый вариант читал всю историю заново — 13 проходов, часы."""
+    main = rps[0]
+    sig = main.sig
+    con = core.open_ro(main.a.db)
+    try:
+        total = con.execute("SELECT COUNT(*) FROM hl_fills WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ?",
+                            (since, until)).fetchone()[0]
+        cur = con.execute(
+            "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
+            "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, until))
+        done = 0
+        last_note = 0.0
+        while rows := cur.fetchmany(5000):
+            for row in rows:
+                done += 1
+                for rp in rps:
+                    rp.settle(int(row[4]))
+                # Одиночный сигнал приоритетного кита — если он приоритетный хоть у
+                # одного варианта; остальные его пропускают (solo — не свой).
+                sig.priority = set().union(*(rp.priority for rp in rps))
+                # Строка — по одной: одновременных сигналов (порядок по нашему
+                # винрейту с китами, как у живого бота в одном опросе) почти нет.
+                for s in reversed(sig.feed([row])):  # как candidates: встречный «крупный» — первым
+                    now = s["ts"] + main.a.delay * 1000
+                    for rp in rps:
+                        if s.get("solo") and s["solo"] not in rp.priority:
+                            continue
+                        why = rp.decide(s, now)
+                        rp.skips[why or "entered"] += 1
+                main.loss_cache.clear()   # выход китов — на момент решения: дальше не нужен
+            sig.seen.clear()  # повтор идёт по строкам один раз — повторов нет, память не копим
+            if time.time() - last_note > 2:
+                last_note = time.time()
+                main.progress({"stage": "повтор", "done": done, "total": total, "trades": len(main.trades),
+                               "requests": main.requests()})
+                main.px.save()
+                main.hours.save()
+                sig.sweep(int(rows[-1][4]))
+    finally:
+        con.close()
+    for rp in rps:
+        rp.settle(10**17)   # закрытые к концу данных — в капитал (открытые — нет)
+    main.px.save()
+    main.hours.save()
+    main.progress({"stage": "готово", "done": total, "total": total, "trades": len(main.trades),
+                   "requests": main.requests()})
 
 
 # ── итоги ────────────────────────────────────────────────────────────────────
@@ -626,19 +665,15 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     instr = instruments(f, a.offline, a.cache)
     rp = Replay(a, prices, instr, progress, hours)
     since = now - a.since_days * core.DAY_MS
-    rp.run(since, now)
+    # Варианты — тем же проходом, что основной (свечи, окна китов и запросы к базе — общие).
+    alts = [Replay(a, prices, instr, progress, hours, rules=r, shared=rp) for r in VARIANTS] \
+        if getattr(a, "variants", False) else []
+    replay_all([rp, *alts], since, now)
     s = summary(a, rp, since, now)
     s["variants"] = []
-    if getattr(a, "variants", False):
+    if alts:
         days = (now - since) / core.DAY_MS
-        s["variants"].append(variant_row(rp.rules, s["full"], days))
-        for i, r in enumerate(VARIANTS, 1):
-            def note(p: dict[str, Any], i: int = i, r: Rules = r) -> None:
-                progress({**p, "stage": f"вариант {i} из {len(VARIANTS)}: {r.name}"})
-            alt = Replay(a, prices, instr, note, hours, rules=r)   # свечи — те же (кеш в памяти)
-            alt.run(since, now)
-            s["variants"].append(variant_row(r, stats(alt.trades), days))
-        progress({"stage": "готово", "done": 1, "total": 1, "trades": len(rp.trades), "requests": rp.requests()})
+        s["variants"] = [variant_row(x.rules, stats(x.trades), days) for x in (rp, *alts)]
 
     def fmt(ms: float) -> str:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

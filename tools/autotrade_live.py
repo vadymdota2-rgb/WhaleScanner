@@ -490,8 +490,10 @@ class Signals:
             if v is None or v[0] < self.limit:
                 continue
             if (w.count >= MIN_WHALES or wallet in self.priority) and w.big_u > 0:
-                # Приоритетный кит — сигнал и в одиночку (правило владельца 27.11.2026).
-                out.append(self._signal(coin, side, w, opp, newest))
+                # Приоритетный кит — сигнал и в одиночку (правило владельца 27.11.2026);
+                # solo — чей это одиночный сигнал (бэктест сверяет со своими приоритетными).
+                out.append({**self._signal(coin, side, w, opp, newest),
+                            **({"solo": wallet} if w.count < MIN_WHALES else {})})
             # Против этих китов стоят киты крупнее (по объёму) и их тоже от 2 —
             # сигнал и в их сторону: входим с крупными (правило владельца).
             if opp is not None and opp.count >= MIN_WHALES and opp.big_u > 0 \
@@ -505,14 +507,16 @@ class Signals:
             return 0.0
         return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
 
-    def priority_in(self, coin: str, side: int, wallets: object, now: int) -> str:
+    def priority_in(self, coin: str, side: int, wallets: object, now: int, priority: set[str] | None = None) -> str:
         """Приоритетный кит сигнала, что ещё в окне за 2 часа до «сейчас» (от
-        1000 $): кошелёк или ''."""
+        1000 $): кошелёк или ''. priority — свои приоритетные (вариант
+        бэктеста), иначе — self.priority."""
         w = self.windows.get((coin, side))
         if w is None or not isinstance(wallets, dict):
             return ""
         w.expire(now - WINDOW_MS)
-        return next((x for x in sorted(wallets) if x in self.priority and (v := w.per.get(x)) is not None
+        prio = self.priority if priority is None else priority
+        return next((x for x in sorted(wallets) if x in prio and (v := w.per.get(x)) is not None
                      and v[0] >= self.limit), "")
 
     def balance(self, coin: str, side: int, now: int) -> tuple[float, float, int]:

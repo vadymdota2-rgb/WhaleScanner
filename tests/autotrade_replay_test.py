@@ -242,6 +242,89 @@ class ReplayTest(unittest.TestCase):
         v = {x["name"]: x for x in self.go(self.whales(), ma_up, variants=True)["summary"]["variants"]}
         self.assertEqual((v["текущие правила"]["trades"], v["без MA30"]["trades"], v["без уровней 4ч"]["trades"]), (0, 1, 0))
 
+    def test_variants_one_pass_equal_separate_runs(self) -> None:
+        """Варианты идут одним проходом с основным (общие окна китов и запросы
+        к базе): итог каждого — тот же, что у отдельного повтора с его
+        правилами. Сценарий: 4 бумаги, тейки, стопы, выход кита, повторный
+        сигнал после паузы и одиночный кит."""
+        rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 30 * MIN, base=10),
+                *self.whales(coin="SOL", px=150, t=T + 31 * MIN, base=20),
+                *self.whales(coin="DOGE", px=0.2, t=T + 32 * MIN, base=30),
+                *self.whales(t=T + 50 * MIN, base=40), *self.whales(t=T + 4 * 60 * MIN, base=50),
+                opn(60, "0xsolo", "BTC", -1, T + 6 * 60 * MIN, 5000, 100_000),
+                cls(70, "0xa", "ETH", 1, T + 90 * MIN, -50.0)]
+        rows.sort(key=lambda r: r[4])
+
+        def price(c: str, ts: int) -> float:
+            base = self.PX[c]
+            k = (ts - T) // (20 * MIN)
+            wave = (0.0, 0.004, 0.009, 0.013, -0.006, -0.012, -0.018, 0.002)[k % 8] if ts >= T else 0.0
+            return base * (1 + wave)
+
+        r = self.go(rows, price, variants=True)
+        one_pass = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertGreater(sum(x["trades"] for x in one_pass.values()), 10, "сценарий не пустой")
+        self.assertGreater(len({(x["trades"], x["net"]) for x in one_pass.values()}), 3, "варианты различаются")
+        a = self.args()
+        prices = rp.Prices(a.cache, self.market, 0, True, NOW)
+        hours = rp.Prices(a.cache, self.market, 0, True, NOW, bar="4H", bar_ms=rp.core.LEVEL_BAR_MS)
+        instr = rp.instruments(self.market, True, a.cache)
+        for rules in (rp.Rules(), *rp.VARIANTS):
+            alone = rp.Replay(a, prices, instr, lambda _p: None, hours, rules=rules)
+            alone.run(NOW - a.since_days * DAY, NOW)
+            want = rp.variant_row(rules, rp.stats(alone.trades), a.since_days)
+            self.assertEqual(one_pass[rules.name], want, rules.name)
+
+    def test_priority_whale_is_per_variant(self) -> None:
+        """Рейтинг у каждого варианта свой: при тейке +0,3 % пять сделок с 0xa —
+        в плюс (+0,4 %), 0xa приоритетный; у основного (тейк +1 %) первая
+        сделка не закрыта — рейтинга нет. Потом 0xa один в SOL: вариант входит,
+        основной сигнала не видит (его пропуски — как без вариантов); 0xa и
+        0xc в ETH у сопротивления: вариант входит (приоритетный — мимо
+        уровней), основной — «level»."""
+        H = 60 * MIN
+        entries = [T + i * 4 * H for i in range(5)]
+        late = T + 20 * H
+
+        def price(c: str, ts: int) -> float:
+            base = self.PX[c]
+            if c == "BTC":
+                if T - 28 * H <= ts < T - 24 * H:
+                    return 96_000.0
+                if T - 24 * H <= ts < T - 20 * H:
+                    return 110_000.0
+                for e in entries:
+                    if e <= ts < e + 10 * MIN:
+                        return 100_000.0              # вход — у поддержки
+                    if e + 10 * MIN <= ts < e + 30 * MIN:
+                        return 100_400.0
+                return 99_000.0                       # MA30 ниже цены входа
+            if late - 28 * H <= ts < late - 24 * H:
+                return base * 0.88                    # поддержка 4 дня
+            if ts >= late - 24 * H:
+                return base * (1.004 if (late + 10 * MIN <= ts < late + 30 * MIN
+                                         or late + 2 * H + 10 * MIN <= ts < late + 2 * H + 30 * MIN) else 1.0)
+            return base * 1.01                        # сопротивление: цена 1,0 — у самого верха
+
+        rows: list[tuple] = []
+        for i, e in enumerate(entries):
+            rows += [opn(10 * i + 1, "0xa", "BTC", 1, e - MIN, 5000, 100_000), opn(10 * i + 2, "0xb", "BTC", 1, e, 5000, 100_000)]
+        # Первым после пятой сделки — одиночный 0xa (SOL): рейтинг варианта уже
+        # должен быть пересчитан на этой строке, а не на его следующем решении.
+        rows += [opn(90, "0xa", "SOL", 1, late, 5000, 150),
+                 opn(80, "0xa", "ETH", 1, late + 2 * H - MIN, 5000, 3000), opn(81, "0xc", "ETH", 1, late + 2 * H, 5000, 3000)]
+        rows.sort(key=lambda r: r[4])
+        r = self.go(rows, price, variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(v["тейк +0,3 %"]["trades"], 7, "5 BTC, ETH и SOL — с приоритетным")
+        self.assertEqual(v["текущие правила"]["trades"], 1, "основной: BTC открыт, ETH — у сопротивления")
+        self.assertGreater(r["skips"].get("level", 0), 0)
+        with_variants = r["skips"]
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(rows, price)
+        self.assertEqual(r["skips"], with_variants, "пропуски основного — как без вариантов")
+
     def test_far_level_stop_capped(self) -> None:
         """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 1,5 % от
         цены входа с проскальзыванием не считая (100 000 → 98 500)."""
