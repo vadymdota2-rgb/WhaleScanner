@@ -53,6 +53,8 @@ class FakeOkx:
         self.pos_mode = pos_mode
         self.n = 0
         self.reject: dict[str, str] = {}   # бумага → код отказа OKX на ордер
+        self.hold = False                  # лимиты входа висят (не исполняются сразу)
+        self.book: dict[str, tuple[float, float]] = {}   # бумага → (лучшая покупка, лучшая продажа)
         self.hl: dict[str, object] = {}    # бумага → (минимум, максимум) часовых свечей за сутки или свои строки
         self.ma: dict[str, object] = {}    # бумага → закрытие 15-минутных свечей (MA30 ≈ оно) или свои строки
 
@@ -79,7 +81,8 @@ class FakeOkx:
                            for i in range(int(q.get("limit", "24")))])
             return ok(got if isinstance(got, list) else [])
         if p == "/api/v5/market/ticker":
-            return ok([{"instId": q["instId"], "last": str(self.last[q["instId"]])}])
+            bid, ask = self.book.get(q["instId"], ("", ""))
+            return ok([{"instId": q["instId"], "last": str(self.last[q["instId"]]), "bidPx": str(bid), "askPx": str(ask)}])
         if p == "/api/v5/account/config":
             return ok([{"posMode": self.pos_mode, "acctLv": "2"}])
         if p == "/api/v5/account/balance":
@@ -97,7 +100,15 @@ class FakeOkx:
             o = {**b, "ordId": str(self.n), "state": "live", "cTime": str(T0)}
             closing = b.get("reduceOnly") or (b.get("posSide") == "long" and b["side"] == "sell") \
                 or (b.get("posSide") == "short" and b["side"] == "buy")
-            if b["ordType"] == "market" and closing:
+            # Лимит входа «только мейкер»: по умолчанию исполняется сразу по своей
+            # цене (как вход), hold — висит, пока тест не исполнит или не снимет.
+            kind, fill = b["ordType"], self.last[b["instId"]]
+            if kind == "post_only":
+                if self.hold:
+                    self.orders.append(o)
+                    return ok([{"ordId": o["ordId"], "clOrdId": b.get("clOrdId", ""), "sCode": "0"}])
+                kind, fill = "market", float(b["px"])
+            if kind == "market" and closing:
                 # Закрытие: уменьшить свою позицию (не открыть встречную).
                 px = self.last[b["instId"]]
                 o.update(state="filled", avgPx=str(px), accFillSz=b["sz"], fillTime=str(T0))
@@ -109,18 +120,18 @@ class FakeOkx:
                                              * float(self.instr[b["instId"]]["ctVal"]), 6))
                         p["pos"] = str(sign * left)
                 self.pos = [p for p in self.pos if abs(float(p["pos"])) > 1e-12]
-            elif b["ordType"] == "market" and any(
+            elif kind == "market" and any(
                     p["instId"] == b["instId"] and p.get("posSide", "net") == b.get("posSide", "net")
                     and (b.get("posSide") or (float(p["pos"]) > 0) == (b["side"] == "buy")) for p in self.pos):
                 # Докупка в ту же позицию: объём растёт, средняя — взвешенная.
-                px = self.last[b["instId"]]
-                o.update(state="filled", avgPx=str(px), accFillSz=b["sz"])
+                px = fill
+                o.update(state="filled", avgPx=str(px), accFillSz=b["sz"], fillTime=str(T0))
                 p = next(p for p in self.pos if p["instId"] == b["instId"] and p.get("posSide", "net") == b.get("posSide", "net"))
                 old, add = abs(float(p["pos"])), float(b["sz"])
                 p["avgPx"] = str((float(p["avgPx"]) * old + px * add) / (old + add))
                 p["pos"] = str((1 if float(p["pos"]) > 0 else -1) * (old + add))
-            elif b["ordType"] == "market":
-                o.update(state="filled", avgPx=str(self.last[b["instId"]]), accFillSz=b["sz"])
+            elif kind == "market":
+                o.update(state="filled", avgPx=str(fill), accFillSz=b["sz"], fillTime=str(T0))
                 sign = 1 if b["side"] == "buy" else -1
                 self.pos.append({"instId": b["instId"], "pos": str(sign * float(b["sz"]) if self.pos_mode == "net_mode"
                                                                       else float(b["sz"])),
@@ -204,7 +215,8 @@ class Base(unittest.TestCase):
             return json.load(f)
 
     def market_orders(self) -> list[dict]:
-        return [o for o in self.ex.orders if o["ordType"] == "market"]
+        """Вход (лимит «только мейкер») и выходы по рынку."""
+        return [o for o in self.ex.orders if o["ordType"] in ("market", "post_only")]
 
     def whales(self, coin: str = "BTC", side: int = 1, px: float = 100_000, usd: float = 5000, ago: int = 5) -> list:
         return [fill(1, "0xa", coin, side, self.now - ago * MIN - MIN, usd, px),
@@ -635,10 +647,10 @@ class SignalsTest(Base):
 
 
 class OrderTypeTest(Base):
-    def test_entry_always_market_exit_always_limit_at_tp(self) -> None:
-        """Правило владельца: вход — всегда рыночным ордером, выход — лимитным
-        по цене тейка; по рынку бот закрывает только вслед за китом, вышедшим
-        в убыток (WhaleExitTest) — без этого рыночного закрытия нет."""
+    def test_entry_limit_post_only_exit_limit_at_tp(self) -> None:
+        """Правило владельца (27.11.2026): вход — не по рынку, а лимитом «только
+        мейкер» (post_only); выход — лимитом по цене тейка; по рынку бот
+        закрывает только стоп и вслед за китом в убытке."""
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             self.ex = FakeOkx(mode)
             tr = self.trader(self.whales(side=side))
@@ -647,7 +659,8 @@ class OrderTypeTest(Base):
             opening = "buy" if side > 0 else "sell"
             entries = [o for o in self.ex.orders if o["side"] == opening]
             exits = [o for o in self.ex.orders if o["side"] != opening]
-            self.assertEqual([o["ordType"] for o in entries], ["market"], mode)
+            self.assertEqual([o["ordType"] for o in entries], ["post_only"], mode)
+            self.assertEqual(entries[0]["px"], "100000", "нет стакана — по цене сделки")
             self.assertEqual([o["ordType"] for o in exits], ["limit"], mode)
             self.assertEqual(float(exits[0]["px"]), tr.st["open"]["tp"])
             self.assertAlmostEqual(tr.st["open"]["tp"] / tr.st["open"]["px"], 1 + side * lv.TP)
@@ -1021,88 +1034,145 @@ class BiggerSideTest(Base):
         self.assertEqual(self.state()["open"]["usd_against"], 0.0)
 
 
-class PartialEntryTest(Base):
-    """Рыночный вход исполнился частично (6 из 10), потом доисполнился:
-    запись и тейк — на весь объём, а не на первую часть."""
+class LimitEntryTest(Base):
+    """Вход — лимит «только мейкер» по лучшей цене своей стороны стакана; ждёт
+    5 минут, потом снимается: исполненная часть — позиция, ничего — входа нет."""
 
-    def partial(self, mode: str = "net_mode") -> lv.Trader:
-        self.ex = FakeOkx(mode)
+    def pending(self, side: int = 1) -> lv.Trader:
+        self.ex.hold = True
+        tr = self.trader(self.whales(side=side))
+        self.on()
+        tr.step()
+        self.assertEqual(self.state()["opens"], [])
+        self.assertIn("entering", self.state())
+        return tr
+
+    def entry(self) -> dict:
+        return next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
+
+    def sync(self, tr: lv.Trader, minutes: int) -> None:
+        self.now += minutes * MIN
+        tr.last_sync = 0
+        tr.step()
+
+    def test_at_best_bid_or_ask_on_tick(self) -> None:
+        """Лонг — по лучшей покупке (вниз на шаг), шорт — по лучшей продаже
+        (вверх на шаг)."""
+        for side, want in ((1, "99990.1"), (-1, "100010.2")):
+            self.ex = FakeOkx()
+            self.ex.book["BTC-USDT-SWAP"] = (99_990.17, 100_010.13)
+            tr = self.trader(self.whales(side=side))
+            self.on()
+            tr.step()
+            e = self.entry()
+            self.assertEqual((e["ordType"], e["px"], e["side"]), ("post_only", want, "buy" if side > 0 else "sell"))
+            self.assertAlmostEqual(self.state()["opens"][0]["px"], float(want))
+            self.assertTrue(any("лимитом" in x for x in self.state()["events"]))
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_waits_then_fills(self) -> None:
+        """Пока лимит висит — позиции нет, второй вход не идёт («по одному»);
+        исполнился — позиция, тейк от цены исполнения."""
+        tr = self.pending()
+        con = sqlite3.connect(self.db)
+        con.executemany(INS, [fill(10, "0xc", "STX", 1, self.now - 2 * MIN, 5000, 0.5),
+                              fill(11, "0xd", "STX", 1, self.now - MIN, 5000, 0.5)])
+        con.commit()
+        con.close()
+        self.sync(tr, 1)
+        self.assertEqual(self.state()["last_skip"]["code"], "entering")
+        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "post_only"]), 1)
+        self.entry().update(state="filled", accFillSz="10", avgPx="100000", fillTime=str(T0))
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
+        self.sync(tr, 1)
+        [op] = self.state()["opens"]
+        self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 101_000.0))
+        self.assertNotIn("entering", self.state())
+        self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["101000"])
+
+    def test_timeout_keeps_filled_part(self) -> None:
+        """Исполнилось 6 из 10, 5 минут прошли — остаток снят, позиция — 6,
+        тейк — на 6."""
+        tr = self.pending()
+        self.entry().update(state="partially_filled", accFillSz="6", avgPx="100000")
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "6", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
+        self.sync(tr, 4)
+        self.assertEqual(self.state()["opens"], [], "время не вышло — ждём")
+        self.sync(tr, 2)
+        self.assertEqual(self.entry()["state"], "canceled", "остаток снят")
+        [op] = self.state()["opens"]
+        self.assertEqual(op["size"], 6.0)
+        self.assertEqual([o["sz"] for o in self.ex.orders if o["ordType"] == "limit"], ["6"])
+
+    def test_timeout_without_fill_is_no_entry(self) -> None:
+        tr = self.pending()
+        self.sync(tr, 6)
+        self.assertEqual(self.entry()["state"], "canceled")
+        st = self.state()
+        self.assertEqual(st["opens"], [])
+        self.assertNotIn("entering", st)
+        self.assertTrue(any("лимит входа не исполнился" in x for x in st["events"]))
+        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
+        self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
+
+    def test_post_only_canceled_at_once_is_a_miss(self) -> None:
+        """Лимит «только мейкер» встал бы в рынок — биржа снимает его сразу:
+        пропуск «limit_miss» в том же шаге, следующий сигнал — дальше."""
         tr = self.trader(self.whales())
         self.on()
         real = tr.okx.order
 
         def order(body):
             got = real(body)
-            if body["clOrdId"].startswith("wtin"):
-                self.ex.orders[-1].update(state="partially_filled", accFillSz="6")
-                self.ex.pos[0]["pos"] = "6"
+            if body["ordType"] == "post_only":
+                self.ex.orders[-1].update(state="canceled", accFillSz="0")
+                self.ex.pos.clear()
             return got
 
         tr.okx.order = order  # type: ignore[method-assign]
         tr.step()
-        op = self.state()["open"]
-        self.assertEqual((op["size"], op["in_done"]), (6.0, False))
-        [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual(tp["sz"], "6")
-        return tr
+        st = self.state()
+        self.assertEqual((st["opens"], st["last_skip"]["code"]), ([], "limit_miss"))
+        self.assertNotIn("entering", st)
 
-    def fill_rest(self, px: float = 100_000.0) -> None:
-        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
-        entry.update(state="filled", accFillSz="10", avgPx=str(px))
-        self.ex.pos[0]["pos"] = "10"
+    def test_never_more_than_ordered_and_garbage_price(self) -> None:
+        tr = self.pending()
+        self.entry().update(state="filled", accFillSz="1000", avgPx=str(10**20))   # порча ответа
+        self.sync(tr, 1)
+        [op] = self.state()["opens"]
+        self.assertEqual((op["size"], op["px"]), (10.0, 100_000.0), "не больше заказанного; цена — лимита")
 
-    def test_late_fill_moves_record_and_tp_to_full_size(self) -> None:
-        for mode in ("net_mode", "long_short_mode"):
-            tr = self.partial(mode)
-            self.fill_rest(px=100_100.0)  # средняя цена всего входа — выше
-            self.now += MIN
-            tr.last_sync = 0
-            tr.step()
-            op = self.state()["open"]
-            self.assertEqual((op["size"], op["in_done"], op["px"]), (10.0, True, 100_100.0), mode)
-            live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
-            self.assertEqual([(o["sz"], o["px"]) for o in live], [("10", "101101")], "тейк — на весь объём от новой средней")
-            self.assertTrue(any("вход доисполнился" in e for e in self.state()["events"]))
-            for _ in range(2):   # дальше ничего не меняется и тейк не дублируется
-                self.now += MIN
-                tr.last_sync = 0
-                tr.step()
-            self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]), 1)
+    def test_check_error_waits(self) -> None:
+        """Проверка лимита — отказ OKX: запись остаётся, повтор на сверке."""
+        tr = self.pending()
+        with mock.patch.object(tr.okx, "get_order", side_effect=lv.OkxError("50011", "часто")):
+            self.sync(tr, 1)
+        self.assertIn("entering", self.state())
+        self.assertTrue(any("лимит входа не проверен" in x for x in self.state()["events"]))
+        self.entry().update(state="filled", accFillSz="10", avgPx="100000")
+        self.sync(tr, 1)
+        self.assertEqual(len(self.state()["opens"]), 1)
+
+    def test_order_never_found_dropped_after_10_minutes(self) -> None:
+        """Ордера входа нет (не дошёл до биржи; OKX 51603 «ордера нет» — то же):
+        ждём 10 минут, потом запись снята."""
+        for gone in ("clear", "51603"):
+            tr = self.pending()
+            if gone == "clear":
+                self.ex.orders.clear()
+                self.sync(tr, 9)
+            else:
+                with mock.patch.object(tr.okx, "get_order", side_effect=lv.OkxError("51603", "Order does not exist")):
+                    self.sync(tr, 9)
+            self.assertIn("entering", self.state(), gone)
+            with mock.patch.object(tr.okx, "get_order", side_effect=lv.OkxError("51603", "Order does not exist")):
+                self.sync(tr, 2)
+            self.assertNotIn("entering", self.state(), gone)
+            self.assertFalse(any("лимит входа не проверен" in x for x in self.state()["events"]), gone)
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
-
-    def test_no_late_fill_keeps_partial_and_stops_checking(self) -> None:
-        tr = self.partial()
-        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
-        entry.update(state="canceled")   # остаток рыночного отменён — 6 и есть весь вход
-        self.now += MIN
-        tr.last_sync = 0
-        tr.step()
-        op = self.state()["open"]
-        self.assertEqual((op["size"], op["in_done"]), (6.0, True))
-        self.assertEqual([o["sz"] for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], ["6"])
-
-    def test_tp_already_filling_is_not_touched(self) -> None:
-        tr = self.partial()
-        tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
-        tp.update(state="partially_filled", accFillSz="2")
-        self.fill_rest()
-        self.now += MIN
-        tr.last_sync = 0
-        tr.step()
-        self.assertEqual(tp["state"], "partially_filled", "тейк не снят")
-        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "и не задвоен")
-        self.assertTrue(any("тейк уже исполняется" in e for e in self.state()["events"]))
-
-    def test_never_more_than_ordered(self) -> None:
-        tr = self.partial()
-        entry = next(o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtin"))
-        entry.update(state="filled", accFillSz="1000")   # порча ответа
-        self.now += MIN
-        tr.last_sync = 0
-        tr.step()
-        self.assertEqual(self.state()["open"]["size"], 10.0)
-
+            self.ex = FakeOkx()
 
 class StopTest(Base):
     """Стоп — за уровнем, от которого вошли: лонг — на 0,5 % ниже поддержки
@@ -1289,7 +1359,7 @@ class StopTest(Base):
 
         def order_then_crash(body):
             real(body)
-            if body["ordType"] == "market":
+            if body["ordType"] == "post_only":
                 raise SystemExit("упала")
             return ""
 
@@ -1875,7 +1945,7 @@ class RecoverTest(Base):
 
         def order_then_crash(body):
             real_order(body)
-            if body["ordType"] == "market":
+            if body["ordType"] == "post_only":
                 raise SystemExit("упала")
             return ""
 
@@ -1905,6 +1975,20 @@ class RecoverTest(Base):
         tr.step()
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк не дублируется")
         self.assertEqual(len(self.market_orders()), 1, "повторного входа нет")
+
+    def test_old_version_entering_adopted_with_whales_and_stop(self) -> None:
+        """Запись «входим» прежней версии (рыночный вход, без лимита): ордер
+        исполнен, позиция есть — принять её с китами и стопом из записи."""
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
+        self.ex.orders.append({"instId": "BTC-USDT-SWAP", "ordId": "7", "clOrdId": "wtin7", "side": "buy",
+                               "ordType": "market", "state": "filled", "accFillSz": "10", "avgPx": "100000", "cTime": str(T0)})
+        tr = self.trader(self.whales())
+        tr.st["entering"] = {"inst": "BTC-USDT-SWAP", "cl": "wtin7", "at": self.now, "coin": "BTC", "side": 1,
+                             "whales": 2, "wallets": {"0xa": 1, "0xb": 2}, "stop": 98_500.0}
+        tr.sync()
+        [op] = tr.st["opens"]
+        self.assertEqual((op["wallets"], op["stop"], op["adopted"]), ({"0xa": 1, "0xb": 2}, 98_500.0, True))
+        self.assertNotIn("entering", tr.st)
 
     def test_lost_record_found_by_order_tag(self) -> None:
         self.crash_after_order()
@@ -1957,10 +2041,10 @@ class ReviewTest(Base):
         return [fill(tid, "0xc", "STX", 1, self.now - ago * MIN - MIN, 5000, 0.5),
                 fill(tid + 1, "0xd", "STX", 1, self.now - ago * MIN, 5000, 0.5)]
 
-    def test_network_failure_after_market_order_never_sends_second(self) -> None:
-        """Рыночный ордер ушёл, а проверка исполнения упала обрывом сети: на
-        следующем шаге новый сигнал по другой бумаге — второго рыночного
-        ордера нет; своя позиция принята по метке, тейк поставлен."""
+    def test_network_failure_after_entry_order_never_sends_second(self) -> None:
+        """Лимит входа ушёл, а проверка исполнения упала обрывом сети: на
+        следующем шаге новый сигнал по другой бумаге — второго ордера входа
+        нет; своя позиция принята по метке, тейк поставлен."""
         tr = self.trader(self.whales())
         self.on()
         real = tr.okx.get_order
@@ -1976,14 +2060,19 @@ class ReviewTest(Base):
         self.add_fills(self.stx())
         tr.last_sync = 0
         tr.step()
-        self.assertEqual(len(self.market_orders()), 1, "второго рыночного ордера нет")
-        self.ex.pos = shown
+
+        def btc(kind: str) -> list:
+            return [o for o in self.ex.orders if o["ordType"] == kind and o["instId"] == "BTC-USDT-SWAP"]
+
+        self.assertEqual(len(btc("post_only")), 1, "второго входа в BTC нет")
+        self.ex.pos = [*shown, *self.ex.pos]
         tr.last_sync = 0
         tr.step()
         st = self.state()
         self.assertEqual(st["open"]["inst"], "BTC-USDT-SWAP")
         self.assertNotIn("entering", st)
-        self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1)
+        self.assertEqual(len(btc("limit")), 1, "тейк BTC — один")
+        self.assertEqual(len(btc("post_only")), 1)
 
     def test_gateway_error_on_order_is_not_a_refusal(self) -> None:
         """Шлюз ответил 502 (не JSON), а ордер на бирже исполнился: это не
@@ -1995,7 +2084,7 @@ class ReviewTest(Base):
 
         def order(body):
             got = real(body)
-            if body["ordType"] == "market":
+            if body["ordType"] == "post_only":
                 raise lv.OkxError("502", "HTTP")
             return got
 
@@ -2005,43 +2094,23 @@ class ReviewTest(Base):
         st = self.state()
         self.assertIn("entering", st)
         self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
-        self.assertIn("не подтверждён", st["last_skip"]["why"])
+        self.assertIn("ждёт исполнения", st["last_skip"]["why"])
         tr.okx.order = real  # type: ignore[method-assign]
         tr.last_sync = 0
         tr.step()
         self.assertIn(self.state()["open"]["inst"], ("BTC-USDT-SWAP", "STX-USDT-SWAP"))
         self.assertEqual(len(self.market_orders()), 1)
 
-    def test_canceled_market_order_is_not_a_position(self) -> None:
-        tr = self.trader(self.whales())
-        self.on()
-        real = tr.okx.order
-
-        def order(body):
-            got = real(body)
-            if body["ordType"] == "market":
-                self.ex.orders[-1].update(state="canceled", accFillSz="0")
-                self.ex.pos.clear()
-            return got
-
-        tr.okx.order = order  # type: ignore[method-assign]
-        tr.step()
-        st = self.state()
-        self.assertIsNone(st["open"])
-        self.assertNotIn("entering", st)
-        self.assertFalse(st["blocked"]["BTC-USDT-SWAP"]["permanent"])
-        self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
-
     def test_unconfirmed_fill_is_not_recorded_as_position(self) -> None:
-        """Биржа приняла рыночный ордер, но исполнение не подтверждает (state
-        live, исполнено 0): позицию не записывать — ждать сверки."""
+        """Биржа приняла лимит входа, он висит (state live, исполнено 0):
+        позицию не записывать — ждать сверки."""
         tr = self.trader(self.whales())
         self.on()
         real = tr.okx.order
 
         def order(body):
             got = real(body)
-            if body["ordType"] == "market":
+            if body["ordType"] == "post_only":
                 self.ex.orders[-1].update(state="live", accFillSz="0")
                 self.ex.pos.clear()
             return got

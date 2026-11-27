@@ -88,7 +88,7 @@ class PropsTest(Base):
                 tr.st["entered"]["BTC"] = self.now - 2 * 3_600_000
             self.on(on)
             tr.step()
-            markets = [o for o in self.ex.orders if o["ordType"] == "market"]
+            markets = [o for o in self.ex.orders if o["ordType"] == "post_only"]   # вход — лимит «только мейкер»
             frac = lv.MARGIN_FRAC
             notional = Decimal(repr(round(self.ex.eq * frac * lv.LEVERAGE, 6)))
             qty = notional / (ct_val if ct_usd else ct_val * Decimal(repr(price)))
@@ -97,8 +97,12 @@ class PropsTest(Base):
             should = (on and manual != "same" and age <= 15 and not paused
                       and self.ex.eq > 0 and abs(hl / ref - 1) <= lv.MATCH_TOL and side * (hl / ref - 1) <= lv.CHASE
                       and want_sz >= min_sz)
-            tp_try = lv.round_step(price * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
-            should = should and tp_try > 0 and lv.TP * 0.999 <= side * (float(tp_try) / price - 1) <= lv.TP + lv.TP_SLACK
+            # Цена лимита — цена сделки на шаге (лонг — вниз, шорт — вверх); ноль — не
+            # входим; тейк — от неё и на шаге.
+            lim = lv.round_step(price, tick, ROUND_FLOOR if side > 0 else ROUND_CEILING)
+            tp_try = lv.round_step(float(lim) * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
+            should = should and lim > 0 and tp_try > 0 \
+                and lv.TP * 0.999 <= side * (float(tp_try) / float(lim) - 1) <= lv.TP + lv.TP_SLACK
             ctx = f"случай {case}: side {side} price {price} ref {ref} eq {self.ex.eq} ct {ct_val} usd {ct_usd} " \
                   f"lot {lot} min {min_sz} on {on} age {age} paused {paused} ручная {manual}"
             self.assertEqual(len(markets), int(should), ctx)
@@ -115,11 +119,12 @@ class PropsTest(Base):
             tp = Decimal(limits[0]["px"])
             self.assertEqual(limits[0]["sz"], m["sz"], ctx)
             self.assertEqual(tp % tick, 0, ctx)
-            want_tp = lv.round_step(price * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
+            self.assertEqual(Decimal(m["px"]), lim, ctx)
+            want_tp = lv.round_step(float(lim) * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
             self.assertEqual(tp, want_tp, ctx)
-            move = side * (float(tp) / price - 1)
+            move = side * (float(tp) / float(lim) - 1)
             self.assertGreaterEqual(move, lv.TP * 0.999999, ctx)
-            self.assertLessEqual(move, min(lv.TP + float(tick) / price + 1e-9, lv.TP + lv.TP_SLACK), ctx)
+            self.assertLessEqual(move, min(lv.TP + float(tick) / float(lim) + 1e-9, lv.TP + lv.TP_SLACK), ctx)
         # Проверка не пустая: заметная доля случаев дошла до входа.
         self.assertGreater(entered, PROPS // 20)
         self.assertGreater(shared, 0, "ни одного входа при ручной позиции — генератор не проверяет правило")
