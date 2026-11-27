@@ -6,7 +6,7 @@
 Свойства (рынок честный, параметры случайные; PROPS случаев):
   1. Вход — тогда и только тогда, когда: модуль включён, у бота нет своей
      позиции, ручной позиции владельца на этой же бумаге нет, сигнал свежий, в бумагу не входили 3 часа, цена OKX
-     сходится с ценой китов (±2 %) и не хуже её больше чем на 0,3 %,
+     сходится с ценой китов (±2 %) и не хуже её (CHASE),
      размер не меньше минимума бумаги.
   2. Размер — ровно floor(маржа × капитал × 10 / (контракт × цена) / шаг) × шаг,
      маржа всегда 5 %, и при ручной позиции владельца на счёте (контракт в
@@ -95,11 +95,12 @@ class PropsTest(Base):
             want_sz = (qty / lot).to_integral_value(rounding=ROUND_DOWN) * lot
             hl = price
             should = (on and manual != "same" and age <= 15 and not paused
-                      and self.ex.eq > 0 and abs(hl / ref - 1) <= lv.MATCH_TOL and side * (hl / ref - 1) <= lv.CHASE
+                      and self.ex.eq > 0 and abs(hl / ref - 1) <= lv.MATCH_TOL and side * (hl / ref - 1) <= lv.CHASE + lv.PX_EPS
                       and want_sz >= min_sz)
-            # Граница ордера — средняя китов ±0,3 % на шаге внутрь (ноль — не входим);
+            # Граница ордера — средняя китов ± CHASE (с допуском PX_EPS на погрешность
+            # дроби) на шаге внутрь (ноль — не входим);
             # исполнение — по цене сделки, тейк — от неё и на шаге.
-            lim = lv.round_step(ref * (1 + side * lv.CHASE), tick, ROUND_FLOOR if side > 0 else ROUND_CEILING)
+            lim = lv.round_step(ref * (1 + side * (lv.CHASE + lv.PX_EPS)), tick, ROUND_FLOOR if side > 0 else ROUND_CEILING)
             tp_try = lv.round_step(price * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
             should = should and lim > 0 and tp_try > 0 \
                 and lv.TP * 0.999 <= side * (float(tp_try) / price - 1) <= lv.TP + lv.TP_SLACK

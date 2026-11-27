@@ -542,7 +542,8 @@ class TradeTest(Base):
         live = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
         self.assertEqual([o["sz"] for o in live], ["10"])
     def test_chase_and_other_asset_and_stale(self) -> None:
-        cases = [(100_400, "цена ушла от китов"), (110_000, "другой актив"), (99_000, "")]
+        cases = [(100_400, "цена хуже средней цены китов"), (100_001, "цена хуже средней цены китов"), (110_000, "другой актив"),
+                 (99_000, "")]
         for okx_px, why in cases:
             self.ex = FakeOkx()
             self.ex.last["BTC-USDT-SWAP"] = okx_px
@@ -654,7 +655,7 @@ class SignalsTest(Base):
 class OrderTypeTest(Base):
     def test_entry_market_ioc_exit_limit_at_tp(self) -> None:
         """Правило владельца (27.11.2026): вход — по рынку ордером IOC с границей
-        «средняя китов ±0,3 %» (не гонимся за ценой); выход — лимитом по цене
+        «средняя цена китов» (не гонимся за ценой); выход — лимитом по цене
         тейка; по рынку бот закрывает только стоп и вслед за китом в убытке."""
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             self.ex = FakeOkx(mode)
@@ -665,7 +666,7 @@ class OrderTypeTest(Base):
             entries = [o for o in self.ex.orders if o["side"] == opening]
             exits = [o for o in self.ex.orders if o["side"] != opening]
             self.assertEqual([o["ordType"] for o in entries], ["ioc"], mode)
-            self.assertEqual(entries[0]["px"], "100300" if side > 0 else "99700", "граница — средняя китов ±0,3 %")
+            self.assertEqual(entries[0]["px"], "100000", "граница — средняя цена китов")
             self.assertEqual([o["ordType"] for o in exits], ["limit"], mode)
             self.assertEqual(float(exits[0]["px"]), tr.st["open"]["tp"])
             self.assertAlmostEqual(tr.st["open"]["tp"] / tr.st["open"]["px"], 1 + side * lv.TP)
@@ -1062,15 +1063,16 @@ class EntryOrderTest(Base):
         tr.step()
 
     def test_ioc_bound_is_whales_price_plus_chase_on_tick(self) -> None:
-        """Вход — по рынку, но не хуже средней цены китов ±0,3 % (граница на шаге
-        цены 0,7 — внутрь): лонг — 100 300 вниз (100 299,5), шорт — 99 700
-        вверх (99 700,3). Исполнение — по цене сделки (лучше границы)."""
+        """Вход — по рынку, но не хуже средней цены китов ± CHASE (здесь 0,3 %;
+        граница на шаге цены 0,7 — внутрь): лонг — 100 300 вниз (100 299,5),
+        шорт — 99 700 вверх (99 700,3). Исполнение — по цене сделки (лучше границы)."""
         for side, want in ((1, "100299.5"), (-1, "99700.3")):
             self.ex = FakeOkx()
             self.ex.instr["BTC-USDT-SWAP"]["tickSz"] = "0.7"
             tr = self.trader(self.whales(side=side))
             self.on()
-            tr.step()
+            with mock.patch.object(lv, "CHASE", 0.003):
+                tr.step()
             e = self.entry()
             self.assertEqual((e["ordType"], e["px"], e["side"]), ("ioc", want, "buy" if side > 0 else "sell"))
             self.assertAlmostEqual(self.state()["opens"][0]["px"], 100_000.0)
@@ -1123,6 +1125,24 @@ class EntryOrderTest(Base):
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
         self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
 
+    def test_zero_chase_bound_rounds_inward(self) -> None:
+        """CHASE = 0 (правило 27.11.2026): граница — ровно средняя цена китов, на
+        шаге цены внутрь: лонг — 99 999,9, шорт — 100 000,6 при шаге 0,7. Цена
+        рынка ровно на цене китов — хуже границы: IOC не исполнился, входа нет."""
+        for side, want in ((1, "99999.9"), (-1, "100000.6")):
+            self.ex = FakeOkx()
+            self.ex.instr["BTC-USDT-SWAP"]["tickSz"] = "0.7"
+            tr = self.trader(self.whales(side=side))
+            self.on()
+            tr.step()
+            e = self.entry()
+            self.assertEqual((e["ordType"], e["px"]), ("ioc", want))
+            st = self.state()
+            self.assertEqual((st["opens"], st["last_skip"]["code"]), ([], "limit_miss"))
+            self.assertTrue(any(f"не хуже {want} (средняя цена китов; маржа" in x for x in st["events"]))
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
+
     def test_price_ran_past_bound_is_a_miss(self) -> None:
         """Пока шёл ордер, цена ушла дальше 0,3 % от китов — IOC не исполнился
         (биржа сняла сразу): пропуск «limit_miss» в том же шаге, за ценой не
@@ -1140,7 +1160,7 @@ class EntryOrderTest(Base):
         tr.step()
         st = self.state()
         self.assertEqual((st["opens"], st["last_skip"]["code"]), ([], "limit_miss"))
-        self.assertIn("цена ушла дальше 0.3 % от китов", st["last_skip"]["why"])
+        self.assertIn("цена ушла хуже средней цены китов — вход не исполнился", st["last_skip"]["why"])
         self.assertNotIn("entering", st)
         self.assertEqual(self.ex.pos, [], "позиции нет")
 
@@ -1198,11 +1218,11 @@ class StopTest(Base):
     """Стоп — 3 % от цены входа (правило владельца 27.11.2026): лонг — ниже,
     шорт — выше; уровни на него не влияют. Стоп — на входе и не меняется.
     Цена дошла — снять тейк и закрыть по рынку только на закрытие; усреднения
-    нет. Цена входа 100 000: лонг — стоп 97 000, шорт — 103 000."""
+    нет. Цена входа 100 000: лонг — стоп 98 500, шорт — 101 500 (1,5 %)."""
 
     trades = WhaleExitTest.trades
     LEVELS: ClassVar[dict[int, tuple[float, float]]] = {1: (99_000.0, 103_000.0), -1: (97_000.0, 100_800.0)}
-    STOPS: ClassVar[dict[int, float]] = {1: 97_000.0, -1: 103_000.0}
+    STOPS: ClassVar[dict[int, float]] = {1: 98_500.0, -1: 101_500.0}
 
     def enter(self, mode: str = "net_mode", side: int = 1, levels: bool = True) -> lv.Trader:
         self.ex = FakeOkx(mode)
@@ -1265,20 +1285,20 @@ class StopTest(Base):
         """Уровней нет — стоп всё равно есть: 1,5 % от входа; до него — сидим,
         без доливки."""
         tr = self.enter(levels=False)
-        self.assertAlmostEqual(self.state()["open"]["stop"], 97_000.0)
+        self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0)
         for px in (98_600.0, 100_300.0, 98_501.0):
             self.price(px)
             self.sync(tr)
         self.assertEqual(self.exits(), [])
         self.assertEqual(len(self.market_orders()), 1, "усреднения нет — только вход")
-        self.price(97_000.0)
+        self.price(98_500.0)
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
 
     def test_far_level_stop_capped(self) -> None:
-        """Уровни любые (поддержка 90 000) — стоп всё равно 3 % от входа; шорт —
+        """Уровни любые (поддержка 90 000) — стоп всё равно 1,5 % от входа; шорт —
         зеркально."""
-        for side, levels, want in ((1, (90_000.0, 130_000.0), 97_000.0), (-1, (70_000.0, 110_000.0), 103_000.0)):
+        for side, levels, want in ((1, (90_000.0, 130_000.0), 98_500.0), (-1, (70_000.0, 110_000.0), 101_500.0)):
             self.ex = FakeOkx()
             self.ex.hl["BTC-USDT-SWAP"] = levels
             tr = self.trader(self.whales(side=side))
@@ -1290,12 +1310,12 @@ class StopTest(Base):
 
     def test_fixed_stop_rule(self) -> None:
         fs = lv.core.fixed_stop
-        self.assertAlmostEqual(fs(100.0, 1), 97.0)
-        self.assertAlmostEqual(fs(100.0, -1), 103.0)
+        self.assertAlmostEqual(fs(100.0, 1), 98.5)
+        self.assertAlmostEqual(fs(100.0, -1), 101.5)
         self.assertAlmostEqual(fs(100.0, 1, 0.05), 95.0)
         for px in (0.0, -1.0, float("nan"), float("inf")):
             self.assertEqual(fs(px, 1), 0.0, px)
-        self.assertAlmostEqual(lv.core.entry_stop(0.0, 0.0, 100.0, 1), 97.0, "за уровнем — по умолчанию не дальше 3 %")
+        self.assertAlmostEqual(lv.core.entry_stop(0.0, 0.0, 100.0, 1), 98.5, "за уровнем — по умолчанию не дальше 1,5 %")
 
     def test_entry_stop_rule(self) -> None:
         """Стоп за уровнем (вариант бэктеста), здесь — не дальше 1,5 %."""
@@ -1715,7 +1735,7 @@ class RatingTest(Base):
         self.on()
         tr.step()
         self.assertEqual(len(self.market_orders()), 1)
-        self.assertAlmostEqual(self.state()["open"]["stop"], 97_000.0, msg="стоп — и у приоритетного, 3 % от входа")
+        self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0, msg="стоп — и у приоритетного, 1,5 % от входа")
         self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [], "MA не спрашиваем")
 
     def test_priority_still_respects_chase(self) -> None:

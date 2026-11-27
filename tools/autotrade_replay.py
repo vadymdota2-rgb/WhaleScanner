@@ -274,7 +274,8 @@ class Trade:
     pnl: float          # $ с комиссиями
     why: str            # тейк / стоп / кит вышел в убыток / открыта
     mae: float          # худший ход против нас внутри сделки, $
-    wallets: tuple[str, ...] = ()   # киты сигнала — для рейтинга
+    wallets: tuple[str, ...]        # киты сигнала — для рейтинга
+    fees: float                     # $ комиссий входа и выхода (уже в pnl)
 
     @property
     def open(self) -> bool:
@@ -301,12 +302,13 @@ class Rules:
 # Сравнение (--variants): что дало бы одно изменение правил на тех же китах —
 # чтобы менять тейк, стоп и фильтры по данным, а не наугад.
 VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1 %", tp=0.01), Rules("тейк +1,5 %", tp=0.015),
-            Rules("стоп 1,5 %", stop_max=0.015), Rules("стоп 5 %", stop_max=0.05),
-            Rules("стоп за уровнем, не дальше 3 %", at_level=True),
+            Rules("стоп 1 %", stop_max=0.01), Rules("стоп 3 %", stop_max=0.03),
+            Rules("тейк +1,5 % и стоп 3 %", tp=0.015, stop_max=0.03),
+            Rules("стоп за уровнем, не дальше 1,5 %", at_level=True),
             Rules("стоп только за уровнем", at_level=True, stop_max=math.inf),
             Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False), Rules("1 позиция", max_open=1),
             Rules("пауза бумаги 30 мин", pause_ms=30 * 60_000), Rules("вход лимитом (мейкер, 5 мин)", limit=True),
-            Rules("вход не хуже цены китов", chase=0.0), Rules("против китов", flip=True))
+            Rules("догоняем до 0,3 %", chase=0.003), Rules("против китов", flip=True))
 
 
 # Разбор сигналов (--variants): куда идёт цена после сигнала — в сторону
@@ -411,7 +413,7 @@ class Replay:
         if abs(hl_px / s["ref_px"] - 1) > lv.MATCH_TOL:
             return "other_asset"
         side = -s["side"] if self.rules.flip else s["side"]   # сторона сделки
-        if side * (hl_px / s["ref_px"] - 1) > self.rules.chase:
+        if side * (hl_px / s["ref_px"] - 1) > self.rules.chase + lv.PX_EPS:
             return "chase"
         lo, hi = self.cached(("lvl", inst, now), lambda: self.range_levels(inst, now))
         if self.rules.levels and not prio and core.level_ok(lo, hi, last, side) is False:
@@ -502,7 +504,7 @@ class Replay:
             heapq.heappush(self.closing, (t_out, len(self.trades)))
         self.busy.append((t_out if why != "открыта" else 10**18, inst))
         self.trades.append(Trade(s["coin"], side, start, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae,
-                                 tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str)))))
+                                 tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str))), fees))
         return True
 
     def study_signal(self, s: dict[str, Any], now: int) -> None:
@@ -708,6 +710,7 @@ def stats(trades: Sequence[Trade]) -> dict[str, Any]:
             "avg_win": round(sum(wins) / len(wins), 2) if wins else 0.0,
             "avg_loss": round(sum(losses) / len(losses), 2) if losses else 0.0,
             "pf": round(sum(wins) / gl, 3) if gl > 0 else None, "net": round(sum(pnl), 2), "max_dd": round(dd, 2),
+            "fees": round(sum(t.fees for t in trades), 2),
             "worst_streak": worst, "worst_streak_usd": round(worst_usd, 2),
             "open": sum(t.open for t in trades), "unrealized": round(sum(t.pnl for t in trades if t.open), 2),
             "max_mae": round(max((t.mae for t in trades), default=0.0), 2),
@@ -799,12 +802,21 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
-def variant_row(r: Rules, st: dict[str, Any], days: float) -> dict[str, Any]:
-    """Строка сравнения: настройки варианта, его итог и сделок в месяц (30 дней)."""
+def halves(trades: Sequence[Trade], since: int, now: int) -> list[float]:
+    """Итог первой и второй половины периода (по времени входа): вариант,
+    лучший в обеих, — не случайность одного удачного отрезка."""
+    mid = since + (now - since) // 2
+    return [round(sum((t.pnl for t in trades if t.entry_t < mid), 0.0), 2),
+            round(sum((t.pnl for t in trades if t.entry_t >= mid), 0.0), 2)]
+
+
+def variant_row(r: Rules, st: dict[str, Any], days: float, half: Sequence[float] = ()) -> dict[str, Any]:
+    """Строка сравнения: настройки варианта, его итог, сделок в месяц (30
+    дней), комиссии (итог до них — net + fees) и итог по половинам периода."""
     return {"name": r.name, "tp_pct": round(r.tp * 100, 3), "per_month": round(st["trades"] / max(days, 1.0) * 30, 1),
             "stop_max_pct": round(r.stop_max * 100, 3) if math.isfinite(r.stop_max) else None,
-            "levels": r.levels, "ma": r.ma,
-            **{k: st[k] for k in ("trades", "win_pct", "net", "pf", "max_dd", "open")}}
+            "levels": r.levels, "ma": r.ma, "halves": list(half),
+            **{k: st[k] for k in ("trades", "win_pct", "net", "pf", "max_dd", "open", "fees")}}
 
 
 def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = None) -> dict[str, Any]:
@@ -841,7 +853,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     s["edge"] = rp.study.rows() if rp.study is not None else []
     if alts:
         days = (now - since) / core.DAY_MS
-        s["variants"] = [variant_row(x.rules, stats(x.trades), days) for x in (rp, *alts)]
+        s["variants"] = [variant_row(x.rules, stats(x.trades), days, halves(x.trades, since, now)) for x in (rp, *alts)]
 
     def fmt(ms: float) -> str:
         return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -854,7 +866,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         "Бэктест-повтор по актуальным правилам живого бота",
         f"Период: {fmt(since)} — {fmt(now)}; капитал {a.deposit:.2f} $ → {rp.equity:.2f} $ (закрытые сделки); "
         f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, "
-        f"стоп {core.STOP_PCT * 100:g} % от входа, "
+        f"стоп {core.STOP_PCT * 100:g} % от входа, вход по рынку не хуже средней цены китов"
+        f"{lv.chase_text('+')}, "
         "выход вслед за китом в убытке.",
         "Весь период: " + line(s["full"]),
         "Первые 3/4: " + line(s["first"]),
@@ -863,7 +876,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         f"Запросов к OKX: {rp.requests()} (часовых — {hours.requests})"
         + (f", сбоев: {prices.errors + hours.errors}" if prices.errors + hours.errors else ""),
         *(["", "Варианты (те же киты, одно изменение правил):"] if s["variants"] else []),
-        *(f"  {v['name']}: " + line(v) + f", в месяц ≈ {v['per_month']:g}" for v in s["variants"]),
+        *(f"  {v['name']}: " + line(v) + f", в месяц ≈ {v['per_month']:g}, комиссии {v['fees']:.2f} $, "
+          f"половины: {v['halves'][0]:+.2f} / {v['halves'][1]:+.2f} $" for v in s["variants"]),
         *(["", "Куда идёт цена после сигнала (в сторону китов, %: 15 мин / 1 ч / 4 ч / 24 ч; доля в сторону китов за 1 ч):"]
           if s["edge"] else []),
         *(f"  {e['key']} ({e['n']}): {e['r15m']} / {e['r1h']} / {e['r4h']} / {e['r24h']}; {e['up1h']} %" for e in s["edge"]),
