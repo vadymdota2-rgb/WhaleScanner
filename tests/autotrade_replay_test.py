@@ -119,9 +119,9 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.why, t.coin, t.side), ("тейк", "BTC", 1))
         self.assertGreater(t.pnl, 0)
-        # 5 % × 20 000 × 10 = 10 000 $ = 0,1 BTC лимитом по 100 000; тейк 101 000: +100 $
+        # 5 % × 20 000 × 10 = 10 000 $ = 0,1 BTC лимитом по 100 000; тейк 100 800: +80 $
         # минус мейкер 0,02 % на входе и на выходе (без проскальзывания).
-        self.assertAlmostEqual(t.pnl, 100 - 0.1 * (100_000 + 101_000) * 0.0002, delta=0.02)
+        self.assertAlmostEqual(t.pnl, 80 - 0.1 * (100_000 + 100_800) * 0.0002, delta=0.02)
         s = r["summary"]
         self.assertEqual((s["full"]["trades"], s["sizing"]["margin_pct"], s["trades"][0]["why"]), (1, 5.0, "тейк"))
         self.assertGreater(s["sizing"]["deposit_end"], s["sizing"]["deposit"])
@@ -143,11 +143,11 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, step_price(100_000, [(T + 90 * MIN, 0.012)]))
         self.assertEqual(r["trades"][0].why, "тейк")
 
-    def test_stop_beyond_level(self) -> None:
-        """Стоп за уровнем входа (как у живого бота): за сутки до сигнала — 99 000
-        и 103 000 (раньше окна MA30 — она ровная), цена 100 000 (лонг у поддержки) → стоп 99 000 × 0,995 = 98 505.
-        Свеча открылась за стопом — по её открытию; задела стоп — по цене стопа;
-        98 600 — держим; уровней не было — стопа нет."""
+    def test_stop_3_percent(self) -> None:
+        """Стоп — 3 % от цены входа (как у живого бота; уровни 99 000–103 000 не
+        влияют): вход 100 000 → стоп 97 000. Свеча открылась за стопом — по её
+        открытию; задела стоп — по цене стопа; 97 100 — держим, потом тейк;
+        уровней нет — тот же стоп."""
         H = 60 * MIN
 
         def hist(after):
@@ -157,40 +157,40 @@ class ReplayTest(unittest.TestCase):
                 return after(t)
             return f
 
-        r = self.go(self.whales(), hist(lambda t: 98_000.0 if t >= T + 20 * MIN else 100_000.0))
+        r = self.go(self.whales(), hist(lambda t: 96_000.0 if t >= T + 20 * MIN else 100_000.0))
         [t] = r["trades"]
         self.assertEqual(t.why, "стоп")
-        self.assertAlmostEqual(t.exit_px, 98_000 * 0.9995, delta=1, msg="свеча открылась за стопом — по её открытию")
+        self.assertAlmostEqual(t.exit_px, 96_000 * 0.9995, delta=1, msg="свеча открылась за стопом — по её открытию")
         os.remove(self.db)
         self.cache += "2"
-        r = self.go(self.whales(), hist(lambda t: 101_200.0 if t >= T + 90 * MIN else 98_600.0 if t >= T + 20 * MIN else 100_000.0))
-        self.assertEqual([t.why for t in r["trades"]], ["тейк"], "98 600 — выше стопа")
+        r = self.go(self.whales(), hist(lambda t: 100_900.0 if t >= T + 90 * MIN else 97_100.0 if t >= T + 20 * MIN else 100_000.0))
+        self.assertEqual([t.why for t in r["trades"]], ["тейк"], "97 100 — выше стопа")
         os.remove(self.db)
         self.cache += "3"
-        r = self.go(self.whales(), hist(lambda t: 98_400.0 if T + 20 * MIN < t < T + 25 * MIN else 100_000.0))
+        r = self.go(self.whales(), hist(lambda t: 96_000.0 if T + 21 * MIN <= t < T + 25 * MIN else 100_000.0))
         [t] = r["trades"]
         self.assertEqual(t.why, "стоп")
-        self.assertAlmostEqual(t.exit_px, 98_505 * 0.9995, delta=1, msg="по цене стопа")
+        self.assertAlmostEqual(t.exit_px, 97_000 * 0.9995, delta=1, msg="по цене стопа")
         os.remove(self.db)
         self.cache += "4"
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.014)]))   # сутки ровно 100 000 — уровней нет
-        self.assertEqual([t.why for t in r["trades"]], ["открыта"], "уровней нет — стоп 1,5 %: −1,4 % — держим")
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.029)]))   # сутки ровно 100 000 — уровней нет
+        self.assertEqual([t.why for t in r["trades"]], ["открыта"], "−2,9 % — держим")
         os.remove(self.db)
         self.cache += "5"
-        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.016)]))
+        r = self.go(self.whales(), step_price(100_000, [(T + 20 * MIN, -0.031)]))
         [t] = r["trades"]
-        self.assertEqual(t.why, "стоп", "уровней нет — стоп 1,5 % от входа")
-        self.assertAlmostEqual(t.exit_px, 98_400 * 0.9995, delta=1, msg="свеча открылась за стопом")
+        self.assertEqual(t.why, "стоп", "уровней нет — стоп 3 % от входа")
+        self.assertAlmostEqual(t.exit_px, 96_900 * 0.9995, delta=1, msg="свеча открылась за стопом")
 
     def test_variants_one_change_each(self) -> None:
-        """--variants: те же киты по 7 вариантам правил (по одному изменению).
-        Цена +1,2 %: тейк +0,5 % и +1 % — тейк, +1,5 % — не дошла (открыта).
+        """--variants: те же киты по вариантам правил (по одному изменению).
+        Цена +1,2 %: тейк +0,5 %, +0,8 % и +1 % — тейк, +1,5 % — не дошла (открыта).
         Без вариантов — список пуст, повтор один."""
         r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]), variants=True)
         v = {x["name"]: x for x in r["summary"]["variants"]}
         self.assertEqual(list(v), ["текущие правила", *(x.name for x in rp.VARIANTS)])
         self.assertEqual((v["текущие правила"]["trades"], v["текущие правила"]["net"]), (1, r["summary"]["full"]["net"]))
-        self.assertEqual((v["текущие правила"]["tp_pct"], v["текущие правила"]["stop_max_pct"]), (1.0, 1.5))
+        self.assertEqual((v["текущие правила"]["tp_pct"], v["текущие правила"]["stop_max_pct"]), (0.8, 3.0))
         self.assertEqual(v["тейк +1,5 %"]["open"], 1)
         self.assertEqual(v["тейк +0,5 %"]["open"], 0)
         self.assertLess(v["тейк +0,5 %"]["net"], v["текущие правила"]["net"])
@@ -207,8 +207,9 @@ class ReplayTest(unittest.TestCase):
         self.assertNotIn("Варианты", r["text"])
 
     def test_variants_stop_and_filters(self) -> None:
-        """Поддержка далеко (стоп за ней — 89 550), цена дошла до 98 450:
-        стоп до 1 % и 1,5 % — стоп; до 2,5 % и «только за уровнем» — сидим.
+        """Поддержка далеко (стоп за ней — 89 550), цена дошла до 98 400 (−1,6 %):
+        стоп 1,5 % — стоп; 3 % (сейчас), 5 %, «за уровнем, не дальше 3 %» и
+        «только за уровнем» — сидим.
         Лонг у сопротивления — «без уровней 4ч» входит; MA30 выше цены —
         «без MA30» входит."""
         H = 60 * MIN
@@ -216,12 +217,23 @@ class ReplayTest(unittest.TestCase):
         def far(c: str, t: int) -> float:
             if t < T:
                 return 90_000.0 if T - 16 * H <= t < T - 12 * H else 130_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
-            return 98_450.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
+            return 98_400.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
 
         v = {x["name"]: x for x in self.go(self.whales(), far, variants=True)["summary"]["variants"]}
-        self.assertEqual([v[n]["open"] for n in ("текущие правила", "стоп не дальше 1 %", "стоп не дальше 2,5 %",
-                                                 "стоп только за уровнем")], [0, 0, 1, 1])
-        self.assertLess(v["стоп не дальше 1 %"]["net"], 0)
+        self.assertEqual([v[n]["open"] for n in ("текущие правила", "стоп 1,5 %", "стоп 5 %", "стоп за уровнем, не дальше 3 %",
+                                                 "стоп только за уровнем")], [1, 0, 1, 1, 1])
+        self.assertLess(v["стоп 1,5 %"]["net"], 0)
+        os.remove(self.db)
+        self.cache += "1"
+
+        def near(c: str, t: int) -> float:   # поддержка 99 000 — стоп за ней 98 505, ближе 3 %
+            if t < T:
+                return 99_000.0 if T - 16 * H <= t < T - 12 * H else 130_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
+            return 98_400.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
+
+        v = {x["name"]: x for x in self.go(self.whales(), near, variants=True)["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["open"], v["стоп за уровнем, не дальше 3 %"]["open"]), (1, 0),
+                         "за уровнем — стоп 98 505 сработал; 3 % от входа — сидим")
         os.remove(self.db)
         self.cache += "2"
 
@@ -277,8 +289,8 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(one_pass[rules.name], want, rules.name)
 
     def test_priority_whale_is_per_variant(self) -> None:
-        """Рейтинг у каждого варианта свой: при тейке +0,3 % пять сделок с 0xa —
-        в плюс (+0,4 %), 0xa приоритетный; у основного (тейк +1 %) первая
+        """Рейтинг у каждого варианта свой: при тейке +0,5 % пять сделок с 0xa —
+        в плюс (+0,6 %), 0xa приоритетный; у основного (тейк +0,8 %) первая
         сделка не закрыта — рейтинга нет. Потом 0xa один в SOL: вариант входит,
         основной сигнала не видит (его пропуски — как без вариантов); 0xa и
         0xc в ETH у сопротивления: вариант входит (приоритетный — мимо
@@ -298,12 +310,12 @@ class ReplayTest(unittest.TestCase):
                     if e <= ts < e + 10 * MIN:
                         return 100_000.0              # вход — у поддержки
                     if e + 10 * MIN <= ts < e + 30 * MIN:
-                        return 100_400.0
+                        return 100_600.0
                 return 99_000.0                       # MA30 ниже цены входа
             if late - 28 * H <= ts < late - 24 * H:
                 return base * 0.88                    # поддержка 4 дня
             if ts >= late - 24 * H:
-                return base * (1.004 if (late + 10 * MIN <= ts < late + 30 * MIN
+                return base * (1.006 if (late + 10 * MIN <= ts < late + 30 * MIN
                                          or late + 2 * H + 10 * MIN <= ts < late + 2 * H + 30 * MIN) else 1.0)
             return base * 1.01                        # сопротивление: цена 1,0 — у самого верха
 
@@ -317,7 +329,7 @@ class ReplayTest(unittest.TestCase):
         rows.sort(key=lambda r: r[4])
         r = self.go(rows, price, variants=True)
         v = {x["name"]: x for x in r["summary"]["variants"]}
-        self.assertEqual(v["тейк +0,3 %"]["trades"], 7, "5 BTC, ETH и SOL — с приоритетным")
+        self.assertEqual(v["тейк +0,5 %"]["trades"], 7, "5 BTC, ETH и SOL — с приоритетным")
         self.assertEqual(v["текущие правила"]["trades"], 1, "основной: BTC открыт, ETH — у сопротивления")
         self.assertGreater(r["skips"].get("level", 0), 0)
         with_variants = r["skips"]
@@ -366,16 +378,16 @@ class ReplayTest(unittest.TestCase):
 
     def test_against_whales_variants(self) -> None:
         """«Против китов»: сторона сделки — обратная сигналу. Киты в лонг, цена
-        упала на 1,6 %: с китами — стоп, против — тейк; выхода вслед за китом
+        упала на 3,2 %: с китами — стоп, против — тейк; выхода вслед за китом
         у «против» нет (кит закрылся в убытке — нам это в плюс)."""
         # 0xa закрыл ещё и шорт в убытке: для сделки «против» (шорт) это не выход.
         rows = [*self.whales(), cls(9, "0xa", "BTC", -1, T + 15 * MIN, -100.0)]
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.016)]), variants=True)
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.032)]), variants=True)
         v = {x["name"]: x for x in r["summary"]["variants"]}
         [t] = r["trades"]
         self.assertEqual((t.side, t.why), (1, "стоп"))
         self.assertLess(v["текущие правила"]["net"], 0)
-        for name in ("против китов", "против китов: тейк 1,5 %, стоп до 1 %", "против китов, вход рынком"):
+        for name in ("против китов", "против китов, вход рынком"):
             self.assertEqual(v[name]["trades"], 1, name)
             self.assertGreater(v[name]["net"], 0, name)
             self.assertEqual(v[name]["win_pct"], 100.0, name)
@@ -426,19 +438,31 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, price)
         self.assertEqual(r["summary"]["edge"], [], "без --variants — разбора нет")
 
-    def test_far_level_stop_capped(self) -> None:
-        """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 1,5 % от
-        цены входа с проскальзыванием не считая (100 000 → 98 500)."""
+    def test_entry_not_worse_than_whales_variant(self) -> None:
+        """«Вход не хуже цены китов»: цена выше их средней на 0,2 % — обычно
+        вход (до 0,3 %), этот вариант — нет; цена ниже их средней — входят оба."""
+        r = self.go(self.whales(), step_price(100_200, [(T + 60 * MIN, 0.012)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["вход не хуже цены китов"]["trades"]), (1, 0))
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), step_price(99_900, [(T + 60 * MIN, 0.012)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["вход не хуже цены китов"]["trades"]), (1, 1))
+
+    def test_stop_ignores_far_levels(self) -> None:
+        """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 3 % от цены
+        входа (100 000 → 97 000)."""
         H = 60 * MIN
 
         def f(c: str, t: int) -> float:
             if t < T:
                 return 90_000.0 if T - 16 * H <= t < T - 12 * H else 130_000.0 if T - 24 * H <= t < T - 20 * H else 100_000.0
-            return 98_450.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
+            return 96_950.0 if T + 20 * MIN <= t < T + 25 * MIN else 100_000.0
 
         [t] = self.go(self.whales(), f)["trades"]
         self.assertEqual(t.why, "стоп", "за уровнем стоп был бы 89 550 — сидели бы")
-        self.assertAlmostEqual(t.exit_px, 98_450 * 0.9995, delta=1, msg="свеча открылась за стопом 98 500")
+        self.assertAlmostEqual(t.exit_px, 96_950 * 0.9995, delta=1, msg="свеча открылась за стопом 97 000")
 
     def test_levels_24h(self) -> None:
         """Уровни: минимум и максимум цены за 24 часа до решения. Был минимум
@@ -607,7 +631,7 @@ class ReplayTest(unittest.TestCase):
         v = {x["name"]: x for x in r["summary"]["variants"]}
         self.assertEqual(v["вход рынком"]["trades"], 1)
         self.assertLess(v["вход рынком"]["net"], v["текущие правила"]["net"], "тейкер и проскальзывание — дороже")
-        self.assertAlmostEqual(v["вход рынком"]["net"], 100 - 10_000 * (0.0005 + 0.0002), delta=0.1)
+        self.assertAlmostEqual(v["вход рынком"]["net"], 80 - 10_000 * (0.0005 + 0.0002), delta=0.1)
         os.remove(self.db)
         self.cache += "2"
         r = self.go(self.whales(), step_price(100_000, [(T + 5 * MIN, 0.012)]), variants=True)

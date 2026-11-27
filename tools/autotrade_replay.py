@@ -23,10 +23,9 @@
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск); вход — лимитом по цене решения (мейкер): исполнится,
   если за 5 минут после решения цена до него дошла, иначе — пропуск;
-- выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (0,5 % за
-  уровнем входа: ниже поддержки для лонга, выше сопротивления для шорта, но
-  не дальше core.STOP_MAX от входа; уровней нет — STOP_MAX) или кит сигнала
-  закрыл в убыток; усреднения нет.
+- выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (core.STOP_PCT
+  от цены входа; вариант — за уровнем) или кит сигнала закрыл в убыток;
+  усреднения нет.
 
 Цены — 5-минутные свечи OKX (публичное API, без ключа; история — годы, по
 100 свечей за запрос), только под кандидатов и сделки, с кешем блоками по
@@ -287,7 +286,9 @@ class Rules:
     бота; варианты (VARIANTS) — по одному изменению, на тех же сделках китов."""
     name: str = "текущие правила"
     tp: float = lv.TP
-    stop_max: float = core.STOP_MAX   # бесконечность — стоп только за уровнем
+    stop_max: float = core.STOP_PCT   # стоп, доля от входа (за уровнем — предел; бесконечность — только уровень)
+    at_level: bool = False            # стоп за уровнем 4ч (не дальше stop_max), а не ровно stop_max от входа
+    chase: float = lv.CHASE           # не хуже средней цены китов больше чем на эту долю
     levels: bool = True               # фильтр уровней 4ч (стоп за уровнем — всегда)
     ma: bool = True                   # фильтр MA30 15м
     max_open: int = lv.MAX_OPEN       # своих позиций одновременно
@@ -298,15 +299,14 @@ class Rules:
 
 # Сравнение (--variants): что дало бы одно изменение правил на тех же китах —
 # чтобы менять тейк, стоп и фильтры по данным, а не наугад.
-VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1,5 %", tp=0.015),
-            Rules("стоп не дальше 1 %", stop_max=0.01), Rules("стоп не дальше 2,5 %", stop_max=0.025),
-            Rules("стоп только за уровнем", stop_max=math.inf),
-            Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False),
-            Rules("тейк +0,3 %", tp=0.003), Rules("1 позиция", max_open=1),
+VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1 %", tp=0.01), Rules("тейк +1,5 %", tp=0.015),
+            Rules("стоп 1,5 %", stop_max=0.015), Rules("стоп 5 %", stop_max=0.05),
+            Rules("стоп за уровнем, не дальше 3 %", at_level=True),
+            Rules("стоп только за уровнем", at_level=True, stop_max=math.inf),
+            Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False), Rules("1 позиция", max_open=1),
             Rules("пауза бумаги 30 мин", pause_ms=30 * 60_000), Rules("вход рынком", limit=False),
-            Rules("скальпинг: тейк +0,3 %, стоп до 1 %, пауза 30 мин", tp=0.003, stop_max=0.01, pause_ms=30 * 60_000),
-            Rules("против китов", flip=True), Rules("против китов: тейк 1,5 %, стоп до 1 %", flip=True, tp=0.015, stop_max=0.01),
-            Rules("против китов, вход рынком", flip=True, limit=False))
+            Rules("вход не хуже цены китов", chase=0.0),
+            Rules("против китов", flip=True), Rules("против китов, вход рынком", flip=True, limit=False))
 
 
 # Разбор сигналов (--variants): куда идёт цена после сигнала — в сторону
@@ -411,7 +411,7 @@ class Replay:
         if abs(hl_px / s["ref_px"] - 1) > lv.MATCH_TOL:
             return "other_asset"
         side = -s["side"] if self.rules.flip else s["side"]   # сторона сделки
-        if side * (hl_px / s["ref_px"] - 1) > lv.CHASE:
+        if side * (hl_px / s["ref_px"] - 1) > self.rules.chase:
             return "chase"
         lo, hi = self.cached(("lvl", inst, now), lambda: self.range_levels(inst, now))
         if self.rules.levels and not prio and core.level_ok(lo, hi, last, side) is False:
@@ -431,7 +431,9 @@ class Replay:
         tp_try = lv.round_step(last * (1 + side * tp), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not tp * 0.999 <= side * (float(tp_try) / last - 1) <= tp + lv.TP_SLACK:
             return "tick"
-        if not self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, side, self.rules.stop_max), side):
+        stop = core.entry_stop(lo, hi, last, side, self.rules.stop_max) if self.rules.at_level \
+            else core.fixed_stop(last, side, self.rules.stop_max)
+        if not self.open_trade(s, inst, ins, sz, last, now, stop, side):
             return "limit_miss"
         return ""
 
@@ -471,7 +473,7 @@ class Replay:
                 fees += qty * px_out * a.fee_taker / 100
                 break
             worst = lo if side > 0 else h
-            # Стоп входа (за уровнем, не дальше STOP_MAX) — по рынку (бот видит
+            # Стоп входа (3 % от входа; вариант — за уровнем) — по рынку (бот видит
             # на сверке; цена — стоп или хуже, если свеча открылась уже за ним).
             # Раньше тейка в той же свече — хуже для нас.
             if stop > 0 and side * (worst - stop) <= 0:
@@ -846,8 +848,8 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     text = "\n".join([
         "Бэктест-повтор по актуальным правилам живого бота",
         f"Период: {fmt(since)} — {fmt(now)}; капитал {a.deposit:.2f} $ → {rp.equity:.2f} $ (закрытые сделки); "
-        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, стоп — {core.LEVEL_STOP_BEYOND * 100:g} % за уровнем входа, "
-        f"не дальше {core.STOP_MAX * 100:g} % от входа, "
+        f"маржа {lv.MARGIN_FRAC * 100:g} % × {lv.LEVERAGE}×, тейк +{lv.TP * 100:g} %, "
+        f"стоп {core.STOP_PCT * 100:g} % от входа, "
         "выход вслед за китом в убытке.",
         "Весь период: " + line(s["full"]),
         "Первые 3/4: " + line(s["first"]),

@@ -458,9 +458,9 @@ class TradeTest(Base):
         self.assertIn(("POST", "/api/v5/account/set-leverage", {"instId": "BTC-USDT-SWAP", "lever": "10", "mgnMode": "cross"}),
                       self.ex.calls)
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"], tp["sz"], tp["reduceOnly"]), ("sell", "101000", "10", True))
+        self.assertEqual((tp["side"], tp["px"], tp["sz"], tp["reduceOnly"]), ("sell", "100800", "10", True))
         st = self.state()
-        self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 101000.0))
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"]), ("BTC-USDT-SWAP", 100800.0))
         tr.sync()
         tr.save()
         self.assertEqual(set(self.state()["positions"][0]), {"instId", "upl"},
@@ -567,7 +567,7 @@ class TradeTest(Base):
         # 10 000 $ / (10 000 000 PEPE × 0,00001 $) = 100 контрактов.
         self.assertEqual((m["instId"], m["side"], m["posSide"], m["sz"]), ("PEPE-USDT-SWAP", "sell", "short", "100"))
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["posSide"], tp["px"]), ("buy", "short", "0.0000099"))
+        self.assertEqual((tp["side"], tp["posSide"], tp["px"]), ("buy", "short", "0.00000992"))
         self.assertNotIn("reduceOnly", tp)
 
     def test_close_records_trade_cancels_tp_then_pause_3h(self) -> None:
@@ -579,7 +579,7 @@ class TradeTest(Base):
         self.now += 30 * MIN
         self.ex.pos = []
         self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "88.5",
-                            "closeAvgPx": "101000", "fee": "-9", "fundingFee": "-2.5"}]
+                            "closeAvgPx": "100800", "fee": "-9", "fundingFee": "-2.5"}]
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
@@ -1087,9 +1087,9 @@ class LimitEntryTest(Base):
         self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
         self.sync(tr, 1)
         [op] = self.state()["opens"]
-        self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 101_000.0))
+        self.assertEqual((op["size"], op["px"], op["tp"]), (10.0, 100_000.0, 100_800.0))
         self.assertNotIn("entering", self.state())
-        self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["101000"])
+        self.assertEqual([o["px"] for o in self.ex.orders if o["ordType"] == "limit"], ["100800"])
 
     def test_timeout_keeps_filled_part(self) -> None:
         """Исполнилось 6 из 10, 5 минут прошли — остаток снят, позиция — 6,
@@ -1195,16 +1195,14 @@ class LimitEntryTest(Base):
             self.ex = FakeOkx()
 
 class StopTest(Base):
-    """Стоп — за уровнем, от которого вошли: лонг — на 0,5 % ниже поддержки
-    (минимум 24 свечей 4ч на входе), шорт — на 0,5 % выше сопротивления
-    (максимум), но не дальше 1,5 % от входа (ближний); уровней нет — 1,5 %.
-    Стоп — на входе и не меняется. Цена дошла — снять тейк и закрыть по рынку
-    только на закрытие; усреднения нет. Цена входа 100 000. Лонг: уровни
-    99 000–103 000 → стоп 98 505; шорт: 97 000–100 800 → 101 304."""
+    """Стоп — 3 % от цены входа (правило владельца 27.11.2026): лонг — ниже,
+    шорт — выше; уровни на него не влияют. Стоп — на входе и не меняется.
+    Цена дошла — снять тейк и закрыть по рынку только на закрытие; усреднения
+    нет. Цена входа 100 000: лонг — стоп 97 000, шорт — 103 000."""
 
     trades = WhaleExitTest.trades
     LEVELS: ClassVar[dict[int, tuple[float, float]]] = {1: (99_000.0, 103_000.0), -1: (97_000.0, 100_800.0)}
-    STOPS: ClassVar[dict[int, float]] = {1: 98_505.0, -1: 101_304.0}
+    STOPS: ClassVar[dict[int, float]] = {1: 97_000.0, -1: 103_000.0}
 
     def enter(self, mode: str = "net_mode", side: int = 1, levels: bool = True) -> lv.Trader:
         self.ex = FakeOkx(mode)
@@ -1259,7 +1257,7 @@ class StopTest(Base):
         """Уровни после входа сдвинулись (новый минимум 95 000) — стоп прежний."""
         tr = self.enter()
         self.ex.hl["BTC-USDT-SWAP"] = (95_000.0, 103_000.0)
-        self.price(98_000.0)
+        self.price(96_900.0)
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
 
@@ -1267,20 +1265,20 @@ class StopTest(Base):
         """Уровней нет — стоп всё равно есть: 1,5 % от входа; до него — сидим,
         без доливки."""
         tr = self.enter(levels=False)
-        self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0)
+        self.assertAlmostEqual(self.state()["open"]["stop"], 97_000.0)
         for px in (98_600.0, 100_300.0, 98_501.0):
             self.price(px)
             self.sync(tr)
         self.assertEqual(self.exits(), [])
         self.assertEqual(len(self.market_orders()), 1, "усреднения нет — только вход")
-        self.price(98_500.0)
+        self.price(97_000.0)
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
 
     def test_far_level_stop_capped(self) -> None:
-        """Уровень далеко (поддержка 90 000 — стоп за ней был бы в 10,5 %) —
-        стоп не дальше 1,5 % от входа; шорт — зеркально."""
-        for side, levels, want in ((1, (90_000.0, 130_000.0), 98_500.0), (-1, (70_000.0, 110_000.0), 101_500.0)):
+        """Уровни любые (поддержка 90 000) — стоп всё равно 3 % от входа; шорт —
+        зеркально."""
+        for side, levels, want in ((1, (90_000.0, 130_000.0), 97_000.0), (-1, (70_000.0, 110_000.0), 103_000.0)):
             self.ex = FakeOkx()
             self.ex.hl["BTC-USDT-SWAP"] = levels
             tr = self.trader(self.whales(side=side))
@@ -1290,8 +1288,20 @@ class StopTest(Base):
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
 
+    def test_fixed_stop_rule(self) -> None:
+        fs = lv.core.fixed_stop
+        self.assertAlmostEqual(fs(100.0, 1), 97.0)
+        self.assertAlmostEqual(fs(100.0, -1), 103.0)
+        self.assertAlmostEqual(fs(100.0, 1, 0.05), 95.0)
+        for px in (0.0, -1.0, float("nan"), float("inf")):
+            self.assertEqual(fs(px, 1), 0.0, px)
+        self.assertAlmostEqual(lv.core.entry_stop(0.0, 0.0, 100.0, 1), 97.0, "за уровнем — по умолчанию не дальше 3 %")
+
     def test_entry_stop_rule(self) -> None:
-        st = lv.core.entry_stop
+        """Стоп за уровнем (вариант бэктеста), здесь — не дальше 1,5 %."""
+        def st(lo: float, hi: float, px: float, side: int, most: float = 0.015) -> float:
+            return lv.core.entry_stop(lo, hi, px, side, most)
+
         self.assertAlmostEqual(st(99.0, 120.0, 100.0, 1), 99.0 * 0.995, msg="уровень ближе 1,5 % — за уровнем")
         self.assertAlmostEqual(st(80.0, 100.9, 100.0, -1), 100.9 * 1.005)
         self.assertAlmostEqual(st(90.0, 120.0, 100.0, 1), 98.5, msg="уровень дальше — 1,5 % от входа")
@@ -1344,29 +1354,29 @@ class StopTest(Base):
         self.sync(tr)
         self.assertEqual(self.exits(), [])
         self.assertIsNotNone(self.state()["open"])
-        self.ex.last["BTC-USDT-SWAP"] = 98_000.0
+        self.ex.last["BTC-USDT-SWAP"] = 96_900.0
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
         self.assertTrue(any("стоп: цена 1 дошла" in e for e in self.state()["events"]))
 
     def test_mark_missing_uses_ticker(self) -> None:
         tr = self.enter()
-        self.ex.last["BTC-USDT-SWAP"] = 98_000.0
+        self.ex.last["BTC-USDT-SWAP"] = 96_900.0
         for p in self.ex.pos:
             p["markPx"] = ""
         self.sync(tr)
         self.assertEqual(self.trades()[0]["why"], "стоп")
-        self.assertTrue(any("стоп: цена 98000 дошла до стопа" in e for e in self.state()["events"]))
+        self.assertTrue(any("стоп: цена 96900 дошла до стопа" in e for e in self.state()["events"]))
 
     def test_exit_near_tp_is_not_tp(self) -> None:
         """Пометка «тейк» — только по цене тейка (лимит исполняется ровно по
         ней): выход по рынку вслед за китом на 0,15 % ниже тейка — не тейк."""
         tr = self.enter()
         op = tr.st["open"]
-        self.assertEqual(op["tp"], 101_000.0)
+        self.assertEqual(op["tp"], 100_800.0)
         op["exit"] = {"kind": "whale", "why": "кит"}
-        tr._record_close(dict(op), {"closeAvgPx": "100850", "realizedPnl": "8", "uTime": str(self.now)})
-        tr._record_close(dict(op), {"closeAvgPx": "101000", "realizedPnl": "9", "uTime": str(self.now)})
+        tr._record_close(dict(op), {"closeAvgPx": "100650", "realizedPnl": "8", "uTime": str(self.now)})
+        tr._record_close(dict(op), {"closeAvgPx": "100800", "realizedPnl": "9", "uTime": str(self.now)})
         self.assertEqual([t["why"] for t in self.trades()], ["кит вышел в убыток", "тейк"])
 
     def test_stop_survives_crash_between_order_and_record(self) -> None:
@@ -1705,7 +1715,7 @@ class RatingTest(Base):
         self.on()
         tr.step()
         self.assertEqual(len(self.market_orders()), 1)
-        self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0, msg="стоп — и у приоритетного, не дальше 1,5 %")
+        self.assertAlmostEqual(self.state()["open"]["stop"], 97_000.0, msg="стоп — и у приоритетного, 3 % от входа")
         self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [], "MA не спрашиваем")
 
     def test_priority_still_respects_chase(self) -> None:
@@ -1788,7 +1798,7 @@ class EeaTest(Base):
             self.assertEqual((m["instId"], m["sz"]), (x, str(int(10_000 / ct_usd))), ccy)
             self.assertAlmostEqual(tr.st["open"]["notional"], 10_000, delta=1)
             [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-            self.assertEqual((tp["instId"], tp["px"], tp["posSide"]), (x, "101000", "long"))
+            self.assertEqual((tp["instId"], tp["px"], tp["posSide"]), (x, "100800", "long"))
             self.assertFalse(any(c[2].get("instId") == "BTC-USDT-SWAP" for c in self.ex.calls if c[1] == "/api/v5/trade/order"))
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
@@ -1811,7 +1821,7 @@ class EeaTest(Base):
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк один, не дубли")
         self.now += 10 * MIN
         self.ex.pos = []
-        self.ex.history = [{"instId": x, "uTime": str(self.now), "realizedPnl": "77.0", "closeAvgPx": "101000"}]
+        self.ex.history = [{"instId": x, "uTime": str(self.now), "realizedPnl": "77.0", "closeAvgPx": "100800"}]
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
@@ -1987,10 +1997,10 @@ class RecoverTest(Base):
         tr.sync()  # первая сверка шага после перезапуска
         tr.save()
         st = self.state()
-        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 101000.0, 2))
+        self.assertEqual((st["open"]["inst"], st["open"]["tp"], st["open"]["whales"]), ("BTC-USDT-SWAP", 100800.0, 2))
         self.assertNotIn("entering", st)
         [tp] = [o for o in self.ex.orders if o["ordType"] == "limit"]
-        self.assertEqual((tp["side"], tp["px"]), ("sell", "101000"))
+        self.assertEqual((tp["side"], tp["px"]), ("sell", "100800"))
         tr.last_sync = 0
         tr.step()
         self.assertEqual(len([o for o in self.ex.orders if o["ordType"] == "limit"]), 1, "тейк не дублируется")
@@ -2160,14 +2170,14 @@ class ReviewTest(Base):
         self.on()
         tr.step()
         tp = next(o for o in self.ex.orders if o["ordType"] == "limit")
-        tp.update(state="filled", avgPx="101000", accFillSz="10", pnl="100", fee="-5", fillTime=str(self.now + 5 * MIN))
+        tp.update(state="filled", avgPx="100800", accFillSz="10", pnl="100", fee="-5", fillTime=str(self.now + 5 * MIN))
         self.ex.pos[0]["pos"] = "15"
         self.now += 10 * MIN
         tr.last_sync = 0
         tr.step()
         with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
             [t] = [json.loads(x) for x in f]
-        self.assertEqual((t["why"], t["pnl"], t["px_out"]), ("тейк", 100.0, 101000.0))
+        self.assertEqual((t["why"], t["pnl"], t["px_out"]), ("тейк", 100.0, 100800.0))
         self.assertIsNone(self.state()["open"])
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"], [])
 
@@ -2184,7 +2194,7 @@ class ReviewTest(Base):
             self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "4", "posSide": "short", "avgPx": "100500",
                             "markPx": "100500"}]
             self.now += 10 * MIN
-            px = "101000" if tp_state == "filled" else "100200"
+            px = "100800" if tp_state == "filled" else "100200"
             self.ex.history = [{"instId": "BTC-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "9", "closeAvgPx": px}]
             tr.last_sync = 0
             tr.step()

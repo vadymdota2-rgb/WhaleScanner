@@ -69,9 +69,10 @@ LEVEL_MS = LEVEL_BARS * LEVEL_BAR_MS
 LEVEL_LONG_BELOW = 0.4
 LEVEL_SHORT_ABOVE = 0.6
 LEVEL_STOP_BEYOND = 0.005   # стоп — на 0,5 % за уровнем входа (правило владельца 24.11.2026)
-# Стоп — не дальше STOP_MAX от цены входа (27.11.2026): уровень 4 дней бывает
-# в 5–10 % от цены, а тейк — доли процента; такой стоп съедал бы десятки тейков.
-STOP_MAX = 0.015
+# Стоп — 3 % от цены входа (правило владельца 27.11.2026: «тейк 0,8 %, стоп
+# 3 %»; было — за уровнем, не дальше 1,5 %: частые стопы на шуме, 43 % сделок
+# в плюс). За уровнем (entry_stop) — вариант бэктеста.
+STOP_PCT = 0.03
 
 
 def level_ok(lo: float, hi: float, px: float, side: int) -> bool | None:
@@ -142,9 +143,17 @@ def level_stop(lo: float, hi: float, side: int) -> float:
     return lo * (1 - LEVEL_STOP_BEYOND) if side > 0 else hi * (1 + LEVEL_STOP_BEYOND)
 
 
-def entry_stop(lo: float, hi: float, px: float, side: int, most: float = STOP_MAX) -> float:
-    """Стоп входа (фиксируется на входе): за уровнем (level_stop), но не
-    дальше most (STOP_MAX) от цены входа px — ближний из двух. Уровней нет
+def fixed_stop(px: float, side: int, pct: float = STOP_PCT) -> float:
+    """Стоп входа: pct от цены входа px (лонг — ниже, шорт — выше); цена —
+    мусор — 0 (вызывающий такое не открывает)."""
+    if not math.isfinite(px) or px <= 0:
+        return 0.0
+    return px * (1 - side * pct)
+
+
+def entry_stop(lo: float, hi: float, px: float, side: int, most: float = STOP_PCT) -> float:
+    """Стоп за уровнем (вариант бэктеста): за уровнем (level_stop), но не
+    дальше most от цены входа px — ближний из двух. Уровней нет
     или уровень по ту сторону цены — ровно most от px: без стопа бот не
     входит. Цена px — мусор — 0 (вызывающий такое не открывает). most —
     бесконечность (вариант бэктеста «стоп только за уровнем») — только
