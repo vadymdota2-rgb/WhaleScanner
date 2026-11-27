@@ -49,9 +49,11 @@ import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -76,19 +78,45 @@ def candle_ok(r: object) -> bool:
         isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) for x in r) and min(r[1:]) > 0
 
 
+class Limiter:
+    """Запросов к OKX — не чаще одного в interval секунд на все потоки
+    (публичные свечи OKX: 20 запросов за 2 с с адреса)."""
+
+    def __init__(self, interval: float) -> None:
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.next = 0.0
+
+    def wait(self) -> None:
+        with self.lock:
+            now = time.monotonic()
+            at = max(now, self.next)
+            self.next = at + self.interval
+        if at > now:
+            time.sleep(at - now)
+
+
 class Prices:
     """5-минутные свечи OKX по блокам из 100 (один запрос на блок), кеш на
     диске по бумагам; без сети (--offline) — только кеш. В кеш навсегда —
     только ответ OKX за уже закончившийся блок: сбой сети или незаконченный
-    блок — лишь на этот прогон (иначе пустой блок от сбоя остался бы навсегда)."""
+    блок — лишь на этот прогон (иначе пустой блок от сбоя остался бы навсегда).
+
+    С пулом (pool) — блок запрашивается вместе с соседними (предыдущий — для
+    MA30 и уровней, два следующих — повтор идёт вперёд) параллельно; частота
+    — общий Limiter; сбой — до 3 попыток."""
 
     def __init__(self, cache: str, fetch: Fetch, pause: float, offline: bool, now_ms: int,
-                 bar: str = "5m", bar_ms: int = BAR_MS) -> None:
+                 bar: str = "5m", bar_ms: int = BAR_MS, pool: ThreadPoolExecutor | None = None,
+                 limiter: Limiter | None = None) -> None:
         self.cache, self.fetch, self.pause, self.offline, self.now_ms = cache, fetch, pause, offline, now_ms
+        self.pool, self.limiter = pool, limiter or Limiter(pause)
+        self.pending: dict[tuple[str, int], Future[list[Any] | None]] = {}
         self.bar, self.bar_ms, self.block_ms = bar, bar_ms, 100 * bar_ms
         self.blocks: dict[str, dict[int, list[list[float]]]] = {}
         self.fresh: dict[tuple[str, int], list[list[float]]] = {}
         self.dirty: set[str] = set()
+        self.index: dict[tuple[str, int], dict[int, list[float]]] = {}   # свеча по времени начала — без перебора блока
         self.requests = 0
         self.errors = 0
         os.makedirs(cache, exist_ok=True)
@@ -129,14 +157,13 @@ class Prices:
             return self.fresh[(inst, b)]
         if self.offline:
             return []
-        if self.requests and self.pause:
-            time.sleep(self.pause)
-        self.requests += 1
-        try:
-            rows = self.fetch({"okx": "/api/v5/market/history-candles",
-                               "params": {"instId": inst, "bar": self.bar, "after": end, "limit": 100}})
-        except Exception:  # noqa: BLE001 — сеть: сбой — блок без свечей, а не падение
-            rows = None
+        fut = self.pending.pop((inst, b), None)
+        if fut is None:
+            self.requests += 1
+            rows = self._get(inst, b)
+        else:
+            rows = fut.result()
+        self._prefetch(inst, b)
         if not isinstance(rows, list):
             self.errors += 1
         out: list[list[float]] = []
@@ -155,10 +182,42 @@ class Prices:
             self.fresh[(inst, b)] = out
         return out
 
+    def _get(self, inst: str, b: int) -> list[Any] | None:
+        """Запрос блока к OKX (и из потока пула): сбой или не список — ещё
+        попытка (до 3, пауза 1 и 2 с); не вышло — None."""
+        for attempt in range(3):
+            if attempt:
+                time.sleep(attempt)
+            self.limiter.wait()
+            try:
+                rows = self.fetch({"okx": "/api/v5/market/history-candles",
+                                   "params": {"instId": inst, "bar": self.bar, "after": (b + 1) * self.block_ms,
+                                              "limit": 100}})
+            except Exception:  # noqa: BLE001 — сеть: сбой — ещё попытка, потом блок без свечей
+                rows = None
+            if isinstance(rows, list):
+                return rows
+        return None
+
+    def _prefetch(self, inst: str, b: int) -> None:
+        """Соседние блоки — заранее, параллельно (только с пулом)."""
+        if self.pool is None:
+            return
+        have = self.blocks.get(inst, {})
+        for nb in (b - 1, b + 1, b + 2):
+            if nb < 0 or nb * self.block_ms >= self.now_ms or nb in have or (inst, nb) in self.fresh \
+                    or (inst, nb) in self.pending:
+                continue
+            self.requests += 1
+            self.pending[(inst, nb)] = self.pool.submit(self._get, inst, nb)
+
     def candle(self, inst: str, t: int) -> list[float] | None:
         """Свеча, в которую попадает момент t."""
-        start = t // self.bar_ms * self.bar_ms
-        return next((c for c in self.block(inst, t // self.block_ms) if c[0] == start), None)
+        b = t // self.block_ms
+        idx = self.index.get((inst, b))
+        if idx is None:
+            idx = self.index[(inst, b)] = {int(c[0]): c for c in self.block(inst, b)}
+        return idx.get(t // self.bar_ms * self.bar_ms)
 
     def candles(self, inst: str, start: int, end: int) -> Iterator[list[float]]:
         """Свечи с момента start до end — по блокам, по мере надобности."""
@@ -262,8 +321,11 @@ class Replay:
         # Варианты идут одним проходом (replay_all): окна китов и запросы к базе
         # о выходах китов — общие с основным повтором (shared), своё — капитал,
         # позиции, рейтинг и пропуски.
-        self.sig: lv.Signals = shared.sig if shared is not None else lv.Signals(a.db)
-        self.loss_cache: dict[Any, Any] = shared.loss_cache if shared is not None else {}
+        self.sig: lv.Signals = shared.sig if shared is not None else lv.Signals(a.db, keep=True)
+        # Расчёты на момент решения (выход китов, объёмы за и против, уровни,
+        # MA30) — одни на все варианты: ключ — сигнал и момент; чистится на
+        # каждой строке (replay_all).
+        self.memo: dict[Any, Any] = shared.memo if shared is not None else {}
         self.rows_cache: dict[Any, list[tuple[str, int, int]]] = shared.rows_cache if shared is not None else {}
         self.priority: set[str] = set()   # свои приоритетные киты (рейтинг этого варианта)
         self.equity = float(a.deposit)
@@ -291,7 +353,7 @@ class Replay:
             return "no_inst"
         if any(b[1] == inst for b in self.busy):
             return "own_same"
-        usd, against, count = self.sig.balance(s["coin"], s["side"], now)
+        usd, against, count = self.cached(("bal", s["coin"], s["side"], now), lambda: self.sig.balance(s["coin"], s["side"], now))
         prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now, self.priority)   # приоритетный — без этих правил
         if against > 0 and against >= usd and not prio:
             return "bigger_against"
@@ -308,10 +370,11 @@ class Replay:
             return "other_asset"
         if s["side"] * (hl_px / s["ref_px"] - 1) > lv.CHASE:
             return "chase"
-        lo, hi = self.range_levels(inst, now)
+        lo, hi = self.cached(("lvl", inst, now), lambda: self.range_levels(inst, now))
         if self.rules.levels and not prio and core.level_ok(lo, hi, last, s["side"]) is False:
             return "level"
-        if self.rules.ma and not prio and core.ma_ok(self.ma30_15m(inst, now, last), last, s["side"]) is False:
+        if self.rules.ma and not prio and core.ma_ok(self.cached(("ma", inst, now), lambda: self.ma30_15m(inst, now, last)),
+                                                     last, s["side"]) is False:
             return "ma30"
         if self.equity <= 0:
             return "no_equity"
@@ -349,7 +412,9 @@ class Replay:
         avg_px = entry
         fees = qty * entry * fee_in / 100
         tp = float(lv.round_step(avg_px * (1 + side * self.rules.tp), tick, rnd))
-        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, start)
+        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
+        if exit_at is not None and exit_at + SYNC_MS <= start:
+            return False   # кит закрылся в убытке, пока лимит ждал, — бот снял лимит (как живой)
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
         for tf, o, h, lo, cl in self.px.candles(inst, start, self.px.now_ms):
@@ -391,10 +456,15 @@ class Replay:
     def whale_loss(self, s: dict[str, Any], now: int) -> bool:
         """Кит сигнала уже закрыл в убыток (Signals.whale_loss) — один запрос к
         базе на сигнал и момент на все варианты."""
-        key = (s["coin"], s["side"], tuple(sorted((s.get("wallets") or {}).items())), now)
-        if key not in self.loss_cache:
-            self.loss_cache[key] = bool(self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now))
-        return bool(self.loss_cache[key])
+        key = ("loss", s["coin"], s["side"], tuple(sorted((s.get("wallets") or {}).items())), now)
+        return bool(self.cached(key, lambda: bool(self.sig.whale_loss(s["coin"], s["side"], s.get("wallets") or {}, now))))
+
+    def cached(self, key: Any, make: Callable[[], Any]) -> Any:
+        """Общий для вариантов расчёт на момент решения: первый вариант
+        считает, остальные берут готовое."""
+        if key not in self.memo:
+            self.memo[key] = make()
+        return self.memo[key]
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
         """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
@@ -486,6 +556,7 @@ def replay_all(rps: Sequence[Replay], since: int, until: int) -> None:
             "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
             "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, until))
         done = 0
+        last_save = time.time()
         last_note = 0.0
         while rows := cur.fetchmany(5000):
             for row in rows:
@@ -504,17 +575,20 @@ def replay_all(rps: Sequence[Replay], since: int, until: int) -> None:
                             continue
                         why = rp.decide(s, now)
                         rp.skips[why or "entered"] += 1
-                main.loss_cache.clear()   # выход китов — на момент решения: дальше не нужен
+                main.memo.clear()   # расчёты — на момент решения: дальше не нужны
             sig.seen.clear()  # повтор идёт по строкам один раз — повторов нет, память не копим
             if time.time() - last_note > 2:
                 last_note = time.time()
                 main.progress({"stage": "повтор", "done": done, "total": total, "trades": len(main.trades),
                                "requests": main.requests()})
+                sig.sweep(int(rows[-1][4]))
+            if time.time() - last_save > 60:   # кеш свечей — на диск раз в минуту (не каждые 2 с)
+                last_save = time.time()
                 main.px.save()
                 main.hours.save()
-                sig.sweep(int(rows[-1][4]))
     finally:
         con.close()
+        sig.close()
     for rp in rps:
         rp.settle(10**17)   # закрытые к концу данных — в капитал (открытые — нет)
     main.px.save()
@@ -660,15 +734,22 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
 
     progress({"stage": "каталог OKX", "done": 0, "total": 0, "trades": 0, "requests": 0})
     f = fetch or okx_fetch
-    prices = Prices(a.cache, f, a.pause, a.offline, now)
-    hours = Prices(a.cache, f, a.pause, a.offline, now, bar="4H", bar_ms=core.LEVEL_BAR_MS)  # уровни графика 4ч
+    # Свечи — до 4 запросов сразу, общая частота — не чаще раза в --pause.
+    pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="okx")
+    limiter = Limiter(a.pause)
+    prices = Prices(a.cache, f, a.pause, a.offline, now, pool=pool, limiter=limiter)
+    hours = Prices(a.cache, f, a.pause, a.offline, now, bar="4H", bar_ms=core.LEVEL_BAR_MS, pool=pool,
+                   limiter=limiter)  # уровни графика 4ч
     instr = instruments(f, a.offline, a.cache)
     rp = Replay(a, prices, instr, progress, hours)
     since = now - a.since_days * core.DAY_MS
     # Варианты — тем же проходом, что основной (свечи, окна китов и запросы к базе — общие).
     alts = [Replay(a, prices, instr, progress, hours, rules=r, shared=rp) for r in VARIANTS] \
         if getattr(a, "variants", False) else []
-    replay_all([rp, *alts], since, now)
+    try:
+        replay_all([rp, *alts], since, now)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     s = summary(a, rp, since, now)
     s["variants"] = []
     if alts:

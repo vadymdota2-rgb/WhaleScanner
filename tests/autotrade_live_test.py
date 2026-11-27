@@ -1143,6 +1143,26 @@ class LimitEntryTest(Base):
         [op] = self.state()["opens"]
         self.assertEqual((op["size"], op["px"]), (10.0, 100_000.0), "не больше заказанного; цена — лимита")
 
+    def test_whale_loss_while_waiting_cancels_limit(self) -> None:
+        """Пока лимит висел, кит сигнала закрылся в убытке — лимит снят, входа
+        нет (иначе вход и сразу выход по рынку в минус)."""
+        tr = self.pending()
+        close_fill(self.db, 50, "0xa", "BTC", 3, self.now + MIN, -120.0)
+        self.sync(tr, 2)
+        st = self.state()
+        self.assertEqual(self.entry()["state"], "canceled")
+        self.assertEqual(st["opens"], [])
+        self.assertNotIn("entering", st)
+        self.assertTrue(any("кит сигнала закрылся в убытке, пока лимит входа ждал" in x for x in st["events"]))
+
+    def test_book_error_uses_trade_price(self) -> None:
+        """Стакан не получен (отказ OKX) — лимит по цене сделки, шаг не падает."""
+        tr = self.trader(self.whales())
+        self.on()
+        with mock.patch.object(tr.okx, "best", side_effect=lv.OkxError("50011", "часто")):
+            tr.step()
+        self.assertEqual(self.entry()["px"], "100000")
+
     def test_check_error_waits(self) -> None:
         """Проверка лимита — отказ OKX: запись остаётся, повтор на сверке."""
         tr = self.pending()
@@ -2509,10 +2529,55 @@ class BacktestServiceTest(unittest.TestCase):
                 break
             lv.time.sleep(0.05)
         self.assertEqual(self.status()["progress"], "повтор: 25 % (250 из 1 000 сделок китов), сделок 3, запросов к OKX 17")
+        b.st["started"] -= 120   # 2 минуты на четверть — осталось ≈ 6
+        b._progress()
+        self.assertEqual(self.status()["progress"],
+                         "повтор: 25 % (250 из 1 000 сделок китов), осталось ≈ 6 мин, сделок 3, запросов к OKX 17")
         b.tick(False)
         self.assertEqual(self.status()["progress"], "")
         self.assertTrue(lv.Backtests(self.dir, "/db").script.endswith("autotrade_replay.py"))
         self.assertTrue(os.path.isfile(lv.Backtests(self.dir, "/db").script))
+
+    def test_code_update_restarts_running_backtest(self) -> None:
+        """Код обновился посреди пересчёта: пересчёт остановлен и заказан
+        заново — новая служба сразу начнёт его новым кодом."""
+        b = self.bts("sleep")
+        self.request()
+        b.tick(True)
+        proc = b.proc
+        self.assertIsNotNone(proc)
+        b.restart_for_update()
+        self.assertIsNone(b.proc)
+        self.assertIsNotNone(proc.poll(), "старый пересчёт остановлен")
+        self.assertIn("код обновился", self.status()["error"])
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "run.request")))
+        b2 = self.bts("sleep")
+        b2.tick(True)
+        self.assertIsNotNone(b2.proc, "новая служба начинает заново")
+        b2.tick(False)
+        b.restart_for_update()   # пересчёта нет — ничего
+
+    def test_code_updated_restarts_service_and_backtest(self) -> None:
+        """Файл кода изменился — служба выходит (systemd поднимет новую), идущий
+        пересчёт остановлен и заказан заново; не изменился — работаем дальше."""
+        src = os.path.join(self.dir, "code.py")
+        with open(src, "w") as f:
+            f.write("1")
+        me = [src, os.path.join(self.dir, "нет.py")]
+        stamp = lv.mtimes(me)
+        b = self.bts("sleep")
+        self.request()
+        b.tick(True)
+        logs: list[str] = []
+        tr = lv.Trader(lv.Okx("K", "S", "P", False, FakeOkx()), lv.Signals(os.path.join(self.dir, "db")), self.dir,
+                       log=logs.append)
+        self.assertFalse(lv.code_updated(me, stamp, b, tr))
+        self.assertIsNotNone(b.proc)
+        os.utime(src, (1, 1))
+        self.assertTrue(lv.code_updated(me, stamp, b, tr))
+        self.assertIsNone(b.proc, "пересчёт остановлен")
+        self.assertTrue(os.path.exists(os.path.join(self.dir, "run.request")), "и заказан заново")
+        self.assertTrue(any("код обновился" in x for x in logs))
 
     def test_deposit_unknown_is_1000(self) -> None:
         self.assertEqual(lv.Backtests(self.dir, "/db").deposit(), 1000.0)
@@ -2528,6 +2593,21 @@ class BacktestServiceTest(unittest.TestCase):
         mem = int(next(ln for ln in unit.splitlines() if ln.startswith("MemoryMax=")).split("=")[1].rstrip("M"))
         self.assertGreaterEqual(mem, lv.BT_NEED_MB)
         self.assertGreater(lv.BT_NEED_MB, lv.BT_MEM_MB)
+
+
+class SignalsDbTest(Base):
+    def test_backtest_keeps_one_connection_service_opens_each_time(self) -> None:
+        """Бэктест (keep) — одно соединение с базой на проход (десятки тысяч
+        запросов о выходе китов); служба — своё на каждый запрос."""
+        make_db(self.db, self.whales())
+        for keep, want in ((True, 1), (False, 3)):
+            sig = lv.Signals(self.db, keep=keep)
+            with mock.patch.object(lv.core, "open_ro", wraps=lv.core.open_ro) as opened:
+                for _ in range(3):
+                    sig.whale_loss("BTC", 1, {"0xa": 1}, self.now)
+            self.assertEqual(opened.call_count, want, keep)
+            sig.close()
+            sig.close()   # повторно — без ошибки
 
 
 if __name__ == "__main__":

@@ -434,8 +434,10 @@ class Signals:
     """Окна китов по бумаге и стороне — по ходу, из новых строк базы бота.
     Куски одного ордера складываются в сумму кита (как в бэктесте)."""
 
-    def __init__(self, db: str) -> None:
+    def __init__(self, db: str, keep: bool = False) -> None:
         self.db = db
+        self.keep = keep
+        self._kept: sqlite3.Connection | None = None
         self.windows: dict[tuple[str, int], core.Window] = {}
         self.seen: dict[int, int] = {}   # tid → ts (против повторов при перекрытии опроса)
         self.priority: set[str] = set()  # приоритетные киты (наш винрейт с ними > 90 % от 5 сделок)
@@ -444,6 +446,25 @@ class Signals:
     def _con(self) -> sqlite3.Connection:
         return core.open_ro(self.db)  # нет базы — OSError: ошибка шага, а не выход службы
 
+    def _rows(self, sql: str, args: tuple[Any, ...]) -> list[Any]:
+        """Запрос к базе бота (только чтение). Служба — соединение на запрос
+        (бот мог пересоздать базу); бэктест (keep) — одно на весь проход:
+        десятки тысяч запросов о выходе китов без открытия базы на каждый."""
+        if self.keep:
+            if self._kept is None:
+                self._kept = self._con()
+            return self._kept.execute(sql, args).fetchall()
+        con = self._con()
+        try:
+            return con.execute(sql, args).fetchall()
+        finally:
+            con.close()
+
+    def close(self) -> None:
+        if self._kept is not None:
+            self._kept.close()
+            self._kept = None
+
     def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
         китов от 1000 $ за 2 часа, и строка, на которой это случилось."""
@@ -451,13 +472,9 @@ class Signals:
         # (опрос кошельков), и опоздавшая сделка должна попасть в окно, а не
         # потеряться. Повторы отсекает seen (tid).
         since = now - WINDOW_MS
-        con = self._con()
-        try:
-            rows = con.execute(
-                "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
-                "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now)).fetchall()
-        finally:
-            con.close()
+        rows = self._rows(
+            "SELECT tid, wallet, coin, dir_code, ts, notional_nanos, ABS(CAST(sz AS REAL)) FROM hl_fills "
+            "WHERE dir_code IN (1, 2) AND ts >= ? AND ts <= ? ORDER BY ts, tid", (since, now))
         out = self.feed(rows)
         cut = now - WINDOW_MS - 20 * 60_000
         self.seen = {t: s for t, s in self.seen.items() if s >= cut}
@@ -503,9 +520,7 @@ class Signals:
 
     def whale_usd(self, w: core.Window | None) -> float:
         """Объём китов окна (кошельки от 1000 $), $."""
-        if w is None:
-            return 0.0
-        return float(sum(v[0] for v in w.per.values() if v[2] > 0 and v[0] >= self.limit)) / NANOS
+        return float(w.whale_n) / NANOS if w is not None else 0.0   # сумма — по ходу (core.Window)
 
     def priority_in(self, coin: str, side: int, wallets: object, now: int, priority: set[str] | None = None) -> str:
         """Приоритетный кит сигнала, что ещё в окне за 2 часа до «сейчас» (от
@@ -558,15 +573,11 @@ class Signals:
         # лонг, «Short > Long» — шорт. Разворот В нашу сторону (кит закрыл
         # встречный шорт в минус и перешёл в лонг вместе с нами) — не выход.
         flip = "%Long > Short%" if side > 0 else "%Short > Long%"
-        con = self._con()
-        try:
-            rows = con.execute(
-                f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
-                f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
-                f"AND (dir_code != {core.FLIP} OR dir LIKE ?)",
-                (coin, *since, *codes, min(since.values()), now, flip)).fetchall()
-        finally:
-            con.close()
+        rows = self._rows(
+            f"SELECT wallet, ts, closed_pnl_nanos FROM hl_fills WHERE coin = ? AND wallet IN ({','.join('?' * len(since))}) "  # noqa: S608 — только «?»
+            f"AND dir_code IN ({','.join('?' * len(codes))}) AND ts >= ? AND ts <= ? "
+            f"AND (dir_code != {core.FLIP} OR dir LIKE ?)",
+            (coin, *since, *codes, min(since.values()), now, flip))
         pnl: dict[str, int] = {}
         for wl, ts, p in rows:
             if ts >= since.get(wl, now + 1):
@@ -577,14 +588,10 @@ class Signals:
         """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
         за 2 часа до сигнала, и их первая сделка в окне. Для позиции, открытой
         до того, как бот стал запоминать китов."""
-        con = self._con()
-        try:
-            rows = con.execute(
-                "SELECT wallet, MIN(ts), SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND dir_code = ? "
-                "AND ts >= ? AND ts <= ? GROUP BY wallet",
-                (coin, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, ts - WINDOW_MS, ts)).fetchall()
-        finally:
-            con.close()
+        rows = self._rows(
+            "SELECT wallet, MIN(ts), SUM(notional_nanos) FROM hl_fills WHERE coin = ? AND dir_code = ? "
+            "AND ts >= ? AND ts <= ? GROUP BY wallet",
+            (coin, core.OPEN_LONG if side > 0 else core.OPEN_SHORT, ts - WINDOW_MS, ts))
         return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}
 
     def sweep(self, now: int) -> None:
@@ -602,7 +609,7 @@ BT_HOUR_UTC, BT_MINUTE = 3, 17
 # Бэктест — повтор по правилам живого бота (autotrade_replay.py): свечи OKX
 # (публичное API) только под кандидатов и сделки. Раньше — сетка прежнего
 # бэктеста с паузой 15 с к Hyperliquid: часы без видимого хода («завис»).
-BT_PAUSE_SEC = 0.15               # между запросами к OKX (публичное API: до 20 в 2 с)
+BT_PAUSE_SEC = 0.11               # между запросами к OKX на все потоки (публичное API: до 20 в 2 с)
 BT_DAYS = 30                      # сколько последних дней повторять
 BT_MEM_MB = 1200                  # предел памяти самого бэктеста (RLIMIT_AS)
 BT_NEED_MB = 1600                 # столько должна разрешать служба (MemoryMax) — иначе не запускаем
@@ -733,10 +740,23 @@ class Backtests:
         text = f"{p.get('stage', '')}".strip()
         if total > 0:
             text += f": {done / total * 100:.0f} % ({int(done):,} из {int(total):,} сделок китов)".replace(",", " ")
+            spent = time.time() - num(self.st.get("started"), time.time())
+            if 0 < done < total and spent > 60:   # осталось — по скорости с начала пересчёта
+                text += f", осталось ≈ {max(1, round(spent * (total - done) / done / 60))} мин"
         text += f", сделок {int(num(p.get('trades')))}, запросов к OKX {int(num(p.get('requests')))}"
         if text != self.st.get("progress"):
             self.st["progress"] = text[:200]
             self._write()
+
+    def restart_for_update(self) -> None:
+        """Код обновился посреди пересчёта: остановить его и заказать заново —
+        новая служба сразу начнёт пересчёт новым кодом."""
+        if self.proc is None:
+            return
+        self._stop(self.proc, terminate=True)
+        self._done(None, "код обновился — пересчёт начат заново новой версией")
+        with open(os.path.join(self.dir, "run.request"), "w", encoding="utf-8") as f:
+            json.dump({"at": int(time.time()), "why": "update"}, f)
 
     @staticmethod
     def _stop(proc: subprocess.Popen[bytes], terminate: bool) -> None:
@@ -1413,7 +1433,11 @@ class Trader:
         # владельца 27.11.2026): по лучшей цене своей стороны стакана (лонг —
         # покупка, шорт — продажа), нет её — по цене сделки; на шаге цены.
         # Ждёт исполнения LIMIT_WAIT_MS; не исполнился — снять, входа нет.
-        lim = round_step(self.okx.best(inst, s["side"]) or last, tick, ROUND_FLOOR if s["side"] > 0 else ROUND_CEILING)
+        try:
+            best = self.okx.best(inst, s["side"])
+        except (OkxError, OSError):   # стакан не получен — по цене сделки, шаг не падает
+            best = 0.0
+        lim = round_step(best or last, tick, ROUND_FLOOR if s["side"] > 0 else ROUND_CEILING)
         # Тейк (от цены лимита) должен встать на шаг цены не ближе TP и не дальше
         # TP + 0,5 %: шаг слишком крупный для этой цены — тейк невозможен, без
         # выхода не входим.
@@ -1480,9 +1504,17 @@ class Trader:
         inst, cl = str(e.get("inst")), str(e.get("cl"))
         try:
             o = self.okx.get_order(inst, cl_id=cl)
-            if o.get("state") in ("live", "partially_filled") and self.clock() >= num(e.get("until")):
-                self.okx.cancel(inst, str(o.get("ordId")))   # время вышло — снять остаток
-                o = self.okx.get_order(inst, cl_id=cl)
+            if o.get("state") in ("live", "partially_filled"):
+                # Время вышло — или кит сигнала, пока лимит висел, закрылся в
+                # убытке (иначе вход и сразу выход по рынку в минус): снять остаток.
+                wallets = e.get("wallets") if isinstance(e.get("wallets"), dict) else {}
+                lost = self.clock() < num(e.get("until")) and wallets and self.sig.whale_loss(
+                    str(e.get("coin")), 1 if num(e.get("side")) > 0 else -1, wallets, self.clock())
+                if self.clock() >= num(e.get("until")) or lost:
+                    if lost:
+                        self.event(f"{inst}: кит сигнала закрылся в убытке, пока лимит входа ждал, — снимаю лимит")
+                    self.okx.cancel(inst, str(o.get("ordId")))
+                    o = self.okx.get_order(inst, cl_id=cl)
         except OkxError as err:
             if err.code != "51603":   # 51603 «ордера нет» — как не найден
                 self.event(f"{inst}: лимит входа не проверен — {err}; повтор на сверке")
@@ -1643,6 +1675,24 @@ class Trader:
         self.save()
 
 
+def mtimes(paths: list[str]) -> list[float]:
+    return [os.path.getmtime(p) if os.path.exists(p) else 0.0 for p in paths]
+
+
+def code_updated(me: list[str], stamp: list[float], bts: Backtests, tr: Trader) -> bool:
+    """Код обновился (автодеплой) — True: выйти, systemd поднимет с новым.
+    Идущий пересчёт — остановить и заказать заново (новая служба начнёт его
+    новым кодом); раньше служба ждала его до 6 часов — торговля и бэктест
+    шли старым кодом."""
+    if mtimes(me) == stamp:
+        return False
+    if bts.proc is not None:
+        bts.restart_for_update()
+    tr.event("код обновился — перезапуск")
+    tr.save()
+    return True
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Автокопирование китов — реальная торговля на OKX")
     ap.add_argument("--db", default=os.environ.get("WHALE_HL_DB_FILE", "hyperliquid.db"), help="база бота (только чтение)")
@@ -1689,8 +1739,9 @@ def main(argv: list[str] | None = None) -> int:
         tr.save()
         time.sleep(300)  # служба перезапустится и попробует снова
         return 1
-    me = [os.path.abspath(__file__), core.__file__]  # код обновился — перезапуск (бэктест — отдельным процессом)
-    stamp = [os.path.getmtime(p) for p in me]
+    # Код обновился (и торговли, и бэктеста) — перезапуск службы.
+    me = [os.path.abspath(__file__), core.__file__, os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotrade_replay.py")]
+    stamp = mtimes(me)
     # Вход, начатый до перезапуска и не записанный, разберёт первая сверка шага
     # (resolve_entering; своя позиция без записи — find_own по метке ордера).
     tr.event(f"старт ({'демо-счёт' if okx.simulated else 'РЕАЛЬНЫЙ счёт'})")
@@ -1721,10 +1772,7 @@ def main(argv: list[str] | None = None) -> int:
             with contextlib.suppress(OSError):
                 tr.save()
             time.sleep(min(300, 5 * 2 ** min(fails, 6)))
-        # Код обновился (автодеплой) — выйти: systemd поднимет с новым. Идёт
-        # пересчёт — дождаться его (иначе systemd убьёт его вместе со службой).
-        if bts.proc is None and [os.path.getmtime(p) for p in me] != stamp:
-            tr.event("код обновился — перезапуск")
+        if code_updated(me, stamp, bts, tr):
             return 0
         time.sleep(POLL_SEC)
 

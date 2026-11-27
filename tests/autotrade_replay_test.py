@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from typing import ClassVar
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -324,6 +325,44 @@ class ReplayTest(unittest.TestCase):
         self.cache += "2"
         r = self.go(rows, price)
         self.assertEqual(r["skips"], with_variants, "пропуски основного — как без вариантов")
+
+    def test_whale_loss_before_limit_fill_no_entry(self) -> None:
+        """Кит сигнала закрылся в убытке через минуту после решения, а лимит
+        исполнился бы только следующей 5-минуткой: бот снял лимит — входа нет
+        (как живой); вход рынком — вошёл и вышел вслед за китом."""
+        rows = [*self.whales(), cls(9, "0xa", "BTC", 1, T + MIN, -100.0)]
+        r = self.go(rows, lambda c, t: 100_000.0, variants=True)
+        self.assertEqual(r["trades"], [])
+        self.assertEqual(r["skips"].get("limit_miss"), 1)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(v["вход рынком"]["trades"], 1)
+
+    def test_candles_retry_and_memo_cleared(self) -> None:
+        """Сбой запроса свечей — ещё попытка (до 3): блок со свечами, сбоев нет.
+        Три сбоя подряд — блок без свечей и сбой в итоге. Расчёты на момент
+        решения после прохода не копятся (память)."""
+        self.market = FakeMarket(lambda c, ts: 100_000.0)
+        calls = {"n": 0}
+
+        def flaky(body):
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise OSError("обрыв")
+            return self.market(body)
+
+        with mock.patch.object(rp.time, "sleep"):
+            px = rp.Prices(self.cache, flaky, 0, False, NOW)
+            self.assertTrue(px.block("BTC-USDT-SWAP", (T // px.block_ms)))
+            self.assertEqual((px.errors, calls["n"]), (0, 3))
+            dead = rp.Prices(self.cache + "x", lambda b: None, 0, False, NOW)
+            self.assertEqual(dead.block("BTC-USDT-SWAP", T // dead.block_ms), [])
+            self.assertEqual(dead.errors, 1)
+        make_db(self.db, self.whales())
+        a = self.args()
+        prices = rp.Prices(a.cache, self.market, 0, False, NOW)
+        r = rp.Replay(a, prices, rp.instruments(self.market, False, a.cache), lambda _p: None)
+        r.run(NOW - a.since_days * DAY, NOW)
+        self.assertEqual(r.memo, {})
 
     def test_far_level_stop_capped(self) -> None:
         """Поддержка далеко (90 000 — стоп за ней в 10,5 %): стоп — 1,5 % от
