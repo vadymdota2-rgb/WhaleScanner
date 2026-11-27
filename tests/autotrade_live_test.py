@@ -211,6 +211,175 @@ class Base(unittest.TestCase):
                 fill(2, "0xb", coin, side, self.now - ago * MIN, usd, px)]
 
 
+class MultiTest(Base):
+    """Правило владельца (27.11.2026): своих позиций — до 3 одновременно, на
+    разных бумагах; каждая — 5 % маржи × 10×, со своим тейком и стопом."""
+
+    PX: ClassVar[dict[str, float]] = {"BTC": 100_000.0, "ETH": 3_000.0, "SOL": 150.0, "DOGE": 0.2}
+
+    def setUp(self) -> None:
+        super().setUp()
+        for c, px in self.PX.items():
+            self.ex.instr.setdefault(f"{c}-USDT-SWAP", {"instId": f"{c}-USDT-SWAP", "state": "live", "ctVal": "1",
+                                                        "ctMult": "1", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.0001"})
+            self.ex.last[f"{c}-USDT-SWAP"] = px
+
+    def sig(self, coins: tuple[str, ...], base: int = 10, side: int = 1) -> list:
+        out = []
+        for i, c in enumerate(coins):
+            out += [fill(base + 2 * i, f"0x{c.lower()}a", c, side, self.now - 3 * MIN + i, 5000, self.PX[c]),
+                    fill(base + 2 * i + 1, f"0x{c.lower()}b", c, side, self.now - 2 * MIN + i, 5000, self.PX[c])]
+        return out
+
+    def add(self, rows: list) -> None:
+        con = sqlite3.connect(self.db)
+        con.executemany(INS, rows)
+        con.commit()
+        con.close()
+
+    def opens(self) -> list[str]:
+        return sorted(o["inst"] for o in self.state()["opens"])
+
+    def test_three_positions_then_skip(self) -> None:
+        """Четыре сигнала в одном опросе — входим в три (на каждую — 5 %,
+        свой тейк); четвёртый — «у бота уже 3 позиции»."""
+        tr = self.trader(self.sig(("BTC", "ETH", "SOL", "DOGE")))
+        self.on()
+        tr.step()
+        self.assertEqual(len({m["instId"] for m in self.market_orders()}), 3)
+        self.assertEqual(len(self.opens()), 3)
+        tps = [o for o in self.ex.orders if o["ordType"] == "limit"]
+        self.assertEqual(sorted(o["instId"] for o in tps), self.opens(), "у каждой — свой тейк")
+        sk = self.state()["last_skip"]
+        self.assertEqual(sk["code"], "own_open")
+        self.assertIn("у бота уже 3 позиции", sk["why"])
+        self.assertEqual(self.state()["open"]["inst"], self.state()["opens"][0]["inst"], "open — первая (для прежней вкладки)")
+        for o in self.state()["opens"]:
+            self.assertEqual(o["margin_pct"], 5.0)
+
+    def test_closed_one_frees_slot(self) -> None:
+        """Одна из трёх закрылась тейком — запись сделки только её; следующий
+        сигнал занимает освободившееся место."""
+        tr = self.trader(self.sig(("BTC", "ETH", "SOL")))
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.opens()), 3)
+        eth = next(o for o in self.ex.orders if o["ordType"] == "limit" and o["instId"] == "ETH-USDT-SWAP")
+        eth["state"] = "filled"
+        self.ex.pos = [p for p in self.ex.pos if p["instId"] != "ETH-USDT-SWAP"]
+        self.now += 5 * MIN
+        self.ex.history = [{"instId": "ETH-USDT-SWAP", "uTime": str(self.now), "realizedPnl": "9", "closeAvgPx": eth["px"]}]
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.opens(), ["BTC-USDT-SWAP", "SOL-USDT-SWAP"])
+        with open(os.path.join(self.dir, "live", "trades.jsonl"), encoding="utf-8") as f:
+            [t] = [json.loads(x) for x in f]
+        self.assertEqual((t["inst"], t["why"]), ("ETH-USDT-SWAP", "тейк"))
+        self.add(self.sig(("DOGE",), base=50))
+        self.now += 5_000
+        tr.step()
+        self.assertEqual(self.opens(), ["BTC-USDT-SWAP", "DOGE-USDT-SWAP", "SOL-USDT-SWAP"])
+
+    def test_same_inst_never_twice(self) -> None:
+        """Своя позиция на бумаге держится дольше паузы (3 ч) — новый сигнал
+        по ней (и в другую сторону) — «у бота уже позиция», а не ручная."""
+        tr = self.trader(self.sig(("BTC",)))
+        self.on()
+        tr.step()
+        self.now += 4 * 60 * MIN
+        self.add([fill(60, "0xc", "BTC", -1, self.now - 2 * MIN, 5000, 100_000),
+                  fill(61, "0xd", "BTC", -1, self.now - MIN, 5000, 100_000)])
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual(self.state()["last_skip"]["code"], "own_same")
+
+    def test_owner_position_does_not_count(self) -> None:
+        """Ручная позиция владельца — не своя: бот держит свои три рядом с ней."""
+        self.ex.pos = [{"instId": "STX-USDT-SWAP", "pos": "5", "posSide": "net", "avgPx": "0.5"}]
+        self.ex.history = []
+        tr = self.trader(self.sig(("BTC", "ETH", "SOL")))
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.opens()), 3)
+
+    def test_stop_closes_only_its_position(self) -> None:
+        tr = self.trader(self.sig(("BTC", "ETH")))
+        self.on()
+        tr.step()
+        self.ex.last["ETH-USDT-SWAP"] = 2_900.0
+        for p in self.ex.pos:
+            if p["instId"] == "ETH-USDT-SWAP":
+                p["markPx"] = "2900"
+        self.now += MIN
+        tr.last_sync = 0
+        tr.step()
+        self.assertEqual(self.opens(), ["BTC-USDT-SWAP"])
+        [ex] = [o for o in self.ex.orders if str(o.get("clOrdId", "")).startswith("wtex")]
+        self.assertEqual(ex["instId"], "ETH-USDT-SWAP")
+
+    def test_restart_keeps_all_and_reads_old_single(self) -> None:
+        tr = self.trader(self.sig(("BTC", "ETH", "SOL")))
+        self.on()
+        tr.step()
+        tr2 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.assertEqual(sorted(o["inst"] for o in tr2.st["opens"]), self.opens())
+        st = self.state()
+        old = {k: v for k, v in st.items() if k != "opens"}   # состояние прежней версии — одна open
+        with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+            json.dump(old, f)
+        tr3 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.assertEqual([o["inst"] for o in tr3.st["opens"]], [st["open"]["inst"]])
+        dup = {**st, "opens": [st["opens"][0], st["opens"][0], "x"]}   # порча: повтор бумаги и мусор
+        with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+            json.dump(dup, f)
+        tr4 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.assertEqual(len(tr4.st["opens"]), 1)
+        four = {**st, "opens": [*st["opens"], {**st["opens"][0], "inst": "DOGE-USDT-SWAP"}]}   # больше трёх — не бывает
+        with open(os.path.join(self.dir, "live", "state.json"), "w", encoding="utf-8") as f:
+            json.dump(four, f)
+        tr5 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.assertEqual(len(tr5.st["opens"]), 3)
+
+    def test_recorded_own_never_readopted(self) -> None:
+        """Сверка после перезапуска: на счёте две свои записанные и ручная
+        (проверена первой) — свои не принимаются заново (запись со стопом
+        и китами не теряется), ручная остаётся ручной."""
+        self.ex.pos = [{"instId": "STX-USDT-SWAP", "pos": "5", "posSide": "net", "avgPx": "0.5", "markPx": "0.5"}]
+        tr = self.trader(self.sig(("BTC", "ETH")))
+        self.on()
+        tr.step()
+        def key(o: dict) -> tuple:
+            return o["stop"], sorted(o["wallets"]), o["in_id"], o.get("adopted", False)
+
+        before = {o["inst"]: key(o) for o in self.state()["opens"]}
+        self.assertEqual(len(before), 2)
+        tr2 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.now += MIN
+        tr2.sync()
+        self.assertEqual({o["inst"]: key(o) for o in tr2.st["opens"]}, before)
+
+    def test_adopts_unrecorded_own_beside_recorded(self) -> None:
+        """Две свои записаны, третья открыта нашим ордером, но запись потеряна
+        (сбой) — сверка узнаёт её по метке и принимает третьей."""
+        tr = self.trader(self.sig(("BTC", "ETH", "SOL")))
+        self.on()
+        tr.step()
+        tr.st["opens"] = [o for o in tr.st["opens"] if o["inst"] != "SOL-USDT-SWAP"]
+        tr.save()
+        tr2 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.now += MIN
+        tr2.sync()
+        self.assertEqual(sorted(o["inst"] for o in tr2.st["opens"]), ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
+        self.assertTrue(tr2.st["opens"][-1]["adopted"])
+
+
 class SignTest(Base):
     def test_signature_and_headers(self) -> None:
         seen = {}
@@ -322,11 +491,6 @@ class TradeTest(Base):
         # Запрос позиций — без фильтра по виду (все позиции счёта).
         q = [c[2] for c in self.ex.calls if c[1] == "/api/v5/account/positions"]
         self.assertTrue(q and all("instType" not in x for x in q))
-        # Своя позиция у бота — одна: пока она открыта, второй нет (и при ручной).
-        self.now += 2 * MIN
-        tr.last_sync = 0
-        self.assertIn("у бота уже есть своя позиция", tr.try_enter({"coin": "SOL", "side": 1, "ts": self.now,
-                                                                    "whales": 2, "ref_px": 100.0}))
 
     def test_no_manual_position_also_5_percent(self) -> None:
         tr = self.trader(self.whales())
@@ -1486,14 +1650,13 @@ class RatingTest(Base):
 
     def test_higher_rated_signal_first(self) -> None:
         """BTC — свежее, но киты без рейтинга; STX — раньше, но наш винрейт с его
-        китом 80 %: входим в STX."""
+        китом 80 %: входим сначала в STX (позиций до 3 — потом и в BTC)."""
         self.history(["0xs1"], 4, 5)
         stx = [fill(10, "0xs1", "STX", 1, self.now - 4 * MIN, 5000, 0.5), fill(11, "0xs2", "STX", 1, self.now - 3 * MIN, 5000, 0.5)]
         tr = self.trader(stx + self.whales(ago=1))
         self.on()
         tr.step()
-        [m] = self.market_orders()
-        self.assertEqual(m["instId"], "STX-USDT-SWAP")
+        self.assertEqual([m["instId"] for m in self.market_orders()], ["STX-USDT-SWAP", "BTC-USDT-SWAP"])
 
     def test_close_records_wallets_and_updates_rating(self) -> None:
         self.history(["0xa"], 4, 4)

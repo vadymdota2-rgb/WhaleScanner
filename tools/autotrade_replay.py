@@ -17,8 +17,9 @@
   винрейт с китами сигнала — раньше; кит выше 90 % (от 5 сделок) — с ним и в
   одиночку, без «против крупнее», уровней и MA30;
 - бумага есть на OKX (USDT-SWAP), цена сходится с китами (±2 %), не хуже их
-  средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; позиция —
-  одна;
+  средней больше чем на 0,3 %; в бумагу — не чаще раза в 3 часа; своих
+  позиций — до 3, на разных бумагах (капитал и рейтинг — по сделкам,
+  закрытым к моменту входа);
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск), рыночный вход (проскальзывание);
 - выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (0,5 % за
@@ -40,6 +41,7 @@
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
 import math
 import os
@@ -59,6 +61,7 @@ import autotrade_core as core
 import autotrade_live as lv
 
 BAR_MS = 300_000                  # 5-минутные свечи OKX
+LIMIT_WAIT_MS = 5 * 60_000        # вариант «вход лимитом»: ордер ждёт исполнения 5 минут
 SYNC_MS = 15_000                  # живой бот сверяет счёт раз в 15 с
 Fetch = Callable[[dict[str, Any]], object]
 
@@ -227,6 +230,9 @@ class Rules:
     stop_max: float = core.STOP_MAX   # бесконечность — стоп только за уровнем
     levels: bool = True               # фильтр уровней 4ч (стоп за уровнем — всегда)
     ma: bool = True                   # фильтр MA30 15м
+    max_open: int = lv.MAX_OPEN       # своих позиций одновременно
+    pause_ms: int = lv.COIN_PAUSE_MS  # в бумагу — не чаще
+    limit: bool = False               # вход лимитом по цене решения (мейкер, без проскальзывания) — не рынком
 
 
 # Сравнение (--variants): что дало бы одно изменение правил на тех же китах —
@@ -234,7 +240,11 @@ class Rules:
 VARIANTS = (Rules("тейк +0,5 %", tp=0.005), Rules("тейк +1,5 %", tp=0.015),
             Rules("стоп не дальше 1 %", stop_max=0.01), Rules("стоп не дальше 2,5 %", stop_max=0.025),
             Rules("стоп только за уровнем", stop_max=math.inf),
-            Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False))
+            Rules("без уровней 4ч", levels=False), Rules("без MA30", ma=False),
+            Rules("тейк +0,3 %", tp=0.003), Rules("1 позиция", max_open=1),
+            Rules("пауза бумаги 30 мин", pause_ms=30 * 60_000), Rules("вход лимитом", limit=True),
+            Rules("скальпинг: лимит, тейк +0,3 %, стоп до 1 %, пауза 30 мин", tp=0.003, stop_max=0.01,
+                  pause_ms=30 * 60_000, limit=True))
 
 
 class Replay:
@@ -253,16 +263,18 @@ class Replay:
         self.equity = float(a.deposit)
         self.trades: list[Trade] = []
         self.entered: dict[str, int] = {}
-        self.busy_until = 0
+        self.busy: list[tuple[int, str]] = []          # свои позиции: (время выхода, бумага); открытая — 10^18
+        self.closing: list[tuple[int, int]] = []       # куча (время выхода, № сделки): ещё не в капитале и рейтинге
         self.skips: defaultdict[str, int] = defaultdict(int)
         self.rating = core.Rating()   # наш винрейт с китами — по закрытым сделкам повтора
-        self.rated = 0                # сколько сделок уже в рейтинге
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, s: dict[str, Any], now: int) -> str:
-        if now < self.busy_until:
+        self.settle(now)
+        self.busy = [b for b in self.busy if b[0] > now]
+        if len(self.busy) >= self.rules.max_open:
             return "own_open"
-        if now - self.entered.get(s["coin"], -10**15) < lv.COIN_PAUSE_MS:
+        if now - self.entered.get(s["coin"], -10**15) < self.rules.pause_ms:
             return "coin_pause"
         # Бумаги нет на OKX — сразу (живой бот проверяет это позже, итог тот же,
         # а повтор не тратит запрос к базе на каждый такой сигнал).
@@ -271,6 +283,8 @@ class Replay:
         ins = self.instr.get(inst)
         if not ins:
             return "no_inst"
+        if any(b[1] == inst for b in self.busy):
+            return "own_same"
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
         prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)   # приоритетный кит — без этих правил
         if against > 0 and against >= usd and not prio:
@@ -305,24 +319,34 @@ class Replay:
         tp_try = lv.round_step(last * (1 + s["side"] * tp), tick, ROUND_CEILING if s["side"] > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not tp * 0.999 <= s["side"] * (float(tp_try) / last - 1) <= tp + lv.TP_SLACK:
             return "tick"
-        self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, s["side"], self.rules.stop_max))
+        if not self.open_trade(s, inst, ins, sz, last, now, core.entry_stop(lo, hi, last, s["side"], self.rules.stop_max)):
+            return "limit_miss"
         return ""
 
     def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int,
-                   stop: float) -> None:
+                   stop: float) -> bool:
+        """Сделка от входа до выхода по свечам; False — лимит входа не исполнился."""
         a, side = self.a, s["side"]
         slip = a.slippage / 100
         rnd = ROUND_CEILING if side > 0 else ROUND_FLOOR
-        entry = last * (1 + side * slip)
+        start, entry, fee_in = now, last * (1 + side * slip), a.fee_taker
+        if self.rules.limit:
+            # Лимит по цене решения: исполнится, если за 5 минут цена (свечи ПОСЛЕ
+            # решения) дошла до него; мейкер, без проскальзывания.
+            got = next((c for c in self.px.candles(inst, now, now + LIMIT_WAIT_MS + 1)
+                        if c[0] > now and side * (c[3 if side > 0 else 2] - last) <= 0), None)
+            if got is None:
+                return False
+            start, entry, fee_in = int(got[0]), last, a.fee_maker
         tick = lv.dec(ins.get("tickSz")) or Decimal("0.0001")
         qty = float(sz) * coin_per_contract(ins, entry)      # монет в позиции
         avg_px = entry
-        fees = qty * entry * a.fee_taker / 100
+        fees = qty * entry * fee_in / 100
         tp = float(lv.round_step(avg_px * (1 + side * self.rules.tp), tick, rnd))
-        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, now)
+        exit_at = self.loss_exit_time(s["coin"], side, s.get("wallets") or {}, start)
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
-        for tf, o, h, lo, cl in self.px.candles(inst, now, self.px.now_ms):
+        for tf, o, h, lo, cl in self.px.candles(inst, start, self.px.now_ms):
             t = int(tf)
             end = t + BAR_MS
             # Кит вышел в убыток — бот замечает на сверке (до 15 с) и закрывает по рынку.
@@ -348,12 +372,15 @@ class Replay:
                 break
             t_out, px_out = end, cl
         pnl = qty * side * (px_out - avg_px) - fees
+        self.entered[s["coin"]] = start
+        # Позиция занимает место до выхода; итог — в капитал и рейтинг только
+        # к моменту выхода (settle): позиций до трёх, закрываются не по порядку.
         if why != "открыта":
-            self.equity += pnl
-        self.entered[s["coin"]] = now
-        self.busy_until = t_out if why != "открыта" else 10**18
-        self.trades.append(Trade(s["coin"], side, now, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae,
+            heapq.heappush(self.closing, (t_out, len(self.trades)))
+        self.busy.append((t_out if why != "открыта" else 10**18, inst))
+        self.trades.append(Trade(s["coin"], side, start, t_out, entry, tp, px_out, qty * avg_px, pnl, why, mae,
                                  tuple(sorted(w for w in s.get("wallets") or {} if isinstance(w, str)))))
+        return True
 
     def loss_exit_time(self, coin: str, side: int, wallets: dict[str, Any], since: int) -> int | None:
         """Когда кто-то из китов сигнала впервые оказался в убытке по закрытиям
@@ -410,15 +437,16 @@ class Replay:
     def requests(self) -> int:
         return self.px.requests + self.hours.requests
 
-    def rate_closed(self, now: int) -> None:
-        """Рейтинг китов — по сделкам повтора, закрытым к моменту now (позиция
-        одна: закрываются по порядку входа), как у живого бота по trades.jsonl."""
-        while self.rated < len(self.trades) and not self.trades[self.rated].open \
-                and self.trades[self.rated].exit_t <= now:
-            t = self.trades[self.rated]
+    def settle(self, now: int) -> None:
+        """Сделки, закрытые к моменту now: итог — в капитал (размер следующих
+        входов — от него), киты — в рейтинг (как у живого бота по
+        trades.jsonl). Позиций до трёх — закрываются не по порядку входа."""
+        while self.closing and self.closing[0][0] <= now:
+            _t, i = heapq.heappop(self.closing)
+            t = self.trades[i]
+            self.equity += t.pnl
             self.rating.add(t.wallets, t.pnl > 0)
             self.sig.priority = self.rating.priority()
-            self.rated += 1
 
     def run(self, since: int, until: int) -> None:
         con = core.open_ro(self.a.db)
@@ -433,14 +461,12 @@ class Replay:
             while rows := cur.fetchmany(5000):
                 for row in rows:
                     done += 1
-                    self.rate_closed(int(row[4]))
+                    self.settle(int(row[4]))
                     # Строка — по одной: одновременных сигналов (порядок по нашему
                     # винрейту с китами, как у живого бота в одном опросе) почти нет.
                     for s in reversed(self.sig.feed([row])):  # как candidates: встречный «крупный» — первым
                         why = self.decide(s, s["ts"] + self.a.delay * 1000)
                         self.skips[why or "entered"] += 1
-                        if not why:
-                            break
                 self.sig.seen.clear()  # повтор идёт по строкам один раз — повторов нет, память не копим
                 if time.time() - last_note > 2:
                     last_note = time.time()
@@ -451,6 +477,7 @@ class Replay:
                     self.sig.sweep(int(rows[-1][4]))
         finally:
             con.close()
+        self.settle(10**17)   # закрытые к концу данных — в капитал (открытые — нет)
         self.px.save()
         self.hours.save()
         self.progress({"stage": "готово", "done": total, "total": total, "trades": len(self.trades),
@@ -574,9 +601,9 @@ def parser() -> argparse.ArgumentParser:
     return ap
 
 
-def variant_row(r: Rules, st: dict[str, Any]) -> dict[str, Any]:
-    """Строка сравнения: настройки варианта и его итог."""
-    return {"name": r.name, "tp_pct": round(r.tp * 100, 3),
+def variant_row(r: Rules, st: dict[str, Any], days: float) -> dict[str, Any]:
+    """Строка сравнения: настройки варианта, его итог и сделок в месяц (30 дней)."""
+    return {"name": r.name, "tp_pct": round(r.tp * 100, 3), "per_month": round(st["trades"] / max(days, 1.0) * 30, 1),
             "stop_max_pct": round(r.stop_max * 100, 3) if math.isfinite(r.stop_max) else None,
             "levels": r.levels, "ma": r.ma,
             **{k: st[k] for k in ("trades", "win_pct", "net", "pf", "max_dd", "open")}}
@@ -603,13 +630,14 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
     s = summary(a, rp, since, now)
     s["variants"] = []
     if getattr(a, "variants", False):
-        s["variants"].append(variant_row(rp.rules, s["full"]))
+        days = (now - since) / core.DAY_MS
+        s["variants"].append(variant_row(rp.rules, s["full"], days))
         for i, r in enumerate(VARIANTS, 1):
             def note(p: dict[str, Any], i: int = i, r: Rules = r) -> None:
                 progress({**p, "stage": f"вариант {i} из {len(VARIANTS)}: {r.name}"})
             alt = Replay(a, prices, instr, note, hours, rules=r)   # свечи — те же (кеш в памяти)
             alt.run(since, now)
-            s["variants"].append(variant_row(r, stats(alt.trades)))
+            s["variants"].append(variant_row(r, stats(alt.trades), days))
         progress({"stage": "готово", "done": 1, "total": 1, "trades": len(rp.trades), "requests": rp.requests()})
 
     def fmt(ms: float) -> str:
@@ -632,7 +660,7 @@ def run(a: argparse.Namespace, fetch: Fetch | None = None, now_ms: int | None = 
         f"Запросов к OKX: {rp.requests()} (часовых — {hours.requests})"
         + (f", сбоев: {prices.errors + hours.errors}" if prices.errors + hours.errors else ""),
         *(["", "Варианты (те же киты, одно изменение правил):"] if s["variants"] else []),
-        *(f"  {v['name']}: " + line(v) for v in s["variants"]),
+        *(f"  {v['name']}: " + line(v) + f", в месяц ≈ {v['per_month']:g}" for v in s["variants"]),
         "",
         "Сделки:",
         *(f"  {fmt(t.entry_t)} {t.coin} {'лонг' if t.side > 0 else 'шорт'} {t.entry_px:.6g} → {t.exit_px:.6g} "

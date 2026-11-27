@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from typing import ClassVar
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -27,7 +28,11 @@ MIN = 60_000
 INSTR = [{"instId": "BTC-USDT-SWAP", "ctVal": "0.01", "ctMult": "1", "ctValCcy": "BTC", "lotSz": "0.01", "minSz": "0.01",
           "tickSz": "0.1", "state": "live"},
          {"instId": "ETH-USDT-SWAP", "ctVal": "0.1", "ctMult": "1", "ctValCcy": "ETH", "lotSz": "0.01", "minSz": "0.01",
-          "tickSz": "0.01", "state": "live"}]
+          "tickSz": "0.01", "state": "live"},
+         {"instId": "SOL-USDT-SWAP", "ctVal": "1", "ctMult": "1", "ctValCcy": "SOL", "lotSz": "0.01", "minSz": "0.01",
+          "tickSz": "0.001", "state": "live"},
+         {"instId": "DOGE-USDT-SWAP", "ctVal": "1", "ctMult": "1", "ctValCcy": "DOGE", "lotSz": "1", "minSz": "1",
+          "tickSz": "0.00001", "state": "live"}]
 
 
 class FakeMarket:
@@ -368,12 +373,63 @@ class ReplayTest(unittest.TestCase):
         [t] = r["trades"]
         self.assertEqual((t.side, t.why), (-1, "тейк"))
 
-    def test_one_position_and_no_inst(self) -> None:
+    PX: ClassVar[dict[str, float]] = {"BTC": 100_000.0, "ETH": 3000.0, "SOL": 150.0, "DOGE": 0.2, "NOPE": 1.0}
+
+    def test_three_positions_and_no_inst(self) -> None:
+        """Своих позиций — до 3 (как у живого бота): BTC, ETH, SOL открыты,
+        DOGE — «own_open»; бумаги нет на OKX — «no_inst». Вариант «1 позиция» —
+        только BTC."""
         rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 30 * MIN, base=10),
-                *self.whales(coin="NOPE", px=1, t=T + 31 * MIN, base=20)]
-        r = self.go(rows, lambda c, t: 3000.0 if c == "ETH" else 100_000.0)
-        self.assertEqual([t.coin for t in r["trades"]], ["BTC"], "позиция одна")
+                *self.whales(coin="SOL", px=150, t=T + 31 * MIN, base=20),  # NOPE — раньше: пока место есть
+                *self.whales(coin="DOGE", px=0.2, t=T + 32 * MIN, base=30),
+                *self.whales(coin="NOPE", px=1, t=T + 15 * MIN, base=40)]
+        r = self.go(rows, lambda c, t: self.PX[c], variants=True)
+        self.assertEqual([t.coin for t in r["trades"]], ["BTC", "ETH", "SOL"], "позиций до трёх")
         self.assertGreater(r["skips"]["own_open"], 0)
+        self.assertGreater(r["skips"]["no_inst"], 0)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["1 позиция"]["trades"], v["текущие правила"]["trades"]), (1, 3))
+
+    def test_same_coin_while_open_and_equity_from_closed_only(self) -> None:
+        """BTC открыт дольше паузы — новый сигнал BTC: «own_same». Размер
+        ETH (вход, пока BTC открыт) — от капитала без итога BTC; SOL (после
+        тейка BTC) — с ним."""
+        rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 30 * MIN, base=10),
+                *self.whales(coin="SOL", px=150, t=T + 90 * MIN, base=20)]
+
+        def price(c: str, t: int) -> float:
+            return 101_200.0 if c == "BTC" and t >= T + 60 * MIN else self.PX[c]
+
+        r = self.go(rows, price)
+        btc, eth, sol = r["trades"]
+        self.assertEqual((btc.why, eth.why, sol.why), ("тейк", "открыта", "открыта"))
+        self.assertAlmostEqual(eth.notional, 33.33 * 0.1 * 3000 * 1.0005, delta=0.5, msg="10 000 $ без итога BTC")
+        self.assertAlmostEqual(sol.notional, (20_000 + btc.pnl) * 0.5 * 1.0005, delta=2, msg="с проскальзыванием входа")
+        self.assertGreater(sol.notional, eth.notional + 30)
+        os.remove(self.db)
+        self.cache += "2"
+        rows = [*self.whales(), *self.whales(t=T + 4 * 60 * MIN, base=10)]
+        r = self.go(rows, lambda c, t: self.PX[c])
+        self.assertEqual(len(r["trades"]), 1)
+        self.assertEqual(r["skips"].get("own_same"), 1)
+
+    def test_limit_entry_variant(self) -> None:
+        """«Вход лимитом»: по цене решения, мейкером, без проскальзывания —
+        если за 5 минут после решения цена дошла до лимита; ушла вверх сразу —
+        входа нет («limit_miss»)."""
+        r = self.go(self.whales(), step_price(100_000, [(T + 60 * MIN, 0.012)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual(v["вход лимитом"]["trades"], 1)
+        self.assertGreater(v["вход лимитом"]["net"], v["текущие правила"]["net"], "мейкер и без проскальзывания — дешевле")
+        # 0,1 BTC по 100 000 → тейк 101 000: +100 $ минус мейкер 0,02 % на входе и выходе.
+        self.assertAlmostEqual(v["вход лимитом"]["net"], 100 - 0.1 * (100_000 + 101_000) * 0.0002, delta=0.02)
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(self.whales(), step_price(100_000, [(T + 5 * MIN, 0.012)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["вход лимитом"]["trades"], v["текущие правила"]["trades"]), (0, 1))
+        self.assertIn("в месяц ≈", r["text"])
+        self.assertEqual(v["текущие правила"]["per_month"], 1.0, "1 сделка за 30 дней повтора")
 
     def test_coin_pause_three_hours(self) -> None:
         rows = [*self.whales(), *self.whales(t=T + 120 * MIN, base=10), *self.whales(t=T + 200 * MIN, base=20)]
@@ -381,6 +437,12 @@ class ReplayTest(unittest.TestCase):
                                                (T + 130 * MIN, 0.012), (T + 131 * MIN, 0.0)]))
         self.assertEqual(len(r["trades"]), 2, "вход в +0 мин, в +120 — пауза 3 ч, в +200 — снова")
         self.assertGreater(r["skips"]["coin_pause"], 0)
+        os.remove(self.db)
+        self.cache += "2"
+        r = self.go(rows, step_price(100_000, [(T + 60 * MIN, 0.012), (T + 61 * MIN, 0.0),
+                                               (T + 130 * MIN, 0.012), (T + 131 * MIN, 0.0)]), variants=True)
+        v = {x["name"]: x for x in r["summary"]["variants"]}
+        self.assertEqual((v["текущие правила"]["trades"], v["пауза бумаги 30 мин"]["trades"]), (2, 3))
 
     def test_no_okx_coin_skipped(self) -> None:
         r = self.go(self.whales(coin="NOPE", px=1), lambda c, t: 1.0)

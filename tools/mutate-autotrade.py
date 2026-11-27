@@ -28,11 +28,24 @@ ENV = {**os.environ, "AUTOTRADE_PROPS": "400", "AUTOTRADE_FUZZ": "400", "AUTOTRA
 # Рейтинг повтора — только по сделкам, закрытым к моменту решения: пока сделка
 # открыта, позиция занята и вход всё равно «own_open» — наблюдаемо то же самое
 # (проверка — защита от взгляда в будущее).
-EQUIV: set[str] = {"киты против — те же 2 часа", "тейка нет в записи — его надо поставить", "повтор: рейтинг — только закрытые к моменту решения"}
+EQUIV: set[str] = {"киты против — те же 2 часа", "тейка нет в записи — его надо поставить"}
 
 MUTS = [
     # Правила владельца
     ("MIN_WHALES = 2", "MIN_WHALES = 1", "сигнал — от 2 китов"),
+    ("MAX_OPEN = 3", "MAX_OPEN = 2", "своих позиций — до 3"),
+    ("        if len(mine) >= MAX_OPEN:", "        if len(mine) > MAX_OPEN:", "больше 3 своих — не открываем"),
+    ("        if inst in mine:\n            return self._skip(\"own_same\"", "        if False:\n            return self._skip(\"own_same\"",
+     "своя на бумаге — вторую не открываем"),
+    ("                continue   # вошли — следующие", "                break   # вошли — следующие", "вошли — и в следующие сигналы опроса"),
+    ("            if not inst or inst in mine or time.time()", "            if not inst or time.time()", "сверка: свои записанные — не принимать заново"),
+    ("                    or any(o[\"inst\"] == op[\"inst\"] for o in opens):", "                    or False:", "состояние: повтор бумаги — одна запись"),
+    ("        st[\"opens\"] = opens[:MAX_OPEN]", "        st[\"opens\"] = opens", "состояние: не больше 3 позиций"),
+    ("else [got_open] if got_open is not None else []", "else []", "состояние прежней версии (open) — подхватывается"),
+    ("        self.st[\"opens\"] = [o for o in self.st[\"opens\"] if (o[\"inst\"], o[\"side\"]) != (op[\"inst\"], op[\"side\"])]\n", "",
+     "закрытая — из своих позиций"),
+    ("        self.st[\"open\"] = self.st[\"opens\"][0] if self.st[\"opens\"] else None\n        self.st.update(", "        self.st.update(",
+     "open — первая позиция для прежней вкладки"),
     ("MIN_WHALE_USD = 1000", "MIN_WHALE_USD = 100", "кит — от 1000 $"),
     ("        if mark > 0 and op[\"side\"] * (mark - stop) > 0:", "        if mark > 0 and op[\"side\"] * (mark - stop) >= 0:",
      "стоп — дошла до уровня стопа включительно"),
@@ -63,8 +76,8 @@ MUTS = [
     ("TP = 0.01 ", "TP = 0.005 ", "тейк +1 %"),
     ("COIN_PAUSE_MS = 3 * 3_600_000", "COIN_PAUSE_MS = 3_600_000", "в бумагу — раз в 3 часа"),
     ("if key in seen or now - s[\"ts\"] > FRESH_MS:", "if key in seen:", "сигнал старше 15 минут — не входим"),
-    ("        if self.st.get(\"open\"):\n            return self._skip(\"own_open\"", "        if False:\n            return self._skip(\"own_open\"",
-     "своя позиция у бота — одна"),
+    ("        if len(mine) >= MAX_OPEN:\n            return self._skip(\"own_open\"", "        if False:\n            return self._skip(\"own_open\"",
+     "своих позиций — не больше 3"),
     ("        if inst in foreign:", "        if False:", "на бумагу с ручной позицией — не входим"),
     ("        if unknown:\n", "        if False:\n", "своя непринятая позиция — новых входов нет"),
     ("min(size_of(p.get(\"pos\")), size_of(op.get(\"size\")))", "size_of(p.get(\"pos\"))", "тейк заново — только на объём бота"),
@@ -95,7 +108,8 @@ MUTS = [
     ("        live = [p for p in self.positions if p.get(\"instId\") == op[\"inst\"] and self._side_of(p) == op[\"side\"]]\n        if live:",
      "        live = [p for p in self.positions if p.get(\"instId\") == op[\"inst\"]]\n        if live:", "своя позиция — та же сторона (long/short)"),
     ("            if tp.get(\"state\") == \"filled\":", "            if False:", "тейк исполнен — сделка закрыта"),
-    ("        if op is not None and not (isinstance(op, dict)", "        if False and not (isinstance(op, dict)", "испорченная запись позиции — забыть"),
+    ("            if not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)", "            if False and not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)",
+     "испорченная запись позиции — забыть"),
     # Выход вслед за китом в убытке
     (" for wl, p in sorted(pnl.items()) if p < 0]", " for wl, p in sorted(pnl.items()) if p != 0]", "выход — только когда кит закрыл в убыток"),
     ("            if ts >= since.get(wl, now + 1):", "            if True:", "убыток — только после входа кита в окно"),
@@ -117,7 +131,7 @@ MUTS = [
      "закрытая сделка — её вход не повод принять позицию"),
     ("        return {str(w): int(t) for w, t, n in rows if int(n or 0) >= self.limit}",
      "        return {str(w): int(t) for w, t, n in rows}", "восстановленные киты — только от 1000 $"),
-    ("        if op and \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
+    ("        if \"wallets\" not in op and num(op.get(\"signal_ts\")) > 0:", "        if False:",
      "позиция прежней версии — киты по базе"),
     # Входим с крупными
     ("        if against > 0 and against >= usd and not prio:", "        if False:", "против сигнала киты крупнее — не входим"),
@@ -241,13 +255,28 @@ MUTS = [
 ]
 
 RP_MUTS = [
-    ("        if now < self.busy_until:", "        if False:", "повтор: позиция одна"),
-    ("        if now - self.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
+    ("        if len(self.busy) >= self.rules.max_open:\n            return", "        if False:\n            return", "повтор: позиций не больше 3"),
+    ("        if now - self.entered.get(s[\"coin\"], -10**15) < self.rules.pause_ms:", "        if False:", "повтор: в бумагу — раз в 3 часа"),
     ("        if against > 0 and against >= usd and not prio:", "        if False:", "повтор: против — киты крупнее"),
     ("        if count < lv.MIN_WHALES and not prio:", "        if False:", "повтор: на момент входа китов от 2"),
     ("        if count < lv.MIN_WHALES and not prio:", "        if count < lv.MIN_WHALES:", "повтор: приоритетный — и один в окне"),
-    ("                and self.trades[self.rated].exit_t <= now:", "                and self.trades[self.rated].exit_t <= now + 10**12:",
-     "повтор: рейтинг — только закрытые к моменту решения"),
+    ("        while self.closing and self.closing[0][0] <= now:", "        while self.closing:",
+     "повтор: капитал и рейтинг — только закрытые к моменту решения"),
+    ("            heapq.heappush(self.closing, (t_out, len(self.trades)))\n", "", "повтор: закрытая — в капитал и рейтинг"),
+    ("        self.settle(10**17)   # закрытые", "        pass   # закрытые", "повтор: в конце — закрытые в капитал"),
+    ("        if len(self.busy) >= self.rules.max_open:", "        if len(self.busy) > self.rules.max_open:", "повтор: позиций до 3"),
+    ("        self.busy = [b for b in self.busy if b[0] > now]\n", "", "повтор: закрытая освобождает место"),
+    ("        if any(b[1] == inst for b in self.busy):\n            return \"own_same\"", "        if False:\n            return \"own_same\"",
+     "повтор: своя на бумаге — вторую не открываем"),
+    ("        if now - self.entered.get(s[\"coin\"], -10**15) < self.rules.pause_ms:",
+     "        if now - self.entered.get(s[\"coin\"], -10**15) < lv.COIN_PAUSE_MS:", "повтор: вариант — своя пауза бумаги"),
+    ("        if self.rules.limit:\n", "        if False:\n", "повтор: вариант — вход лимитом"),
+    ("                        if c[0] > now and side", "                        if side", "повтор: лимит — только свечи после решения"),
+    ("            start, entry, fee_in = int(got[0]), last, a.fee_maker", "            start, entry, fee_in = int(got[0]), last, a.fee_taker",
+     "повтор: лимит — мейкер"),
+    ("            if got is None:\n                return False\n", "", "повтор: лимит не исполнился — входа нет"),
+    ("\"per_month\": round(st[\"trades\"] / max(days, 1.0) * 30, 1),", "\"per_month\": round(st[\"trades\"] / max(days, 1.0), 1),",
+     "повтор: сделок в месяц"),
     ("        if self.rules.levels and not prio and core.level_ok(", "        if self.rules.levels and core.level_ok(",
      "повтор: приоритетный — без уровней"),
     ("        if self.sig.whale_loss(", "        if False and self.sig.whale_loss(", "повтор: кит уже вышел в убыток"),

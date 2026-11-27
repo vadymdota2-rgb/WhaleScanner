@@ -18,7 +18,8 @@
 - маржа — всегда 5 % капитала счёта, плечо 10×, кросс (сделки владельца
   руками на счёте входу не мешают);
   на ту же бумагу, где ручная позиция, — не входит;
-- у бота своя позиция — всегда одна: пока её не закрыли, вторую не открываем;
+- своих позиций у бота — до 3 одновременно (правило владельца 27.11.2026;
+  было — одна), на разных бумагах: на бумагу, где уже есть своя, — не входит;
 - выход — тейк +1 % движения цены (лимитный ордер на бирже); и второй
   выход: кто-то из китов сигнала закрыл свою сделку по этой бумаге В УБЫТКЕ
   (стоп, ликвидация или он увидел, что ситуация изменилась) — бот снимает
@@ -111,6 +112,9 @@ MATCH_TOL = 0.02
 # 10 %, а при ручной сделке на счёте — 5 %). Своя позиция у бота — одна.
 MARGIN_FRAC = 0.05
 LEVERAGE = 10
+# Своих позиций бота — до MAX_OPEN одновременно, на разных бумагах (правило
+# владельца 27.11.2026; раньше — одна): каждая — 5 % маржи × 10×.
+MAX_OPEN = 3
 TP = 0.01                   # тейк +1 % движения цены (27.11.2026: при +0,5 % комиссии и проскальзывание
                             # ~0,2 % съедали почти половину тейка; было +0,5 %)
 COIN_PAUSE_MS = 3 * 3_600_000
@@ -902,23 +906,33 @@ class Trader:
             if not isinstance(st.get(k), kind):
                 st[k] = kind()
         st["events"] = [e for e in st["events"] if isinstance(e, str)]
-        op = st.get("open")
-        if op is not None and not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)
-                                   and op["side"] in (1, -1) and isinstance(op["inst"], str)
-                                   and num(op["px"]) > 0 and num(op["tp"]) > 0 and num(op["size"]) > 0):
-            # Запись позиции испорчена: забыть её — find_own узнает свою позицию по метке ордера.
-            self._log(f"[AUTO-LIVE] запись позиции в state.json испорчена — сверка по счёту: {str(op)[:200]}")
-            op = None
-        if op is not None and not isinstance(op.get("exit", {}), dict):
-            op.pop("exit")
-        st["open"] = op
+        # Свои позиции: opens (список); у прежней версии — одна, open.
+        got_opens, got_open = st.get("opens"), st.get("open")
+        raw: list[Any] = got_opens if isinstance(got_opens, list) else [got_open] if got_open is not None else []
+        opens: list[dict[str, Any]] = []
+        for op in raw:
+            if not (isinstance(op, dict) and all(k in op for k in OPEN_KEYS)
+                    and op["side"] in (1, -1) and isinstance(op["inst"], str)
+                    and num(op["px"]) > 0 and num(op["tp"]) > 0 and num(op["size"]) > 0) \
+                    or any(o["inst"] == op["inst"] for o in opens):
+                # Запись позиции испорчена (или повтор бумаги): забыть её — find_own
+                # узнает свою позицию по метке ордера.
+                self._log(f"[AUTO-LIVE] запись позиции в state.json испорчена — сверка по счёту: {str(op)[:200]}")
+                continue
+            if not isinstance(op.get("exit", {}), dict):
+                op.pop("exit")
+            opens.append(op)
+        st["opens"] = opens[:MAX_OPEN]
+        st["open"] = st["opens"][0] if st["opens"] else None
         if not isinstance(st.get("entering"), dict):
             st.pop("entering", None)
         st["error"] = st["error"] if isinstance(st.get("error"), str) else ""
         return st
 
     def save(self) -> None:
-        # Во вкладку (wt_autotrade.live) — только то, что она читает.
+        # Во вкладку (wt_autotrade.live) — только то, что она читает; open —
+        # первая позиция для вкладки прежней версии.
+        self.st["open"] = self.st["opens"][0] if self.st["opens"] else None
         self.st.update(heartbeat=self.clock(), simulated=self.okx.simulated, equity=self.equity,
                        positions=[{k: p.get(k) for k in ("instId", "upl")} for p in self.positions])
         tmp = os.path.join(self.dir, "state.json.tmp")
@@ -998,7 +1012,7 @@ class Trader:
         и исполнен, позиция есть — она своя: принять и поставить тейк; ордер
         отменён или за 10 минут не подтвердился позицией — входа не было."""
         e = self.st.get("entering")
-        if not isinstance(e, dict) or self.st.get("open"):
+        if not isinstance(e, dict) or any(o["inst"] == e.get("inst") for o in self.st["opens"]):
             self.st.pop("entering", None)
             return
         try:
@@ -1017,11 +1031,12 @@ class Trader:
             self.st.pop("entering", None)
 
     def _track_open(self) -> None:
-        """Наша позиция: есть — тейк на месте? нет — закрылась (тейк или руками):
-        записать сделку."""
-        op = self.st.get("open")
-        if not op:
-            return
+        """Наши позиции: есть — тейк на месте? нет — закрылась (тейк или
+        руками): записать сделку."""
+        for op in list(self.st["opens"]):
+            self._track_one(op)
+
+    def _track_one(self, op: dict[str, Any]) -> None:
         # Своя позиция — та же бумага и та же сторона (в режиме long/short на
         # бумаге может быть и встречная ручная позиция владельца).
         live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
@@ -1123,7 +1138,7 @@ class Trader:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
         self.rating.add(trade["wallets"], pnl > 0)
         self.sig.priority = self.rating.priority()
-        self.st["open"] = None
+        self.st["opens"] = [o for o in self.st["opens"] if (o["inst"], o["side"]) != (op["inst"], op["side"])]
         # Вход этой сделки — уже закрыт: позицию на той же бумаге (докупленную
         # владельцем руками) find_own не примет за свою по метке этого ордера.
         self.st["closed_ids"] = [*self.st.get("closed_ids", [])[-99:], str(op.get("in_id") or "")]
@@ -1142,14 +1157,15 @@ class Trader:
         закрыл позицию в убыток — закрыть свою: снять тейк и рыночным ордером
         только на закрытие. Не вышло (сбой, отказ) — запись «выходим»
         остаётся, тейк заново не ставится, попытка — раз в минуту."""
-        op = self.st.get("open")
-        if op and "wallets" not in op and num(op.get("signal_ts")) > 0:
+        for op in list(self.st["opens"]):
+            self._follow_one(op)
+
+    def _follow_one(self, op: dict[str, Any]) -> None:
+        if "wallets" not in op and num(op.get("signal_ts")) > 0:
             # Позиция открыта прежней версией (без китов в записи) — найти их по базе.
             op["wallets"] = self.sig.wallets_at(op["coin"], op["side"], int(num(op["signal_ts"])))
             self.event(f"{op['inst']}: киты сигнала восстановлены по базе — {len(op['wallets'])}; "
                        "выход вслед за ними в убытке включён")
-        if not op:
-            return
         now = self.clock()
         if not op.get("exit"):
             why = self._stop_hit(op)
@@ -1337,8 +1353,9 @@ class Trader:
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
-        if self.st.get("open"):
-            return self._skip("own_open", f"у бота уже есть своя позиция ({(self.st.get('open') or {}).get('inst')})")
+        mine = {o["inst"] for o in self.st["opens"]}
+        if len(mine) >= MAX_OPEN:
+            return self._skip("own_open", f"у бота уже {len(mine)} позиции ({', '.join(sorted(mine))}) — больше {MAX_OPEN} не открываем")
         if self.st.get("entering"):
             return self._skip("entering", "прошлый вход ещё не подтверждён биржей — сверка")
         if self.unverified:
@@ -1346,7 +1363,8 @@ class Trader:
         unknown = [str(p.get("instId")) for p in self.positions if str(p.get("instId")) in self.st.get("own_unknown", {})]
         if unknown:
             return self._skip("own_unknown", f"своя позиция без записи ({', '.join(unknown)}) — проверьте её в OKX; пока она есть, бот не входит")
-        # Остальные позиции на счёте — владельца (руками): на их бумаги бот не входит.
+        # Позиции на счёте: свои (mine) проверяются раньше («own_same»), остальные —
+        # владельца (руками): на их бумаги бот не входит.
         foreign = [str(p.get("instId")) for p in self.positions]
         if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
             return self._skip("coin_pause", "в эту бумагу входили меньше 3 часов назад")
@@ -1379,6 +1397,8 @@ class Trader:
             left = int((MARKET_PAUSE_MS - (now - num(mb.get("at")))) // 60_000) + 1
             return self._skip("market", f"ключу OKX закрыт рынок {inst_type(inst)} — проверка снова через {left} мин "
                                         f"({mb.get('why', '')})")
+        if inst in mine:
+            return self._skip("own_same", f"на {inst} у бота уже позиция — вторую на ту же бумагу не открываем")
         if inst in foreign:
             # Своя сделка бота на той же бумаге смешалась бы с ручной (в режиме
             # net — вычлась бы из неё), а тейк бота закрыл бы часть ручной.
@@ -1496,7 +1516,7 @@ class Trader:
               # Рыночный исполнен частично — может доисполниться: сверка
               # увеличит запись и тейк (_entry_fill).
               "in_done": o.get("state") == "filled", "ordered": float(sz)}
-        self.st["open"] = op
+        self.st["opens"].append(op)
         self.st["entered"][s["coin"]] = now
         self.st.pop("entering", None)
         self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} {fmt_dec(sz)} по {fill_px} "
@@ -1541,7 +1561,7 @@ class Trader:
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
               "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": num(info.get("stop")),
               "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {}}
-        self.st["open"] = op
+        self.st["opens"] = [*(o for o in self.st["opens"] if o["inst"] != inst), op]
         self.st["entered"][coin] = opened
         self.event(f"найдена своя позиция без записи: {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(Decimal(str(size)))} "
                    f"по {px} — принята, тейк {op['tp_s']}")
@@ -1558,14 +1578,15 @@ class Trader:
         ордером (метка clOrdId «wtin…» за последние 7 дней) — свои,
         принять. Нет такой метки — чужие (владельца): не трогать. Каждую
         бумагу — не чаще раза в час."""
-        if self.st.get("open"):
-            return
+        if len(self.st["opens"]) >= MAX_OPEN:
+            return   # больше своих быть не может: остальные — владельца
+        mine = {o["inst"] for o in self.st["opens"]}
         checked = self._checked
         held = {str(p.get("instId") or "") for p in self.positions}
         self.unverified &= held
         for p in self.positions:
             inst = str(p.get("instId") or "")
-            if not inst or time.time() - checked.get(inst, 0) < 3600:
+            if not inst or inst in mine or time.time() - checked.get(inst, 0) < 3600:
                 continue
             side = self._side_of(p)
             try:
@@ -1578,14 +1599,14 @@ class Trader:
                 continue
             checked[inst] = time.time()
             self.unverified.discard(inst)
-            mine = [o for o in hist
-                    if str(o.get("clOrdId", "")).startswith(f"{TAG}in") and o.get("state") in ("filled", "partially_filled")
-                    and (1 if o.get("side") == "buy" else -1) == side
-                    and self.clock() - num(o.get("cTime")) < 7 * 86_400_000
-                    and str(o.get("ordId") or "") not in self.st["closed_ids"]]
-            if mine:
+            tagged = [o for o in hist
+                      if str(o.get("clOrdId", "")).startswith(f"{TAG}in") and o.get("state") in ("filled", "partially_filled")
+                      and (1 if o.get("side") == "buy" else -1) == side
+                      and self.clock() - num(o.get("cTime")) < 7 * 86_400_000
+                      and str(o.get("ordId") or "") not in self.st["closed_ids"]]
+            if tagged:
                 info = self.st.get("entering") if (self.st.get("entering") or {}).get("inst") == inst else None
-                self.adopt(p, mine[0], info)
+                self.adopt(p, tagged[0], info)
                 self.st.pop("entering", None)
                 return
 
@@ -1606,7 +1627,7 @@ class Trader:
             if self.skip_code == "candles":
                 self.retry.append(s)
             if not why:
-                break
+                continue   # вошли — следующие сигналы опроса тоже (до MAX_OPEN позиций)
             self.st["last_skip"] = {"coin": s["coin"], "side": s["side"], "why": why, "at": self.clock(),
                                     "code": self.skip_code}
             self.count_skip(s, self.skip_code)
@@ -1631,7 +1652,8 @@ def main(argv: list[str] | None = None) -> int:
         msg = "нет ключа OKX (OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSPHRASE в /etc/whale-autotrade.env)"
         tmp = os.path.join(a.dir, "live", "state.json.tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"error": msg, "heartbeat": now_ms(), "open": None, "entered": {}, "events": []}, f, ensure_ascii=False)
+            json.dump({"error": msg, "heartbeat": now_ms(), "open": None, "opens": [], "entered": {}, "events": []}, f,
+                      ensure_ascii=False)
         os.replace(tmp, os.path.join(a.dir, "live", "state.json"))
         print(f"[AUTO-LIVE] {msg}", flush=True)
         time.sleep(300)  # служба перезапустится — проверит снова
