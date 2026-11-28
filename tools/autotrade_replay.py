@@ -372,7 +372,7 @@ class Replay:
         tick = lv.dec(ins.get("tickSz")) or Decimal("0.0001")
         qty = float(sz) * coin_per_contract(ins, entry)      # монет в позиции
         avg_px = entry
-        stop = core.fixed_stop(avg_px, side)   # стоп — от цены входа (как живой бот — от цены исполнения)
+        stop = core.fixed_stop(last, side)   # стоп — от цены решения, как у живого бота (правило владельца 28.11.2026)
         fees = qty * entry * a.fee_taker / 100
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
         mae = 0.0

@@ -1189,9 +1189,9 @@ class StopTest(Base):
             os.remove(os.path.join(self.dir, "live", "state.json"))
             os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
 
-    def test_stop_from_fill_price(self) -> None:
-        """Стоп и тейк — от цены исполнения (99 800), а не от цены решения
-        (100 000): 99 800 × 0,985 = 98 303."""
+    def test_stop_from_decision_price(self) -> None:
+        """Стоп — от цены решения (100 000 → 98 500; правило владельца
+        28.11.2026, вариант 1), тейк — от цены исполнения (99 800 → 101 297)."""
         self.ex = FakeOkx()
         tr = self.trader(self.whales())
         real = tr.okx.order
@@ -1206,7 +1206,7 @@ class StopTest(Base):
         tr.step()
         op = self.state()["open"]
         self.assertEqual(op["px"], 99_800.0)
-        self.assertAlmostEqual(op["stop"], 98_303.0)
+        self.assertAlmostEqual(op["stop"], 98_500.0)
         self.assertAlmostEqual(op["tp"], 101_297.0)
 
     def test_stop_fixed_at_entry(self) -> None:

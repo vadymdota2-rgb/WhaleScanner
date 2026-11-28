@@ -464,10 +464,10 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual([(x.side, x.why) for x in r["trades"]], [(-1, "тейк")])
             self.assertEqual(r["trades"][0].wallets, ("0xbig1", "0xbig2"), "с крупными, не против толпы лонгов")
 
-    def test_stop_from_entry_price(self) -> None:
-        """Стоп — 1,5 % от цены входа (99 049,5 = 99 000 + проскальзывание),
-        а не от цены решения (99 000): провал до 97 540 — стоп (97 563,76),
-        от цены решения (97 515) был бы не стоп."""
+    def test_stop_from_decision_price(self) -> None:
+        """Стоп — 1,5 % от цены решения (99 000 → 97 515), как у живого бота,
+        а не от цены входа с проскальзыванием (99 049,5 → 97 563,76): провал
+        до 97 540 — не стоп, потом тейк."""
         def price(c: str, ts: int) -> float:
             if T + 17 * MIN <= ts < T + 20 * MIN:
                 return 97_540.0
@@ -476,7 +476,7 @@ class ReplayTest(unittest.TestCase):
         r = self.go(self.whales(), price)
         [t] = r["trades"]
         self.assertAlmostEqual(t.entry_px, 99_049.5)
-        self.assertEqual(t.why, "стоп")
+        self.assertEqual(t.why, "тейк")
 
     def test_big_rechecked_at_decision(self) -> None:
         """«Крупные против толпы» — на момент решения: сигнал крупных шортов

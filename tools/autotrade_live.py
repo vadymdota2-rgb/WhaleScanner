@@ -1476,8 +1476,9 @@ class Trader:
         why = "" if prio else self.ma_check(inst, last, s["side"])
         if why:
             return why
-        # Стоп — STOP_PCT от цены входа (уровни 4ч убраны 27.11.2026: правило
-        # владельца); здесь — от цены решения, в записи позиции — от цены исполнения.
+        # Стоп — STOP_PCT от цены решения (тикер), не от цены исполнения: по
+        # бэктесту 28.11.2026 так лучше (+276 $ против +255 $ — правило владельца,
+        # вариант 1); уровни 4ч убраны 27.11.2026.
         s = {**s, "stop": core.fixed_stop(last, s["side"])}
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
@@ -1609,8 +1610,9 @@ class Trader:
               "whales": e.get("whales"), "ref_px": e.get("ref_px"), "signal_ts": e.get("signal_ts"),
               "in_id": str(o.get("ordId") or ""), "margin_pct": round(MARGIN_FRAC * 100, 2),
               "wallets": e.get("wallets") if isinstance(e.get("wallets"), dict) else {},
-              # Стоп — STOP_PCT от цены ВХОДА (исполнения), а не от цены решения.
-              "usd": e.get("usd"), "usd_against": e.get("usd_against"), "stop": core.fixed_stop(fill_px, side),
+              # Стоп — от цены решения (запись «входим»); её нет — от цены исполнения.
+              "usd": e.get("usd"), "usd_against": e.get("usd_against"),
+              "stop": num(e.get("stop")) or core.fixed_stop(fill_px, side),
               **({"priority": e["priority"]} if isinstance(e.get("priority"), str) else {}),
               **({"fade": True} if e.get("fade") else {}), **({"big": True} if e.get("big") else {})}
         self.st["opens"] = [*(x for x in self.st["opens"] if x["inst"] != inst), op]
@@ -1656,9 +1658,10 @@ class Trader:
         op: dict[str, Any] = {"coin": coin, "inst": inst, "side": side, "opened": opened, "px": px, "size": size,
               "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
-              # Стоп — от цены входа и у подхваченной (раньше без записи
-              # «входим» стопа не было вовсе: позиция без защиты).
-              "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": core.fixed_stop(px, side),
+              # Стоп — из записи «входим» (от цены решения); её нет — от цены
+              # входа (раньше без записи стопа не было вовсе: позиция без защиты).
+              "in_id": str(order.get("ordId") or ""), "adopted": True,
+              "stop": num(info.get("stop")) or core.fixed_stop(px, side),
               "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {},
               **({"fade": True} if info.get("fade") else {}), **({"big": True} if info.get("big") else {})}
         self.st["opens"] = [*(o for o in self.st["opens"] if o["inst"] != inst), op]
