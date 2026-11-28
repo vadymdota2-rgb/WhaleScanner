@@ -187,9 +187,10 @@ def fill(tid: int, wallet: str, coin: str, side: int, ts: int, usd: float, px: f
 class Base(unittest.TestCase):
     AGAINST = False   # сценарии по направлению китов; против китов — AgainstTest
     CHASE = 0.0       # вход не хуже цены китов; против китов (±1 % лучше) — AgainstTest
+    MAX_OPEN = 3      # сценарии нескольких позиций; в коде — 1 (OnePositionTest)
 
     def setUp(self) -> None:
-        for name, value in (("AGAINST", self.AGAINST), ("CHASE", self.CHASE)):
+        for name, value in (("AGAINST", self.AGAINST), ("CHASE", self.CHASE), ("MAX_OPEN", self.MAX_OPEN)):
             patcher = mock.patch.object(lv, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -1438,6 +1439,32 @@ class AgainstTest(Base):
         tr2.save()
         op = self.state()["open"]
         self.assertEqual((op["side"], op.get("fade")), (-1, True))
+
+
+class OnePositionTest(Base):
+    """Правило владельца 28.11.2026: на старт — одна позиция бота (MAX_OPEN = 1)."""
+
+    MAX_OPEN = 1
+
+    def test_default_is_one_in_code(self) -> None:
+        import ast
+        with open(lv.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        got = [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+               for x in n.targets if isinstance(x, ast.Name) and x.id == "MAX_OPEN"]
+        self.assertEqual(got, [1])
+
+    def test_second_signal_waits(self) -> None:
+        eth = [fill(10, "0xc", "ETH", 1, self.now - 3 * MIN, 50_000, 3000), fill(11, "0xd", "ETH", 1, self.now - 2 * MIN, 50_000, 3000)]
+        self.ex.instr["ETH-USDT-SWAP"] = {"instId": "ETH-USDT-SWAP", "state": "live", "ctVal": "0.1", "ctMult": "1",
+                                          "ctValCcy": "ETH", "lotSz": "0.01", "minSz": "0.01", "tickSz": "0.01"}
+        self.ex.last["ETH-USDT-SWAP"] = 3000.0
+        tr = self.trader(self.whales() + eth)
+        self.on()
+        tr.step()
+        self.assertEqual(len(self.state()["opens"]), 1)
+        self.assertEqual(len(self.market_orders()), 1)
+        self.assertEqual(self.state()["last_skip"]["code"], "own_open")
 
 
 class StallTest(Base):

@@ -96,7 +96,7 @@ class ReplayTest(unittest.TestCase):
     AGAINST = False   # сценарии по направлению китов; против китов — test_against_whales
 
     def setUp(self) -> None:
-        for name, value in (("AGAINST", self.AGAINST), ("CHASE", 0.0)):
+        for name, value in (("AGAINST", self.AGAINST), ("CHASE", 0.0), ("MAX_OPEN", 3)):
             patcher = mock.patch.object(rp.lv, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
