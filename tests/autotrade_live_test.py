@@ -3,7 +3,7 @@
 """Реальная торговля автокопирования (tools/autotrade_live.py) — на поддельной
 OKX и синтетической базе: без сети, без ключей, без денег.
 
-Проверяется: подпись запросов OKX; сигнал — 2 кита от 1000 $ за 2 часа;
+Проверяется: подпись запросов OKX; сигнал — 2 кита от 10 000 $ за 2 часа;
 размер — 5 % капитала × 10×; тейк +1 % лимитным ордером reduce-only; одна
 позиция на счёте (и ручная владельца тоже блокирует); пауза 3 часа на
 бумагу; не догоняем дальше 0,3 %; другой актив с тем же именем — пропуск;
@@ -215,7 +215,7 @@ class Base(unittest.TestCase):
         """Вход (по рынку, IOC с границей цены) и выходы по рынку."""
         return [o for o in self.ex.orders if o["ordType"] in ("market", "ioc")]
 
-    def whales(self, coin: str = "BTC", side: int = 1, px: float = 100_000, usd: float = 5000, ago: int = 5) -> list:
+    def whales(self, coin: str = "BTC", side: int = 1, px: float = 100_000, usd: float = 50_000, ago: int = 5) -> list:
         return [fill(1, "0xa", coin, side, self.now - ago * MIN - MIN, usd, px),
                 fill(2, "0xb", coin, side, self.now - ago * MIN, usd, px)]
 
@@ -236,8 +236,8 @@ class MultiTest(Base):
     def sig(self, coins: tuple[str, ...], base: int = 10, side: int = 1) -> list:
         out = []
         for i, c in enumerate(coins):
-            out += [fill(base + 2 * i, f"0x{c.lower()}a", c, side, self.now - 3 * MIN + i, 5000, self.PX[c]),
-                    fill(base + 2 * i + 1, f"0x{c.lower()}b", c, side, self.now - 2 * MIN + i, 5000, self.PX[c])]
+            out += [fill(base + 2 * i, f"0x{c.lower()}a", c, side, self.now - 3 * MIN + i, 50_000, self.PX[c]),
+                    fill(base + 2 * i + 1, f"0x{c.lower()}b", c, side, self.now - 2 * MIN + i, 50_000, self.PX[c])]
         return out
 
     def add(self, rows: list) -> None:
@@ -296,8 +296,8 @@ class MultiTest(Base):
         self.on()
         tr.step()
         self.now += 4 * 60 * MIN
-        self.add([fill(60, "0xc", "BTC", -1, self.now - 2 * MIN, 5000, 100_000),
-                  fill(61, "0xd", "BTC", -1, self.now - MIN, 5000, 100_000)])
+        self.add([fill(60, "0xc", "BTC", -1, self.now - 2 * MIN, 50_000, 100_000),
+                  fill(61, "0xd", "BTC", -1, self.now - MIN, 50_000, 100_000)])
         tr.last_sync = 0
         tr.step()
         self.assertEqual(len(self.market_orders()), 1)
@@ -464,13 +464,13 @@ class TradeTest(Base):
                          "во вкладку — только то, что она читает")
 
     def test_one_whale_or_small_whale_no_trade(self) -> None:
-        for fills in ([fill(1, "0xa", "BTC", 1, self.now - MIN, 5000, 100_000)],
-                      [fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000),
-                       fill(2, "0xb", "BTC", 1, self.now - MIN, 900, 100_000)],
-                      [fill(1, "0xa", "BTC", 1, self.now - 3 * 60 * MIN, 5000, 100_000),  # старше 2 часов
-                       fill(2, "0xb", "BTC", 1, self.now - MIN, 5000, 100_000)],
-                      [fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000),     # разные стороны
-                       fill(2, "0xb", "BTC", -1, self.now - MIN, 5000, 100_000)]):
+        for fills in ([fill(1, "0xa", "BTC", 1, self.now - MIN, 50_000, 100_000)],
+                      [fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 50_000, 100_000),
+                       fill(2, "0xb", "BTC", 1, self.now - MIN, 9_000, 100_000)],
+                      [fill(1, "0xa", "BTC", 1, self.now - 3 * 60 * MIN, 50_000, 100_000),  # старше 2 часов
+                       fill(2, "0xb", "BTC", 1, self.now - MIN, 50_000, 100_000)],
+                      [fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 50_000, 100_000),     # разные стороны
+                       fill(2, "0xb", "BTC", -1, self.now - MIN, 50_000, 100_000)]):
             self.ex = FakeOkx()
             tr = self.trader(fills)
             self.on()
@@ -628,8 +628,8 @@ class TradeTest(Base):
 
 class SignalsTest(Base):
     def test_future_fills_ignored_until_their_time(self) -> None:
-        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now + 10 * MIN, 5000, 100_000),
-                          fill(2, "0xb", "BTC", 1, self.now + 11 * MIN, 5000, 100_000)])
+        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now + 10 * MIN, 50_000, 100_000),
+                          fill(2, "0xb", "BTC", 1, self.now + 11 * MIN, 50_000, 100_000)])
         sig = lv.Signals(self.db)
         self.assertEqual(sig.poll(self.now), [])
         self.assertEqual(len(sig.poll(self.now + 12 * MIN)), 1)
@@ -637,8 +637,8 @@ class SignalsTest(Base):
     def test_window_drops_whales_older_than_two_hours(self) -> None:
         """Кит A — давно (3 часа назад от второго опроса), кит B — сейчас: двух
         китов за 2 часа нет — сигнала нет."""
-        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now - MIN, 5000, 100_000),
-                          fill(2, "0xb", "BTC", 1, self.now + 3 * 60 * MIN, 5000, 100_000)])
+        make_db(self.db, [fill(1, "0xa", "BTC", 1, self.now - MIN, 50_000, 100_000),
+                          fill(2, "0xb", "BTC", 1, self.now + 3 * 60 * MIN, 50_000, 100_000)])
         sig = lv.Signals(self.db)
         self.assertEqual(sig.poll(self.now), [])
         self.assertEqual(sig.poll(self.now + 3 * 60 * MIN + MIN), [])
@@ -833,11 +833,11 @@ class WhaleExitTest(Base):
 
     def test_position_from_old_version_recovers_whales_from_db(self) -> None:
         """Позиция открыта прежней версией: китов в записи нет — бот находит
-        их по базе (кто открывал за 2 часа до сигнала от 1000 $) и следит."""
+        их по базе (кто открывал за 2 часа до сигнала от 10 000 $) и следит."""
         tr = self.enter()
         del tr.st["open"]["wallets"]
         con = sqlite3.connect(self.db)   # мелкий (100 $) в том же окне — не кит сигнала
-        con.execute(INS, fill(49, "0xsmall", "BTC", 1, self.now - 7 * MIN, 100, 100_000))
+        con.execute(INS, fill(49, "0xsmall", "BTC", 1, self.now - 7 * MIN, 1_000, 100_000))
         con.commit()
         con.close()
         tr.save()
@@ -929,7 +929,7 @@ class SignalMomentTest(Base):
     def test_small_trade_does_not_refresh_old_whales(self) -> None:
         """Киты вошли час назад (сигнал давний), сейчас кто-то купил на 50 $ —
         это не свежий сигнал. Раньше бот входил по такой сделке."""
-        fills = [*self.whales(ago=60), fill(9, "0xdust", "BTC", 1, self.now - MIN, 50, 100_000)]
+        fills = [*self.whales(ago=60), fill(9, "0xdust", "BTC", 1, self.now - MIN, 500, 100_000)]
         tr = self.trader(fills)
         self.on()
         tr.step()
@@ -939,12 +939,12 @@ class SignalMomentTest(Base):
         """Кит A вошёл 125 минут назад (прочитан прошлым опросом), кит B — 14
         минут назад: от строки B оба в окне, но на момент решения A старше 2
         часов — китов 1, не входим. Раньше бот входил."""
-        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 100 * MIN, 5000, 100_000)])
+        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 100 * MIN, 50_000, 100_000)])
         self.on()
         tr.step()
         self.now += 25 * MIN
         con = sqlite3.connect(self.db)
-        con.execute(INS, fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000))
+        con.execute(INS, fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 50_000, 100_000))
         con.commit()
         con.close()
         tr.last_sync = 0
@@ -959,7 +959,7 @@ class BiggerSideTest(Base):
     бот вошёл в лонг. Теперь: против сигнала киты крупнее — в слабую сторону
     не входим; крупных от 2 — входим с ними."""
 
-    def shorts(self, n: int = 2, usd: float = 700_000, ago: int = 40) -> list[tuple]:
+    def shorts(self, n: int = 2, usd: float = 7_000_000, ago: int = 40) -> list[tuple]:
         return [fill(100 + i, f"0xbig{i}", "BTC", -1, self.now - (ago + i) * MIN, usd, 100_000) for i in range(n)]
 
     def test_small_longs_against_big_shorts_bot_goes_short(self) -> None:
@@ -970,7 +970,7 @@ class BiggerSideTest(Base):
         self.assertEqual(m["side"], "sell", "вошли с крупными — в шорт")
         op = self.state()["open"]
         self.assertEqual((op["side"], sorted(op["wallets"])), (-1, ["0xbig0", "0xbig1"]))
-        self.assertEqual((op["usd"], op["usd_against"]), (1_400_000.0, 10_000.0))
+        self.assertEqual((op["usd"], op["usd_against"]), (14_000_000.0, 100_000.0))
 
     def test_one_big_short_blocks_long_but_is_no_signal(self) -> None:
         tr = self.trader(self.shorts(n=1) + self.whales())
@@ -979,19 +979,19 @@ class BiggerSideTest(Base):
         self.assertEqual(self.market_orders(), [])
         sk = self.state()["last_skip"]
         self.assertEqual(sk["code"], "bigger_against")
-        self.assertIn("шорты 700 000 $ против 10 000 $", sk["why"])
+        self.assertIn("шорты 7 000 000 $ против 100 000 $", sk["why"])
 
     def test_smaller_against_does_not_block(self) -> None:
-        tr = self.trader(self.shorts(n=2, usd=2000) + self.whales())
+        tr = self.trader(self.shorts(n=2, usd=20_000) + self.whales())
         self.on()
         tr.step()
         [m] = self.market_orders()
         self.assertEqual(m["side"], "buy")
-        self.assertEqual(self.state()["open"]["usd_against"], 4000.0)
+        self.assertEqual(self.state()["open"]["usd_against"], 40_000.0)
 
     def test_equal_sides_no_entry(self) -> None:
         """Поровну — непонятно, кто сильнее: не входим ни в одну сторону."""
-        tr = self.trader(self.shorts(n=2, usd=5000) + self.whales())
+        tr = self.trader(self.shorts(n=2, usd=50_000) + self.whales())
         self.on()
         tr.step()
         self.assertEqual(self.market_orders(), [])
@@ -1022,9 +1022,22 @@ class BiggerSideTest(Base):
         [m] = self.market_orders()
         self.assertEqual(m["side"], "buy")
 
-    def test_small_against_wallets_under_1000_do_not_count(self) -> None:
-        """Против — только киты (кошелёк от 1000 $): мелочь против не мешает."""
-        crumbs = [fill(200 + i, f"0xc{i}", "BTC", -1, self.now - 30 * MIN + i, 900, 100_000) for i in range(50)]
+    def test_whale_from_10000_exactly(self) -> None:
+        """Кит — кошелёк от 10 000 $ в окне (правило владельца 28.11.2026):
+        двое по 10 000 $ — сигнал; двое по 9 999 $ — не киты, сигнала нет."""
+        for usd, enters in ((10_000, True), (9_999, False)):
+            self.ex = FakeOkx()
+            tr = self.trader(self.whales(usd=usd))
+            self.on()
+            tr.step()
+            self.assertEqual(len(self.market_orders()), int(enters), usd)
+            os.remove(self.db)
+            if os.path.exists(os.path.join(self.dir, "live", "state.json")):
+                os.remove(os.path.join(self.dir, "live", "state.json"))
+
+    def test_small_against_wallets_under_10000_do_not_count(self) -> None:
+        """Против — только киты (кошелёк от 10 000 $): мелочь против не мешает."""
+        crumbs = [fill(200 + i, f"0xc{i}", "BTC", -1, self.now - 30 * MIN + i, 9_000, 100_000) for i in range(50)]
         tr = self.trader(crumbs + self.whales())
         self.on()
         tr.step()
@@ -1077,8 +1090,8 @@ class EntryOrderTest(Base):
         одному»); исполнился — позиция, тейк от цены исполнения."""
         tr = self.pending()
         con = sqlite3.connect(self.db)
-        con.executemany(INS, [fill(10, "0xc", "STX", 1, self.now - 2 * MIN, 5000, 0.5),
-                              fill(11, "0xd", "STX", 1, self.now - MIN, 5000, 0.5)])
+        con.executemany(INS, [fill(10, "0xc", "STX", 1, self.now - 2 * MIN, 50_000, 0.5),
+                              fill(11, "0xd", "STX", 1, self.now - MIN, 50_000, 0.5)])
         con.commit()
         con.close()
         self.sync(tr, 0)
@@ -1116,6 +1129,18 @@ class EntryOrderTest(Base):
         self.assertTrue(any("ордер входа не исполнился" in x for x in st["events"]))
         self.assertEqual([o for o in self.ex.orders if o["ordType"] == "limit"], [], "тейка без позиции нет")
         self.assertEqual(st.get("blocked", {}), {}, "бумага не исключена")
+
+    def test_whales_average_with_float_noise_enters(self) -> None:
+        """Средняя цена китов — дробь: 12 345 $ и 50 000 $ по 100 000 дают
+        99 999,99999999999. Цена рынка ровно 100 000 — не «хуже китов»
+        (допуск PX_EPS): вход, граница ордера — 100 000."""
+        fills = [fill(1, "0xa", "BTC", 1, self.now - 6 * MIN, 12_345, 100_000),
+                 fill(2, "0xb", "BTC", 1, self.now - 5 * MIN, 50_000, 100_000)]
+        tr = self.trader(fills)
+        self.on()
+        tr.step()
+        self.assertEqual(self.entry()["px"], "100000")
+        self.assertEqual(len(self.state()["opens"]), 1)
 
     def test_zero_chase_bound_rounds_inward(self) -> None:
         """CHASE = 0 (правило 27.11.2026): граница — ровно средняя цена китов, на
@@ -1409,7 +1434,7 @@ class CandlesErrorTest(Base):
             tr.step()
         self.assertEqual([s["whales"] for s in tr.retry], [2])
         con = sqlite3.connect(self.db)
-        con.execute(INS, fill(7, "0xc", "BTC", 1, self.now, 5000, 100_000))
+        con.execute(INS, fill(7, "0xc", "BTC", 1, self.now, 50_000, 100_000))
         con.commit()
         con.close()
         self.now += 5_000
@@ -1529,7 +1554,7 @@ class RatingTest(Base):
                 f.write(json.dumps({"coin": "X", "pnl": 5.0 if i < wins else -3.0, "wallets": wallets}) + "\n")
 
     def solo(self, wallet: str = "0xa", side: int = 1) -> list[tuple]:
-        return [fill(1, wallet, "BTC", side, self.now - 2 * MIN, 5000, 100_000)]
+        return [fill(1, wallet, "BTC", side, self.now - 2 * MIN, 50_000, 100_000)]
 
     def test_rating_class(self) -> None:
         r = lv.core.Rating()
@@ -1588,7 +1613,7 @@ class RatingTest(Base):
     def test_priority_ignores_ma_and_bigger_against_but_keeps_stop(self) -> None:
         self.history(["0xa"], 5, 5)
         self.ex.ma["BTC-USDT-SWAP"] = 101_000.0               # MA выше цены — обычно «ma30»
-        big = [fill(50, "0xbig", "BTC", -1, self.now - 30 * MIN, 900_000, 100_000)]  # против крупнее
+        big = [fill(50, "0xbig", "BTC", -1, self.now - 30 * MIN, 9_000_000, 100_000)]  # против крупнее
         tr = self.trader(self.solo() + big)
         self.on()
         tr.step()
@@ -1630,7 +1655,7 @@ class RatingTest(Base):
         """BTC — свежее, но киты без рейтинга; STX — раньше, но наш винрейт с его
         китом 80 %: входим сначала в STX (позиций до 3 — потом и в BTC)."""
         self.history(["0xs1"], 4, 5)
-        stx = [fill(10, "0xs1", "STX", 1, self.now - 4 * MIN, 5000, 0.5), fill(11, "0xs2", "STX", 1, self.now - 3 * MIN, 5000, 0.5)]
+        stx = [fill(10, "0xs1", "STX", 1, self.now - 4 * MIN, 50_000, 0.5), fill(11, "0xs2", "STX", 1, self.now - 3 * MIN, 50_000, 0.5)]
         tr = self.trader(stx + self.whales(ago=1))
         self.on()
         tr.step()
@@ -1719,15 +1744,15 @@ class RejectTest(Base):
         позиции нет, бумага исключена на неделю, бот не долбит её ордерами и
         входит по следующему сигналу в другую бумагу."""
         self.ex.reject["STX-USDT-SWAP"] = "51155"
-        fills = [fill(1, "0xa", "STX", 1, self.now - 4 * MIN, 5000, 0.5),
-                 fill(2, "0xb", "STX", 1, self.now - 3 * MIN, 5000, 0.5),
-                 fill(3, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000),
-                 fill(4, "0xb", "BTC", 1, self.now - 1 * MIN, 5000, 100_000)]
+        fills = [fill(1, "0xa", "STX", 1, self.now - 4 * MIN, 50_000, 0.5),
+                 fill(2, "0xb", "STX", 1, self.now - 3 * MIN, 50_000, 0.5),
+                 fill(3, "0xa", "BTC", 1, self.now - 2 * MIN, 50_000, 100_000),
+                 fill(4, "0xb", "BTC", 1, self.now - 1 * MIN, 50_000, 100_000)]
         # BTC — раньше в списке «свежих первыми» нельзя: сначала пробуем STX.
         fills = [fills[2], fills[3], fills[0], fills[1]]
         fills = [(i + 1, *f[1:]) for i, f in enumerate(fills)]
-        fills[2] = (3, "0xa", "STX", 1, self.now - MIN // 2, int(5000e9), str(5000 / 0.5))
-        fills[3] = (4, "0xb", "STX", 1, self.now - MIN // 3, int(5000e9), str(5000 / 0.5))
+        fills[2] = (3, "0xa", "STX", 1, self.now - MIN // 2, int(50_000e9), str(50_000 / 0.5))
+        fills[3] = (4, "0xb", "STX", 1, self.now - MIN // 3, int(50_000e9), str(50_000 / 0.5))
         tr = self.trader(fills)
         self.on()
         tr.step()
@@ -1767,7 +1792,7 @@ class RejectTest(Base):
         ордером, а не по ордеру на каждый сигнал); ключ исправили — следующий
         сигнал входит, в том числе по BTC."""
         self.ex.reject["BTC-USDT-SWAP"] = self.ex.reject["STX-USDT-SWAP"] = "50124"
-        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 5000, 0.5), fill(11, "0xd", "STX", 1, self.now - 2 * MIN, 5000, 0.5)]
+        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 50_000, 0.5), fill(11, "0xd", "STX", 1, self.now - 2 * MIN, 50_000, 0.5)]
         tr = self.trader(self.whales() + stx)
         self.on()
         tr.step()
@@ -1796,7 +1821,7 @@ class RejectTest(Base):
                             "ctValCcy": "BTC", "lotSz": "1", "minSz": "1", "tickSz": "0.1"}
         self.ex.last[x] = 100_000.0
         self.ex.reject["STX-USDT-SWAP"] = "50124"
-        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 5000, 0.5), fill(11, "0xd", "STX", 1, self.now - MIN // 2, 5000, 0.5)]
+        stx = [fill(10, "0xc", "STX", 1, self.now - 3 * MIN, 50_000, 0.5), fill(11, "0xd", "STX", 1, self.now - MIN // 2, 50_000, 0.5)]
         tr = self.trader(self.whales() + stx)
         self.on()
         tr.step()
@@ -1812,7 +1837,7 @@ class RejectTest(Base):
         tr.step()
         con = sqlite3.connect(self.db)
         con.executemany(INS,
-                        [fill(20 + i, f"0x{i}", "BTC", 1, self.now + i * 1000, 5000, 100_000) for i in range(3)])
+                        [fill(20 + i, f"0x{i}", "BTC", 1, self.now + i * 1000, 50_000, 100_000) for i in range(3)])
         con.commit()
         con.close()
         self.now += 5000
@@ -1946,8 +1971,8 @@ class ReviewTest(Base):
         con.close()
 
     def stx(self, tid: int = 10, ago: int = 2) -> list[tuple]:
-        return [fill(tid, "0xc", "STX", 1, self.now - ago * MIN - MIN, 5000, 0.5),
-                fill(tid + 1, "0xd", "STX", 1, self.now - ago * MIN, 5000, 0.5)]
+        return [fill(tid, "0xc", "STX", 1, self.now - ago * MIN - MIN, 50_000, 0.5),
+                fill(tid + 1, "0xd", "STX", 1, self.now - ago * MIN, 50_000, 0.5)]
 
     def test_network_failure_after_entry_order_never_sends_second(self) -> None:
         """Лимит входа ушёл, а проверка исполнения упала обрывом сети: на
@@ -2120,12 +2145,12 @@ class ReviewTest(Base):
     def test_late_whale_fill_is_counted(self) -> None:
         """Сделка кита пришла в базу позже следующей (бот записал её с
         задержкой): она всё равно считается в окне 2 часов."""
-        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 5000, 100_000)])
+        tr = self.trader([fill(1, "0xa", "BTC", 1, self.now - 2 * MIN, 50_000, 100_000)])
         self.on()
         tr.step()
         self.assertEqual(self.market_orders(), [])
         # Время — на 12 минут раньше уже прочитанной: опоздала дольше любого «нахлёста».
-        self.add_fills([fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 5000, 100_000)])
+        self.add_fills([fill(2, "0xb", "BTC", 1, self.now - 14 * MIN, 50_000, 100_000)])
         self.now += MIN
         tr.last_sync = 0
         tr.step()
