@@ -14,7 +14,8 @@
   2 часа, у каждого от 1000 $ (сделки китов — из базы бота, только чтение);
 - ПРОТИВ КИТОВ (правило владельца 28.11.2026): сделка — в обратную сторону от
   сигнала (киты в лонг — бот в шорт); цена входа, MA30, стоп и тейк — по
-  стороне сделки; выхода вслед за китом в убытке нет (его убыток — наш плюс);
+  стороне сделки; киты — тоже толпа, кроме крупных против толпы: с другой
+  стороны киты (от 2), а сигнальные крупнее — с ними, без разворота; выхода вслед за китом в убытке нет (его убыток — наш плюс);
 - только фьючерсы (крипта, акции, металлы), бумага должна быть на OKX и цена
   сходиться с ценой китов (±2 %) — иначе это другой актив;
 - цена входа — CHASE от средней цены китов по стороне сделки: против китов
@@ -561,9 +562,13 @@ class Signals:
         for t, wl, _n, _u in w.orders:
             if wl in big and wl not in first:
                 first[wl] = t
+        # Крупные против толпы: с другой стороны тоже киты (от 2), а эти — крупнее
+        # по объёму. Против китов бот такой сигнал не разворачивает — идёт с
+        # крупными (правило владельца 28.11.2026: киты — тоже толпа, кроме этих).
+        big_side = opp is not None and opp.count >= MIN_WHALES and self.whale_usd(w) > self.whale_usd(opp)
         return {"coin": coin, "side": side, "ts": ts, "whales": w.count, "wallets": first,
                 "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_usd(w), 2),
-                "usd_against": round(self.whale_usd(opp), 2)}
+                "usd_against": round(self.whale_usd(opp), 2), **({"big": True} if big_side else {})}
 
     def whale_loss(self, coin: str, side: int, wallets: dict[str, Any], now: int) -> list[tuple[str, float]]:
         """Киты сигнала, закрывшие позицию по этой бумаге и стороне в убыток:
@@ -1412,8 +1417,9 @@ class Trader:
         if lost:
             return self._skip("whale_exit", f"кит сигнала уже закрыл позицию в убыток ({lost[0][0][:10]}…, "
                                             f"{lost[0][1]:+.0f} $) — не входим")
-        if AGAINST:
-            # Против китов: дальше (догон, MA30, стоп, тейк, ордер) — сторона сделки.
+        if AGAINST and not s.get("big"):
+            # Против китов (толпы): дальше (цена входа, MA30, стоп, тейк, ордер) —
+            # сторона сделки. Крупные против толпы (big) — идём с ними, не разворачиваем.
             s = {**s, "side": -s["side"], "fade": True}
         base, scale = core.okx_candidate(s["coin"])
         inst = self.inst_for(base)
@@ -1486,7 +1492,8 @@ class Trader:
                                    "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against"),
                                    "stop": s.get("stop", 0.0), "limit": fmt_dec(lim), "last": last, "until": now + ENTRY_WAIT_MS,
                                    "ordered": fmt_dec(sz), **({"priority": s["priority"]} if s.get("priority") else {}),
-                                   **({"fade": True} if s.get("fade") else {})}
+                                   **({"fade": True} if s.get("fade") else {}),
+                                   **({"big": True} if s.get("big") else {})}
             self.save()
             self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                             "ordType": "ioc", "px": fmt_dec(lim), "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
@@ -1582,7 +1589,7 @@ class Trader:
               "wallets": e.get("wallets") if isinstance(e.get("wallets"), dict) else {},
               "usd": e.get("usd"), "usd_against": e.get("usd_against"), "stop": num(e.get("stop")),
               **({"priority": e["priority"]} if isinstance(e.get("priority"), str) else {}),
-              **({"fade": True} if e.get("fade") else {})}
+              **({"fade": True} if e.get("fade") else {}), **({"big": True} if e.get("big") else {})}
         self.st["opens"] = [*(x for x in self.st["opens"] if x["inst"] != inst), op]
         self.st["entered"][op["coin"]] = now
         self.st.pop("entering", None)
@@ -1628,7 +1635,7 @@ class Trader:
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
               "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": num(info.get("stop")),
               "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {},
-              **({"fade": True} if info.get("fade") else {})}
+              **({"fade": True} if info.get("fade") else {}), **({"big": True} if info.get("big") else {})}
         self.st["opens"] = [*(o for o in self.st["opens"] if o["inst"] != inst), op]
         self.st["entered"][coin] = opened
         self.event(f"найдена своя позиция без записи: {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(Decimal(str(size)))} "

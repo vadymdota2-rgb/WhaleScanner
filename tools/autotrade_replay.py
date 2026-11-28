@@ -333,7 +333,9 @@ class Replay:
         hl_px = last * scale
         if abs(hl_px / s["ref_px"] - 1) > lv.MATCH_TOL:
             return "other_asset"
-        side = -s["side"] if lv.AGAINST else s["side"]   # сторона сделки: против китов — обратная
+        # Сторона сделки: против китов (толпы) — обратная; крупные против толпы
+        # (big) — с ними, как живой бот.
+        side = -s["side"] if lv.AGAINST and not s.get("big") else s["side"]
         if side * (hl_px / s["ref_px"] - 1) > lv.CHASE + lv.PX_EPS:
             return "chase"
         # MA30 15м — по стороне сделки (как живой бот): шорт — не при цене выше MA30.
