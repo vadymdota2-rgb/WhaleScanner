@@ -546,7 +546,7 @@ class TradeTest(Base):
         self.assertEqual([o["sz"] for o in live], ["10"])
     def test_chase_and_other_asset_and_stale(self) -> None:
         cases = [(100_400, "— вход только не хуже средней цены китов"), (100_001, "— вход только не хуже средней цены китов"), (110_000, "другой актив"),
-                 (99_000, "")]
+                 (99_000, ""), (95_000, "")]   # 5 % от китов — тот же актив (допуск 10 %, было 2 %)
         for okx_px, why in cases:
             self.ex = FakeOkx()
             self.ex.last["BTC-USDT-SWAP"] = okx_px
@@ -1479,6 +1479,20 @@ class AgainstTest(Base):
         self.assertEqual((op["side"], op.get("fade")), (-1, True))
 
 
+    def test_old_entering_adopted_keeps_fade(self) -> None:
+        """Запись «входим» без лимита (прежняя версия): подхват по ней —
+        с пометкой «против китов» (иначе сделка не попала бы в рейтинг)."""
+        self.ex.pos = [{"instId": "BTC-USDT-SWAP", "pos": "-10", "posSide": "net", "avgPx": "100000", "markPx": "100000"}]
+        self.ex.orders.append({"instId": "BTC-USDT-SWAP", "ordId": "7", "clOrdId": "wtin7", "side": "sell",
+                               "ordType": "market", "state": "filled", "accFillSz": "10", "avgPx": "100000", "cTime": str(T0)})
+        tr = self.trader(self.whales())
+        tr.st["entering"] = {"inst": "BTC-USDT-SWAP", "cl": "wtin7", "at": self.now, "coin": "BTC", "side": -1,
+                             "whales": 2, "wallets": {"0xa": 1, "0xb": 2}, "stop": 101_500.0, "fade": True}
+        tr.sync()
+        [op] = tr.st["opens"]
+        self.assertEqual((op["side"], op.get("fade"), op["adopted"]), (-1, True, True))
+
+
 class OnePositionTest(Base):
     """Лимит позиций: в коде — 3 (правило владельца); при лимите 1 второй
     сигнал ждёт («own_open»)."""
@@ -1642,6 +1656,23 @@ class StallTest(Base):
             self.sync(tr, 5)
         self.assertEqual(self.exits(), [])
         self.assertNotIn("best", self.state()["open"])
+
+    def test_stall_needs_mark_and_ticker_above_lock(self) -> None:
+        """Замедление — только если и цена позиции (mark), и цена сделки
+        (тикер) не ниже +0,8 %: одна из них ниже — не выходим."""
+        for mark, last in ((100_500.0, 100_900.0), (100_850.0, 100_700.0)):
+            tr = self.enter()
+            self.price(100_900.0)
+            self.sync(tr)
+            self.ex.last["BTC-USDT-SWAP"] = last
+            for pos in self.ex.pos:
+                pos["markPx"] = str(mark)
+            for _ in range(4):
+                self.sync(tr, 5)
+            self.assertEqual(self.exits(), [], (mark, last))
+            self.assertIsNotNone(self.state()["open"])
+            os.remove(self.db)
+            os.remove(os.path.join(self.dir, "live", "state.json"))
 
     def test_ioc_not_filled_restores_tp(self) -> None:
         """Пока шёл ордер, цена ушла ниже +0,8 % — IOC не исполнился: выхода
@@ -2039,6 +2070,26 @@ class RatingTest(Base):
         self.assertEqual(len(self.market_orders()), 1)
         self.assertAlmostEqual(self.state()["open"]["stop"], 98_500.0, msg="стоп — и у приоритетного, 1,5 % от входа")
         self.assertEqual([c for c in self.ex.calls if c[2].get("bar") == "15m"], [], "MA не спрашиваем")
+
+    def test_priority_against_bigger_crowd_is_fade_not_big(self) -> None:
+        """Против китов: приоритетный кит один в лонг, против него 2 кита
+        крупнее — «крупные против толпы» только когда сигнальные крупнее; здесь
+        нет: против приоритетного (шорт), а не вместе с ним."""
+        path = os.path.join(self.dir, "live", "trades.jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            for _ in range(5):
+                f.write(json.dumps({"coin": "X", "pnl": 5.0, "wallets": ["0xa"], "fade": True}) + "\n")
+        big = [fill(50 + i, f"0xbig{i}", "BTC", -1, self.now - (30 + i) * MIN, 900_000, 100_000) for i in range(2)]
+        with mock.patch.object(lv, "AGAINST", True):
+            tr = self.trader(big + self.solo())
+            self.assertEqual(tr.sig.priority, {"0xa"})
+            self.on()
+            tr.step()
+        m = self.market_orders()[0]
+        self.assertEqual(m["side"], "sell", "против приоритетного — шорт")
+        op = self.state()["open"]
+        self.assertEqual((op["side"], op.get("fade"), "big" in op, op.get("priority")), (-1, True, False, "0xa"))
 
     def test_priority_still_respects_chase(self) -> None:
         self.history(["0xa"], 5, 5)

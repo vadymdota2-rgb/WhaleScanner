@@ -478,6 +478,23 @@ class ReplayTest(unittest.TestCase):
         self.assertAlmostEqual(t.entry_px, 99_049.5)
         self.assertEqual(t.why, "тейк")
 
+    def test_stall_inside_candle(self) -> None:
+        """Замедление внутри свечи: максимум +0,9 %, потом 25 минут ниже +0,8 %,
+        свеча открылась ниже, но внутри дошла до +0,85 % — выход по +0,8 %
+        (100 800), а не стоп потом."""
+        def price(c: str, ts: int) -> float:
+            if ts < T + 10 * MIN:
+                return 100_000.0
+            if ts < T + 15 * MIN:
+                return 100_900.0
+            if T + 44 * MIN <= ts < T + 45 * MIN:
+                return 100_850.0
+            return 98_000.0 if ts >= T + 180 * MIN else 100_500.0
+
+        r = self.go(self.whales(), price)
+        [t] = r["trades"]
+        self.assertEqual((t.why, t.exit_px, t.exit_t), ("замедление", 100_800.0, T + 40 * MIN))
+
     def test_big_rechecked_at_decision(self) -> None:
         """«Крупные против толпы» — на момент решения: сигнал крупных шортов
         против толпы лонгов, а к решению (через 6 минут) лонги вышли из окна —

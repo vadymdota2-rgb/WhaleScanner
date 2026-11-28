@@ -85,16 +85,18 @@ inline constexpr long long DAY_SEC = 86400;
     return true;
 }
 
-// Целое поле ответа Telegram; дробь, строка или нет поля — -1 (ни с одной
-// ценой не совпадёт). value(key, 0) тут не годится: 250.9 он молча режет до
-// 250, а с int по умолчанию 4294967546 становится 250.
+// Целое поле ответа Telegram; дробь, строка, отрицательное или нет поля — -1
+// (ни с одной ценой не совпадёт): сумма, срок подписки и время перевода
+// отрицательными не бывают. value(key, 0) тут не годится: 250.9 он молча
+// режет до 250, а с int по умолчанию 4294967546 становится 250.
 [[nodiscard]] inline long long intField(const nlohmann::json& j, const char* key) {
     if (!j.is_object()) return -1;
     const auto it = j.find(key);
     if (it == j.end() || !it->is_number_integer()) return -1;
     if (it->is_number_unsigned() && it->get<unsigned long long>() > static_cast<unsigned long long>(LLONG_MAX))
         return -1;
-    return it->get<long long>();
+    const long long v = it->get<long long>();
+    return v >= 0 ? v : -1;
 }
 
 // Строковое поле объекта; нет поля, не строка или не объект — пусто.

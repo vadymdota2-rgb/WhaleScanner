@@ -1,0 +1,5 @@
+{
+  "currency": "XTR",
+  "total_amount": -250,
+  "invoice_q~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ovider_payment_charge_id": ""
+}

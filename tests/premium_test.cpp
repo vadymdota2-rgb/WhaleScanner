@@ -253,7 +253,9 @@ static void rules() {
     CHECK(intField(j, "e") == -1);
     CHECK(intField(j, "f") == -1);
     json big = {{"max", 9223372036854775807ULL}, {"over", 9223372036854775808ULL}, {"neg", -5}};
-    CHECK(intField(big, "max") == LLONG_MAX && intField(big, "over") == -1 && intField(big, "neg") == -5);
+    // Отрицательное — не сумма и не время (фаззинг нашёл «total_amount»: -250).
+    CHECK(intField(big, "max") == LLONG_MAX && intField(big, "over") == -1 && intField(big, "neg") == -1);
+    CHECK(intField(json{{"z", 0}}, "z") == 0);
     CHECK(intField(json::array(), "a") == -1);
 
     // Срок: продление с конца действующего, кончившийся — с сейчас.
