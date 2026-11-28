@@ -187,7 +187,7 @@ def fill(tid: int, wallet: str, coin: str, side: int, ts: int, usd: float, px: f
 class Base(unittest.TestCase):
     AGAINST = False   # сценарии по направлению китов; против китов — AgainstTest
     CHASE = 0.0       # вход не хуже цены китов; против китов (±1 % лучше) — AgainstTest
-    MAX_OPEN = 3      # сценарии нескольких позиций; в коде — 1 (OnePositionTest)
+    MAX_OPEN = 3      # до 3 позиций, как в коде (OnePositionTest — лимит 1)
 
     def setUp(self) -> None:
         for name, value in (("AGAINST", self.AGAINST), ("CHASE", self.CHASE), ("MAX_OPEN", self.MAX_OPEN)):
@@ -1442,17 +1442,18 @@ class AgainstTest(Base):
 
 
 class OnePositionTest(Base):
-    """Правило владельца 28.11.2026: на старт — одна позиция бота (MAX_OPEN = 1)."""
+    """Лимит позиций: в коде — 3 (правило владельца); при лимите 1 второй
+    сигнал ждёт («own_open»)."""
 
     MAX_OPEN = 1
 
-    def test_default_is_one_in_code(self) -> None:
+    def test_default_is_three_in_code(self) -> None:
         import ast
         with open(lv.__file__, encoding="utf-8") as f:
             tree = ast.parse(f.read())
         got = [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
                for x in n.targets if isinstance(x, ast.Name) and x.id == "MAX_OPEN"]
-        self.assertEqual(got, [1])
+        self.assertEqual(got, [3])
 
     def test_second_signal_waits(self) -> None:
         eth = [fill(10, "0xc", "ETH", 1, self.now - 3 * MIN, 50_000, 3000), fill(11, "0xd", "ETH", 1, self.now - 2 * MIN, 50_000, 3000)]

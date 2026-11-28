@@ -64,7 +64,7 @@ MUTS = [
     ("        s = {**s, \"stop\": core.fixed_stop(last, s[\"side\"])}", "        s = {**s, \"stop\": 0.0}", "стоп — на входе"),
     # Правила владельца
     ("MIN_WHALES = 2", "MIN_WHALES = 1", "сигнал — от 2 китов"),
-    ("MAX_OPEN = 1 ", "MAX_OPEN = 2 ", "своих позиций — 1"),
+    ("MAX_OPEN = 3 ", "MAX_OPEN = 2 ", "своих позиций — до 3"),
     ("    if bts.proc is not None:\n        bts.restart_for_update()", "    if False:\n        bts.restart_for_update()", "код обновился — пересчёт заново новым кодом"),
     ("    if mtimes(me) == stamp:\n        return False", "    if True:\n        return False", "код обновился — служба перезапускается"),
     ("        self._done(None, \"код обновился — пересчёт начат заново новой версией\")\n        with open(", "        self._done(None, \"код обновился — пересчёт начат заново новой версией\")\n        if False:\n          with open(", "код обновился — пересчёт заказан заново"),
