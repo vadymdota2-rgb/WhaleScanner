@@ -130,7 +130,7 @@ PX_EPS = 1e-9
 # плюс, не повод пропускать (правило владельца 28.11.2026).
 MATCH_TOL = 0.10
 # Маржа входа — всегда 5 % капитала (правило владельца 22.11.2026; раньше —
-# 10 %, а при ручной сделке на счёте — 5 %). Своя позиция у бота — одна.
+# 10 %, а при ручной сделке на счёте — 5 %).
 MARGIN_FRAC = 0.05
 LEVERAGE = 10
 # Своих позиций бота — до MAX_OPEN одновременно, на разных бумагах: каждая — 5 %
@@ -564,8 +564,8 @@ class Signals:
 
     def _signal(self, coin: str, side: int, w: core.Window, opp: core.Window | None, ts: int) -> dict[str, Any]:
         """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
-        (от неё смотрим, не закрыли ли они в убыток), средняя цена китов,
-        объём китов сигнала и китов против (та же бумага, те же 2 часа)."""
+        (киты — для рейтинга), средняя цена китов, объём китов сигнала и
+        китов против (та же бумага, те же 2 часа), «крупные против толпы»."""
         big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit}
         first: dict[str, int] = {}
         for t, wl, _n, _u in w.orders:
@@ -574,10 +574,16 @@ class Signals:
         # Крупные против толпы: с другой стороны тоже киты (от 2), а эти — крупнее
         # по объёму. Против китов бот такой сигнал не разворачивает — идёт с
         # крупными (правило владельца 28.11.2026: киты — тоже толпа, кроме этих).
-        big_side = opp is not None and opp.count >= MIN_WHALES and self.whale_usd(w) > self.whale_usd(opp)
+        big_side = self.crowd_big(opp, self.whale_usd(w), self.whale_usd(opp))
         return {"coin": coin, "side": side, "ts": ts, "whales": w.count, "wallets": first,
                 "ref_px": (w.big_n / NANOS) / w.big_u, "usd": round(self.whale_usd(w), 2),
                 "usd_against": round(self.whale_usd(opp), 2), **({"big": True} if big_side else {})}
+
+    @staticmethod
+    def crowd_big(opp: core.Window | None, usd: float, against: float) -> bool:
+        """Крупные против толпы: с другой стороны тоже киты (от 2), а эти —
+        крупнее по объёму."""
+        return opp is not None and opp.count >= MIN_WHALES and usd > against
 
     def sweep(self, now: int) -> None:
         """Очистка: окна бумаг, по которым давно не было сделок, сами не
@@ -937,6 +943,10 @@ class Trader:
                 continue
             if not isinstance(op.get("exit", {}), dict):
                 op.pop("exit")
+            if num(op.get("stop")) <= 0:
+                # Запись прежней версии (или подхват без записи «входим») — без
+                # стопа: стоп — по правилу, STOP_PCT от цены входа.
+                op["stop"] = core.fixed_stop(num(op["px"]), op["side"])
             opens.append(op)
         st["opens"] = opens[:MAX_OPEN]
         st["open"] = st["opens"][0] if st["opens"] else None
@@ -1147,12 +1157,13 @@ class Trader:
         except OkxError as e:
             self.event(f"{op['inst']}: остаток тейка не снят — {e}; проверьте ордера в OKX")
 
-    # выход по рынку: стоп (выхода вслед за китом нет — правило владельца 28.11.2026)
+    # выход по рынку: стоп или замедление (выхода вслед за китом нет — правило владельца 28.11.2026)
     def follow_whales(self) -> None:
         """Стоп (цена позиции дошла до стопа входа) — закрыть свою: снять
-        тейк и рыночным ордером только на закрытие. Не вышло (сбой, отказ) —
-        запись «выходим» остаётся, тейк заново не ставится, попытка — раз в
-        минуту. Выход вслед за китом в убытке убран: бот торгует против китов."""
+        тейк и рыночным ордером только на закрытие; замедление — так же, но
+        ордером IOC не меньше +0,8 %. Не вышло (сбой, отказ) — запись
+        «выходим» остаётся, тейк заново не ставится, попытка — раз в минуту.
+        Выход вслед за китом в убытке убран: бот торгует против китов."""
         for op in list(self.st["opens"]):
             self._follow_one(op)
 
@@ -1185,6 +1196,7 @@ class Trader:
             got = self._exit_fills(op)
             if got is None:
                 return  # прежний ордер выхода ещё исполняется
+            before = got[0]
             remaining = size_of(op.get("size")) - got[0]
             if remaining <= 0:
                 self._record_close(op, got[1])
@@ -1225,12 +1237,17 @@ class Trader:
             return
         if got is not None and got[0] >= size_of(op.get("size")):
             self._record_close(op, got[1])
-        elif got is not None and got[0] <= 0 and op["exit"].get("kind") == "stall":
-            # Цена ушла ниже +0,8 % — ничего не продано: выхода нет, тейк обратно;
-            # дальше — как прежде (тейк, стоп или снова замедление выше +0,8 %).
-            op.pop("exit", None)
+        elif got is not None and got[0] <= before and op["exit"].get("kind") == "stall":
+            # Цена ушла ниже +0,8 % — в этот раз ничего не продано: тейк обратно
+            # (на непроданный остаток); через минуту — снова, если замедление.
+            # Ничего не продано и раньше — выхода нет: дальше как прежде (тейк,
+            # стоп или снова замедление). Часть продана — запись «выходим»
+            # остаётся (исполненное — в итог сделки), остаток — с тейком и стопом.
+            op["stall_wait"] = now + 60_000
+            if got[0] <= 0:
+                op.pop("exit", None)
             self.event(f"{op['inst']}: выход по замедлению не исполнился — цена ниже +{LOCK_PCT * 100:g} %; тейк обратно")
-            self._place_tp(op, size_of(op.get("size")))
+            self._place_tp(op, size_of(op.get("size")) - got[0])
             self.save()
 
     def _stall_hit(self, op: dict[str, Any], now: int) -> str:
@@ -1241,8 +1258,8 @@ class Trader:
         live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
         px, side = num(op.get("px")), op["side"]
         mark = num(live[0].get("markPx")) if live else 0.0
-        if not live or px <= 0 or mark <= 0:
-            return ""
+        if not live or px <= 0 or mark <= 0 or now < num(op.get("stall_wait")):
+            return ""   # stall_wait — минута после неисполненного выхода (не дёргать тейк каждые 15 с)
         gain = side * (mark / px - 1)
         best = num(op.get("best"))
         if gain >= LOCK_PCT and (best <= 0 or side * (mark - best) > 0):
@@ -1260,9 +1277,10 @@ class Trader:
         """Стоп входа: цена позиции (mark) и цена сделки (тикер) обе дошли до
         op["stop"] (лонг — ниже или на нём, шорт — выше или на нём; mark нет —
         по тикеру) — причина строкой; нет — пусто.
-        Стопа в записи нет (позиция прежней версии) или позиции на счёте нет —
-        не стоп (закрытие запишет _track_open)."""
-        stop = num(op.get("stop"))
+        Стопа в записи нет (позиция прежней версии) — STOP_PCT от цены входа:
+        позиции без стопа не бывает. Позиции на счёте нет — не стоп (закрытие
+        запишет _track_open)."""
+        stop = num(op.get("stop")) or core.fixed_stop(num(op.get("px")), op["side"])
         live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
         if not live or stop <= 0:
             return ""
@@ -1278,7 +1296,7 @@ class Trader:
         return f"стоп: цена {mark:.6g} дошла до стопа {stop:.6g} ({'ниже' if op['side'] > 0 else 'выше'} входа {op['px']:.6g})"
 
     def _exit_fills(self, op: dict[str, Any]) -> tuple[Decimal, dict[str, Any]] | None:
-        """Ордера выхода по рынку (стоп): сколько исполнено и итог для записи
+        """Ордера выхода по рынку (стоп, замедление): сколько исполнено и итог для записи
         (средняя цена, PnL и комиссии — суммой). Какой-то ещё исполняется — None."""
         done, val, pnl, fee, last = Decimal(0), 0.0, 0.0, 0.0, 0.0
         for cl in op["exit"].get("ids", []):
@@ -1404,7 +1422,11 @@ class Trader:
         if now - num(self.st["entered"].get(s["coin"])) < COIN_PAUSE_MS:
             return self._skip("coin_pause", "в эту бумагу входили меньше 3 часов назад")
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
-        s = {**s, "usd": round(usd, 2), "usd_against": round(against, 2)}
+        # «Крупные против толпы» — тоже на момент решения: киты другой стороны
+        # могли выйти из окна (тогда это толпа — против неё) или прийти.
+        big = self.sig.crowd_big(self.sig.windows.get((s["coin"], -s["side"])), usd, against)
+        s = {k: v for k, v in s.items() if k != "big"}
+        s = {**s, "usd": round(usd, 2), "usd_against": round(against, 2), **({"big": True} if big else {})}
         # Приоритетный кит (наш винрейт с ним > 90 % от 5 сделок): с ним входим
         # и в одиночку, без «против крупнее» и MA30.
         prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)
@@ -1454,7 +1476,8 @@ class Trader:
         why = "" if prio else self.ma_check(inst, last, s["side"])
         if why:
             return why
-        # Стоп — STOP_PCT от цены входа (уровни 4ч убраны 27.11.2026: правило владельца).
+        # Стоп — STOP_PCT от цены входа (уровни 4ч убраны 27.11.2026: правило
+        # владельца); здесь — от цены решения, в записи позиции — от цены исполнения.
         s = {**s, "stop": core.fixed_stop(last, s["side"])}
         if self.equity <= 0:
             return self._skip("no_equity", "капитал счёта 0")
@@ -1586,7 +1609,8 @@ class Trader:
               "whales": e.get("whales"), "ref_px": e.get("ref_px"), "signal_ts": e.get("signal_ts"),
               "in_id": str(o.get("ordId") or ""), "margin_pct": round(MARGIN_FRAC * 100, 2),
               "wallets": e.get("wallets") if isinstance(e.get("wallets"), dict) else {},
-              "usd": e.get("usd"), "usd_against": e.get("usd_against"), "stop": num(e.get("stop")),
+              # Стоп — STOP_PCT от цены ВХОДА (исполнения), а не от цены решения.
+              "usd": e.get("usd"), "usd_against": e.get("usd_against"), "stop": core.fixed_stop(fill_px, side),
               **({"priority": e["priority"]} if isinstance(e.get("priority"), str) else {}),
               **({"fade": True} if e.get("fade") else {}), **({"big": True} if e.get("big") else {})}
         self.st["opens"] = [*(x for x in self.st["opens"] if x["inst"] != inst), op]
@@ -1632,7 +1656,9 @@ class Trader:
         op: dict[str, Any] = {"coin": coin, "inst": inst, "side": side, "opened": opened, "px": px, "size": size,
               "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
-              "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": num(info.get("stop")),
+              # Стоп — от цены входа и у подхваченной (раньше без записи
+              # «входим» стопа не было вовсе: позиция без защиты).
+              "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": core.fixed_stop(px, side),
               "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {},
               **({"fade": True} if info.get("fade") else {}), **({"big": True} if info.get("big") else {})}
         self.st["opens"] = [*(o for o in self.st["opens"] if o["inst"] != inst), op]

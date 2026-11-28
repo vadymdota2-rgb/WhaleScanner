@@ -395,6 +395,9 @@ class MultiTest(Base):
         tr2.sync()
         self.assertEqual(sorted(o["inst"] for o in tr2.st["opens"]), ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"])
         self.assertTrue(tr2.st["opens"][-1]["adopted"])
+        sol = tr2.st["opens"][-1]
+        self.assertAlmostEqual(sol["stop"], sol["px"] * (1 - sol["side"] * 0.015),
+                               msg="подхват без записи «входим» — со стопом 1,5 % от входа")
 
 
 class SignTest(Base):
@@ -1186,6 +1189,26 @@ class StopTest(Base):
             os.remove(os.path.join(self.dir, "live", "state.json"))
             os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
 
+    def test_stop_from_fill_price(self) -> None:
+        """Стоп и тейк — от цены исполнения (99 800), а не от цены решения
+        (100 000): 99 800 × 0,985 = 98 303."""
+        self.ex = FakeOkx()
+        tr = self.trader(self.whales())
+        real = tr.okx.order
+
+        def order(body):
+            if body["ordType"] == "ioc":
+                self.ex.last["BTC-USDT-SWAP"] = 99_800.0   # исполнилось лучше цены решения
+            return real(body)
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        self.on()
+        tr.step()
+        op = self.state()["open"]
+        self.assertEqual(op["px"], 99_800.0)
+        self.assertAlmostEqual(op["stop"], 98_303.0)
+        self.assertAlmostEqual(op["tp"], 101_297.0)
+
     def test_stop_fixed_at_entry(self) -> None:
         """Стоп ставится на входе и не меняется: 96 900 — за ним."""
         tr = self.enter()
@@ -1225,18 +1248,33 @@ class StopTest(Base):
         [t] = self.trades()
         self.assertEqual(t["why"], "стоп")
 
-    def test_record_without_stop_never_stops(self) -> None:
-        """Позиция прежней версии — стопа в записи нет (0): не стоп ни для
-        лонга, ни для шорта (у шорта «цена выше нуля» — не стоп)."""
+    def test_record_without_stop_gets_rule_stop(self) -> None:
+        """Позиция прежней версии — стопа в записи нет (0): позиции без
+        стопа не бывает — стоп по правилу, 1,5 % от цены входа (раньше такая
+        позиция не закрывалась ни при каком убытке). Цена не дошла — не стоп."""
         for mode, side in (("net_mode", 1), ("long_short_mode", -1)):
             tr = self.enter(mode, side)
             tr.st["open"]["stop"] = 0.0
-            self.price(100_000.0 - side * 5_000)
+            self.price(100_000.0 - side * 1_000)
             self.sync(tr)
             self.assertEqual(self.exits(), [], mode)
-            self.assertIsNotNone(self.state()["open"], mode)
+            self.price(100_000.0 - side * 1_500)
+            self.sync(tr)
+            self.assertEqual([o["ordType"] for o in self.exits()], ["market"], mode)
+            self.assertEqual(self.trades()[-1]["why"], "стоп", mode)
             os.remove(self.db)
             os.remove(os.path.join(self.dir, "live", "state.json"))
+            os.remove(os.path.join(self.dir, "live", "trades.jsonl"))
+
+    def test_old_record_without_stop_loaded_with_stop(self) -> None:
+        """Состояние прежней версии без стопа — при загрузке стоп по правилу
+        (виден и во вкладке)."""
+        tr = self.enter()
+        tr.st["open"]["stop"] = 0.0
+        tr.save()
+        tr2 = lv.Trader(lv.Okx("K", "S", "P", False, self.ex), lv.Signals(self.db), self.dir,
+                        clock=lambda: self.now, log=self.logs.append)
+        self.assertAlmostEqual(tr2.st["opens"][0]["stop"], 98_500.0)
 
     def test_mark_beyond_stop_needs_ticker(self) -> None:
         """Цена позиции за стопом (порча ответа: 1 $), а тикер — нет: не
@@ -1629,6 +1667,61 @@ class StallTest(Base):
         self.assertTrue(any("выход по замедлению не исполнился" in e for e in st["events"]))
         self.assertEqual(self.trades(), [])
 
+    def test_partial_stall_fill_tp_on_rest(self) -> None:
+        """Выход по замедлению продал часть (4 из 10), повтор не исполнился —
+        остаток не остаётся без тейка: тейк на 6, запись «выходим» (проданное —
+        в итог сделки) остаётся."""
+        tr = self.enter()
+        self.price(100_900.0)
+        self.sync(tr)
+        real = tr.okx.order
+        calls = []
+
+        def order(body):
+            if str(body.get("clOrdId", "")).startswith("wtex"):
+                calls.append(body)
+                if len(calls) == 1:
+                    body = {**body, "sz": "4"}                    # продано 4 из 10
+                else:
+                    self.ex.last["BTC-USDT-SWAP"] = 100_700.0     # ниже +0,8 % — не исполнится
+            return real(body)
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        self.sync(tr, 16)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(True, [o["ordType"] == "limit" and o["state"] == "live" for o in self.ex.orders], "тейк снят")
+        self.sync(tr, 1.25)
+        self.assertEqual(len(calls), 2)
+        op = self.state()["open"]
+        self.assertEqual(op["exit"]["kind"], "stall")
+        live_tp = [o for o in self.ex.orders if o["ordType"] == "limit" and o["state"] == "live"]
+        self.assertEqual([(o["px"], o["sz"]) for o in live_tp], [("101500", "6")], "тейк на остаток")
+
+    def test_stall_miss_waits_a_minute(self) -> None:
+        """IOC замедления не исполнился, цена снова выше +0,8 % — не дёргаем
+        тейк каждые 15 с: следующая попытка — через минуту."""
+        tr = self.enter()
+        self.price(100_900.0)
+        self.sync(tr)
+        real = tr.okx.order
+        miss = [True]
+
+        def order(body):
+            if str(body.get("clOrdId", "")).startswith("wtex") and miss[0]:
+                self.ex.last["BTC-USDT-SWAP"] = 100_700.0
+            return real(body)
+
+        tr.okx.order = order  # type: ignore[method-assign]
+        self.sync(tr, 16)
+        self.assertEqual(len(self.exits()), 1)
+        miss[0] = False
+        self.price(100_850.0)
+        self.sync(tr)                                    # 15 с — рано
+        self.assertEqual(len(self.exits()), 1)
+        self.sync(tr, 1)                                 # минута прошла — снова
+        self.assertEqual(len(self.exits()), 2)
+        self.assertEqual(self.trades()[-1]["why"], "замедление")
+
     def test_stop_beats_pending_stall_exit(self) -> None:
         """Выход по замедлению ещё идёт, а цена дошла до стопа — стоп важнее:
         закрываем по рынку."""
@@ -1663,6 +1756,20 @@ class BigCrowdTest(Base):
         tr.step()
         op = self.state()["open"]
         self.assertEqual((op["side"], op.get("fade"), "big" in op), (-1, True, False))
+
+    def test_big_rechecked_at_decision(self) -> None:
+        """Сигнал помечен «крупные против толпы», но к решению толпы с другой
+        стороны уже нет (вышла из окна) — это обычная толпа: против неё."""
+        shorts = [fill(100 + i, f"0xbig{i}", "BTC", -1, self.now - (40 + i) * MIN, 700_000, 100_000) for i in range(2)]
+        tr = self.trader(shorts)
+        tr.sig.poll(self.now)
+        tr.sync()
+        w = tr.sig.windows[("BTC", -1)]
+        s = {**tr.sig._signal("BTC", -1, w, None, self.now - 40 * MIN), "big": True}
+        self.on()
+        self.assertEqual(tr.try_enter(s), "")
+        op = self.state()["open"]
+        self.assertEqual((op["side"], op.get("fade"), "big" in op), (1, True, False))
 
     def test_big_needs_two_on_the_other_side(self) -> None:
         """С другой стороны один кит (не толпа от 2) — сигнал толпы, разворот."""

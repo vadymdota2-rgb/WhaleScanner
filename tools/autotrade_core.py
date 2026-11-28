@@ -21,7 +21,7 @@ from typing import Any
 OKX_API = "https://www.okx.com"
 # Имена на OKX, которые отличаются от Hyperliquid (сверено по цене в ноябре
 # 2026). Совпадение имени ничего не доказывает: xyz:STX — акции Seagate, а STX
-# на OKX — токен Stacks; поэтому вход всё равно сверяет цену (±2 %).
+# на OKX — токен Stacks; поэтому вход всё равно сверяет цену (±10 %, MATCH_TOL).
 OKX_ALIASES = {"GOLD": "XAU", "SILVER": "XAG", "COPPER": "XCU", "PLATINUM": "XPT", "PALLADIUM": "XPD",
                "NATGAS": "NG", "BRENTOIL": "BZ", "SP500": "US500", "XYZ100": "US100", "ANTH": "ANTHROPIC",
                "OAI": "OPENAI", "SMSN": "SAMSUNG", "SKHX": "SKHYNIX", "TCNT": "TENCENT"}

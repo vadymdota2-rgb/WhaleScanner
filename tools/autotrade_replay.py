@@ -3,8 +3,7 @@
 """Бэктест-повтор по актуальным правилам живого бота: история сделок китов из
 базы бота (только чтение) прогоняется через ТОТ ЖЕ код сигналов, что у
 службы торговли (autotrade_live.Signals: окна китов, момент — сделка кита,
-«входим с крупными», убыток и добор кита), и через те же правила входа и
-выхода:
+«крупные против толпы»), и через те же правила входа и выхода:
 
 - от 2 китов в одну сторону за 2 часа, у каждого от 1000 $; сделка — против
   китов (lv.AGAINST: обратная сторона; цена входа —
@@ -23,7 +22,8 @@
   закрытым к моменту входа);
 - маржа 5 % капитала × 10×, объём — по контракту и шагу OKX (меньше
   минимума — пропуск); вход — по рынку (тейкер, проскальзывание), но не хуже
-  средней цены китов (как IOC с границей у живого бота);
+  границы lv.CHASE от средней цены китов (как IOC с границей у живого бота);
+- 2 стопа подряд — новых входов нет 2 часа (lv.LOSS_STREAK, lv.LOSS_PAUSE_MS);
 - выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (core.STOP_PCT
   от цены входа) или замедление (прибыль была от +0,8 %, 15 минут без нового
   максимума — выход не меньше +0,8 %); выхода вслед за китом нет; усреднения нет.
@@ -322,6 +322,7 @@ class Replay:
         if any(b[1] == inst for b in self.busy):
             return "own_same"
         usd, against, count = self.sig.balance(s["coin"], s["side"], now)
+        big = self.sig.crowd_big(self.sig.windows.get((s["coin"], -s["side"])), usd, against)   # на момент решения
         prio = self.sig.priority_in(s["coin"], s["side"], s.get("wallets"), now)   # приоритетный — без этих правил
         if against > 0 and against >= usd and not prio:
             return "bigger_against"
@@ -336,7 +337,7 @@ class Replay:
             return "other_asset"
         # Сторона сделки: против китов (толпы) — обратная; крупные против толпы
         # (big) — с ними, как живой бот.
-        side = -s["side"] if lv.AGAINST and not s.get("big") else s["side"]
+        side = -s["side"] if lv.AGAINST and not big else s["side"]
         if side * (hl_px / s["ref_px"] - 1) > lv.CHASE + lv.PX_EPS:
             return "chase"
         # MA30 15м — по стороне сделки (как живой бот): шорт — не при цене выше MA30.
@@ -353,11 +354,11 @@ class Replay:
         tp_try = lv.round_step(last * (1 + side * lv.TP), tick, ROUND_CEILING if side > 0 else ROUND_FLOOR)
         if tp_try <= 0 or not lv.TP * 0.999 <= side * (float(tp_try) / last - 1) <= lv.TP + lv.TP_SLACK:
             return "tick"
-        self.open_trade(s, inst, ins, sz, last, now, core.fixed_stop(last, side), side)
+        self.open_trade(s, inst, ins, sz, last, now, side)
         return ""
 
     def open_trade(self, s: dict[str, Any], inst: str, ins: dict[str, Any], sz: Decimal, last: float, now: int,
-                   stop: float, side: int) -> None:
+                   side: int) -> None:
         """Сделка от входа до выхода по свечам."""
         a = self.a
         slip = a.slippage / 100
@@ -371,6 +372,7 @@ class Replay:
         tick = lv.dec(ins.get("tickSz")) or Decimal("0.0001")
         qty = float(sz) * coin_per_contract(ins, entry)      # монет в позиции
         avg_px = entry
+        stop = core.fixed_stop(avg_px, side)   # стоп — от цены входа (как живой бот — от цены исполнения)
         fees = qty * entry * a.fee_taker / 100
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
         mae = 0.0

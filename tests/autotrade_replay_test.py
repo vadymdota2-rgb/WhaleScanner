@@ -464,6 +464,35 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual([(x.side, x.why) for x in r["trades"]], [(-1, "тейк")])
             self.assertEqual(r["trades"][0].wallets, ("0xbig1", "0xbig2"), "с крупными, не против толпы лонгов")
 
+    def test_stop_from_entry_price(self) -> None:
+        """Стоп — 1,5 % от цены входа (99 049,5 = 99 000 + проскальзывание),
+        а не от цены решения (99 000): провал до 97 540 — стоп (97 563,76),
+        от цены решения (97 515) был бы не стоп."""
+        def price(c: str, ts: int) -> float:
+            if T + 17 * MIN <= ts < T + 20 * MIN:
+                return 97_540.0
+            return 100_600.0 if ts >= T + 60 * MIN else 99_000.0
+
+        r = self.go(self.whales(), price)
+        [t] = r["trades"]
+        self.assertAlmostEqual(t.entry_px, 99_049.5)
+        self.assertEqual(t.why, "стоп")
+
+    def test_big_rechecked_at_decision(self) -> None:
+        """«Крупные против толпы» — на момент решения: сигнал крупных шортов
+        против толпы лонгов, а к решению (через 6 минут) лонги вышли из окна —
+        это обычная толпа: против неё, лонг (без пересчёта был бы шорт)."""
+        with mock.patch.object(rp.lv, "AGAINST", True):
+            crowd = [opn(1, "0xa", "BTC", 1, T - 116 * MIN, 5000, 100_000), opn(2, "0xb", "BTC", 1, T - 115 * MIN, 5000, 100_000)]
+            big = [opn(100, "0xbig1", "BTC", -1, T - 2 * MIN, 700_000, 100_000),
+                   opn(101, "0xbig2", "BTC", -1, T, 700_000, 100_000)]
+
+            def price(c: str, ts: int) -> float:
+                return 99_000.0 if ts < T - 60 * MIN else 101_600.0 if ts >= T + 60 * MIN else 100_000.0
+
+            r = self.go(crowd + big, price, delay=360)
+            self.assertEqual([(x.side, x.why) for x in r["trades"]], [(1, "тейк")])
+
     def test_two_stops_pause_two_hours(self) -> None:
         """Два стопа подряд — входов нет 2 часа (как живой бот): BTC и ETH по
         стопу, сигнал SOL через 30 минут — «loss_pause»; DOGE через 3 часа — вход."""
