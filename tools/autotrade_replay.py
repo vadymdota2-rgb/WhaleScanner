@@ -25,7 +25,8 @@
   минимума — пропуск); вход — по рынку (тейкер, проскальзывание), но не хуже
   средней цены китов (как IOC с границей у живого бота);
 - выход: лимитный тейк от цены входа (lv.TP); по рынку — стоп (core.STOP_PCT
-  от цены входа); выхода вслед за китом нет; усреднения нет.
+  от цены входа) или замедление (прибыль была от +0,8 %, 15 минут без нового
+  максимума — выход не меньше +0,8 %); выхода вслед за китом нет; усреднения нет.
 
 Один расчёт — по текущим правилам (вариантов нет: правило владельца
 27.11.2026 — «улучшаем только один»); в итоге — комиссии и итог каждой
@@ -272,7 +273,7 @@ class Trade:
     exit_px: float      # цена выхода; открытая — цена на конец данных
     notional: float     # $ по цене входа
     pnl: float          # $ с комиссиями
-    why: str            # тейк / стоп / открыта
+    why: str            # тейк / стоп / замедление / открыта
     mae: float          # худший ход против нас внутри сделки, $
     wallets: tuple[str, ...]        # киты сигнала — для рейтинга
     fees: float                     # $ комиссий входа и выхода (уже в pnl)
@@ -371,9 +372,23 @@ class Replay:
         tp = float(lv.round_step(avg_px * (1 + side * lv.TP), tick, rnd))
         mae = 0.0
         why, t_out, px_out = "открыта", self.px.now_ms, avg_px
+        # Замедление (как живой бот): прибыль дошла до +LOCK_PCT — помним лучшую
+        # цену; STALL_MS без нового максимума — выход по рынку, но не меньше
+        # +LOCK_PCT (IOC с границей lock). Лучшая цена — по свечам: время
+        # максимума — конец свечи (бот видит его на сверке, не раньше).
+        lock = avg_px * (1 + side * lv.LOCK_PCT)
+        peak, peak_at = 0.0, 0
         for tf, o, h, lo, cl in self.px.candles(inst, start, self.px.now_ms):
             t = int(tf)
             end = t + BAR_MS
+            stalled = peak > 0 and t - peak_at >= lv.STALL_MS
+            if stalled and side * (o - lock) >= 0:
+                # Свеча открылась выше +0,8 % — по рынку на открытии, не хуже lock.
+                px_out = o * (1 - side * slip)
+                px_out = lock if side * (px_out - lock) < 0 else px_out
+                why, t_out = "замедление", t
+                fees += qty * px_out * a.fee_taker / 100
+                break
             worst = lo if side > 0 else h
             # Стоп входа (STOP_PCT от входа) — по рынку (бот видит на сверке; цена —
             # стоп или хуже, если свеча открылась уже за ним). Раньше тейка в той
@@ -390,6 +405,13 @@ class Replay:
                 why, t_out, px_out = "тейк", t, tp
                 fees += qty * tp * a.fee_maker / 100
                 break
+            if stalled and side * (best - lock) >= 0:
+                # Замедление, цена внутри свечи вернулась к +0,8 % — выход по границе.
+                why, t_out, px_out = "замедление", t, lock
+                fees += qty * lock * a.fee_taker / 100
+                break
+            if side * (best - lock) >= 0 and (peak <= 0 or side * (best - peak) > 0):
+                peak, peak_at = best, end   # новый максимум прибыли от +0,8 % — отсчёт заново
             t_out, px_out = end, cl
         pnl = qty * side * (px_out - avg_px) - fees
         self.entered[s["coin"]] = start

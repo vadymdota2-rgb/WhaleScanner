@@ -32,6 +32,9 @@
   владельца 27.11.2026, было +0,8 %) или стоп; выхода вслед за китом нет
   (убран по правилу владельца 28.11.2026). Кит сигнала уже вышел в убыток до
   входа — не входим;
+- замедление: прибыль хоть раз дошла до +0,8 %, а потом 15 минут нет нового
+  максимума — закрыть по рынку, но не меньше +0,8 % (IOC с границей; цена
+  ниже — выхода нет, тейк обратно; правило владельца 28.11.2026);
 - стоп — 1,5 % от цены входа (лонг — ниже, шорт — выше; по бэктесту
   27.11.2026, было 3 %); на входе и не меняется;
   цена позиции (mark) дошла — снять тейк и закрыть по рынку (только на
@@ -128,6 +131,11 @@ LEVERAGE = 10
 # Своих позиций бота — до MAX_OPEN одновременно, на разных бумагах (правило
 # владельца 27.11.2026; раньше — одна): каждая — 5 % маржи × 10×.
 MAX_OPEN = 3
+# Замедление (правило владельца 28.11.2026): прибыль хоть раз дошла до +0,8 %
+# (LOCK_PCT), а потом 15 минут (STALL_MS) нет нового максимума — закрыть по
+# рынку, но не меньше +0,8 % (ордер IOC с границей; ниже — ждём тейк или стоп).
+LOCK_PCT = 0.008
+STALL_MS = 15 * 60_000
 TP = 0.015                  # тейк +1,5 % движения цены (правило владельца 27.11.2026; было +0,8 %, до того +1 %)
 COIN_PAUSE_MS = 3 * 3_600_000
 FILL_TOL = 0.05            # цена исполнения входа — не дальше 5 % от границы цены ордера
@@ -1116,7 +1124,8 @@ class Trader:
                  # Тейк — лимит: исполнение ровно по его цене (0,05 % — запас на
                  # среднюю цену); выход по рынку рядом с тейком — не тейк.
                  "why": "тейк" if out_px > 0 and abs(out_px / op["tp"] - 1) < 0.0005
-                 else ("стоп" if op["exit"].get("kind") == "stop" else "кит вышел в убыток") if op.get("exit")
+                 else {"stop": "стоп", "stall": "замедление"}.get(str(op["exit"].get("kind")), "кит вышел в убыток")
+                 if op.get("exit")
                  else "закрыта",
                  "wallets": sorted(w for w in op.get("wallets") or {} if isinstance(w, str))}
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
@@ -1147,12 +1156,22 @@ class Trader:
 
     def _follow_one(self, op: dict[str, Any]) -> None:
         now = self.clock()
-        if not op.get("exit"):
+        ex = op.get("exit")
+        if isinstance(ex, dict) and ex.get("kind") == "stall":
+            # Выход по замедлению ещё идёт, а цена дошла до стопа — стоп важнее.
             why = self._stop_hit(op)
+            if why:
+                ex.update(kind="stop", why=why, tried=0)
+                self.event(f"{op['inst']}: {why} — закрываю позицию бота по рынку")
+        if not op.get("exit"):
+            why, kind = self._stop_hit(op), "stop"
+            if not why:
+                why, kind = self._stall_hit(op, now), "stall"
             if not why:
                 return
-            op["exit"] = {"at": now, "tried": 0, "why": why, "kind": "stop"}
-            self.event(f"{op['inst']}: {why} — закрываю позицию бота по рынку")
+            op["exit"] = {"at": now, "tried": 0, "why": why, "kind": kind}
+            self.event(f"{op['inst']}: {why} — закрываю позицию бота "
+                       + ("по рынку" if kind == "stop" else f"по рынку, не меньше +{LOCK_PCT * 100:g} %"))
         if now - num(op["exit"].get("tried")) < 60_000:
             return
         op["exit"]["tried"] = now
@@ -1181,6 +1200,12 @@ class Trader:
             cl = f"{TAG}ex{now % 10**12}"
             body = {"instId": op["inst"], "tdMode": "cross", "side": "sell" if op["side"] > 0 else "buy",
                     "ordType": "market", "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(op["side"])}
+            if op["exit"].get("kind") == "stall":
+                # Замедление — по рынку, но не меньше +0,8 %: IOC с границей (лонг
+                # продаёт не ниже, шорт покупает не выше; на шаге цены в нашу пользу).
+                lock = round_step(op["px"] * (1 + op["side"] * LOCK_PCT), ins.get("tickSz", "0.0001"),
+                                  ROUND_CEILING if op["side"] > 0 else ROUND_FLOOR)
+                body.update(ordType="ioc", px=fmt_dec(lock))
             if self.pos_mode != "long_short_mode":
                 body["reduceOnly"] = True  # только закрытие: не перевернуть позицию
             # Метка ордера — в запись ДО отправки: ответ не дошёл — ордер всё
@@ -1198,6 +1223,36 @@ class Trader:
             return
         if got is not None and got[0] >= size_of(op.get("size")):
             self._record_close(op, got[1])
+        elif got is not None and got[0] <= 0 and op["exit"].get("kind") == "stall":
+            # Цена ушла ниже +0,8 % — ничего не продано: выхода нет, тейк обратно;
+            # дальше — как прежде (тейк, стоп или снова замедление выше +0,8 %).
+            op.pop("exit", None)
+            self.event(f"{op['inst']}: выход по замедлению не исполнился — цена ниже +{LOCK_PCT * 100:g} %; тейк обратно")
+            self._place_tp(op, size_of(op.get("size")))
+            self.save()
+
+    def _stall_hit(self, op: dict[str, Any], now: int) -> str:
+        """Замедление: прибыль хоть раз дошла до +LOCK_PCT (с этого момента
+        помним лучшую цену — op["best"] и когда она была — op["best_at"]), а
+        потом STALL_MS нет нового максимума и прибыль сейчас не меньше
+        +LOCK_PCT (цена позиции и цена сделки) — причина строкой; нет — пусто."""
+        live = [p for p in self.positions if p.get("instId") == op["inst"] and self._side_of(p) == op["side"]]
+        px, side = num(op.get("px")), op["side"]
+        mark = num(live[0].get("markPx")) if live else 0.0
+        if not live or px <= 0 or mark <= 0:
+            return ""
+        gain = side * (mark / px - 1)
+        best = num(op.get("best"))
+        if gain >= LOCK_PCT and (best <= 0 or side * (mark - best) > 0):
+            op["best"], op["best_at"] = mark, now   # новый максимум прибыли — отсчёт заново
+            return ""
+        if best <= 0 or now - num(op.get("best_at")) < STALL_MS or gain < LOCK_PCT:
+            return ""
+        last = self.okx.ticker(op["inst"])   # подтвердить ценой сделки: одна испорченная цена не закрывает
+        if last <= 0 or side * (last / px - 1) < LOCK_PCT:
+            return ""
+        return (f"движение замедлилось: {STALL_MS // 60_000} минут без нового максимума "
+                f"(лучшая {best:.6g}), прибыль {gain * 100:.2f} %")
 
     def _stop_hit(self, op: dict[str, Any]) -> str:
         """Стоп входа: цена позиции (mark) и цена сделки (тикер) обе дошли до
