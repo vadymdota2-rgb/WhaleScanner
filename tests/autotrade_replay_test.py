@@ -93,7 +93,13 @@ def step_price(base: float, moves: list[tuple[int, float]]):
 
 
 class ReplayTest(unittest.TestCase):
+    AGAINST = False   # сценарии по направлению китов; против китов — test_against_whales
+
     def setUp(self) -> None:
+        for name, value in (("AGAINST", self.AGAINST), ("CHASE", 0.0)):
+            patcher = mock.patch.object(rp.lv, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "hl.db")
@@ -384,6 +390,27 @@ class ReplayTest(unittest.TestCase):
         r = self.go(rows, lambda c, t: self.PX[c])
         self.assertEqual(len(r["trades"]), 1)
         self.assertEqual(r["skips"].get("own_same"), 1)
+
+    def test_against_whales(self) -> None:
+        """Против китов (как живой бот: lv.AGAINST, lv.CHASE = −0,01): киты в
+        лонг по 100 000 — шорт только от 101 000; цена −1,6 % — тейк шорта; кит
+        закрыл лонг в убытке — выхода нет; 100 500 — рано («chase»); MA30 — по
+        стороне сделки: цена выше MA30 — в шорт не входим («ma30»)."""
+        with mock.patch.object(rp.lv, "AGAINST", True), mock.patch.object(rp.lv, "CHASE", -0.01):
+            rows = [*self.whales(), cls(9, "0xa", "BTC", 1, T + 10 * MIN, -100.0)]
+            [tr] = self.go(rows, step_price(101_000, [(T + 60 * MIN, -0.016)]))["trades"]
+            self.assertEqual((tr.side, tr.why), (-1, "тейк"))
+            self.assertAlmostEqual(tr.entry_px, 101_000.0, places=6)
+            self.assertAlmostEqual(tr.tp, 99_485.0)
+            os.remove(self.db)
+            self.cache += "1"
+            r = self.go(self.whales(), step_price(100_500, [(T + 60 * MIN, -0.016)]))
+            self.assertEqual((r["trades"], r["skips"].get("chase")), ([], 1))
+            os.remove(self.db)
+            self.cache += "2"
+            r = self.go(self.whales(), lambda c, ts: 100_000.0 if ts < T else 101_000.0)
+            self.assertEqual((r["trades"], r["skips"].get("ma30")), ([], 1), "цена выше MA30 — в шорт не входим")
+            self.assertIn("вход по рынку на 1 % лучше средней цены китов (шорт — выше, лонг — ниже), против китов", r["text"])
 
     def test_whales_average_with_float_noise_enters(self) -> None:
         """Средняя цена китов 99 999,99999999999 (12 345 $ и 50 000 $ по

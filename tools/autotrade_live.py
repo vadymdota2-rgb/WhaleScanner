@@ -11,14 +11,18 @@
 
 Правила владельца:
 - сигнал — от 2 разных китов Hyperliquid в одну сторону на одной бумаге за
-  2 часа, у каждого от 10 000 $ (правило владельца 28.11.2026; было 1000 $;
-  сделки китов — из базы бота, только чтение);
+  2 часа, у каждого от 1000 $ (сделки китов — из базы бота, только чтение);
+- ПРОТИВ КИТОВ (правило владельца 28.11.2026): сделка — в обратную сторону от
+  сигнала (киты в лонг — бот в шорт); цена входа, MA30, стоп и тейк — по
+  стороне сделки; выхода вслед за китом в убытке нет (его убыток — наш плюс);
 - только фьючерсы (крипта, акции, металлы), бумага должна быть на OKX и цена
   сходиться с ценой китов (±2 %) — иначе это другой актив;
-- не догоняем: цена OKX хуже средней цены китов (CHASE = 0; было — больше
+- цена входа — CHASE от средней цены китов по стороне сделки: против китов
+  шорт — от +1 % выше их входа, лонг — от 1 % ниже (CHASE = −0,01; правило
+  владельца 28.11.2026); было — не хуже их цены (CHASE = 0; до того — больше
   чем на 0,3 %) — пропуск; вход — по рынку ордером IOC с границей «средняя
-  цена китов»: исполняется сразу, но не хуже границы (правило владельца
-  27.11.2026; граница 0 — по бэктесту: итог на 20 $ лучше ±0,3 %);
+  цена китов × (1 + сторона × CHASE)»: исполняется сразу, но не хуже границы
+  (правило владельца 27.11.2026);
 - маржа — всегда 5 % капитала счёта, плечо 10×, кросс (сделки владельца
   руками на счёте входу не мешают);
   на ту же бумагу, где ручная позиция, — не входит;
@@ -36,7 +40,8 @@
   что вслед за китом); работает и при «Стоп» во вкладке; усреднения нет;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
 - MA30 15-минутного графика (средняя 30 закрытий, идущая — по цене): лонг —
-  только цена выше MA30, шорт — ниже; свечей нет — как без MA; свечи OKX не
+  только цена выше MA30, шорт — ниже — по стороне СДЕЛКИ (правило владельца
+  28.11.2026: в шорт не входим, когда цена выше MA30); свечей нет — как без MA; свечи OKX не
   получены (сбой) — не входим до следующего опроса (правило владельца 27.11.2026);
 - рейтинг китов по нашим сделкам (правило владельца 27.11.2026): сделка
   засчитывается всем китам её сигнала; винрейт — от 5 сделок; сигналы с
@@ -45,7 +50,7 @@
   (не догоняем, «кит уже вышел» и стоп — как всегда);
 - уровней графика 4ч нет (убраны по правилу владельца 27.11.2026);
 - входим с крупными: за те же 2 часа по бумаге против сигнала стоят киты
-  крупнее по объёму (кошельки от 10 000 $) — в слабую сторону не входим; если
+  крупнее по объёму (кошельки от 1000 $) — в слабую сторону не входим; если
   крупных от 2 — входим в их сторону.
 
 Кнопки «Старт»/«Стоп» во вкладке пишут switch.json: «Стоп» — новых входов
@@ -102,9 +107,16 @@ NANOS = core.NANOS
 
 # Правила владельца.
 MIN_WHALES = 2
-MIN_WHALE_USD = 10_000          # кит — от 10 000 $ в окне (правило владельца 28.11.2026; было 1000 $)
+MIN_WHALE_USD = 1000            # кит — от 1000 $ в окне (правило владельца 28.11.2026: снова 1000 $, 10 000 $ было днём)
 WINDOW_MS = 2 * 3_600_000
-CHASE = 0.0                # вход не хуже средней цены китов (правило 27.11.2026 по бэктесту: +20 $ к ±0,3 %; было 0,003)
+# Против китов (правило владельца 28.11.2026): сигнал — как прежде, сделка — в
+# обратную сторону; выхода вслед за китом в убытке нет (его убыток — наш плюс).
+AGAINST = True
+# Цена входа относительно средней цены китов, по стороне сделки: > 0 — не хуже
+# неё больше чем на CHASE, 0 — не хуже, < 0 — лучше неё хотя бы на |CHASE|.
+# Против китов (правило владельца 28.11.2026): шорт — от +1 % выше их входа,
+# лонг — от 1 % ниже (было 0 — не хуже их цены; до того 0,003).
+CHASE = -0.01
 # Средняя цена китов — дробь с погрешностью (99 999,99999999 вместо 100 000):
 # при CHASE = 0 цена ровно на цене китов давала бы «хуже китов», а граница IOC
 # уходила бы на шаг цены внутрь. Допуск — 1e-9 (0,0001 $ на 100 000 $).
@@ -147,9 +159,13 @@ BLOCK_MS = 7 * 86_400_000
 FAIL_PAUSE_MS = 15 * 60_000  # другой отказ ордера — эту бумагу не трогать 15 минут
 
 
-def chase_text(sign: str = "больше чем на ") -> str:
-    """Допуск к цене китов для сообщений: «» при CHASE = 0, иначе « больше чем на 0.3 %» или « ±0.3 %»."""
-    return f" {sign}{CHASE * 100:g} %" if CHASE else ""
+def chase_rule() -> str:
+    """Правило цены входа относительно средней цены китов — для сообщений."""
+    if CHASE < 0:
+        return f"на {-CHASE * 100:g} % лучше средней цены китов (шорт — выше, лонг — ниже)"
+    if CHASE > 0:
+        return f"не хуже средней цены китов больше чем на {CHASE * 100:g} %"
+    return "не хуже средней цены китов"
 
 
 def now_ms() -> int:
@@ -454,7 +470,7 @@ class Signals:
 
     def poll(self, now: int) -> list[dict[str, Any]]:
         """Новые строки базы → окна; сигналы: бумага и сторона, где сейчас ≥ 2
-        китов от 10 000 $ за 2 часа, и строка, на которой это случилось."""
+        китов от 1000 $ за 2 часа, и строка, на которой это случилось."""
         # Всё окно 2 часа каждый раз: бот записывает сделки китов с опозданием
         # (опрос кошельков), и опоздавшая сделка должна попасть в окно, а не
         # потеряться. Повторы отсекает seen (tid).
@@ -487,7 +503,7 @@ class Signals:
             opp = self.windows.get((coin, -side))
             if opp is not None:
                 opp.expire(newest - WINDOW_MS)
-            # Момент сигнала — сделка КИТА (кошелёк от 10 000 $ в окне). Мелкая
+            # Момент сигнала — сделка КИТА (кошелёк от 1000 $ в окне). Мелкая
             # сделка (не кит) сигнал не «освежает»: иначе вход через полтора
             # часа после китов по чьей-то сделке на 50 $ выглядел бы свежим.
             v = w.per.get(wallet)
@@ -504,7 +520,7 @@ class Signals:
         return out
 
     def whale_usd(self, w: core.Window | None) -> float:
-        """Объём китов окна (кошельки от 10 000 $), $."""
+        """Объём китов окна (кошельки от 1000 $), $."""
         return float(w.whale_n) / NANOS if w is not None else 0.0   # сумма — по ходу (core.Window)
 
     def priority_in(self, coin: str, side: int, wallets: object, now: int) -> str:
@@ -531,7 +547,7 @@ class Signals:
         return out[0], out[1], (w.count if w is not None else 0)
 
     def _signal(self, coin: str, side: int, w: core.Window, opp: core.Window | None, ts: int) -> dict[str, Any]:
-        """Сигнал: бумага, сторона, киты (от 10 000 $) и их первая сделка в окне
+        """Сигнал: бумага, сторона, киты (от 1000 $) и их первая сделка в окне
         (от неё смотрим, не закрыли ли они в убыток), средняя цена китов,
         объём китов сигнала и китов против (та же бумага, те же 2 часа)."""
         big = {wl for wl, v in w.per.items() if v[2] > 0 and v[0] >= self.limit}
@@ -568,7 +584,7 @@ class Signals:
         return [(wl, p / NANOS) for wl, p in sorted(pnl.items()) if p < 0]
 
     def wallets_at(self, coin: str, side: int, ts: int) -> dict[str, int]:
-        """Киты сигнала по базе: кто от 10 000 $ открывал эту бумагу и сторону
+        """Киты сигнала по базе: кто от 1000 $ открывал эту бумагу и сторону
         за 2 часа до сигнала, и их первая сделка в окне. Для позиции, открытой
         до того, как бот стал запоминать китов."""
         rows = self._rows(
@@ -1151,7 +1167,8 @@ class Trader:
         if not op.get("exit"):
             why = self._stop_hit(op)
             kind = "stop"
-            if not why and isinstance(op.get("wallets"), dict) and op["wallets"]:
+            # Против китов (fade) — выхода вслед за китом нет: его убыток — наш плюс.
+            if not why and not op.get("fade") and isinstance(op.get("wallets"), dict) and op["wallets"]:
                 lost = self.sig.whale_loss(op["coin"], op["side"], op["wallets"], now)
                 why = f"кит {lost[0][0][:10]}… закрыл в убыток {lost[0][1]:+.0f} $" if lost else ""
                 kind = "whale"
@@ -1352,6 +1369,9 @@ class Trader:
         if lost:
             return self._skip("whale_exit", f"кит сигнала уже закрыл позицию в убыток ({lost[0][0][:10]}…, "
                                             f"{lost[0][1]:+.0f} $) — не входим")
+        if AGAINST:
+            # Против китов: дальше (догон, MA30, стоп, тейк, ордер) — сторона сделки.
+            s = {**s, "side": -s["side"], "fade": True}
         base, scale = core.okx_candidate(s["coin"])
         inst = self.inst_for(base)
         blocked = self.st.setdefault("blocked", {})
@@ -1379,7 +1399,9 @@ class Trader:
         if abs(hl_px / s["ref_px"] - 1) > MATCH_TOL:
             return self._skip("other_asset", f"{inst} — другой актив (цена {last} против {s['ref_px'] / scale:.6g})")
         if s["side"] * (hl_px / s["ref_px"] - 1) > CHASE + PX_EPS:
-            return self._skip("chase", f"цена хуже средней цены китов{chase_text()}")
+            return self._skip("chase", f"цена {last:.6g} при средней китов {s['ref_px'] / scale:.6g} — вход только {chase_rule()}")
+        # MA30 15м — по стороне сделки (правило владельца 28.11.2026): в шорт не
+        # входим, когда цена выше MA30, в лонг — когда ниже.
         why = "" if prio else self.ma_check(inst, last, s["side"])
         if why:
             return why
@@ -1397,7 +1419,7 @@ class Trader:
         sz = contract_size(ins, notional, last)
         # Вход — по рынку, но не дальше CHASE от средней цены китов (правило
         # владельца 27.11.2026: «вход маркет ордером, не гонимся за ценой»;
-        # CHASE = 0 — не хуже их цены): ордер IOC с границей цены — исполняется
+        # против китов CHASE = −1 % — лучше их цены): ордер IOC с границей цены — исполняется
         # сразу по лучшим ценам стакана, как рыночный, но не хуже границы (лонг —
         # средняя китов × (1 + CHASE), шорт — × (1 − CHASE), на шаге цены внутрь);
         # остаток — снимается биржей. Простой рыночный ордер при проскальзывании ушёл бы дальше.
@@ -1420,7 +1442,8 @@ class Trader:
                                    "whales": s["whales"], "ref_px": s["ref_px"] / scale, "signal_ts": s["ts"],
                                    "wallets": s.get("wallets") or {}, "usd": s.get("usd"), "usd_against": s.get("usd_against"),
                                    "stop": s.get("stop", 0.0), "limit": fmt_dec(lim), "last": last, "until": now + ENTRY_WAIT_MS,
-                                   "ordered": fmt_dec(sz), **({"priority": s["priority"]} if s.get("priority") else {})}
+                                   "ordered": fmt_dec(sz), **({"priority": s["priority"]} if s.get("priority") else {}),
+                                   **({"fade": True} if s.get("fade") else {})}
             self.save()
             self.okx.order({"instId": inst, "tdMode": "cross", "side": "buy" if s["side"] > 0 else "sell",
                             "ordType": "ioc", "px": fmt_dec(lim), "sz": fmt_dec(sz), "clOrdId": cl, **self._ps(s["side"])})
@@ -1452,11 +1475,11 @@ class Trader:
         if (self.st.get("key_problem") or {}).get("market") == inst_type(inst):
             self.st.pop("key_problem", None)  # ордер на этом рынке принят — ключ в порядке
         self.event(f"вход {inst} {'лонг' if s['side'] > 0 else 'шорт'} по рынку {fmt_dec(sz)}, не хуже {fmt_dec(lim)} "
-                   f"(средняя цена китов{chase_text('±')}; маржа {MARGIN_FRAC * 100:g} %, китов {s['whales']})")
+                   f"(вход {chase_rule()}; маржа {MARGIN_FRAC * 100:g} %, китов {s['whales']})")
         self.save()
         # Исполнился (обычно сразу) — позиция и тейк сейчас; иначе — на сверке.
         if self._resolve_entry(self.st["entering"]) == "miss":
-            return self._skip("limit_miss", f"{inst}: цена ушла хуже средней цены китов{chase_text()} — вход не исполнился")
+            return self._skip("limit_miss", f"{inst}: цена ушла — вход только {chase_rule()}, не исполнился")
         return ""
 
     def _resolve_entry(self, e: dict[str, Any]) -> str:
@@ -1472,7 +1495,8 @@ class Trader:
                 # Время вышло — или кит сигнала, пока ордер висел, закрылся в
                 # убытке (иначе вход и сразу выход по рынку в минус): снять остаток.
                 wallets = e.get("wallets") if isinstance(e.get("wallets"), dict) else {}
-                lost = self.clock() < num(e.get("until")) and wallets and self.sig.whale_loss(
+                # Против китов — их убыток нам не повод: ордер не снимаем.
+                lost = self.clock() < num(e.get("until")) and wallets and not e.get("fade") and self.sig.whale_loss(
                     str(e.get("coin")), 1 if num(e.get("side")) > 0 else -1, wallets, self.clock())
                 if self.clock() >= num(e.get("until")) or lost:
                     if lost:
@@ -1521,7 +1545,8 @@ class Trader:
               "in_id": str(o.get("ordId") or ""), "margin_pct": round(MARGIN_FRAC * 100, 2),
               "wallets": e.get("wallets") if isinstance(e.get("wallets"), dict) else {},
               "usd": e.get("usd"), "usd_against": e.get("usd_against"), "stop": num(e.get("stop")),
-              **({"priority": e["priority"]} if isinstance(e.get("priority"), str) else {})}
+              **({"priority": e["priority"]} if isinstance(e.get("priority"), str) else {}),
+              **({"fade": True} if e.get("fade") else {})}
         self.st["opens"] = [*(x for x in self.st["opens"] if x["inst"] != inst), op]
         self.st["entered"][op["coin"]] = now
         self.st.pop("entering", None)
@@ -1566,7 +1591,8 @@ class Trader:
               "notional": round(size * ct * (1 if in_usd else px), 2), "tp": float(tp), "tp_s": fmt_dec(tp),
               "whales": info.get("whales"), "ref_px": info.get("ref_px"), "signal_ts": info.get("signal_ts"),
               "in_id": str(order.get("ordId") or ""), "adopted": True, "stop": num(info.get("stop")),
-              "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {}}
+              "wallets": info.get("wallets") if isinstance(info.get("wallets"), dict) else {},
+              **({"fade": True} if info.get("fade") else {})}
         self.st["opens"] = [*(o for o in self.st["opens"] if o["inst"] != inst), op]
         self.st["entered"][coin] = opened
         self.event(f"найдена своя позиция без записи: {inst} {'лонг' if side > 0 else 'шорт'} {fmt_dec(Decimal(str(size)))} "
