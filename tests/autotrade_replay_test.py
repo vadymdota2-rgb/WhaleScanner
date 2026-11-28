@@ -145,13 +145,12 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual(json.load(f)["stage"], "готово")
         self.assertTrue(os.path.isfile(os.path.join(self.out, "summary.json")))
 
-    def test_whale_loss_exit(self) -> None:
+    def test_whale_loss_is_no_exit(self) -> None:
+        """Выхода вслед за китом нет: кит закрыл в убыток — сидим до тейка."""
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, -100.0)]
-        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003)]))
+        r = self.go(rows, step_price(100_000, [(T + 20 * MIN, -0.003), (T + 90 * MIN, 0.016)]))
         [t] = r["trades"]
-        self.assertEqual(t.why, "кит вышел в убыток")
-        self.assertLess(t.pnl, 0)
-        self.assertGreaterEqual(t.exit_t, T + 30 * MIN)
+        self.assertEqual(t.why, "тейк")
 
     def test_whale_profit_close_keeps_position(self) -> None:
         rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T + 30 * MIN, +100.0)]
@@ -412,6 +411,59 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual((r["trades"], r["skips"].get("ma30")), ([], 1), "цена выше MA30 — в шорт не входим")
             self.assertIn("вход по рынку на 1 % лучше средней цены китов (шорт — выше, лонг — ниже), против китов", r["text"])
 
+    def test_stall_exit_not_below_lock(self) -> None:
+        """Замедление (как живой бот): +1 % и 15 минут без нового максимума —
+        выход по рынку на открытии свечи (не хуже +0,8 %); максимум +1 %, потом
+        +0,5 % и стоит — не выходим (не меньше +0,8 %)."""
+        def stalled(c: str, ts: int) -> float:
+            return 100_000.0 if ts < T + 60 * MIN else 101_000.0 if ts < T + 120 * MIN else 102_000.0
+
+        [tr] = self.go(self.whales(), stalled)["trades"]
+        self.assertEqual(tr.why, "замедление")
+        self.assertAlmostEqual(tr.exit_px, 101_000 * 0.9995, places=3)
+        self.assertEqual((tr.exit_t - T) // MIN, 80, "максимум виден в конце свечи (65 мин) + 15 минут")
+        os.remove(self.db)
+        self.cache += "1"
+
+        def dipped(c: str, ts: int) -> float:
+            return 100_000.0 if ts < T + 60 * MIN else 101_000.0 if ts < T + 65 * MIN else 100_500.0
+
+        [tr] = self.go(self.whales(), dipped)["trades"]
+        self.assertEqual(tr.why, "открыта")
+        os.remove(self.db)
+        self.cache += "2"
+
+        def back(c: str, ts: int) -> float:   # +1 %, потом +0,5 %, потом свеча задела +0,8 % — выход по границе
+            if ts < T + 60 * MIN:
+                return 100_000.0
+            if ts < T + 65 * MIN:
+                return 101_000.0
+            return 100_850.0 if T + 120 * MIN <= ts < T + 125 * MIN else 100_500.0
+
+        [tr] = self.go(self.whales(), back)["trades"]
+        self.assertEqual(tr.why, "замедление")
+        self.assertGreaterEqual(tr.exit_px, 100_800.0 - 1e-6)
+
+    def test_big_against_crowd_goes_with_big(self) -> None:
+        """Против китов: крупные шорты (от 2) против толпы лонгов — шорт с
+        крупными (без разворота); одна толпа лонгов — шорт против неё."""
+        with mock.patch.object(rp.lv, "AGAINST", True), mock.patch.object(rp.lv, "CHASE", -0.01):
+            # Крупные шорты по 100 000 пришли первыми: тогда они — толпа, но лонг
+            # против них — только от 99 000 (цена 100 000 — пропуск «chase»).
+            # Толпа лонгов (по 101 000) против крупных: шорт с крупными — от 101 000.
+            big = [opn(100, "0xbig1", "BTC", -1, T - 40 * MIN, 700_000, 100_000),
+                   opn(101, "0xbig2", "BTC", -1, T - 39 * MIN, 700_000, 100_000)]
+            crowd = [opn(1, "0xa", "BTC", 1, T - 2 * MIN, 5000, 101_000), opn(2, "0xb", "BTC", 1, T, 5000, 101_000)]
+
+            def price(c: str, ts: int) -> float:   # до T−45 мин — 103 000: MA30 выше цены, шорт разрешён
+                if ts < T - 45 * MIN:
+                    return 103_000.0
+                return 100_000.0 if ts < T - 5 * MIN else 101_000.0 if ts < T + 60 * MIN else 99_000.0
+
+            r = self.go(big + crowd, price)
+            self.assertEqual([(x.side, x.why) for x in r["trades"]], [(-1, "тейк")])
+            self.assertEqual(r["trades"][0].wallets, ("0xbig1", "0xbig2"), "с крупными, не против толпы лонгов")
+
     def test_whales_average_with_float_noise_enters(self) -> None:
         """Средняя цена китов 99 999,99999999999 (12 345 $ и 50 000 $ по
         100 000) при цене 100 000 — не «хуже китов»: вход (как у живого бота)."""
@@ -467,11 +519,11 @@ class ReplayTest(unittest.TestCase):
         self.assertGreater(r["skips"]["chase"], 0)
         os.remove(self.db)
         self.cache += "2"  # свои свечи у каждого случая
-        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T - MIN, -50.0)]   # кит сигнала уже вышел в убыток
+        rows = [*self.whales(), cls(10, "0xa", "BTC", 1, T - MIN, -50.0)]   # кит сигнала уже вышел в убыток — входим
         rows[1] = opn(2, "0xb", "BTC", 1, T, 50_000, 100_000)
         r = self.go(rows, lambda c, t: 100_000.0)
-        self.assertEqual(r["trades"], [])
-        self.assertGreater(r["skips"]["whale_exit"], 0)
+        self.assertEqual(len(r["trades"]), 1)
+        self.assertNotIn("whale_exit", r["skips"])
         os.remove(self.db)
         self.cache += "3"
         # Кит A — за 2 часа минус 2 секунды до кита B: на момент решения (+5 с) он старше 2 часов.

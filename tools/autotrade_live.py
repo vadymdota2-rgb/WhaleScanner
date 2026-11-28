@@ -1516,15 +1516,14 @@ class Trader:
         inst, cl = str(e.get("inst")), str(e.get("cl"))
         try:
             o = self.okx.get_order(inst, cl_id=cl)
-            if o.get("state") in ("live", "partially_filled"):
-                # Время вышло — снять остаток и решить по исполненному.
-                if self.clock() >= num(e.get("until")):
-                    with contextlib.suppress(OkxError):   # уже исполнен или снят — решит повторный запрос
-                        self.okx.cancel(inst, str(o.get("ordId")))
-                    o = self.okx.get_order(inst, cl_id=cl)
-                    if o.get("state") in ("live", "partially_filled") and size_of(o.get("accFillSz")) > 0:
-                        self._open_from_fill(e, o)   # снять не вышло — исполненное и есть вход
-                        return "open"
+            # Висит, а время вышло — снять остаток и решить по исполненному.
+            if o.get("state") in ("live", "partially_filled") and self.clock() >= num(e.get("until")):
+                with contextlib.suppress(OkxError):   # уже исполнен или снят — решит повторный запрос
+                    self.okx.cancel(inst, str(o.get("ordId")))
+                o = self.okx.get_order(inst, cl_id=cl)
+                if o.get("state") in ("live", "partially_filled") and size_of(o.get("accFillSz")) > 0:
+                    self._open_from_fill(e, o)   # снять не вышло — исполненное и есть вход
+                    return "open"
         except OkxError as err:
             if err.code != "51603":   # 51603 «ордера нет» — как не найден
                 self.event(f"{inst}: ордер входа не проверен — {err}; повтор на сверке")
