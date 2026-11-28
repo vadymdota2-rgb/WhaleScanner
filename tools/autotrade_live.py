@@ -1095,9 +1095,18 @@ class Trader:
             return
         self._record_close(op, hist[0] if hist else {})
 
+    @staticmethod
+    def _rated(t: dict[str, Any]) -> bool:
+        """Сделка — в рейтинг, только если она того же вида, что торгует бот
+        сейчас (правило владельца 28.11.2026): против китов (AGAINST) — только
+        сделки с пометкой fade; по китам — только без неё. Иначе высокий
+        винрейт с китом значил бы обратное: «шли за ним и выиграли»."""
+        return (t.get("fade") is True) == AGAINST
+
     def _load_rating(self) -> None:
-        """Рейтинг китов — по нашим закрытым сделкам (trades.jsonl): сделка —
-        всем китам её сигнала; плюсовая — pnl > 0. Приоритетные — в сигналы."""
+        """Рейтинг китов — по нашим закрытым сделкам (trades.jsonl) того же
+        вида, что сейчас (_rated): сделка — всем китам её сигнала; плюсовая —
+        pnl > 0. Приоритетные — в сигналы."""
         self.rating = core.Rating()
         try:
             with open(os.path.join(self.dir, "trades.jsonl"), encoding="utf-8") as f:
@@ -1106,7 +1115,7 @@ class Trader:
                         t = json.loads(line)
                     except ValueError:
                         continue
-                    if isinstance(t, dict):
+                    if isinstance(t, dict) and self._rated(t):
                         self.rating.add(t.get("wallets"), num(t.get("pnl")) > 0)
         except OSError:
             pass
@@ -1127,11 +1136,13 @@ class Trader:
                  else {"stop": "стоп", "stall": "замедление"}.get(str(op["exit"].get("kind")), "кит вышел в убыток")
                  if op.get("exit")
                  else "закрыта",
-                 "wallets": sorted(w for w in op.get("wallets") or {} if isinstance(w, str))}
+                 "wallets": sorted(w for w in op.get("wallets") or {} if isinstance(w, str)),
+                 **({"fade": True} if op.get("fade") else {})}   # против китов — для рейтинга
         with open(os.path.join(self.dir, "trades.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False) + "\n")
-        self.rating.add(trade["wallets"], pnl > 0)
-        self.sig.priority = self.rating.priority()
+        if self._rated(trade):
+            self.rating.add(trade["wallets"], pnl > 0)
+            self.sig.priority = self.rating.priority()
         self.st["opens"] = [o for o in self.st["opens"] if (o["inst"], o["side"]) != (op["inst"], op["side"])]
         # Вход этой сделки — уже закрыт: позицию на той же бумаге (докупленную
         # владельцем руками) find_own не примет за свою по метке этого ордера.
