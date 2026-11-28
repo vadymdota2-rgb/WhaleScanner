@@ -103,7 +103,7 @@ cp -r ~/WalletTracker/tests "$T/wt/"
 import autotrade_live as lv
 want = {"MIN_WHALES": 2, "MIN_WHALE_USD": 1000, "MATCH_TOL": 0.10, "AGAINST": True, "WINDOW_MS": 7_200_000, "CHASE": -0.01, "MARGIN_FRAC": 0.05,
         "LEVERAGE": 10, "TP": 0.015, "COIN_PAUSE_MS": 10_800_000,
-        "MAX_OPEN": 3, "ENTRY_WAIT_MS": 60_000}
+        "MAX_OPEN": 3, "ENTRY_WAIT_MS": 60_000, "LOSS_STREAK": 2, "LOSS_PAUSE_MS": 7_200_000}
 assert not hasattr(lv, "AVG_LOSS"), "усреднения быть не должно"
 assert not hasattr(lv.core, "level_ok") and not hasattr(lv.Okx, "range_levels"), "уровней 4ч быть не должно"
 bad = {k: (getattr(lv, k), v) for k, v in want.items() if getattr(lv, k) != v}

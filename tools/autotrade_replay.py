@@ -298,12 +298,15 @@ class Replay:
         self.entered: dict[str, int] = {}
         self.busy: list[tuple[int, str]] = []          # свои позиции: (время выхода, бумага); открытая — 10^18
         self.closing: list[tuple[int, int]] = []       # куча (время выхода, № сделки): ещё не в капитале и рейтинге
+        self.stops_row, self.pause_until = 0, 0         # стопы подряд и пауза входов (как живой бот)
         self.skips: defaultdict[str, int] = defaultdict(int)
         self.rating = core.Rating()   # наш винрейт с китами — по закрытым сделкам повтора
 
     # правила входа — как Trader.try_enter, без биржи
     def decide(self, s: dict[str, Any], now: int) -> str:
         self.settle(now)
+        if now < self.pause_until:
+            return "loss_pause"
         self.busy = [b for b in self.busy if b[0] > now]
         if len(self.busy) >= lv.MAX_OPEN:
             return "own_open"
@@ -449,6 +452,13 @@ class Replay:
             self.equity += t.pnl
             self.rating.add(t.wallets, t.pnl > 0)
             self.sig.priority = self.rating.priority()   # одиночный сигнал — только приоритетного кита
+            # Стопы подряд (по времени выхода) — пауза входов, как у живого бота.
+            if t.why == "стоп":
+                self.stops_row += 1
+                if self.stops_row >= lv.LOSS_STREAK:
+                    self.pause_until, self.stops_row = _t + lv.LOSS_PAUSE_MS, 0
+            elif t.why in ("тейк", "замедление"):
+                self.stops_row = 0
 
     def run(self, since: int, until: int) -> None:
         """Один проход по сделкам открытия китов за период."""

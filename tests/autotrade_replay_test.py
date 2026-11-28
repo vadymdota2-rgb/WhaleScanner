@@ -464,6 +464,24 @@ class ReplayTest(unittest.TestCase):
             self.assertEqual([(x.side, x.why) for x in r["trades"]], [(-1, "тейк")])
             self.assertEqual(r["trades"][0].wallets, ("0xbig1", "0xbig2"), "с крупными, не против толпы лонгов")
 
+    def test_two_stops_pause_two_hours(self) -> None:
+        """Два стопа подряд — входов нет 2 часа (как живой бот): BTC и ETH по
+        стопу, сигнал SOL через 30 минут — «loss_pause»; DOGE через 3 часа — вход."""
+        rows = [*self.whales(), *self.whales(coin="ETH", px=3000, t=T + 10 * MIN, base=10),
+                *self.whales(coin="SOL", px=150, t=T + 90 * MIN, base=20),
+                *self.whales(coin="DOGE", px=0.2, t=T + 240 * MIN, base=30)]
+
+        def price(c: str, ts: int) -> float:
+            base = self.PX[c]
+            if c in ("BTC", "ETH") and T + 30 * MIN <= ts < T + 60 * MIN:
+                return base * 0.98                       # обе — по стопу
+            return base
+
+        r = self.go(rows, price)
+        self.assertEqual([(x.coin, x.why) for x in r["trades"][:2]], [("BTC", "стоп"), ("ETH", "стоп")])
+        self.assertEqual(r["skips"].get("loss_pause"), 1, "SOL — пауза")
+        self.assertEqual([x.coin for x in r["trades"]], ["BTC", "ETH", "DOGE"])
+
     def test_whales_average_with_float_noise_enters(self) -> None:
         """Средняя цена китов 99 999,99999999999 (12 345 $ и 50 000 $ по
         100 000) при цене 100 000 — не «хуже китов»: вход (как у живого бота)."""

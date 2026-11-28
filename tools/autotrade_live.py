@@ -41,6 +41,7 @@
   цена позиции (mark) дошла — снять тейк и закрыть по рынку (только на
   закрытие); работает и при «Стоп» во вкладке; усреднения нет;
 - в одну и ту же бумагу — не чаще раза в 3 часа;
+- 2 стопа подряд — новых входов нет 2 часа (правило владельца 28.11.2026);
 - MA30 15-минутного графика (средняя 30 закрытий, идущая — по цене): лонг —
   только цена выше MA30, шорт — ниже — по стороне СДЕЛКИ (правило владельца
   28.11.2026: в шорт не входим, когда цена выше MA30); свечей нет — как без MA; свечи OKX не
@@ -142,6 +143,11 @@ LOCK_PCT = 0.008
 STALL_MS = 15 * 60_000
 TP = 0.015                  # тейк +1,5 % движения цены (правило владельца 27.11.2026; было +0,8 %, до того +1 %)
 COIN_PAUSE_MS = 3 * 3_600_000
+# Два стопа подряд (LOSS_STREAK закрытий по стопу без тейка или замедления
+# между ними) — новых входов нет LOSS_PAUSE_MS (правило владельца 28.11.2026);
+# открытые позиции ведутся как обычно.
+LOSS_STREAK = 2
+LOSS_PAUSE_MS = 2 * 3_600_000
 FILL_TOL = 0.05            # цена исполнения входа — не дальше 5 % от границы цены ордера
 ENTRY_WAIT_MS = 60_000      # ордер входа (IOC) не исполнен за минуту — снять остаток и решить по исполненному
 ADOPT_TOL = 0.5            # подхват позиции: средняя цена — не дальше 50 % от рынка
@@ -1127,6 +1133,7 @@ class Trader:
         if self._rated(trade):
             self.rating.add(trade["wallets"], pnl > 0)
             self.sig.priority = self.rating.priority()
+        self._count_stops(trade["why"])
         self.st["opens"] = [o for o in self.st["opens"] if (o["inst"], o["side"]) != (op["inst"], op["side"])]
         # Вход этой сделки — уже закрыт: позицию на той же бумаге (докупленную
         # владельцем руками) find_own не примет за свою по метке этого ордера.
@@ -1360,9 +1367,27 @@ class Trader:
         return self._skip("ma30", f"{inst}: цена {last:.6g} {'ниже' if side > 0 else 'выше'} MA30 15м {ma:.6g} — "
                                   f"{'лонг' if side > 0 else 'шорт'} не входит")
 
+    def _count_stops(self, why: str) -> None:
+        """Стопы подряд: стоп — +1, тейк или замедление — сброс. LOSS_STREAK
+        подряд — пауза входов LOSS_PAUSE_MS, счёт заново."""
+        if why != "стоп":
+            if why in ("тейк", "замедление"):
+                self.st["stops_row"] = 0
+            return
+        row = int(num(self.st.get("stops_row"))) + 1
+        if row >= LOSS_STREAK:
+            self.st["pause_until"] = self.clock() + LOSS_PAUSE_MS
+            row = 0
+            self.event(f"{LOSS_STREAK} стопа подряд — новых входов нет {LOSS_PAUSE_MS // 3_600_000} ч")
+        self.st["stops_row"] = row
+
     def try_enter(self, s: dict[str, Any]) -> str:
         """Вход по сигналу; возвращает причину пропуска ('' — вошли)."""
         now = self.clock()
+        pause = num(self.st.get("pause_until"))
+        if now < pause:
+            left = int(-(-(pause - now) // 60_000))   # минуты вверх: ровно 2 ч — «120 мин»
+            return self._skip("loss_pause", f"{LOSS_STREAK} стопа подряд — пауза входов, ещё {left} мин")
         mine = {o["inst"] for o in self.st["opens"]}
         if len(mine) >= MAX_OPEN:
             return self._skip("own_open", f"у бота уже {len(mine)} позиции ({', '.join(sorted(mine))}) — больше {MAX_OPEN} не открываем")

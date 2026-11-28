@@ -1468,6 +1468,56 @@ class OnePositionTest(Base):
         self.assertEqual(self.state()["last_skip"]["code"], "own_open")
 
 
+class LossPauseTest(Base):
+    """Два стопа подряд — новых входов нет 2 часа (правило владельца
+    28.11.2026); тейк или замедление между стопами сбрасывает счёт."""
+
+    def closed(self, tr: lv.Trader, why: str) -> None:
+        op = {"coin": "X", "inst": f"X{len(why)}-USDT-SWAP", "side": 1, "opened": self.now, "px": 100.0, "size": 1.0,
+              "tp": 101.5, "notional": 100.0, "wallets": {}}
+        if why != "тейк":
+            op["exit"] = {"kind": {"стоп": "stop", "замедление": "stall"}[why]}
+        tr._record_close(op, {"closeAvgPx": "101.5" if why == "тейк" else "98", "realizedPnl": "1", "uTime": str(self.now)})
+
+    def test_two_stops_pause_two_hours(self) -> None:
+        tr = self.trader(self.whales())
+        self.on()
+        self.closed(tr, "стоп")
+        self.assertEqual(num_pause(tr), 0, "один стоп — не пауза")
+        self.closed(tr, "стоп")
+        self.assertEqual(num_pause(tr), self.now + 2 * 3_600_000)
+        tr.step()
+        self.assertEqual(self.market_orders(), [])
+        sk = self.state()["last_skip"]
+        self.assertEqual(sk["code"], "loss_pause")
+        self.assertIn("2 стопа подряд — пауза входов, ещё 120 мин", sk["why"])
+        self.assertTrue(any("2 стопа подряд — новых входов нет 2 ч" in e for e in self.state()["events"]))
+        self.now += 2 * 3_600_000
+        con = sqlite3.connect(self.db)   # свежий сигнал через 2 часа
+        con.execute(INS, fill(30, "0xc", "BTC", 1, self.now - 2 * MIN, 50_000, 100_000))
+        con.execute(INS, fill(31, "0xd", "BTC", 1, self.now - MIN, 50_000, 100_000))
+        con.commit()
+        con.close()
+        tr.step()
+        self.assertEqual(len(self.market_orders()), 1, "пауза кончилась — входим")
+
+    def test_take_or_stall_between_resets(self) -> None:
+        tr = self.trader(self.whales())
+        for between in ("тейк", "замедление"):
+            tr.st.pop("pause_until", None)
+            tr.st.pop("stops_row", None)
+            self.closed(tr, "стоп")
+            self.closed(tr, between)
+            self.closed(tr, "стоп")
+            self.assertEqual(num_pause(tr), 0, between)
+            self.closed(tr, "стоп")
+            self.assertGreater(num_pause(tr), 0, "снова два подряд — пауза")
+
+
+def num_pause(tr: lv.Trader) -> float:
+    return lv.num(tr.st.get("pause_until"))
+
+
 class StallTest(Base):
     """Замедление (правило владельца 28.11.2026): прибыль дошла до +0,8 %, а
     потом 15 минут нет нового максимума — закрыть по рынку, но не меньше

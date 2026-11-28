@@ -64,7 +64,7 @@ MUTS = [
     ("        s = {**s, \"stop\": core.fixed_stop(last, s[\"side\"])}", "        s = {**s, \"stop\": 0.0}", "стоп — на входе"),
     # Правила владельца
     ("MIN_WHALES = 2", "MIN_WHALES = 1", "сигнал — от 2 китов"),
-    ("MAX_OPEN = 3 ", "MAX_OPEN = 2 ", "своих позиций — до 3"),
+    ("MAX_OPEN = 3   #", "MAX_OPEN = 2   #", "своих позиций — до 3"),
     ("    if bts.proc is not None:\n        bts.restart_for_update()", "    if False:\n        bts.restart_for_update()", "код обновился — пересчёт заново новым кодом"),
     ("    if mtimes(me) == stamp:\n        return False", "    if True:\n        return False", "код обновился — служба перезапускается"),
     ("        self._done(None, \"код обновился — пересчёт начат заново новой версией\")\n        with open(", "        self._done(None, \"код обновился — пересчёт начат заново новой версией\")\n        if False:\n          with open(", "код обновился — пересчёт заказан заново"),
@@ -255,6 +255,10 @@ MUTS = [
     ("and ms - num(b.get(\"at\")) < (BLOCK_MS", "and ms - num(b.get(\"at\")) < 10**15 + (BLOCK_MS", "очистка: истёкшие запреты бумаг"),
     ("            if os.path.getsize(path) > LOG_MAX_BYTES:", "            if False:", "ротация журнала"),
     ("            if now - mtime > CACHE_MAX_DAYS * 86400:", "            if False:", "кеш старше 30 дней — удаляется"),
+    ("        if now < pause:", "        if False:", "2 стопа подряд — пауза входов"),
+    ("LOSS_STREAK = 2", "LOSS_STREAK = 3", "пауза — после 2 стопов, не 3"),
+    ("LOSS_PAUSE_MS = 2 * 3_600_000", "LOSS_PAUSE_MS = 3_600_000", "пауза — 2 часа"),
+    ("            if why in (\"тейк\", \"замедление\"):", "            if why == \"тейк\":", "замедление тоже сбрасывает счёт стопов"),
 ]
 
 RP_MUTS = [
@@ -314,6 +318,7 @@ RP_MUTS = [
     ("        if isinstance(rows, list) and end <= self.now_ms:", "        if end <= self.now_ms:", "повтор: сбой сети не ложится в кеш"),
     ("                            got[int(k)] = [c for c in v if candle_ok(c)]", "                            got[int(k)] = v",
      "повтор: испорченный кеш — без мусора"),
+    ("        if now < self.pause_until:", "        if False:", "повтор: 2 стопа подряд — пауза входов"),
 ]
 
 CORE_MUTS = [
