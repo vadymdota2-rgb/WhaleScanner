@@ -101,7 +101,7 @@ cp -r ~/WalletTracker/tests "$T/wt/"
 ```bash
 (cd "$T/ws/tools" && python3 - <<'EOF'
 import autotrade_live as lv
-want = {"MIN_WHALES": 2, "MIN_WHALE_USD": 1000, "AGAINST": True, "WINDOW_MS": 7_200_000, "CHASE": -0.01, "MARGIN_FRAC": 0.05,
+want = {"MIN_WHALES": 2, "MIN_WHALE_USD": 1000, "MATCH_TOL": 0.10, "AGAINST": True, "WINDOW_MS": 7_200_000, "CHASE": -0.01, "MARGIN_FRAC": 0.05,
         "LEVERAGE": 10, "TP": 0.015, "COIN_PAUSE_MS": 10_800_000,
         "MAX_OPEN": 3, "ENTRY_WAIT_MS": 60_000}
 assert not hasattr(lv, "AVG_LOSS"), "усреднения быть не должно"
